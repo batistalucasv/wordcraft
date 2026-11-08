@@ -69,11 +69,14 @@ const RLM: char = '\u{200F}';
 pub(super) fn para_number(ui: &mut Ui, value: &mut f32, kind: ParaNumber, key: &str, mixed: &mut BTreeSet<String>, label: &egui::Response) {
     let unit = crate::options::unit();
     let blank = mixed.contains(key);
+    // For blank line spacing (e.g. mixed or non-multiple), use 0.0 as a sentinel outside
+    // 0.5..=5.0 so typing 1.0 still triggers `changed()`.
+    let mut shown_value = if blank && matches!(kind, ParaNumber::Lines) { 0.0 } else { *value };
     // A value from the document outside the range (line spacing 6) stays until edited.
     let field = match kind {
-        ParaNumber::Length => egui::DragValue::new(value).speed(3.6 / unit.pt_per_unit()).max_decimals(2),
-        ParaNumber::Points => egui::DragValue::new(value).speed(1.0).range(0.0..=1584.0).clamp_existing_to_range(false),
-        ParaNumber::Lines => egui::DragValue::new(value).speed(0.05).range(0.5..=5.0).clamp_existing_to_range(false),
+        ParaNumber::Length => egui::DragValue::new(&mut shown_value).speed(3.6 / unit.pt_per_unit()).max_decimals(2),
+        ParaNumber::Points => egui::DragValue::new(&mut shown_value).speed(1.0).range(0.0..=1584.0).clamp_existing_to_range(false),
+        ParaNumber::Lines => egui::DragValue::new(&mut shown_value).speed(0.05).range(0.5..=5.0).clamp_existing_to_range(false),
     };
     let field = match kind {
         ParaNumber::Length if blank => field.measure_blank(unit),
@@ -86,6 +89,7 @@ pub(super) fn para_number(ui: &mut Ui, value: &mut f32, kind: ParaNumber, key: &
         ParaNumber::Lines => field,
     };
     if ui.add(field).labelled_by(label.id).changed() {
+        *value = shown_value;
         mixed.remove(key);
     }
 }
