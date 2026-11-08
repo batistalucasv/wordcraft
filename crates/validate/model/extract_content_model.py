@@ -433,6 +433,7 @@ def build(schema_dir, profile="wml"):
 
 
 def main():
+    """Run content model extraction from schemas and emit JSON tables."""
     here = os.path.dirname(os.path.abspath(__file__))
     args = sys.argv[1:]
     profile = "wml"
@@ -444,6 +445,10 @@ def main():
     default_out = "content_model_dml.json" if profile == "dml" else "content_model.json"
     out_path = args[1] if len(args) > 1 else os.path.join(here, default_out)
     data = build(schema_dir, profile)
+    missing = [u for u in data["meta"]["unresolved"] if u.startswith("missing file ")]
+    if missing:
+        print(f"extract_content_model.py: schema files not found in {schema_dir}: {missing}", file=sys.stderr)
+        return 1
     with open(out_path, "w", encoding="utf-8") as fh:
         json.dump(data, fh, indent=1, sort_keys=True)
         fh.write("\n")
@@ -451,7 +456,8 @@ def main():
     print("unresolved:", len(data["meta"]["unresolved"]))
     for u in data["meta"]["unresolved"][:25]:
         print("  ", u)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

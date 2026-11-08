@@ -29,7 +29,7 @@ SHA-256 of the checked-in files:
 
 | File | SHA-256 |
 |---|---|
-| `extract_content_model.py` | `259d43e4cfe6785c2a62e5b4a68ca61f971332d7205b643c25a5ee1b66b81466` |
+| `extract_content_model.py` | `3830f8c121c21412fb4fda70ced250b3c812d3b2b1052ea6d22980fc3d595dfb` |
 | `generate_model.py` | `0732c987ce12378365e9a36c88690fb0bde757830d027af7706bbbe23a55f1fe` |
 | `content_model_v2.json` | `f36a42e324bae4cf4d6ce03ebbfb53e2e5729d76ae5f4929332a272d02545978` |
 | `content_model_v2_transitional.json` | `92c433577c914785908f42553718cc41b4f12161125596383ab6836ac3c54fbf` |
