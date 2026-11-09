@@ -939,3 +939,83 @@ fn word_diff(
     }
     p
 }
+
+#[cfg(test)]
+mod note_alignment_budget_tests {
+    use super::*;
+
+    /// Mirrors the thirty-note native fixture without depending on Word-produced files.
+    fn note(index: u32, revised: bool) -> NoteInfo {
+        let mut tokens: Vec<String> = (0..50).map(|word| format!("note{index:02}word{word:02}")).collect();
+        if revised {
+            tokens[25] = format!("note{index:02}replacement");
+        }
+        let key = tokens.join(" ");
+        let context = format!("Reference {index:02} {} context.", if revised { "revised" } else { "original" });
+        NoteInfo { id: index + if revised { 101 } else { 1 }, key, tokens, ref_pos: Some((index as usize, context)) }
+    }
+
+    /// Later notes still receive similarity scores when earlier pairs use the quadratic budget.
+    #[test]
+    fn edited_notes_remain_paired_after_note_alignment_budget_is_exhausted() {
+        let old: Vec<_> = (0..30).map(|i| note(i, false)).collect();
+        let new: Vec<_> = (0..30).map(|i| note(i, true)).collect();
+        let mut budget = MAX_NOTE_ALIGN_BUDGET;
+        let (pairs, inserted, deleted) = align_note_run(&old, &new, &mut budget);
+        assert_eq!(pairs, (0..30).map(|i| (i + 1, i + 101)).collect::<Vec<_>>());
+        assert!(inserted.is_empty(), "edited notes are not new notes: {inserted:?}");
+        assert!(deleted.is_empty(), "edited notes are not deleted notes: {deleted:?}");
+    }
+
+    /// Edited edges still leave ordered interior evidence; unrelated inserted notes stay new.
+    #[test]
+    fn exhausted_budget_keeps_interior_matches_without_inventing_inserted_note_pairs() {
+        let old: Vec<_> = (0..30).map(|i| note(i, false)).collect();
+        let mut new: Vec<_> = (0..30).map(|i| note(i, true)).collect();
+        for (i, n) in new.iter_mut().enumerate() {
+            n.tokens[0] = format!("note{i:02}start");
+            n.tokens[49] = format!("note{i:02}end");
+            n.key = n.tokens.join(" ");
+        }
+        new.insert(5, note(99, true));
+        for (position, info) in new.iter_mut().enumerate() {
+            if let Some((index, _)) = &mut info.ref_pos {
+                *index = position;
+            }
+        }
+        let mut budget = 0;
+        let (pairs, inserted, deleted) = align_note_run(&old, &new, &mut budget);
+        assert_eq!(pairs, (0..30).map(|i| (i + 1, i + 101)).collect::<Vec<_>>());
+        assert_eq!(inserted, vec![200]);
+        assert!(deleted.is_empty());
+    }
+
+    /// Exhausted-budget matches remain genuine ordered subsequences, including shifts/repeats.
+    #[test]
+    fn bounded_fallback_never_exceeds_exact_lcs() {
+        let bound = |a: &[&str], b: &[&str]| lcs_len(a, b, &mut 0);
+        assert_eq!(bound(&["a", "b", "c", "d"], &["x", "a", "b", "c", "d", "y"]), 4);
+        assert_eq!(bound(&["a", "b", "c"], &["a", "x", "b", "c"]), 3);
+        let examples =
+            ["", "a", "a a", "a b a", "b a b", "a b c d", "d c b a", "a x b c a", "b c a x", "a b c d e", "x b c d y", "a b c z d", "a x b c y d"];
+        for a in examples {
+            for b in examples {
+                let a: Vec<_> = a.split_whitespace().collect();
+                let b: Vec<_> = b.split_whitespace().collect();
+                let lower = bound(&a, &b);
+                assert!(lower <= a.len().min(b.len()));
+                assert!(lower <= lcs_len(&a, &b, &mut 200_000), "{a:?}, {b:?}");
+            }
+        }
+    }
+
+    /// A word-bag approximation would incorrectly accept this reversed note as identical.
+    #[test]
+    fn exhausted_budget_does_not_pair_reordered_words_as_an_identical_note() {
+        let info =
+            |id, text: &str| NoteInfo { id, key: text.to_string(), tokens: text.split_whitespace().map(str::to_string).collect(), ref_pos: None };
+        let mut budget = 0;
+        let score = note_score(&info(1, "one two three four"), &info(2, "four three two one"), &mut budget);
+        assert!(score < NOTE_SIMILARITY_THRESHOLD, "reordered text has insufficient ordered similarity: {score}");
+    }
+}

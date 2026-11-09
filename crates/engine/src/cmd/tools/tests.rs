@@ -670,3 +670,58 @@ fn compare_pairs_many_notes_when_budget_exhausted() {
         assert!(has_del, "Note tracks deletion of 'observations': {}", para.plain_text());
     }
 }
+
+/// Thirty lightly edited notes stay paired instead of becoming whole deleted/new stories.
+/// The text/context pattern is also observed with native Word Compare; no Word file is used.
+#[test]
+fn compare_many_edited_notes_keeps_minor_note_revisions() {
+    let make = |revised: bool| {
+        let lines: Vec<String> = (0..30).map(|i| format!("Reference {i:02} {} context.", if revised { "revised" } else { "original" })).collect();
+        let mut s = Session::new(Document::from_text(&lines.join("\n")));
+        for (index, line) in lines.iter().enumerate() {
+            let words: Vec<String> = (0..50)
+                .map(|word| if revised && word == 25 { format!("note{index:02}replacement") } else { format!("note{index:02}word{word:02}") })
+                .collect();
+            s.run("caret.set", &json!({"pos": Pos::body(index, line.len())})).unwrap();
+            s.run("references.footnote", &json!({"text": words.join(" ")})).unwrap();
+        }
+        s
+    };
+    let original = make(false);
+    let revised = make(true);
+    let ids: Vec<u32> = original
+        .doc
+        .body
+        .iter()
+        .filter_map(|b| b.as_para())
+        .flat_map(|p| &p.objects)
+        .filter_map(|o| if let InlineObject::NoteRef { id, .. } = o { Some(*id) } else { None })
+        .collect();
+    struct Scratch(std::path::PathBuf);
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    let path = Scratch(std::env::temp_dir().join(format!("wc-note-budget-{}.docx", std::process::id())));
+    crate::io::save_path(&path.0, &revised.doc).unwrap();
+    let mut s = original;
+    s.run("review.compare", &json!({"path": path.0.to_string_lossy()})).unwrap();
+    let parts: Vec<_> = s.doc.parts.values().filter(|p| p.kind == wordcraft_doc::PartKind::Footnote).collect();
+    let wholly_deleted = parts.iter().filter(|p| p.blocks[0].as_para().unwrap().runs.iter().all(|r| r.props.del.is_some())).count();
+    let wholly_inserted = parts.iter().filter(|p| p.blocks[0].as_para().unwrap().runs.iter().all(|r| r.props.ins.is_some())).count();
+    assert_eq!(parts.len(), 30, "whole deleted notes={wholly_deleted}, whole inserted notes={wholly_inserted}");
+    for p in s.doc.body.iter().filter_map(|b| b.as_para()) {
+        for off in p.object_offsets() {
+            let props = p.props_at(off);
+            assert!(props.ins.is_none() && props.del.is_none(), "note references stay unchanged");
+        }
+    }
+    for (index, id) in ids.iter().enumerate() {
+        let p = s.doc.parts.get(id).unwrap().blocks[0].as_para().unwrap();
+        let deleted: String = p.run_ranges().filter(|(_, c)| c.del.is_some()).map(|(r, _)| &p.text[r]).collect();
+        let inserted: String = p.run_ranges().filter(|(_, c)| c.ins.is_some()).map(|(r, _)| &p.text[r]).collect();
+        assert_eq!(deleted.trim(), format!("note{index:02}word25"));
+        assert_eq!(inserted.trim(), format!("note{index:02}replacement"));
+    }
+}
