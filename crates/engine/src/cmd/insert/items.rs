@@ -128,10 +128,24 @@ const PORTUGUESE: DateNames = DateNames {
     default: "dd/MM/yyyy",
 };
 
+/// Italian (observed in Word for Windows with an it-IT document): lower-case names, `MMM` = `nov`,
+/// `ddd` = `mar`, and `dd/MM/yyyy` for a field without a picture (`10/11/2026`).
+const ITALIAN: DateNames = DateNames {
+    months: ["gennaio", "febbraio", "marzo", "aprile", "maggio", "giugno", "luglio", "agosto", "settembre", "ottobre", "novembre", "dicembre"],
+    days: ["giovedì", "venerdì", "sabato", "domenica", "lunedì", "martedì", "mercoledì"],
+    default: "dd/MM/yyyy",
+};
+
 /// Choose month and weekday names according to the primary language subtag.
 fn date_names(lang: Option<&str>) -> &'static DateNames {
     let primary = lang.and_then(|l| l.trim().split(['-', '_']).next()).unwrap_or("");
-    if primary.eq_ignore_ascii_case("pt") { &PORTUGUESE } else { &ENGLISH }
+    if primary.eq_ignore_ascii_case("pt") {
+        &PORTUGUESE
+    } else if primary.eq_ignore_ascii_case("it") {
+        &ITALIAN
+    } else {
+        &ENGLISH
+    }
 }
 
 /// The picture Word gives a `DATE` field that has no `\@` switch, in the field's language.
@@ -457,6 +471,35 @@ mod date_time_locale_tests {
         assert_eq!(p.props_of_char(0).lang.as_deref(), Some("pt-BR"));
         assert_eq!(p.plain_text(), format_date_in("d 'de' MMMM 'de' yyyy", Some("pt-BR")));
         assert!(p.objects.iter().all(|o| !matches!(o, InlineObject::Field { .. })));
+    }
+
+    /// 10 November 2026, noon UTC: a Tuesday.
+    const NOV_10_2026: u64 = 1_794_312_000;
+
+    /// Italian names as Word writes them in an it-IT document (observed on a synthetic document):
+    /// lower case, `MMM` = `nov`, `ddd` = `mar`.
+    #[test]
+    fn italian_month_and_weekday_names() {
+        assert_eq!(format_date_at_in("d MMMM yyyy", Some("it-IT"), NOV_10_2026, 0), "10 novembre 2026");
+        assert_eq!(format_date_at_in("dddd d MMMM yyyy", Some("it-IT"), NOV_10_2026, 0), "martedì 10 novembre 2026");
+        assert_eq!(format_date_at_in("ddd d MMM yyyy", Some("it-IT"), NOV_10_2026, 0), "mar 10 nov 2026");
+        assert_eq!(format_date_at_in("d MMMM yyyy", Some("it"), NOV_10_2026, 0), "10 novembre 2026");
+        // Each month by its own name, so a typo in the table shows.
+        let months: Vec<String> = (1..=12).map(|m| format_date_parts_in("MMMM", Some("it-IT"), 2026, m, 1, (0, 0, 0), 0)).collect();
+        assert_eq!(
+            months,
+            ["gennaio", "febbraio", "marzo", "aprile", "maggio", "giugno", "luglio", "agosto", "settembre", "ottobre", "novembre", "dicembre"]
+        );
+        // 1970-01-01 (day 0) was a Thursday.
+        let days: Vec<String> = (0..7).map(|d| format_date_parts_in("dddd", Some("it-IT"), 1970, 1, 1, (0, 0, 0), d)).collect();
+        assert_eq!(days, ["giovedì", "venerdì", "sabato", "domenica", "lunedì", "martedì", "mercoledì"]);
+    }
+
+    /// A DATE field without `\@` in an it-IT document shows `dd/MM/yyyy` (Word: `10/11/2026`).
+    #[test]
+    fn italian_default_date_picture() {
+        assert_eq!(default_date_picture(Some("it-IT")), "dd/MM/yyyy");
+        assert_eq!(format_date_at_in(default_date_picture(Some("it-IT")), Some("it-IT"), NOV_10_2026, 0), "10/11/2026");
     }
 
     /// Word's doubled apostrophe escapes one literal quote both before and inside a quoted run.

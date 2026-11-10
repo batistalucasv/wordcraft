@@ -187,6 +187,30 @@ fn binary_doc_opened_by_extension_refreshes_date_fields() {
     }
 }
 
+/// A letter written in Italian: the DATE field's language is it-IT only through the document
+/// defaults, and the refreshed date reads `10 novembre 2026`, not `10 November 2026`.
+#[test]
+fn a_date_field_inherits_it_it_from_document_defaults() {
+    const PICTURE: &str = "d MMMM yyyy";
+    const CODE: &str = r#"DATE \@ "d MMMM yyyy""#;
+    let rels = r#"<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>"#;
+    let doc_rels = r#"<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdStyles" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>"#;
+    let styles = r#"<?xml version="1.0" encoding="UTF-8"?><w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:docDefaults><w:rPrDefault><w:rPr><w:lang w:val="it-IT"/></w:rPr></w:rPrDefault></w:docDefaults><w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/></w:style></w:styles>"#;
+    let doc = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t xml:space="preserve">Ancona, </w:t></w:r>{}</w:p></w:body></w:document>"#,
+        field(CODE, "26 marzo 2025", false)
+    );
+    let source = zip(&[("_rels/.rels", rels), ("word/document.xml", &doc), ("word/_rels/document.xml.rels", doc_rels), ("word/styles.xml", styles)]);
+    let opened = wordcraft_engine::io::open_bytes("it-it-word.docx", &source).unwrap();
+    let got = fields(&opened);
+    assert_eq!(got.len(), 1);
+    let (_, result) = &got[0];
+    assert_eq!(result, &wordcraft_engine::cmd::insert::format_date_in(PICTURE, Some("it-IT")));
+    const ENGLISH: [&str; 12] =
+        ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+    assert!(!ENGLISH.iter().any(|m| result.contains(m)), "Italian month name, got {result}");
+}
+
 /// Regression from a synthetic Word document: a visible Brazilian long date is
 /// stored in a TIME field and pt-BR is present only in docDefaults, not in field runs.
 #[test]
