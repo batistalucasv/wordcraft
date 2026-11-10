@@ -44,6 +44,7 @@ pub mod picfx;
 pub mod props;
 pub mod resolve;
 pub mod section;
+pub mod shrink;
 pub mod smart_art;
 pub mod styles;
 pub mod symbol_fonts;
@@ -64,6 +65,7 @@ pub use numbering::{ListKind, Numbering};
 pub use para::{InlineObject, Paragraph, Run};
 pub use props::{Align, CharProps, ParaProps, Rgb, TextColor};
 pub use section::SectionProps;
+pub use shrink::{MAX_SHRINK_FONT_SIZE, MIN_SHRINK_FONT_SIZE, round_half_pt, shrink_document_typography};
 pub use styles::{Style, StyleKind, StyleSheet};
 pub use table::{Cell, Row, Table};
 

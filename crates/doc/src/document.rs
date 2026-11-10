@@ -916,4 +916,11 @@ impl Document {
         }
         out
     }
+
+    /// Shrinks the document's typography by scaling font sizes down by `delta_pt`
+    /// (rounded to 0.5 pt, clamped to 4.0–1638.0 pt) and scaling paragraph spacing
+    /// by `space_factor` across styles and editable stories (excluding headers/footers).
+    pub fn shrink_typography(&mut self, delta_pt: f32, space_factor: f32) {
+        crate::shrink::shrink_document_typography(self, delta_pt, space_factor);
+    }
 }
