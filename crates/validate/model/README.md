@@ -5,7 +5,7 @@ produce it. The chain runs from the ECMA-376 schemas to JSON tables to Rust. Eve
 deterministic, stdlib-only Python script, and every intermediate file is checked in:
 
 ```
-ECMA-376 XSDs ──extract_content_model.py──▶ content_model_*.json ──generate_model.py──▶ ../src/model.rs
+ECMA-376 XSDs ──extract_model_lf.py──▶ content_model_*.json ──generate_model.py──▶ ../src/model.rs
 ```
 
 The crate never runs Python. `../src/model.rs` is checked-in generated Rust, and the crate has no
@@ -17,6 +17,7 @@ need nothing beyond the Rust sources. A change to the tables shows up in review 
 
 | File | What |
 |---|---|
+| `extract_model_lf.py` | LF-output entry point; calls the byte-pinned extractor builder. Use this for regeneration on every platform. |
 | `extract_content_model.py` | XSD → JSON extractor (v2: namespace-qualified type keys). Profiles: `wml` (default) and `dml`. |
 | `content_model_v2.json` | WML tables (`w:`, `m:`, `b:`, `wp:`, `pic:`), Strict |
 | `content_model_v2_transitional.json` | WML tables, Transitional (input to the Strict/Transitional differ) |
@@ -36,6 +37,21 @@ SHA-256 of the checked-in files:
 | `content_model_dml_v2.json` | `9a3e58c9bc70d3b2fa9718a02666b51d2f4822e66ff61e212cdea63e3e569549` |
 | `content_model_dml_v2_transitional.json` | `81290399fb8f89aa287d275172b7214378449a54fd3783e42a8f899958dae127` |
 | `../src/model.rs` | `2b9afc35bb5d65fa829e17c1a80a661df326f06f00e9b7ccce0723c3ae513d0b` |
+
+## Line endings and regeneration
+
+The seven byte-pinned files above keep LF checkout bytes through narrowly scoped
+`.gitattributes` rules, including `../src/model.rs`, even with `core.autocrlf=true`.
+Use `extract_model_lf.py` for extraction: it calls the unchanged builder in
+`extract_content_model.py` and explicitly requests LF when writing JSON. The original
+extractor remains byte-identical for its recorded hash and the tables' provenance;
+its legacy platform-default output entry point is superseded by the LF entry point.
+The generator already explicitly requests LF for its Rust output. No model content
+or existing SHA-256 value changes for this checkout fix.
+
+Run `python3 test_model_checkout.py` to simulate autocrlf checkout bytes from Git's
+attributes and verify them, and to check the LF entry point's output options without
+needing the source schemas. This byte-level simulation does not claim a Windows host run.
 
 ## Sources
 
@@ -60,10 +76,10 @@ SHA-256 of every schema file it read in `meta.file_sha256`.
 Run from this directory:
 
 ```
-python3 extract_content_model.py <strict>                    content_model_v2.json
-python3 extract_content_model.py <transitional>              content_model_v2_transitional.json
-python3 extract_content_model.py --profile dml <strict>       content_model_dml_v2.json
-python3 extract_content_model.py --profile dml <transitional> content_model_dml_v2_transitional.json
+python3 extract_model_lf.py <strict>                    content_model_v2.json
+python3 extract_model_lf.py <transitional>              content_model_v2_transitional.json
+python3 extract_model_lf.py --profile dml <strict>       content_model_dml_v2.json
+python3 extract_model_lf.py --profile dml <transitional> content_model_dml_v2_transitional.json
 python3 generate_model.py --model-dir . --xsd-dir <strict> --out ../src/model.rs
 ```
 
