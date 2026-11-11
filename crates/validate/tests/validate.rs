@@ -5070,3 +5070,175 @@ fn round2_malformed_content_types() {
     assert_eq!(report.verdict, Verdict::Fail, "manifest malformation remains an independent Error: {report:?}");
     assert_finding(&report, "XML-MALFORMED", Some("[Content_Types].xml"));
 }
+
+/// Add an ownership edge without disturbing an owner's existing supporting relationships.
+fn round3_add_rel(d: &mut Doc, owner: &str, id: &str, kind: &str, target: &str) {
+    let part = format!("word/_rels/{owner}.xml.rels");
+    let rels = String::from_utf8(d.get(&part).to_vec()).unwrap();
+    d.set(&part, rels.replace("</Relationships>", &format!(r#"<Relationship Id="{id}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/{kind}" Target="{target}"/></Relationships>"#)));
+}
+
+/// Adding reachability cannot erase a shared header's established error.
+fn round3_shared_story(kind: &str, ct: &str, rule: &str) {
+    for reverse in [false, true] {
+        let mut d = fredapps_owner_doc(kind, ct, if reverse { "2" } else { "1" }, if reverse { "1" } else { "2" });
+        d.set_document("<w:p/>");
+        d.set("word/glossary.xml", format!(r#"<w:glossaryDocument xmlns:w="{W_NS}"><w:docParts/></w:glossaryDocument>"#));
+        d.add_with_override(
+            "word/shared-header.xml",
+            CT_HEADER,
+            format!(r#"<w:hdr xmlns:w="{W_NS}"><w:p><w:r><w:{kind}Reference w:id="1"/></w:r></w:p></w:hdr>"#),
+        );
+        let bad_owner = if reverse { "document" } else { "glossary" };
+        let good_owner = if reverse { "glossary" } else { "document" };
+        round3_add_rel(&mut d, bad_owner, "rH", "header", "shared-header.xml");
+        let control = validate_bytes(&d.build());
+        assert_eq!(control.verdict, Verdict::Fail, "{control:?}");
+        assert_finding(&control, rule, Some("word/shared-header.xml"));
+        round3_add_rel(&mut d, good_owner, "rH", "header", "shared-header.xml");
+        let shared = validate_bytes(&d.build());
+        assert_eq!(shared.verdict, Verdict::Fail, "{kind}, reverse {reverse}: {shared:?}");
+        assert_finding(&shared, rule, Some("word/shared-header.xml"));
+        // A reference satisfied in every established context is still clean.
+        d.set(
+            &format!("word/{}{kind}s.xml", if reverse { "" } else { "gloss-" }),
+            format!(r#"<w:{kind}s xmlns:w="{W_NS}"><w:{kind} w:id="1"><w:p/></w:{kind}></w:{kind}s>"#),
+        );
+        let satisfied = validate_bytes(&d.build());
+        assert_eq!(satisfied.verdict, Verdict::Pass, "{satisfied:?}");
+        assert!(!has(&satisfied, rule), "{satisfied:?}");
+    }
+}
+
+/// Round 3 item 1: comments in a shared story are checked under both owners.
+#[test]
+fn round3_shared_comment_owners() {
+    round3_shared_story("comment", CT_COMMENTS, "ID-COMMENT-REF");
+}
+
+/// The same shared-owner invariant applies to footnote references.
+#[test]
+fn round3_shared_footnote_owners() {
+    round3_shared_story("footnote", CT_FOOTNOTES, "REF-NOTE");
+}
+
+/// The same shared-owner invariant applies to endnote references.
+#[test]
+fn round3_shared_endnote_owners() {
+    round3_shared_story("endnote", CT_ENDNOTES, "REF-NOTE");
+}
+
+/// Unknown glossary settings cannot veto a proven main join in either direction.
+fn round3_unknown_settings(kind: &str, ct: &str) {
+    for dangling in [false, true] {
+        let mut d = round2_note_pr_doc(kind, ct, false, dangling);
+        let rule = if dangling { "NOTE-PR-DANGLING" } else { "NOTE-PR-LISTING" };
+        let complete = validate_bytes(&d.build());
+        assert!(has(&complete, rule), "{complete:?}");
+        let rels = String::from_utf8(d.get("word/_rels/glossary.xml.rels").to_vec()).unwrap();
+        let before_settings = rels.split("<Relationship Id=\"rS\"").next().unwrap();
+        d.set("word/_rels/glossary.xml.rels", format!("{before_settings}<Relationship"));
+        let partial = validate_bytes(&d.build());
+        assert!(has(&partial, rule), "{kind}, dangling {dangling}: {partial:?}");
+        if !dangling {
+            assert_eq!(partial.verdict, Verdict::Fail, "{partial:?}");
+            assert_finding(&partial, rule, Some(&format!("word/{kind}s.xml")));
+        }
+        assert!(partial.coverage_notes.iter().any(|n| n.contains("footnotePr/endnotePr") && n.contains("glossary")), "{partial:?}");
+    }
+}
+
+/// Round 3 item 2: footnote joins retain known main errors under partial glossary discovery.
+#[test]
+fn round3_unknown_footnote_settings() {
+    round3_unknown_settings("footnote", CT_FOOTNOTES);
+}
+
+/// Round 3 item 2: endnote joins retain known main errors under partial glossary discovery.
+#[test]
+fn round3_unknown_endnote_settings() {
+    round3_unknown_settings("endnote", CT_ENDNOTES);
+}
+
+/// Round 3 item 3: unknown comments ownership cannot manufacture a missing-paragraph warning.
+#[test]
+fn round3_unknown_comments_threading() {
+    let mut d = Doc::minimal();
+    d.add_with_override(
+        "word/comments.xml",
+        CT_COMMENTS,
+        format!(r#"<w:comments xmlns:w="{W_NS}" xmlns:w14="{W14_NS}"><w:comment w:id="1"><w:p w14:paraId="00000001"/></w:comment></w:comments>"#),
+    );
+    d.add_with_override(
+        "word/commentsExtended.xml",
+        CT_COMMENTS_EXT,
+        format!(r#"<w15:commentsEx xmlns:w15="{W15_NS}"><w15:commentEx w15:paraId="00000001"/></w15:commentsEx>"#),
+    );
+    let ext = r#"<Relationship Id="rE" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/commentsExtended" Target="commentsExtended.xml"/>"#;
+    let comments =
+        r#"<Relationship Id="rC" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments" Target="comments.xml"/>"#;
+    d.set_doc_rels(&format!("{ext}{comments}"));
+    let complete = validate_bytes(&d.build());
+    assert_eq!(complete.verdict, Verdict::Pass, "{complete:?}");
+    assert!(!has(&complete, "COMMENTEX-LINK"), "{complete:?}");
+    let partial_rels = String::from_utf8(rels_xml(ext)).unwrap().replace("</Relationships>", "<Relationship");
+    d.set("word/_rels/document.xml.rels", partial_rels);
+    let partial = validate_bytes(&d.build());
+    assert_eq!(partial.verdict, Verdict::Incomplete, "{partial:?}");
+    assert!(!has(&partial, "COMMENTEX-LINK"), "{partial:?}");
+    assert!(partial.coverage_notes.iter().any(|n| n.contains("comment-threading") && n.contains("could not be")), "{partial:?}");
+    // Parent links depend only on the established extension set and must still be checked.
+    d.set(
+        "word/commentsExtended.xml",
+        format!(r#"<w15:commentsEx xmlns:w15="{W15_NS}"><w15:commentEx w15:paraId="00000001" w15:paraIdParent="00000002"/></w15:commentsEx>"#),
+    );
+    let parent = validate_bytes(&d.build());
+    assert!(parent.findings.iter().any(|f| f.rule == "COMMENTEX-LINK" && f.message.contains("paraIdParent")), "{parent:?}");
+    assert!(!parent.findings.iter().any(|f| f.rule == "COMMENTEX-LINK" && f.message.contains("no paragraph")), "{parent:?}");
+}
+
+/// Exercise style/numbering consumers with an undiscovered header and an established main source.
+fn round3_unknown_vocabulary(kind: &str, ct: &str, rule: &str, defs: &str, good: &str, bad: &str) {
+    for missing_main in [false, true] {
+        let mut d = round2_unknown_owner_doc(false);
+        d.set_document(if missing_main { bad } else { good });
+        d.set("word/gloss-header.xml", format!(r#"<w:hdr xmlns:w="{W_NS}">{bad}</w:hdr>"#));
+        d.add_with_override(&format!("word/{kind}.xml"), ct, defs.to_string());
+        round3_add_rel(&mut d, "document", "rV", kind, &format!("{kind}.xml"));
+        let report = validate_bytes(&corrupt_entry_data(&d.build(), "word/_rels/glossary.xml.rels"));
+        assert!(!report.findings.iter().any(|f| f.rule == rule && f.part.as_deref() == Some("word/gloss-header.xml")), "{report:?}");
+        assert_eq!(report.findings.iter().filter(|f| f.rule == rule).count(), usize::from(missing_main), "{report:?}");
+        if missing_main {
+            assert_finding(&report, rule, Some("word/document.xml"));
+        }
+        assert_eq!(report.verdict, Verdict::Incomplete, "these rules are warnings: {report:?}");
+    }
+}
+
+/// Round 3 lateral coverage: unknown style-reference ownership skips only the unknown reference.
+#[test]
+fn round3_unknown_style_ownership() {
+    round3_unknown_vocabulary(
+        "styles",
+        CT_STYLES,
+        "REF-STYLE",
+        &format!(r#"<w:styles xmlns:w="{W_NS}"><w:style w:type="paragraph" w:styleId="Known"/></w:styles>"#),
+        r#"<w:p><w:pPr><w:pStyle w:val="Known"/></w:pPr></w:p>"#,
+        r#"<w:p><w:pPr><w:pStyle w:val="Missing"/></w:pPr></w:p>"#,
+    );
+}
+
+/// Round 3 lateral coverage: unknown numbering ownership retains the known owner's finding.
+#[test]
+fn round3_unknown_numbering_ownership() {
+    round3_unknown_vocabulary(
+        "numbering",
+        CT_NUMBERING,
+        "NUM-DANGLING",
+        &format!(
+            r#"<w:numbering xmlns:w="{W_NS}"><w:abstractNum w:abstractNumId="0"/><w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num></w:numbering>"#
+        ),
+        r#"<w:p><w:pPr><w:numPr><w:numId w:val="1"/></w:numPr></w:pPr></w:p>"#,
+        r#"<w:p><w:pPr><w:numPr><w:numId w:val="9"/></w:numPr></w:pPr></w:p>"#,
+    );
+}

@@ -1167,8 +1167,8 @@ fn check_note_pr(pkg: &Package, xml: &XmlScan, acc: &mut Acc) {
         }
         check_owner_note_pr(xml, &owner_map, index, forward_ok, reverse_ok, acc);
     }
-    if xml.special_notes.iter().any(|(part, ..)| part_owner(&owner_map, part).is_none())
-        || xml.note_listings.0.iter().chain(&xml.note_listings.1).any(|(_, part)| part_owner(&owner_map, part).is_none())
+    if xml.special_notes.iter().any(|(part, ..)| part_owners(&owner_map, part).is_empty())
+        || xml.note_listings.0.iter().chain(&xml.note_listings.1).any(|(_, part)| part_owners(&owner_map, part).is_empty())
     {
         acc.note("the footnotePr/endnotePr join skipped facts whose document ownership could not be established".to_string());
         acc.set_incomplete();
@@ -1176,11 +1176,12 @@ fn check_note_pr(pkg: &Package, xml: &XmlScan, acc: &mut Acc) {
 }
 
 /// Whether every relevant settings or notes source for an owner is available and uncapped.
-/// An unknown source owner cannot establish absence in any owner's set.
+/// Unknown parts do not veto a fully discovered owner's established sources; callers
+/// suppress the owner whose own relationship discovery is incomplete.
 fn note_sources_complete(
     pkg: &Package,
     xml: &XmlScan,
-    owner_map: &HashMap<String, usize>,
+    owner_map: &HashMap<String, Vec<usize>>,
     roles: &HashMap<String, scan::PartRole>,
     owner: usize,
     notes: bool,
@@ -1191,17 +1192,14 @@ fn note_sources_complete(
         if !relevant {
             return true;
         }
-        match part_owner(owner_map, &e.name) {
-            None => false,
-            Some(i) if i != owner => true,
-            Some(_) => !e.content_unavailable && !xml.story_incomplete_parts.contains(&key) && !xml.note_incomplete_parts.contains(&key),
-        }
+        !part_owners(owner_map, &e.name).contains(&owner)
+            || (!e.content_unavailable && !xml.story_incomplete_parts.contains(&key) && !xml.note_incomplete_parts.contains(&key))
     })
 }
 
 /// Apply both special-note join directions to retained facts from one established owner.
-fn check_owner_note_pr(xml: &XmlScan, owner_map: &HashMap<String, usize>, owner: usize, forward_ok: bool, reverse_ok: bool, acc: &mut Acc) {
-    let owned = |part: &str| part_owner(owner_map, part) == Some(owner);
+fn check_owner_note_pr(xml: &XmlScan, owner_map: &HashMap<String, Vec<usize>>, owner: usize, forward_ok: bool, reverse_ok: bool, acc: &mut Acc) {
+    let owned = |part: &str| part_owners(owner_map, part).contains(&owner);
     let listed_f: HashSet<&str> = xml.note_listings.0.iter().filter(|(_, part)| owned(part)).map(|(id, _)| id.as_str()).collect();
     let listed_e: HashSet<&str> = xml.note_listings.1.iter().filter(|(_, part)| owned(part)).map(|(id, _)| id.as_str()).collect();
     if forward_ok {
@@ -1805,7 +1803,7 @@ fn check_story(pkg: &Package, xml: &XmlScan, acc: &mut Acc) {
     check_style_refs(pkg, facts, acc);
     check_vocabulary(pkg, acc);
     check_numbering(pkg, facts, acc);
-    check_commentex(pkg, facts, acc);
+    check_commentex(pkg, xml, acc);
     acc.ran("FLD-UNBALANCED");
     acc.ran("STRUCT-TC-NO-P");
     acc.ran("STRUCT-DELTEXT");
@@ -1847,7 +1845,7 @@ fn check_owned_ids(
         }
         let defs: HashSet<String> =
             definitions.iter().filter(|(_, part)| source.is_some_and(|e| e.name.eq_ignore_ascii_case(part))).map(|(id, _)| id.clone()).collect();
-        let refs: Vec<_> = references.iter().filter(|(_, part)| part_owner(&owner_map, part) == Some(index)).cloned().collect();
+        let refs: Vec<_> = references.iter().filter(|(_, part)| part_owners(&owner_map, part).contains(&index)).cloned().collect();
         match kind {
             "comments" => report_missing(acc, "ID-COMMENT-REF", &refs, &defs, "w:commentReference id"),
             "footnotes" => report_missing_note(acc, &refs, &defs, "footnote"),
@@ -1865,20 +1863,23 @@ fn report_unreferenced_comments(pkg: &Package, xml: &XmlScan, acc: &mut Acc) {
     let mut unknown = !ownership_discovery_complete(pkg);
     for e in pkg.entries.iter().filter(|e| !e.is_dir) {
         if roles.get(&e.name.to_ascii_lowercase()).is_some_and(|r| r.is_story) {
-            match part_owner(&owner_map, &e.name) {
-                None => unknown = true,
-                Some(owner) if e.content_unavailable || xml.story_incomplete_parts.contains(&e.name.to_ascii_lowercase()) => {
-                    incomplete_owners.insert(owner);
-                }
-                _ => {}
+            let contexts = part_owners(&owner_map, &e.name);
+            unknown |= contexts.is_empty();
+            if e.content_unavailable || xml.story_incomplete_parts.contains(&e.name.to_ascii_lowercase()) {
+                incomplete_owners.extend(contexts.iter().copied());
             }
         }
     }
-    let refs: HashSet<_> = xml.facts.comment_refs.iter().map(|(id, part)| (part_owner(&owner_map, part), id)).collect();
+    let refs: HashSet<_> =
+        xml.facts.comment_refs.iter().flat_map(|(id, part)| part_owners(&owner_map, part).iter().map(move |owner| (owner, id))).collect();
     let mut seen = HashSet::new();
     for (id, part) in &xml.facts.comment_defs {
-        let Some(owner) = part_owner(&owner_map, part) else { continue };
-        if !unknown && !incomplete_owners.contains(&owner) && !refs.contains(&(Some(owner), id)) && seen.insert((part, id)) {
+        let contexts = part_owners(&owner_map, part);
+        if !unknown
+            && !contexts.is_empty()
+            && contexts.iter().all(|owner| !incomplete_owners.contains(owner) && !refs.contains(&(owner, id)))
+            && seen.insert((part, id))
+        {
             acc.note(format!("w:comment id {id} in {part} is never referenced"));
         }
     }
@@ -2002,19 +2003,20 @@ fn discovery_unavailable(pkg: &Package, owner: Option<&str>) -> bool {
     }
 }
 
-/// Map each part (lowercased) reachable from an owner scope to that owner's index in
+/// Map each part (lowercased) to every owner context that reaches it, indexed in
 /// [`owner_scopes`]. A glossary subtree is attributed to the glossary even though the glossary part
 /// is reached from the main document, so its references are never checked against main definitions.
+/// A shared story is checked in each established context, never silently assigned to the first.
 /// When there is no owner scope at all, every part belongs to the single `None` scope.
-fn owner_index_map(pkg: &Package) -> HashMap<String, usize> {
+fn owner_index_map(pkg: &Package) -> HashMap<String, Vec<usize>> {
     let owners = owner_scopes(pkg);
-    let mut map: HashMap<String, usize> = HashMap::new();
+    let mut map: HashMap<String, Vec<usize>> = HashMap::new();
     if owners.len() == 1 && owners[0].is_none() {
         if !ownership_discovery_complete(pkg) {
             return map;
         }
         for e in pkg.entries.iter().filter(|e| !e.is_dir) {
-            map.insert(e.name.to_ascii_lowercase(), 0);
+            map.insert(e.name.to_ascii_lowercase(), vec![0]);
         }
         return map;
     }
@@ -2027,7 +2029,7 @@ fn owner_index_map(pkg: &Package) -> HashMap<String, usize> {
             if !visited.insert(key.clone()) {
                 continue;
             }
-            map.entry(key).or_insert(i);
+            map.entry(key).or_default().push(i);
             let want = rels_part_name(&part);
             if let Some(rp) = pkg.rels.iter().find(|r| r.name.eq_ignore_ascii_case(&want)) {
                 for r in &rp.rels {
@@ -2047,7 +2049,7 @@ fn owner_index_map(pkg: &Package) -> HashMap<String, usize> {
     // Otherwise an omitted glossary edge could own it; a missing map entry represents unknown.
     if ownership_discovery_complete(pkg) {
         for e in pkg.entries.iter().filter(|e| !e.is_dir) {
-            map.entry(e.name.to_ascii_lowercase()).or_insert(0);
+            map.entry(e.name.to_ascii_lowercase()).or_insert_with(|| vec![0]);
         }
     }
     map
@@ -2061,9 +2063,9 @@ fn ownership_discovery_complete(pkg: &Package) -> bool {
         && !pkg.rels.iter().any(|rp| rp.incomplete)
 }
 
-/// The established owner index of a part; `None` represents uncertain ownership.
-fn part_owner(owner_map: &HashMap<String, usize>, part: &str) -> Option<usize> {
-    owner_map.get(&part.to_ascii_lowercase()).copied()
+/// Every established owner context of a part; an empty slice represents uncertain ownership.
+fn part_owners<'a>(owner_map: &'a HashMap<String, Vec<usize>>, part: &str) -> &'a [usize] {
+    owner_map.get(&part.to_ascii_lowercase()).map(Vec::as_slice).unwrap_or_default()
 }
 
 /// Verify that style references in story parts resolve to a defined style in their owner scope.
@@ -2118,10 +2120,11 @@ fn check_style_refs(pkg: &Package, facts: &scan::StoryFacts, acc: &mut Acc) {
     // Check each reference against its owner's own definitions only (H2).
     let mut reported: HashSet<(&str, &str)> = HashSet::new();
     for (id, part) in &facts.style_refs {
-        let Some(owner) = part_owner(&owner_map, part) else { continue };
-        let Some(Some(defs)) = per_owner.get(owner) else { continue };
-        if !defs.contains(id) && reported.insert((id.as_str(), part.as_str())) {
-            acc.add("REF-STYLE", Some(part.clone()), format!("style id {id} in {part} has no definition in the package"));
+        for &owner in part_owners(&owner_map, part) {
+            let Some(Some(defs)) = per_owner.get(owner) else { continue };
+            if !defs.contains(id) && reported.insert((id.as_str(), part.as_str())) {
+                acc.add("REF-STYLE", Some(part.clone()), format!("style id {id} in {part} has no definition in the package"));
+            }
         }
     }
 }
@@ -2439,16 +2442,17 @@ fn report_style_num_refs(pkg: &Package, styles_name: &str, num_set: &HashSet<Str
 /// `NUM-DANGLING` for `w:numPr/w:numId` references in story parts, each checked against its owner's
 /// own numbering set. A reference whose owner's numbering could not be examined is skipped, so an
 /// unavailable numbering part never manufactures a dangling finding (H2/H8).
-fn report_num_refs(acc: &mut Acc, facts: &scan::StoryFacts, num_sets: &[Option<HashSet<String>>], owner_map: &HashMap<String, usize>) {
+fn report_num_refs(acc: &mut Acc, facts: &scan::StoryFacts, num_sets: &[Option<HashSet<String>>], owner_map: &HashMap<String, Vec<usize>>) {
     let mut reported: HashSet<(&str, &str)> = HashSet::new();
     for (val, part) in &facts.num_ids {
         if val == "0" {
             continue;
         }
-        let Some(owner) = part_owner(owner_map, part) else { continue };
-        let Some(Some(set)) = num_sets.get(owner) else { continue };
-        if !set.contains(val) && reported.insert((val.as_str(), part.as_str())) {
-            acc.add("NUM-DANGLING", Some(part.clone()), format!("w:numPr references numId {val}, which has no w:num definition"));
+        for &owner in part_owners(owner_map, part) {
+            let Some(Some(set)) = num_sets.get(owner) else { continue };
+            if !set.contains(val) && reported.insert((val.as_str(), part.as_str())) {
+                acc.add("NUM-DANGLING", Some(part.clone()), format!("w:numPr references numId {val}, which has no w:num definition"));
+            }
         }
     }
 }
@@ -2467,7 +2471,8 @@ fn report_dups_values(acc: &mut Acc, values: &[String], part: &str, what: &str) 
 }
 
 /// Verify comment-threading relationships between comments, commentsExtended, and commentsIds parts.
-fn check_commentex(pkg: &Package, facts: &scan::StoryFacts, acc: &mut Acc) {
+fn check_commentex(pkg: &Package, xml: &XmlScan, acc: &mut Acc) {
+    let facts = &xml.facts;
     let cap = acc.limits.facts;
     let owners = owner_scopes(pkg);
     let owner_map = owner_index_map(pkg);
@@ -2477,12 +2482,19 @@ fn check_commentex(pkg: &Package, facts: &scan::StoryFacts, acc: &mut Acc) {
     }
     acc.ran("COMMENTEX-LINK");
     for (i, owner) in owners.iter().enumerate() {
-        // If the owner's comments part could not be read, its paragraph ids are unknown, so no
-        // commentEx entry is established as unlinked; likewise, if its commentsExtended part could
-        // not be read, its entries and the commentsIds join cannot be checked. Absence is not
-        // established from unavailable content.
-        if supporting_part(pkg, owner.as_deref(), "comments", package::COMMENTS_CONTENT_TYPE).is_some_and(|e| e.content_unavailable) {
-            continue;
+        // Missing paragraphs are established only from a known, completely observed comments
+        // source. Unknown ownership must not turn the ownership-filtered set into an empty one.
+        let comments = supporting_part(pkg, owner.as_deref(), "comments", package::COMMENTS_CONTENT_TYPE);
+        let comments_complete = match comments {
+            Some(e) => !e.content_unavailable && !xml.story_incomplete_parts.contains(&e.name.to_ascii_lowercase()),
+            None => !discovery_unavailable(pkg, owner.as_deref()),
+        };
+        if !comments_complete {
+            acc.note(format!(
+                "comment-threading paragraphs for {} could not be fully checked (comments ownership or source facts were not fully examined)",
+                owner.as_deref().unwrap_or("the package")
+            ));
+            acc.set_incomplete();
         }
         if supporting_part(pkg, owner.as_deref(), "commentsExtended", package::COMMENTS_EXTENDED_CONTENT_TYPE).is_some_and(|e| e.content_unavailable)
         {
@@ -2491,7 +2503,7 @@ fn check_commentex(pkg: &Package, facts: &scan::StoryFacts, acc: &mut Acc) {
         // Each owner's comment-threading is checked within its own scope: its commentEx entries
         // against its own comments part, and its commentsIds paraIds against its own commentEx.
         let comment_para: HashSet<&str> =
-            facts.comment_para_ids.iter().filter(|(_, p)| part_owner(&owner_map, p) == Some(i)).map(|(p, _)| p.as_str()).collect();
+            facts.comment_para_ids.iter().filter(|(_, p)| part_owners(&owner_map, p).contains(&i)).map(|(p, _)| p.as_str()).collect();
         let ext = supporting_part(pkg, owner.as_deref(), "commentsExtended", package::COMMENTS_EXTENDED_CONTENT_TYPE)
             .and_then(|entry| read_comments_ext(entry, cap, acc).map(|e| (entry.name.clone(), e)));
         let ex_para: HashSet<&str> = match &ext {
@@ -2500,7 +2512,7 @@ fn check_commentex(pkg: &Package, facts: &scan::StoryFacts, acc: &mut Acc) {
         };
         if let Some((name, e)) = &ext {
             for (para, parent) in &e.entries {
-                if !comment_para.contains(para.as_str()) {
+                if comments_complete && !comment_para.contains(para.as_str()) {
                     acc.add(
                         "COMMENTEX-LINK",
                         Some(name.clone()),
@@ -2605,10 +2617,10 @@ fn check_custom_xml(pkg: &Package, acc: &mut Acc) {
         .entries
         .iter()
         .filter(|e| !e.is_dir && pkg.content_types.of(&e.name) == Some(package::CUSTOM_XML_PROPS_CONTENT_TYPE))
-        .filter_map(|e| part_owner(&owner_map, &e.name))
+        .flat_map(|e| part_owners(&owner_map, &e.name).iter().copied())
         .collect();
     if pkg.entries.iter().any(|e| {
-        !e.is_dir && pkg.content_types.of(&e.name) == Some(package::CUSTOM_XML_PROPS_CONTENT_TYPE) && part_owner(&owner_map, &e.name).is_none()
+        !e.is_dir && pkg.content_types.of(&e.name) == Some(package::CUSTOM_XML_PROPS_CONTENT_TYPE) && part_owners(&owner_map, &e.name).is_empty()
     }) {
         acc.note("custom XML ownership could not be established; custom XML schema references were not checked".to_string());
         acc.set_incomplete();
@@ -2670,8 +2682,10 @@ fn check_custom_xml(pkg: &Package, acc: &mut Acc) {
         if pkg.content_types.of(&e.name) != Some(package::CUSTOM_XML_PROPS_CONTENT_TYPE) {
             continue;
         }
-        let Some(owner) = part_owner(&owner_map, &e.name) else { continue };
-        let Some(Some(schemas)) = per_owner.get(owner) else { continue };
+        let schemas: Vec<_> = part_owners(&owner_map, &e.name).iter().filter_map(|&owner| per_owner.get(owner).and_then(Option::as_ref)).collect();
+        if schemas.is_empty() {
+            continue;
+        }
         let Some(text) = e.decoded.as_deref() else { continue };
         let mut guard = scan::ParseGuard::new(acc.limits.events, acc.limits.depth);
         let (uris, capped) = scan::parse_custom_xml_schemas(text, cap, &mut guard);
@@ -2685,7 +2699,7 @@ fn check_custom_xml(pkg: &Package, acc: &mut Acc) {
             acc.set_incomplete();
         }
         for uri in uris {
-            if !schemas.contains(&uri) {
+            if schemas.iter().any(|set| !set.contains(&uri)) {
                 acc.add(
                     "CUSTOMXML-SCHEMA",
                     Some(e.name.clone()),
@@ -3935,6 +3949,99 @@ mod round2_reference_tests {
                 "pooled {pooled}: {report:?}"
             );
             zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        }
+    }
+}
+
+#[cfg(test)]
+mod round3_note_cap_tests {
+    //! Caps invalidate only the owner whose supporting collection lost facts.
+    use super::*;
+    use std::io::{Cursor, Write};
+
+    /// A glossary per-part or pooled cap must preserve the main owner's established note join.
+    #[test]
+    fn round3_note_caps_preserve_other_owner() {
+        let ns = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+        let relns = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+        for (kind, ct) in [("footnote", package::FOOTNOTES_CONTENT_TYPE), ("endnote", package::ENDNOTES_CONTENT_TYPE)] {
+            for dangling in [false, true] {
+                for pooled in [false, true] {
+                    let mut entries = vec![
+                        (
+                            "_rels/.rels".to_string(),
+                            format!(
+                                r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rM" Type="{relns}/officeDocument" Target="word/document.xml"/></Relationships>"#
+                            ),
+                        ),
+                        ("word/document.xml".to_string(), format!(r#"<w:document xmlns:w="{ns}"><w:body><w:p/></w:body></w:document>"#)),
+                        ("word/glossary.xml".to_string(), format!(r#"<w:glossaryDocument xmlns:w="{ns}"><w:docParts/></w:glossaryDocument>"#)),
+                    ];
+                    let mut overrides = format!(
+                        r#"<Override PartName="/word/document.xml" ContentType="{}"/><Override PartName="/word/glossary.xml" ContentType="{}"/>"#,
+                        package::MAIN_CONTENT_TYPE,
+                        package::GLOSSARY_CONTENT_TYPE
+                    );
+                    for gloss in [false, true] {
+                        let prefix = if gloss { "gloss-" } else { "" };
+                        let owner = if gloss { "glossary" } else { "document" };
+                        let glossary_rel = if gloss {
+                            String::new()
+                        } else {
+                            format!(r#"<Relationship Id="rG" Type="{relns}/glossaryDocument" Target="glossary.xml"/>"#)
+                        };
+                        entries.push((format!("word/_rels/{owner}.xml.rels"), format!(r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">{glossary_rel}<Relationship Id="rN" Type="{relns}/{kind}s" Target="{prefix}{kind}s.xml"/><Relationship Id="rS" Type="{relns}/settings" Target="{prefix}settings.xml"/></Relationships>"#)));
+                        let count = if pooled { 2 } else { 3 };
+                        let padding = (1..=count).map(|id| format!(r#"<w:{kind} w:id="{id}"><w:p/></w:{kind}>"#)).collect::<String>();
+                        let notes = if gloss && dangling {
+                            padding
+                        } else if !gloss && (!dangling || pooled) {
+                            format!(r#"<w:{kind} w:id="-1" w:type="separator"><w:p/></w:{kind}>"#)
+                        } else {
+                            String::new()
+                        };
+                        let listing = if gloss && !dangling {
+                            (1..=count).map(|id| format!(r#"<w:{kind} w:id="{id}"/>"#)).collect::<String>()
+                        } else if !gloss && (dangling || pooled) {
+                            format!(r#"<w:{kind} w:id="{}"/>"#, if pooled { "-2" } else { "-1" })
+                        } else {
+                            String::new()
+                        };
+                        entries.push((format!("word/{prefix}{kind}s.xml"), format!(r#"<w:{kind}s xmlns:w="{ns}">{notes}</w:{kind}s>"#)));
+                        entries.push((
+                            format!("word/{prefix}settings.xml"),
+                            format!(r#"<w:settings xmlns:w="{ns}"><w:{kind}Pr>{listing}</w:{kind}Pr></w:settings>"#),
+                        ));
+                        overrides.push_str(&format!(r#"<Override PartName="/word/{prefix}{kind}s.xml" ContentType="{ct}"/><Override PartName="/word/{prefix}settings.xml" ContentType="{}"/>"#, package::SETTINGS_CONTENT_TYPE));
+                    }
+                    entries.push(("[Content_Types].xml".to_string(), format!(r#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/>{overrides}</Types>"#)));
+                    let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+                    for (name, text) in entries {
+                        zip.start_file(name, zip::write::SimpleFileOptions::default()).unwrap();
+                        zip.write_all(text.as_bytes()).unwrap();
+                    }
+                    let bytes = zip.finish().unwrap().into_inner();
+                    let limited = validate_bytes_limited(&bytes, Limits { facts: 2, ..Limits::default() });
+                    let rule = if dangling { "NOTE-PR-DANGLING" } else { "NOTE-PR-LISTING" };
+                    assert_eq!(
+                        limited.findings.iter().filter(|f| f.rule == rule).count(),
+                        1,
+                        "{kind}, dangling {dangling}, pooled {pooled}: {limited:?}"
+                    );
+                    if !dangling {
+                        assert_eq!(limited.verdict, Verdict::Fail, "{limited:?}");
+                        assert!(
+                            limited.findings.iter().any(|f| f.rule == rule && f.part.as_deref() == Some(&format!("word/{kind}s.xml"))),
+                            "{limited:?}"
+                        );
+                    }
+                    assert!(limited.coverage_notes.iter().any(|n| n.contains("footnotePr/endnotePr") && n.contains("glossary")), "{limited:?}");
+                    // The unlimited control has no skipped special-note joins.
+                    let full = validate_bytes(&bytes);
+                    assert!(full.findings.iter().any(|f| f.rule == rule), "{full:?}");
+                    assert!(!full.coverage_notes.iter().any(|n| n.contains("could not be fully joined")), "{full:?}");
+                }
+            }
         }
     }
 }
