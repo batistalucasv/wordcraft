@@ -4868,3 +4868,205 @@ fn fredapps_5_unreferenced_comments_are_scoped() {
     assert!(report.coverage_notes.iter().any(|n| n.contains("in word/comments.xml is never referenced")), "{report:?}");
     assert!(!report.coverage_notes.iter().any(|n| n.contains("in word/gloss-comments.xml is never referenced")), "{report:?}");
 }
+
+/// Round 2 item 1: malformed declarations suppress a join only with explicit INCOMPLETE coverage.
+#[test]
+fn round2_malformed_story_relationships() {
+    let mut d = Doc::minimal();
+    d.set_document(r#"<w:p><w:hyperlink r:id="missing"><w:r><w:t>x</w:t></w:r></w:hyperlink></w:p>"#);
+    d.set("word/_rels/document.xml.rels", r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship"#);
+    let report = validate_bytes(&d.build());
+    assert_eq!(report.verdict, Verdict::Incomplete, "{report:?}");
+    assert!(!has(&report, "REL-REF-MISSING"), "{report:?}");
+    assert!(report.coverage_notes.iter().any(|n| n.contains("document.xml.rels") && n.contains("declarations")), "{report:?}");
+    d.set_document(r#"<w:p><w:r><w:commentReference w:id="9"/></w:r></w:p>"#);
+    d.add_with_override(
+        "word/comments.xml",
+        CT_COMMENTS,
+        format!(r#"<w:comments xmlns:w="{W_NS}"><w:comment w:id="1"><w:p/></w:comment><w:comment w:id="1"><w:p/></w:comment></w:comments>"#),
+    );
+    let report = validate_bytes(&d.build());
+    assert_eq!(report.verdict, Verdict::Fail, "{report:?}");
+    assert_finding(&report, "ID-COMMENT-DUP", Some("word/comments.xml"));
+    assert!(report.coverage_notes.iter().any(|n| n.contains("document.xml.rels") && n.contains("declarations")), "{report:?}");
+}
+
+/// A glossary header remains identifiable when its ownership relationship cannot be examined.
+fn round2_unknown_owner_doc(capped: bool) -> Doc {
+    let mut d = fredapps_owner_doc("comment", CT_COMMENTS, "2", "1");
+    d.set_document(r#"<w:p><w:r><w:commentReference w:id="2"/></w:r></w:p>"#);
+    d.add_with_override(
+        "word/gloss-header.xml",
+        CT_HEADER,
+        format!(r#"<w:hdr xmlns:w="{W_NS}"><w:p><w:r><w:commentReference w:id="1"/></w:r></w:p></w:hdr>"#),
+    );
+    if capped {
+        let mut rels: String = (0..20_000)
+            .map(|i| format!(r#"<Relationship Id="pad{i}" Type="urn:custom" Target="https://example.org/" TargetMode="External"/>"#))
+            .collect();
+        rels.push_str(r#"<Relationship Id="rH" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/header" Target="gloss-header.xml"/><Relationship Id="rC" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments" Target="gloss-comments.xml"/>"#);
+        d.set("word/_rels/glossary.xml.rels", rels_xml(&rels));
+    }
+    d
+}
+
+/// Round 2 item 2: unknown ownership cannot prove missing IDs, while main remains checkable.
+fn round2_check_unknown_owner(capped: bool) {
+    for missing_main in [false, true] {
+        let mut d = round2_unknown_owner_doc(capped);
+        if missing_main {
+            d.set_document(r#"<w:p><w:r><w:commentReference w:id="9"/></w:r></w:p>"#);
+        }
+        let zip = d.build();
+        let bytes = if capped { zip } else { corrupt_entry_data(&zip, "word/_rels/glossary.xml.rels") };
+        let report = validate_bytes(&bytes);
+        assert!(!report.findings.iter().any(|f| f.rule == "ID-COMMENT-REF" && f.part.as_deref() == Some("word/gloss-header.xml")), "{report:?}");
+        assert_eq!(report.verdict, if missing_main { Verdict::Fail } else { Verdict::Incomplete }, "{report:?}");
+        if missing_main {
+            assert_finding(&report, "ID-COMMENT-REF", Some("word/document.xml"));
+        }
+    }
+}
+
+/// Round 2 item 2: unreadable glossary relationships leave header ownership unknown.
+#[test]
+fn round2_unreadable_ownership_discovery() {
+    round2_check_unknown_owner(false);
+}
+
+/// Round 2 item 2: a valid ownership declaration beyond the cutoff is unknown too.
+#[test]
+fn round2_capped_ownership_discovery() {
+    round2_check_unknown_owner(true);
+}
+
+/// Build fully related main/glossary special-note definitions and settings listings.
+fn round2_note_pr_doc(kind: &str, ct: &str, reverse: bool, dangling: bool) -> Doc {
+    let mut d = fredapps_owner_doc(kind, ct, "-1", "-1");
+    d.set_document("<w:p/>");
+    d.set("word/glossary.xml", format!(r#"<w:glossaryDocument xmlns:w="{W_NS}"><w:docParts/></w:glossaryDocument>"#));
+    for gloss in [false, true] {
+        let prefix = if gloss { "gloss-" } else { "" };
+        let defined = !dangling || gloss != reverse;
+        let note = if defined { format!(r#"<w:{kind} w:id="-1" w:type="separator"><w:p/></w:{kind}>"#) } else { String::new() };
+        d.set(&format!("word/{prefix}{kind}s.xml"), format!(r#"<w:{kind}s xmlns:w="{W_NS}">{note}</w:{kind}s>"#));
+        let listed = dangling || gloss != reverse;
+        let listing = if listed { format!(r#"<w:{kind}Pr><w:{kind} w:id="-1"/></w:{kind}Pr>"#) } else { String::new() };
+        d.add_with_override(&format!("word/{prefix}settings.xml"), CT_SETTINGS, format!(r#"<w:settings xmlns:w="{W_NS}">{listing}</w:settings>"#));
+        let rp = if gloss { "word/_rels/glossary.xml.rels" } else { "word/_rels/document.xml.rels" };
+        let rels = String::from_utf8(d.get(rp).to_vec()).unwrap();
+        d.set(rp, rels.replace("</Relationships>", &format!(r#"<Relationship Id="rS" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/settings" Target="{prefix}settings.xml"/></Relationships>"#)));
+    }
+    d
+}
+
+/// A listing or definition in the other owner cannot discharge either special-note join direction.
+fn round2_check_note_pr(kind: &str, ct: &str, dangling: bool) {
+    for reverse in [false, true] {
+        let d = round2_note_pr_doc(kind, ct, reverse, dangling);
+        let report = validate_bytes(&d.build());
+        let rule = if dangling { "NOTE-PR-DANGLING" } else { "NOTE-PR-LISTING" };
+        assert_eq!(report.findings.iter().filter(|f| f.rule == rule).count(), 1, "{kind}, reverse {reverse}: {report:?}");
+        if !dangling {
+            let part = if reverse { format!("word/gloss-{kind}s.xml") } else { format!("word/{kind}s.xml") };
+            assert_finding(&report, rule, Some(&part));
+            assert_eq!(report.verdict, Verdict::Fail, "{report:?}");
+        }
+    }
+}
+
+/// Round 2 item 3: footnote separator listings are owner local.
+#[test]
+fn round2_footnote_listing_ownership() {
+    round2_check_note_pr("footnote", CT_FOOTNOTES, false);
+}
+
+/// Round 2 item 3: endnote separator listings are owner local.
+#[test]
+fn round2_endnote_listing_ownership() {
+    round2_check_note_pr("endnote", CT_ENDNOTES, false);
+}
+
+/// Round 2 item 3: a glossary footnote cannot satisfy a main settings listing, or vice versa.
+#[test]
+fn round2_footnote_dangling_ownership() {
+    round2_check_note_pr("footnote", CT_FOOTNOTES, true);
+}
+
+/// Round 2 item 3: a glossary endnote cannot satisfy a main settings listing, or vice versa.
+#[test]
+fn round2_endnote_dangling_ownership() {
+    round2_check_note_pr("endnote", CT_ENDNOTES, true);
+}
+
+/// Round 2 item 4: rejected custom officeDocument URIs must not produce a false absent-target explanation.
+#[test]
+fn round2_custom_main_diagnostic() {
+    let mut d = Doc::minimal();
+    d.set("_rels/.rels", rels_xml(r#"<Relationship Id="rMain" Type="urn:custom/officeDocument" Target="word/document.xml"/>"#));
+    let report = validate_bytes(&d.build());
+    let finding = assert_finding(&report, "PKG-NO-MAIN", None);
+    assert!(finding.message.contains("no officeDocument relationship"), "{report:?}");
+}
+
+/// Round 2 item 5: unreadable story references cannot establish that a comment is never referenced.
+#[test]
+fn round2_unreadable_comment_references() {
+    let d = fredapps_owner_doc("comment", CT_COMMENTS, "1", "1");
+    let bytes = corrupt_entry_data(&d.build(), "word/document.xml");
+    let report = validate_bytes(&bytes);
+    assert_eq!(report.verdict, Verdict::Incomplete, "{report:?}");
+    assert!(!report.coverage_notes.iter().any(|n| n.contains("in word/comments.xml is never referenced")), "{report:?}");
+}
+
+/// Round 2 item 2 control: once the glossary relationships are readable, its header joins normally.
+#[test]
+fn round2_established_header_ownership() {
+    let mut d = round2_unknown_owner_doc(false);
+    let rels = String::from_utf8(d.get("word/_rels/glossary.xml.rels").to_vec()).unwrap();
+    d.set("word/_rels/glossary.xml.rels", rels.replace("</Relationships>", r#"<Relationship Id="rH" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/header" Target="gloss-header.xml"/></Relationships>"#));
+    assert_eq!(validate_bytes(&d.build()).verdict, Verdict::Pass);
+    d.set("word/gloss-header.xml", format!(r#"<w:hdr xmlns:w="{W_NS}"><w:p><w:r><w:commentReference w:id="2"/></w:r></w:p></w:hdr>"#));
+    let report = validate_bytes(&d.build());
+    assert_eq!(report.verdict, Verdict::Fail, "{report:?}");
+    assert_finding(&report, "ID-COMMENT-REF", Some("word/gloss-header.xml"));
+}
+
+/// Round 2 item 3 control: complete corresponding listings satisfy both owners in both families.
+#[test]
+fn round2_owner_note_listings_satisfied() {
+    for (kind, ct) in [("footnote", CT_FOOTNOTES), ("endnote", CT_ENDNOTES)] {
+        let mut d = round2_note_pr_doc(kind, ct, false, false);
+        d.set("word/settings.xml", format!(r#"<w:settings xmlns:w="{W_NS}"><w:{kind}Pr><w:{kind} w:id="-1"/></w:{kind}Pr></w:settings>"#));
+        let report = validate_bytes(&d.build());
+        assert_eq!(report.verdict, Verdict::Pass, "{report:?}");
+        assert!(!has(&report, "NOTE-PR-LISTING") && !has(&report, "NOTE-PR-DANGLING"), "{report:?}");
+    }
+}
+
+/// Round 2 item 3: an unreadable listing source suppresses its join, retaining the other owner's error.
+#[test]
+fn round2_unreadable_note_listing_is_local() {
+    for (kind, ct) in [("footnote", CT_FOOTNOTES), ("endnote", CT_ENDNOTES)] {
+        let d = round2_note_pr_doc(kind, ct, false, false);
+        let incomplete = validate_bytes(&corrupt_entry_data(&d.build(), "word/settings.xml"));
+        assert_eq!(incomplete.verdict, Verdict::Incomplete, "{incomplete:?}");
+        assert!(!has(&incomplete, "NOTE-PR-LISTING"), "{incomplete:?}");
+        let retained = validate_bytes(&corrupt_entry_data(&d.build(), "word/gloss-settings.xml"));
+        assert_eq!(retained.verdict, Verdict::Fail, "{retained:?}");
+        assert_finding(&retained, "NOTE-PR-LISTING", Some(&format!("word/{kind}s.xml")));
+        assert!(retained.coverage_notes.iter().any(|n| n.contains("footnotePr/endnotePr")), "{retained:?}");
+    }
+}
+
+/// Round 2 item 1: malformed manifest declarations also carry explicit incomplete coverage.
+#[test]
+fn round2_malformed_content_types() {
+    let mut d = Doc::minimal();
+    let ct = String::from_utf8(d.get("[Content_Types].xml").to_vec()).unwrap();
+    d.set("[Content_Types].xml", ct.replace("</Types>", "<Override"));
+    let report = validate_bytes(&d.build());
+    assert!(report.coverage_notes.iter().any(|n| n.contains("[Content_Types].xml declarations were not fully examined")), "{report:?}");
+    assert_eq!(report.verdict, Verdict::Fail, "manifest malformation remains an independent Error: {report:?}");
+    assert_finding(&report, "XML-MALFORMED", Some("[Content_Types].xml"));
+}

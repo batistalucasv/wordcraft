@@ -271,6 +271,13 @@ pub(crate) fn load(bytes: &[u8], acc: &mut Acc) -> Option<Package> {
         acc.set_incomplete();
     }
 
+    content_types.incomplete |= ct_at.and_then(|i| entries.get(i)).is_some_and(|e| e.content_unavailable);
+    if content_types.incomplete {
+        // Parser errors suppress manifest-dependent checks just as budget stops do.
+        acc.note("[Content_Types].xml declarations were not fully examined; dependent absence checks were skipped".to_string());
+        acc.set_incomplete();
+    }
+
     let rels = load_rels(&entries, acc);
 
     // Classify XML parts once (J4) and decode every classified part, whichever its file name, so a
@@ -432,7 +439,7 @@ fn no_main_message(package_rels: Option<&RelsPart>) -> String {
     let Some(rp) = package_rels else {
         return "the package has no _rels/.rels part, so it has no main document part".to_string();
     };
-    match rp.rels.iter().find(|r| !r.external && tail(&r.kind) == "officeDocument") {
+    match rp.rels.iter().find(|r| !r.external && is_office_document_relationship(&r.kind)) {
         None => "the package's _rels/.rels has no officeDocument relationship".to_string(),
         Some(r) => format!("the officeDocument relationship targets {}, which is not in the package", r.target_abs.as_deref().unwrap_or("")),
     }
@@ -645,7 +652,13 @@ fn load_rels(entries: &[Entry], acc: &mut Acc) -> Vec<RelsPart> {
             continue;
         }
         let Some(dir) = rels_dir(&e.name) else { continue };
-        let Some(text) = &e.decoded else { continue };
+        let Some(text) = &e.decoded else {
+            // An unreadable declaration source disables relationship-dependent joins too.
+            acc.note(format!("{} declarations could not be read; dependent absence checks were skipped", e.name));
+            acc.set_incomplete();
+            rels.push(RelsPart { name: e.name.clone(), rels: Vec::new(), incomplete: true });
+            continue;
+        };
         let mut guard = ParseGuard::new(limits.events, limits.depth);
         let (parsed, c, complete) = parse_rels(&dir, text, cap, &mut guard);
         if c {
@@ -654,6 +667,11 @@ fn load_rels(entries: &[Entry], acc: &mut Acc) -> Vec<RelsPart> {
         }
         if guard.exhausted() {
             acc.note(format!("{} exceeded the XML {} budget; later relationships were not recorded", e.name, guard.budget()));
+            acc.set_incomplete();
+        }
+        if !complete {
+            // Suppression without report-level incompleteness would manufacture PASS.
+            acc.note(format!("{} declarations were not fully examined; dependent absence checks were skipped", e.name));
             acc.set_incomplete();
         }
         rels.push(RelsPart { name: e.name.clone(), rels: parsed, incomplete: !complete });
@@ -865,7 +883,7 @@ fn parse_opc_children(text: &str, container: &[u8], namespace: &[u8], guard: &mu
                 guard.leave();
                 depth = depth.saturating_sub(1);
             }
-            Ok((_, Event::Eof)) => return true,
+            Ok((_, Event::Eof)) => return depth == 0,
             Err(_) => return false,
             _ => {}
         }

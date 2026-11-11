@@ -703,7 +703,7 @@ pub(crate) fn validate_bytes_limited(bytes: &[u8], limits: Limits) -> Report {
     );
     check_content_part_types(&pkg, &xml.content_parts, xml.content_part_capped_any, &mut acc);
     check_story(&pkg, &xml, &mut acc);
-    check_note_pr(&xml.facts, &xml, &mut acc);
+    check_note_pr(&pkg, &xml, &mut acc);
     check_media(&pkg, &mut acc);
     acc.finish()
 }
@@ -845,19 +845,12 @@ struct XmlScan {
     compat: Compat,
     /// Parts whose story facts were only partially examined.
     story_incomplete_parts: HashSet<String>,
-    /// Ids listed by `w:footnotePr` / `w:endnotePr` in settings parts.
-    note_listings: (Vec<String>, Vec<String>),
+    /// (ID, source part) listed by `w:footnotePr` / `w:endnotePr` in settings parts.
+    note_listings: (Vec<(String, String)>, Vec<(String, String)>),
     /// Special note definitions: (owning part, id, is_endnote, w:type).
     special_notes: Vec<(String, String, bool, String)>,
-    /// A settings part (a listing source) could not be read.
-    settings_unreadable: bool,
-    /// A note definition or listing collection hit the fact budget.
-    note_capped_any: bool,
-    /// A notes part (a definition source) could not be read.
-    notes_unreadable: bool,
-    /// The definition side of the note join is complete: no notes part
-    /// unreadable or fact-capped, and pooled definitions did not cap.
-    defs_complete: bool,
+    /// Note definition or listing parts with an incomplete scan or pooled collection.
+    note_incomplete_parts: HashSet<String>,
 }
 
 /// Whether every incoming definition will fit the pooled allowances. A dropped definition
@@ -894,12 +887,9 @@ fn check_xml(pkg: &Package, acc: &mut Acc) -> XmlScan {
     let mut content_part_scanned_owners: HashSet<String> = HashSet::new();
     let mut compat_on = false;
     let mut compat_unknown = false;
-    let mut note_listings: (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
+    let mut note_listings = (Vec::new(), Vec::new());
     let mut special_notes: Vec<(String, String, bool, String)> = Vec::new();
-    let mut settings_unreadable = false;
-    let mut note_capped_any = false;
-    let mut notes_unreadable = false;
-    let mut defs_ok_parts = true;
+    let mut note_incomplete_parts = HashSet::new();
     let mut pooled_capped = false;
     let mut facts_pooled_part: Option<String> = None;
     let mut pooled_refs = 0usize;
@@ -913,11 +903,10 @@ fn check_xml(pkg: &Package, acc: &mut Acc) -> XmlScan {
         let role = roles.get(&l).copied().unwrap_or_default();
         if role.is_settings && e.decode_error.is_some() {
             compat_unknown = true;
-            settings_unreadable = true;
+            note_incomplete_parts.insert(l.clone());
         }
         if (role.is_footnotes || role.is_endnotes) && e.decode_error.is_some() {
-            notes_unreadable = true;
-            defs_ok_parts = false;
+            note_incomplete_parts.insert(l.clone());
         }
         if let Some(err) = &e.decode_error {
             match err {
@@ -939,22 +928,14 @@ fn check_xml(pkg: &Package, acc: &mut Acc) -> XmlScan {
         let mut scanned = scan::scan_part(&e.name, text, role, acc);
         story_incomplete_parts.extend((!scanned.facts_complete).then(|| e.name.to_ascii_lowercase()));
         content_part_scanned_owners.insert(e.name.to_ascii_lowercase());
-        if scanned.note_capped {
-            note_capped_any = true;
-        }
+        note_incomplete_parts.extend(scanned.note_capped.then(|| l.clone()));
         if append_note_items(&mut note_listings, &mut special_notes, &e.name, scanned.note_listings, scanned.special_notes, acc.limits.facts) {
-            note_capped_any = true;
-        }
-        if (role.is_footnotes || role.is_endnotes) && (scanned.malformed.is_some() || scanned.fact_capped) {
-            defs_ok_parts = false;
-            if scanned.malformed.is_some() {
-                notes_unreadable = true;
-            }
+            note_incomplete_parts.insert(l.clone());
         }
         if role.is_settings {
             if scanned.malformed.is_some() {
                 compat_unknown = true;
-                settings_unreadable = true;
+                note_incomplete_parts.insert(l.clone());
             }
             // Only a settings part that scanned clean establishes On: a flag
             // seen before a malformation proves nothing about the document.
@@ -968,7 +949,10 @@ fn check_xml(pkg: &Package, acc: &mut Acc) -> XmlScan {
         for prefix in &scanned.unknown_prefixes {
             acc.add("XML-UNDECLARED-PREFIX", Some(e.name.clone()), format!("the namespace prefix `{prefix}` used in {} is not declared", e.name));
         }
-        story_incomplete_parts.extend((!definitions_fit(&facts, &scanned.facts, acc.limits.facts)).then(|| e.name.to_ascii_lowercase()));
+        story_incomplete_parts.extend((!definitions_fit(&facts, &scanned.facts, acc.limits.facts)).then(|| l.clone()));
+        // Pooled reference drops invalidate "never referenced" conclusions at their source.
+        story_incomplete_parts
+            .extend((facts.comment_refs.len().saturating_add(scanned.facts.comment_refs.len()) > acc.limits.facts).then(|| l.clone()));
         if role.is_story && scan::merge_facts(&mut facts, scanned.facts, acc.limits.facts) {
             pooled_capped = true;
             if facts_pooled_part.is_none() {
@@ -1051,7 +1035,6 @@ fn check_xml(pkg: &Package, acc: &mut Acc) -> XmlScan {
     // across parts as well as per part; the allowances were enforced
     // while appending in the loop above, so the accumulated collections
     // never exceeded the fact budget at any point.
-    let defs_complete = defs_ok_parts && !pooled_capped;
     XmlScan {
         facts,
         refs,
@@ -1064,10 +1047,7 @@ fn check_xml(pkg: &Package, acc: &mut Acc) -> XmlScan {
         story_incomplete_parts,
         note_listings,
         special_notes,
-        settings_unreadable,
-        note_capped_any,
-        notes_unreadable,
-        defs_complete,
+        note_incomplete_parts,
     }
 }
 
@@ -1076,7 +1056,7 @@ fn check_xml(pkg: &Package, acc: &mut Acc) -> XmlScan {
 /// accumulated collections never exceed `cap`, however many parts
 /// contribute. Returns true when any entry was discarded.
 fn append_note_items(
-    note_listings: &mut (Vec<String>, Vec<String>),
+    note_listings: &mut (Vec<(String, String)>, Vec<(String, String)>),
     special_notes: &mut Vec<(String, String, bool, String)>,
     part: &str,
     listings: (Vec<String>, Vec<String>),
@@ -1090,8 +1070,8 @@ fn append_note_items(
     if take_f < listings.0.len() || take_e < listings.1.len() {
         capped = true;
     }
-    note_listings.0.extend(listings.0.into_iter().take(take_f));
-    note_listings.1.extend(listings.1.into_iter().take(take_e));
+    note_listings.0.extend(listings.0.into_iter().take(take_f).map(|id| (id, part.to_string())));
+    note_listings.1.extend(listings.1.into_iter().take(take_e).map(|id| (id, part.to_string())));
     for (id, is_end, t) in specials {
         if special_notes.len() >= cap {
             capped = true;
@@ -1167,73 +1147,88 @@ fn retain_native_ink_refs(pkg: &Package, owner: &str, ids: &mut Vec<String>, cap
 }
 
 /// `NOTE-PR-LISTING` (ECMA-376 Part 1 §17.11.9) and its reverse,
-/// `NOTE-PR-DANGLING`: join the special note definitions (separator,
-/// continuationSeparator, continuationNotice) against the
-/// `footnotePr`/`endnotePr` listings in settings parts (the listing
-/// child exists only in the document-wide form of those elements).
-/// Each direction reports only when its own side of the join is
-/// complete: the forward direction needs every listing source read
-/// and uncapped; the reverse additionally needs the definition sets
-/// complete (no notes part unreadable or capped, no pooled cap). An
-/// incomplete join with anything at stake — an unreadable source, a
-/// cap, a definition, or a listing — yields a coverage note and an
-/// INCOMPLETE run instead of a guess.
-///
-/// Severity: the cited text makes the finding a conformance claim
-/// ("shall not be loaded"; non-conformant when the note "is required
-/// by the document content"). Batch b6 found Word for the web loading
-/// and rendering an unlisted separator set normally, but batch Mac-2
-/// found Word for Mac wedging on the same shape; verdicts combine by
-/// union across consumers, so every case is graded Error, and
-/// necessity is not graded per note.
-fn check_note_pr(facts: &scan::StoryFacts, xml: &XmlScan, acc: &mut Acc) {
+/// Join special-note definitions and settings listings within each document owner's ID space.
+/// Each direction requires its absence-producing source to be complete. Unavailable or capped
+/// sources produce explicit INCOMPLETE coverage while independently established findings survive.
+/// Unlisted special notes remain Errors under the existing union-of-consumers calibration:
+/// Word for the web loads them, but Word for Mac wedged on the same shape (batch Mac-2).
+fn check_note_pr(pkg: &Package, xml: &XmlScan, acc: &mut Acc) {
     acc.ran("NOTE-PR-LISTING");
     acc.ran("NOTE-PR-DANGLING");
-    let forward_ok = !xml.settings_unreadable && !xml.note_capped_any;
-    let reverse_ok = forward_ok && xml.defs_complete;
-    if !forward_ok || !reverse_ok {
-        let anything = xml.settings_unreadable
-            || xml.notes_unreadable
-            || xml.note_capped_any
-            || !xml.defs_complete
-            || !xml.special_notes.is_empty()
-            || !xml.note_listings.0.is_empty()
-            || !xml.note_listings.1.is_empty();
-        if anything {
-            acc.note("the footnotePr/endnotePr listings could not be fully joined (a part exceeded the fact budget or a settings or notes part could not be read)".to_string());
+    let owner_map = owner_index_map(pkg);
+    let roles = story_roles(pkg);
+    for (index, owner) in owner_scopes(pkg).iter().enumerate() {
+        let discovered = !discovery_unavailable(pkg, owner.as_deref());
+        let forward_ok = discovered && note_sources_complete(pkg, xml, &owner_map, &roles, index, false);
+        let reverse_ok = forward_ok && note_sources_complete(pkg, xml, &owner_map, &roles, index, true);
+        if !forward_ok || !reverse_ok {
+            acc.note(format!("the footnotePr/endnotePr listings for {} could not be fully joined (ownership, declarations, or source facts were not fully examined)", owner.as_deref().unwrap_or("the package")));
             acc.set_incomplete();
         }
+        check_owner_note_pr(xml, &owner_map, index, forward_ok, reverse_ok, acc);
     }
-    let defs_f: HashSet<&str> = facts.footnote_defs.iter().map(|(id, _)| id.as_str()).collect();
-    let defs_e: HashSet<&str> = facts.endnote_defs.iter().map(|(id, _)| id.as_str()).collect();
+    if xml.special_notes.iter().any(|(part, ..)| part_owner(&owner_map, part).is_none())
+        || xml.note_listings.0.iter().chain(&xml.note_listings.1).any(|(_, part)| part_owner(&owner_map, part).is_none())
+    {
+        acc.note("the footnotePr/endnotePr join skipped facts whose document ownership could not be established".to_string());
+        acc.set_incomplete();
+    }
+}
+
+/// Whether every relevant settings or notes source for an owner is available and uncapped.
+/// An unknown source owner cannot establish absence in any owner's set.
+fn note_sources_complete(
+    pkg: &Package,
+    xml: &XmlScan,
+    owner_map: &HashMap<String, usize>,
+    roles: &HashMap<String, scan::PartRole>,
+    owner: usize,
+    notes: bool,
+) -> bool {
+    pkg.entries.iter().filter(|e| !e.is_dir).all(|e| {
+        let key = e.name.to_ascii_lowercase();
+        let relevant = roles.get(&key).is_some_and(|r| if notes { r.is_footnotes || r.is_endnotes } else { r.is_settings });
+        if !relevant {
+            return true;
+        }
+        match part_owner(owner_map, &e.name) {
+            None => false,
+            Some(i) if i != owner => true,
+            Some(_) => !e.content_unavailable && !xml.story_incomplete_parts.contains(&key) && !xml.note_incomplete_parts.contains(&key),
+        }
+    })
+}
+
+/// Apply both special-note join directions to retained facts from one established owner.
+fn check_owner_note_pr(xml: &XmlScan, owner_map: &HashMap<String, usize>, owner: usize, forward_ok: bool, reverse_ok: bool, acc: &mut Acc) {
+    let owned = |part: &str| part_owner(owner_map, part) == Some(owner);
+    let listed_f: HashSet<&str> = xml.note_listings.0.iter().filter(|(_, part)| owned(part)).map(|(id, _)| id.as_str()).collect();
+    let listed_e: HashSet<&str> = xml.note_listings.1.iter().filter(|(_, part)| owned(part)).map(|(id, _)| id.as_str()).collect();
     if forward_ok {
-        let listed_f: HashSet<&str> = xml.note_listings.0.iter().map(String::as_str).collect();
-        let listed_e: HashSet<&str> = xml.note_listings.1.iter().map(String::as_str).collect();
-        for (part, id, is_end, t) in &xml.special_notes {
-            let listed = if *is_end { listed_e.contains(id.as_str()) } else { listed_f.contains(id.as_str()) };
-            if !listed {
+        for (part, id, is_end, t) in xml.special_notes.iter().filter(|(part, ..)| owned(part)) {
+            let listed = if *is_end { &listed_e } else { &listed_f };
+            if !listed.contains(id.as_str()) {
                 let (note, pr) = if *is_end { ("endnote", "endnotePr") } else { ("footnote", "footnotePr") };
                 acc.add_graded(
-                    "NOTE-PR-LISTING",
-                    Severity::Error,
-                    Evidence::Observed,
-                    Some(part.clone()),
-                    format!(
-                        "the {note} with id {id} in {part} has type {t} but is not listed in any {pr}; ECMA-376 says such a note shall not be loaded"
-                    ),
+                    "NOTE-PR-LISTING", Severity::Error, Evidence::Observed, Some(part.clone()),
+                    format!("the {note} with id {id} in {part} has type {t} but is not listed in its owner's {pr}; ECMA-376 says such a note shall not be loaded"),
                 );
             }
         }
     }
     if reverse_ok {
-        for id in &xml.note_listings.0 {
-            if !defs_f.contains(id.as_str()) {
-                acc.add("NOTE-PR-DANGLING", None, format!("a footnotePr lists footnote id {id}, but no footnote with that id is defined"));
-            }
-        }
-        for id in &xml.note_listings.1 {
-            if !defs_e.contains(id.as_str()) {
-                acc.add("NOTE-PR-DANGLING", None, format!("an endnotePr lists endnote id {id}, but no endnote with that id is defined"));
+        for (note, listings, defs) in
+            [("footnote", &xml.note_listings.0, &xml.facts.footnote_defs), ("endnote", &xml.note_listings.1, &xml.facts.endnote_defs)]
+        {
+            let defined: HashSet<&str> = defs.iter().filter(|(_, part)| owned(part)).map(|(id, _)| id.as_str()).collect();
+            for (id, _) in listings.iter().filter(|(_, part)| owned(part)) {
+                if !defined.contains(id.as_str()) {
+                    acc.add(
+                        "NOTE-PR-DANGLING",
+                        None,
+                        format!("a {note}Pr lists {note} id {id}, but no {note} with that id is defined for its owner"),
+                    );
+                }
             }
         }
     }
@@ -1784,7 +1779,7 @@ fn check_story(pkg: &Package, xml: &XmlScan, acc: &mut Acc) {
     report_definition_dups(acc, "ID-COMMENT-DUP", &facts.comment_defs, "w:comment id");
     acc.ran("ID-COMMENT-REF");
     check_owned_ids(pkg, xml, "comments", package::COMMENTS_CONTENT_TYPE, &facts.comment_defs, &facts.comment_refs, acc);
-    report_unreferenced_comments(pkg, facts, acc);
+    report_unreferenced_comments(pkg, xml, acc);
     acc.ran("ID-DOCPR-DUP");
     report_dups(acc, "ID-DOCPR-DUP", &facts.docpr, "wp:docPr id");
     acc.ran("ID-BOOKMARK-DUP");
@@ -1862,13 +1857,28 @@ fn check_owned_ids(
     }
 }
 
-/// Record unreferenced comments within their document owner's ID space.
-fn report_unreferenced_comments(pkg: &Package, facts: &scan::StoryFacts, acc: &mut Acc) {
+/// Record unreferenced comments only when the owner's entire reference set was observed.
+fn report_unreferenced_comments(pkg: &Package, xml: &XmlScan, acc: &mut Acc) {
     let owner_map = owner_index_map(pkg);
-    let refs: HashSet<_> = facts.comment_refs.iter().map(|(id, part)| (part_owner(&owner_map, part), id)).collect();
+    let roles = story_roles(pkg);
+    let mut incomplete_owners = HashSet::new();
+    let mut unknown = !ownership_discovery_complete(pkg);
+    for e in pkg.entries.iter().filter(|e| !e.is_dir) {
+        if roles.get(&e.name.to_ascii_lowercase()).is_some_and(|r| r.is_story) {
+            match part_owner(&owner_map, &e.name) {
+                None => unknown = true,
+                Some(owner) if e.content_unavailable || xml.story_incomplete_parts.contains(&e.name.to_ascii_lowercase()) => {
+                    incomplete_owners.insert(owner);
+                }
+                _ => {}
+            }
+        }
+    }
+    let refs: HashSet<_> = xml.facts.comment_refs.iter().map(|(id, part)| (part_owner(&owner_map, part), id)).collect();
     let mut seen = HashSet::new();
-    for (id, part) in &facts.comment_defs {
-        if !refs.contains(&(part_owner(&owner_map, part), id)) && seen.insert((part, id)) {
+    for (id, part) in &xml.facts.comment_defs {
+        let Some(owner) = part_owner(&owner_map, part) else { continue };
+        if !unknown && !incomplete_owners.contains(&owner) && !refs.contains(&(Some(owner), id)) && seen.insert((part, id)) {
             acc.note(format!("w:comment id {id} in {part} is never referenced"));
         }
     }
@@ -2000,6 +2010,9 @@ fn owner_index_map(pkg: &Package) -> HashMap<String, usize> {
     let owners = owner_scopes(pkg);
     let mut map: HashMap<String, usize> = HashMap::new();
     if owners.len() == 1 && owners[0].is_none() {
+        if !ownership_discovery_complete(pkg) {
+            return map;
+        }
         for e in pkg.entries.iter().filter(|e| !e.is_dir) {
             map.insert(e.name.to_ascii_lowercase(), 0);
         }
@@ -2030,15 +2043,25 @@ fn owner_index_map(pkg: &Package) -> HashMap<String, usize> {
             }
         }
     }
-    // A part not reached from any owner scope (for example a lone supporting part discovered only
-    // by its content type) belongs to the primary scope, so the simple fixtures keep working.
-    for e in pkg.entries.iter().filter(|e| !e.is_dir) {
-        map.entry(e.name.to_ascii_lowercase()).or_insert(0);
+    // Only complete discovery can assign an unreached supporting part to the primary scope.
+    // Otherwise an omitted glossary edge could own it; a missing map entry represents unknown.
+    if ownership_discovery_complete(pkg) {
+        for e in pkg.entries.iter().filter(|e| !e.is_dir) {
+            map.entry(e.name.to_ascii_lowercase()).or_insert(0);
+        }
     }
     map
 }
 
-/// The owner index a part belongs to, if it is reachable from an owner scope.
+/// Whether all sources that can discover owner subtrees have been examined.
+fn ownership_discovery_complete(pkg: &Package) -> bool {
+    !pkg.entries_truncated
+        && !pkg.content_types.incomplete
+        && !package::content_unavailable(pkg, "[Content_Types].xml")
+        && !pkg.rels.iter().any(|rp| rp.incomplete)
+}
+
+/// The established owner index of a part; `None` represents uncertain ownership.
 fn part_owner(owner_map: &HashMap<String, usize>, part: &str) -> Option<usize> {
     owner_map.get(&part.to_ascii_lowercase()).copied()
 }
@@ -2584,6 +2607,12 @@ fn check_custom_xml(pkg: &Package, acc: &mut Acc) {
         .filter(|e| !e.is_dir && pkg.content_types.of(&e.name) == Some(package::CUSTOM_XML_PROPS_CONTENT_TYPE))
         .filter_map(|e| part_owner(&owner_map, &e.name))
         .collect();
+    if pkg.entries.iter().any(|e| {
+        !e.is_dir && pkg.content_types.of(&e.name) == Some(package::CUSTOM_XML_PROPS_CONTENT_TYPE) && part_owner(&owner_map, &e.name).is_none()
+    }) {
+        acc.note("custom XML ownership could not be established; custom XML schema references were not checked".to_string());
+        acc.set_incomplete();
+    }
     for (i, owner) in owners.iter().enumerate() {
         // The settings part is discovered through the owner's own `.rels`, or in the no-owner
         // fallback scope through the manifest (`find_by_type`). When that source could not be read,
@@ -3859,6 +3888,53 @@ mod budget_tests {
             let report = validate_bytes_limited(&zip, limits);
             assert_eq!(report.verdict, Verdict::Incomplete, "{report:?}");
             assert!(!report.findings.iter().any(|f| f.rule == "REL-REF-MISSING"), "{report:?}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod round2_reference_tests {
+    //! Reference incompleteness includes both per-part and pooled fact drops.
+    use super::*;
+    use std::io::{Cursor, Write};
+
+    /// A dropped reference must not turn the corresponding comment into a never-referenced note.
+    #[test]
+    fn round2_capped_comment_references() {
+        let ns = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+        let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let ct = format!(
+            r#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="{}"/><Override PartName="/word/comments.xml" ContentType="{}"/><Override PartName="/word/header.xml" ContentType="{}"/></Types>"#,
+            package::MAIN_CONTENT_TYPE,
+            package::COMMENTS_CONTENT_TYPE,
+            package::HEADER_CONTENT_TYPE
+        );
+        let rels = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rC" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments" Target="comments.xml"/><Relationship Id="rH" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/header" Target="header.xml"/></Relationships>"#;
+        for pooled in [false, true] {
+            let refs = if pooled { r#"<w:commentReference w:id="1"/>"# } else { r#"<w:commentReference w:id="1"/><w:commentReference w:id="2"/>"# };
+            let doc = format!(r#"<w:document xmlns:w="{ns}"><w:body><w:p><w:r>{refs}</w:r></w:p></w:body></w:document>"#);
+            let header_ref = if pooled { r#"<w:commentReference w:id="2"/>"# } else { "" };
+            let header = format!(r#"<w:hdr xmlns:w="{ns}"><w:p><w:r>{header_ref}</w:r></w:p></w:hdr>"#);
+            let comments = format!(r#"<w:comments xmlns:w="{ns}"><w:comment w:id="2"><w:p/></w:comment></w:comments>"#);
+            let root = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rM" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>"#;
+            for (name, data) in [
+                ("[Content_Types].xml", ct.as_str()),
+                ("_rels/.rels", root),
+                ("word/_rels/document.xml.rels", rels),
+                ("word/document.xml", &doc),
+                ("word/header.xml", &header),
+                ("word/comments.xml", &comments),
+            ] {
+                zip.start_file(name, zip::write::SimpleFileOptions::default()).unwrap();
+                zip.write_all(data.as_bytes()).unwrap();
+            }
+            let bytes = zip.finish().unwrap().into_inner();
+            let report = validate_bytes_limited(&bytes, Limits { facts: 1, ..Limits::default() });
+            assert!(
+                !report.coverage_notes.iter().any(|n| n.contains("id 2 in word/comments.xml is never referenced")),
+                "pooled {pooled}: {report:?}"
+            );
+            zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
         }
     }
 }
