@@ -4,8 +4,9 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::{Cursor, Read};
 
-use quick_xml::Reader;
 use quick_xml::events::{BytesStart, Event};
+use quick_xml::name::ResolveResult;
+use quick_xml::reader::NsReader;
 
 use crate::Acc;
 use crate::scan::ParseGuard;
@@ -89,6 +90,8 @@ pub(crate) struct Entry {
 #[derive(Default)]
 pub(crate) struct ContentTypes {
     overrides: HashMap<String, String>,
+    /// Later declarations were not examined; absence and Default fallbacks are unestablished.
+    pub incomplete: bool,
     defaults: HashMap<String, String>,
     /// Extensions with more than one Default entry (lowercased).
     pub dup_defaults: BTreeSet<String>,
@@ -102,6 +105,10 @@ impl ContentTypes {
         let part = part.trim_start_matches('/').to_ascii_lowercase();
         if let Some(t) = self.overrides.get(&part) {
             return Some(t);
+        }
+        // An unexamined Override can supersede any recorded Default.
+        if self.incomplete {
+            return None;
         }
         let ext = part.rsplit_once('.').map(|(_, e)| e)?;
         self.defaults.get(ext).map(String::as_str)
@@ -121,6 +128,8 @@ pub(crate) struct Rel {
 pub(crate) struct RelsPart {
     pub name: String,
     pub rels: Vec<Rel>,
+    /// Later relationships were not examined, so missing IDs/kinds are unknown.
+    pub incomplete: bool,
 }
 
 /// Everything loaded from a package once.
@@ -252,10 +261,12 @@ pub(crate) fn load(bytes: &[u8], acc: &mut Acc) -> Option<Package> {
         && let Some(text) = &e.decoded
         && parse_content_types(text, &mut content_types, limits.entries, &mut ct_guard)
     {
+        content_types.incomplete = true;
         acc.note(format!("[Content_Types].xml declares more than {} entries; later ones were not recorded", limits.entries));
         acc.set_incomplete();
     }
     if ct_guard.exhausted() {
+        content_types.incomplete = true;
         acc.note(format!("[Content_Types].xml exceeded the XML {} budget; later declarations were not recorded", ct_guard.budget()));
         acc.set_incomplete();
     }
@@ -279,14 +290,14 @@ pub(crate) fn load(bytes: &[u8], acc: &mut Acc) -> Option<Package> {
     acc.ran("PKG-NO-MAIN");
     let package_rels = rels.iter().find(|r| r.name.eq_ignore_ascii_case("_rels/.rels"));
     let main = package_rels
-        .and_then(|rp| rp.rels.iter().find(|r| !r.external && tail(&r.kind) == "officeDocument"))
+        .and_then(|rp| rp.rels.iter().find(|r| !r.external && is_office_document_relationship(&r.kind)))
         .and_then(|r| r.target_abs.as_deref())
         .and_then(|t| canonical(&entries, t));
     if main.is_none() {
         // If `_rels/.rels` is present but its content could not be read, its officeDocument
         // relationship is unknown, not absent: no absence conclusion is established.
         let package_rels_unavailable = entries.iter().any(|e| !e.is_dir && e.name.eq_ignore_ascii_case("_rels/.rels") && e.content_unavailable);
-        if !package_rels_unavailable {
+        if !package_rels_unavailable && !package_rels.is_some_and(|rp| rp.incomplete) {
             acc.add("PKG-NO-MAIN", None, no_main_message(package_rels));
         }
     }
@@ -636,7 +647,7 @@ fn load_rels(entries: &[Entry], acc: &mut Acc) -> Vec<RelsPart> {
         let Some(dir) = rels_dir(&e.name) else { continue };
         let Some(text) = &e.decoded else { continue };
         let mut guard = ParseGuard::new(limits.events, limits.depth);
-        let (parsed, c) = parse_rels(&dir, text, cap, &mut guard);
+        let (parsed, c, complete) = parse_rels(&dir, text, cap, &mut guard);
         if c {
             acc.note(format!("{} declares more than {cap} relationships; later ones were not recorded", e.name));
             acc.set_incomplete();
@@ -645,7 +656,7 @@ fn load_rels(entries: &[Entry], acc: &mut Acc) -> Vec<RelsPart> {
             acc.note(format!("{} exceeded the XML {} budget; later relationships were not recorded", e.name, guard.budget()));
             acc.set_incomplete();
         }
-        rels.push(RelsPart { name: e.name.clone(), rels: parsed });
+        rels.push(RelsPart { name: e.name.clone(), rels: parsed, incomplete: !complete });
     }
     rels
 }
@@ -782,6 +793,21 @@ fn hex(c: u8) -> Option<u8> {
     }
 }
 
+/// Only the Transitional and Strict officeDocument URIs establish a package entry point.
+fn is_office_document_relationship(kind: &str) -> bool {
+    matches!(
+        kind,
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument"
+            | "http://purl.oclc.org/ooxml/officeDocument/relationships/officeDocument"
+    )
+}
+
+/// Whether an owner's relationship declarations are unavailable or only partially examined.
+pub(crate) fn relationships_incomplete(pkg: &Package, part: &str) -> bool {
+    let name = rels_part_name(part);
+    content_unavailable(pkg, &name) || pkg.rels.iter().any(|rp| rp.name.eq_ignore_ascii_case(&name) && rp.incomplete)
+}
+
 /// The last `/`-separated segment of a relationship type.
 pub(crate) fn tail(t: &str) -> &str {
     t.rsplit('/').next().unwrap_or(t)
@@ -789,42 +815,62 @@ pub(crate) fn tail(t: &str) -> &str {
 
 /// Parse `[Content_Types].xml`. Returns `true` when the declaration budget stopped it early.
 fn parse_content_types(text: &str, ct: &mut ContentTypes, cap: usize, guard: &mut ParseGuard) -> bool {
-    let mut reader = Reader::from_reader(text.as_bytes());
-    let mut buf = Vec::new();
     let mut count = 0usize;
     let mut capped = false;
+    let complete = parse_opc_children(text, b"Types", b"http://schemas.openxmlformats.org/package/2006/content-types", guard, |e| {
+        if !matches!(e.local_name().as_ref(), b"Default" | b"Override") {
+            return;
+        }
+        if count >= cap {
+            capped = true;
+        } else {
+            record_content_type(e, ct);
+            count += 1;
+        }
+    });
+    ct.incomplete |= capped || !complete;
+    capped
+}
+
+/// Visit only namespace-qualified direct children of the expected OPC root container.
+/// All XML events still consume the guard, including ignored foreign or nested elements.
+fn parse_opc_children(text: &str, container: &[u8], namespace: &[u8], guard: &mut ParseGuard, mut visit: impl FnMut(&BytesStart)) -> bool {
+    let mut reader = NsReader::from_reader(text.as_bytes());
+    let mut buf = Vec::new();
+    let mut depth = 0usize;
+    let mut valid_root = false;
     loop {
         if !guard.tick() {
-            break;
+            return false;
         }
-        match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(e)) => {
+        match reader.read_resolved_event_into(&mut buf) {
+            Ok((ns, Event::Start(e))) => {
                 if !guard.enter() {
-                    break;
+                    return false;
                 }
-                if count >= cap {
-                    capped = true;
-                } else {
-                    record_content_type(&e, ct);
-                    count += 1;
+                let in_namespace = matches!(ns, ResolveResult::Bound(n) if n.as_ref() == namespace);
+                if depth == 0 {
+                    valid_root = in_namespace && e.local_name().as_ref() == container;
+                } else if depth == 1 && valid_root && in_namespace {
+                    visit(&e);
+                }
+                depth += 1;
+            }
+            Ok((ns, Event::Empty(e))) => {
+                if depth == 1 && valid_root && matches!(ns, ResolveResult::Bound(n) if n.as_ref() == namespace) {
+                    visit(&e);
                 }
             }
-            Ok(Event::Empty(e)) => {
-                if count >= cap {
-                    capped = true;
-                } else {
-                    record_content_type(&e, ct);
-                    count += 1;
-                }
+            Ok((_, Event::End(_))) => {
+                guard.leave();
+                depth = depth.saturating_sub(1);
             }
-            Ok(Event::End(_)) => guard.leave(),
-            Ok(Event::Eof) => break,
-            Err(_) => break,
+            Ok((_, Event::Eof)) => return true,
+            Err(_) => return false,
             _ => {}
         }
         buf.clear();
     }
-    capped
 }
 
 /// Extract and record an `Override` or `Default` content type declaration from an XML element.
@@ -834,9 +880,9 @@ fn record_content_type(e: &BytesStart, ct: &mut ContentTypes) {
     if l != b"Override" && l != b"Default" {
         return;
     }
-    let key = attr_local(e, b"PartName").or_else(|| attr_local(e, b"Extension"));
+    let key = attr_plain(e, b"PartName").or_else(|| attr_plain(e, b"Extension"));
     let Some(key) = key else { return };
-    let Some(value) = attr_local(e, b"ContentType") else { return };
+    let Some(value) = attr_plain(e, b"ContentType") else { return };
     let key = key.trim_start_matches('/').to_ascii_lowercase();
     let (map, dups) = if l == b"Override" { (&mut ct.overrides, &mut ct.dup_overrides) } else { (&mut ct.defaults, &mut ct.dup_defaults) };
     if map.insert(key.clone(), value).is_some() {
@@ -844,35 +890,17 @@ fn record_content_type(e: &BytesStart, ct: &mut ContentTypes) {
     }
 }
 
-/// Parse a `.rels` part. Returns `(relationships, capped)` where `capped` is set when the budget
+/// Parse a `.rels` part. Returns `(relationships, capped, complete)` where `capped` is set when the budget
 /// stopped further relationships from being recorded. The depth bound is tracked like every other
 /// parser (J1), so a deeply nested relationships part stops before a later (possibly dangling)
 /// relationship is read.
-fn parse_rels(dir: &str, text: &str, cap: usize, guard: &mut ParseGuard) -> (Vec<Rel>, bool) {
+fn parse_rels(dir: &str, text: &str, cap: usize, guard: &mut ParseGuard) -> (Vec<Rel>, bool, bool) {
     let mut rels = Vec::new();
-    let mut reader = Reader::from_reader(text.as_bytes());
-    let mut buf = Vec::new();
     let mut capped = false;
-    loop {
-        if !guard.tick() {
-            break;
-        }
-        match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(e)) => {
-                if !guard.enter() {
-                    break;
-                }
-                push_rel(dir, &e, &mut rels, cap, &mut capped);
-            }
-            Ok(Event::Empty(e)) => push_rel(dir, &e, &mut rels, cap, &mut capped),
-            Ok(Event::End(_)) => guard.leave(),
-            Ok(Event::Eof) => break,
-            Err(_) => break,
-            _ => {}
-        }
-        buf.clear();
-    }
-    (rels, capped)
+    let complete = parse_opc_children(text, b"Relationships", b"http://schemas.openxmlformats.org/package/2006/relationships", guard, |e| {
+        push_rel(dir, e, &mut rels, cap, &mut capped);
+    });
+    (rels, capped, complete && !capped)
 }
 
 /// Record one `<Relationship>` element, ignoring any other element.
@@ -890,20 +918,19 @@ fn push_rel(dir: &str, e: &BytesStart, rels: &mut Vec<Rel>, cap: usize, capped: 
 
 /// Parse attributes of a `<Relationship>` element into a [`Rel`] struct, resolving internal targets.
 fn parse_rel(dir: &str, e: &BytesStart) -> Option<Rel> {
-    let id = attr_local(e, b"Id")?;
-    let kind = attr_local(e, b"Type").unwrap_or_default();
-    let target = attr_local(e, b"Target").unwrap_or_default();
-    let external = attr_local(e, b"TargetMode").is_some_and(|m| m.eq_ignore_ascii_case("External"));
+    let id = attr_plain(e, b"Id")?;
+    let kind = attr_plain(e, b"Type").unwrap_or_default();
+    let target = attr_plain(e, b"Target").unwrap_or_default();
+    let external = attr_plain(e, b"TargetMode").is_some_and(|m| m.eq_ignore_ascii_case("External"));
     let target_abs = (!external).then(|| resolve(dir, &target));
     Some(Rel { id, kind, target_abs, external })
 }
 
-/// An attribute by its local name regardless of prefix (content types and rels use unprefixed
-/// or conventionally-prefixed attributes).
-fn attr_local(e: &BytesStart, name: &[u8]) -> Option<String> {
+/// An unqualified OPC attribute; foreign qualified lookalikes never declare OPC metadata.
+fn attr_plain(e: &BytesStart, name: &[u8]) -> Option<String> {
     for a in e.attributes() {
         let a = a.ok()?;
-        if a.key.local_name().as_ref() == name {
+        if a.key.as_ref() == name {
             return a.normalized_value(quick_xml::XmlVersion::Implicit1_0).ok().map(|c| c.into_owned());
         }
     }

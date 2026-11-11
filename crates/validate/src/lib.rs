@@ -702,7 +702,7 @@ pub(crate) fn validate_bytes_limited(bytes: &[u8], limits: Limits) -> Report {
         &mut acc,
     );
     check_content_part_types(&pkg, &xml.content_parts, xml.content_part_capped_any, &mut acc);
-    check_story(&pkg, &xml.facts, xml.compat, &mut acc);
+    check_story(&pkg, &xml, &mut acc);
     check_note_pr(&xml.facts, &xml, &mut acc);
     check_media(&pkg, &mut acc);
     acc.finish()
@@ -750,12 +750,13 @@ fn check_content_types(pkg: &Package, acc: &mut Acc) {
         if l == "[content_types].xml" || l.ends_with(".rels") {
             continue;
         }
-        if pkg.content_types.of(&e.name).is_none() {
+        if !pkg.content_types.incomplete && pkg.content_types.of(&e.name).is_none() {
             acc.add("CT-UNDECLARED", Some(e.name.clone()), format!("part {} has no effective content type", e.name));
         }
     }
     acc.ran("CT-MAIN-TYPE");
     if let Some(main) = &pkg.main
+        && (!pkg.content_types.incomplete || pkg.content_types.of(main).is_some())
         && !is_main_typed(pkg, main)
     {
         let got = pkg.content_types.of(main).unwrap_or("(none)");
@@ -842,6 +843,8 @@ struct XmlScan {
     /// complete scan found no contentParts.
     content_part_scanned_owners: HashSet<String>,
     compat: Compat,
+    /// Parts whose story facts were only partially examined.
+    story_incomplete_parts: HashSet<String>,
     /// Ids listed by `w:footnotePr` / `w:endnotePr` in settings parts.
     note_listings: (Vec<String>, Vec<String>),
     /// Special note definitions: (owning part, id, is_endnote, w:type).
@@ -857,6 +860,18 @@ struct XmlScan {
     defs_complete: bool,
 }
 
+/// Whether every incoming definition will fit the pooled allowances. A dropped definition
+/// makes only its source part incomplete; already collected owner scopes remain checkable.
+fn definitions_fit(facts: &scan::StoryFacts, incoming: &scan::StoryFacts, cap: usize) -> bool {
+    [
+        (facts.comment_defs.len(), incoming.comment_defs.len()),
+        (facts.footnote_defs.len(), incoming.footnote_defs.len()),
+        (facts.endnote_defs.len(), incoming.endnote_defs.len()),
+    ]
+    .into_iter()
+    .all(|(held, added)| held.saturating_add(added) <= cap)
+}
+
 /// Scan all XML parts for well-formedness, undeclared prefixes, illegal characters, and extract story facts.
 fn check_xml(pkg: &Package, acc: &mut Acc) -> XmlScan {
     acc.ran("XML-MALFORMED");
@@ -868,6 +883,7 @@ fn check_xml(pkg: &Package, acc: &mut Acc) -> XmlScan {
     acc.ran("HEADERSOURCE-PRESENT");
     let roles = story_roles(pkg);
     let mut facts = scan::StoryFacts::default();
+    let mut story_incomplete_parts = HashSet::new();
     let mut refs: Vec<(String, Vec<RefFact>)> = Vec::new();
     let mut content_parts: Vec<(String, Vec<String>)> = Vec::new();
     let mut content_part_total = 0usize;
@@ -921,6 +937,7 @@ fn check_xml(pkg: &Package, acc: &mut Acc) -> XmlScan {
         }
         let Some(text) = &e.decoded else { continue };
         let mut scanned = scan::scan_part(&e.name, text, role, acc);
+        story_incomplete_parts.extend((!scanned.facts_complete).then(|| e.name.to_ascii_lowercase()));
         content_part_scanned_owners.insert(e.name.to_ascii_lowercase());
         if scanned.note_capped {
             note_capped_any = true;
@@ -951,6 +968,7 @@ fn check_xml(pkg: &Package, acc: &mut Acc) -> XmlScan {
         for prefix in &scanned.unknown_prefixes {
             acc.add("XML-UNDECLARED-PREFIX", Some(e.name.clone()), format!("the namespace prefix `{prefix}` used in {} is not declared", e.name));
         }
+        story_incomplete_parts.extend((!definitions_fit(&facts, &scanned.facts, acc.limits.facts)).then(|| e.name.to_ascii_lowercase()));
         if role.is_story && scan::merge_facts(&mut facts, scanned.facts, acc.limits.facts) {
             pooled_capped = true;
             if facts_pooled_part.is_none() {
@@ -1043,6 +1061,7 @@ fn check_xml(pkg: &Package, acc: &mut Acc) -> XmlScan {
         content_part_incomplete_owners,
         content_part_scanned_owners,
         compat,
+        story_incomplete_parts,
         note_listings,
         special_notes,
         settings_unreadable,
@@ -1401,7 +1420,7 @@ fn check_part_refs(pkg: &Package, refs: &[(String, Vec<RefFact>)], acc: &mut Acc
     for (part, values) in refs {
         // The part's own `.rels` could not be read: which relationships it declares is unknown, so
         // its `r:id`/`r:embed`/`r:link` values are not established as unresolved.
-        if package::content_unavailable(pkg, &rels_part_name(part)) {
+        if package::relationships_incomplete(pkg, part) {
             continue;
         }
         let ids = part_rel_ids(pkg, part);
@@ -1449,7 +1468,7 @@ fn check_typed_image_refs(pkg: &Package, refs: &[(String, Vec<RefFact>)], acc: &
                 // external-relationship conclusions above and below do not depend on the manifest.)
                 if !package::content_unavailable(pkg, "[Content_Types].xml") {
                     let ct = pkg.content_types.of(target);
-                    if !ct.is_some_and(|c| c.starts_with("image/")) {
+                    if (!pkg.content_types.incomplete || ct.is_some()) && !ct.is_some_and(|c| c.starts_with("image/")) {
                         acc.add(
                             "REL-TYPED",
                             Some(part.clone()),
@@ -1504,6 +1523,9 @@ fn check_typed_targets(pkg: &Package, acc: &mut Acc) {
     for r in &rp.rels {
         let Some(target) = &r.target_abs else { continue };
         let ct = pkg.content_types.of(target);
+        if ct.is_none() && pkg.content_types.incomplete {
+            continue;
+        }
         match tail(&r.kind) {
             "header" if ct != Some(package::HEADER_CONTENT_TYPE) => {
                 acc.add("REL-TYPED", Some(rp.name.clone()), header_footer_message("header", &r.id, target, ct));
@@ -1705,7 +1727,9 @@ fn check_typed_content(
 }
 
 /// Check cross-document story identifier families (comments, docPr, bookmarks, revisions, notes, styles, headers).
-fn check_story(pkg: &Package, facts: &scan::StoryFacts, compat: Compat, acc: &mut Acc) {
+fn check_story(pkg: &Package, xml: &XmlScan, acc: &mut Acc) {
+    let facts = &xml.facts;
+    let compat = xml.compat;
     acc.ran("COMMENT-RANGE-COUNT");
     if facts.comment_range_starts > 32_767 {
         acc.add(
@@ -1757,15 +1781,10 @@ fn check_story(pkg: &Package, facts: &scan::StoryFacts, compat: Compat, acc: &mu
         Compat::Off => {}
     }
     acc.ran("ID-COMMENT-DUP");
-    report_dups(acc, "ID-COMMENT-DUP", &facts.comment_defs, "w:comment id");
+    report_definition_dups(acc, "ID-COMMENT-DUP", &facts.comment_defs, "w:comment id");
     acc.ran("ID-COMMENT-REF");
-    let comment_defs = id_set(&facts.comment_defs);
-    // A comments part that could not be read leaves the pooled definitions incomplete, so a
-    // reference must not be reported as dangling: absence is not established.
-    if !kind_source_unavailable(pkg, "comments", package::COMMENTS_CONTENT_TYPE) {
-        report_missing(acc, "ID-COMMENT-REF", &facts.comment_refs, &comment_defs, "w:commentReference id");
-    }
-    report_unreferenced_comments(facts, acc);
+    check_owned_ids(pkg, xml, "comments", package::COMMENTS_CONTENT_TYPE, &facts.comment_defs, &facts.comment_refs, acc);
+    report_unreferenced_comments(pkg, facts, acc);
     acc.ran("ID-DOCPR-DUP");
     report_dups(acc, "ID-DOCPR-DUP", &facts.docpr, "wp:docPr id");
     acc.ran("ID-BOOKMARK-DUP");
@@ -1780,19 +1799,11 @@ fn check_story(pkg: &Package, facts: &scan::StoryFacts, compat: Compat, acc: &mu
     acc.ran("ID-REVISION-DUP");
     report_dups(acc, "ID-REVISION-DUP", &facts.revisions, "revision id");
     acc.ran("NOTE-DUP");
-    report_dups(acc, "NOTE-DUP", &facts.footnote_defs, "w:footnote id");
-    report_dups(acc, "NOTE-DUP", &facts.endnote_defs, "w:endnote id");
+    report_definition_dups(acc, "NOTE-DUP", &facts.footnote_defs, "w:footnote id");
+    report_definition_dups(acc, "NOTE-DUP", &facts.endnote_defs, "w:endnote id");
     acc.ran("REF-NOTE");
-    let footnote_defs = id_set(&facts.footnote_defs);
-    let endnote_defs = id_set(&facts.endnote_defs);
-    // An unreadable footnotes/endnotes part leaves the definitions incomplete, so a reference is
-    // not established as dangling.
-    if !kind_source_unavailable(pkg, "footnotes", package::FOOTNOTES_CONTENT_TYPE) {
-        report_missing_note(acc, &facts.footnote_refs, &footnote_defs, "footnote");
-    }
-    if !kind_source_unavailable(pkg, "endnotes", package::ENDNOTES_CONTENT_TYPE) {
-        report_missing_note(acc, &facts.endnote_refs, &endnote_defs, "endnote");
-    }
+    check_owned_ids(pkg, xml, "footnotes", package::FOOTNOTES_CONTENT_TYPE, &facts.footnote_defs, &facts.footnote_refs, acc);
+    check_owned_ids(pkg, xml, "endnotes", package::ENDNOTES_CONTENT_TYPE, &facts.endnote_defs, &facts.endnote_refs, acc);
     acc.ran("REF-HEADER");
     check_header_footer_refs(pkg, facts, acc);
     acc.ran("REF-STYLE");
@@ -1807,28 +1818,57 @@ fn check_story(pkg: &Package, facts: &scan::StoryFacts, compat: Compat, acc: &mu
     check_custom_xml(pkg, acc);
 }
 
-/// Collect a set of unique identifier strings from `(id, part)` pairs.
-fn id_set(items: &[(String, String)]) -> HashSet<String> {
-    items.iter().map(|(id, _)| id.clone()).collect()
+/// Duplicate decimal IDs are forbidden within a definition part, not between independent owners.
+fn report_definition_dups(acc: &mut Acc, rule: &'static str, items: &[(String, String)], what: &str) {
+    let mut seen = HashSet::new();
+    let mut reported = HashSet::new();
+    for (id, part) in items {
+        if !seen.insert((part, id)) && reported.insert((part, id)) {
+            acc.add(rule, Some(part.clone()), format!("duplicate {what} {id} in {part}"));
+        }
+    }
 }
 
-/// Whether the definitions a story kind would contribute to any owner are unestablished: either the
-/// supporting part resolves to one whose content could not be read, or the discovery source that
-/// would find it (the owner's `.rels`, or the manifest in the no-owner fallback scope) could not be
-/// read. In both cases the part's existence is unestablished, not established-absent, so references
-/// checked against it are not reported as dangling.
-fn kind_source_unavailable(pkg: &Package, kind: &str, ct: &str) -> bool {
-    owner_scopes(pkg).iter().any(|owner| {
-        discovery_unavailable(pkg, owner.as_deref()) || supporting_part(pkg, owner.as_deref(), kind, ct).is_some_and(|e| e.content_unavailable)
-    })
+/// Join each owner's references only to the definition part reached by its own relationships.
+/// Unavailable or truncated discovery/definition sources cannot establish missing IDs.
+fn check_owned_ids(
+    pkg: &Package,
+    xml: &XmlScan,
+    kind: &str,
+    ct: &str,
+    definitions: &[(String, String)],
+    references: &[(String, String)],
+    acc: &mut Acc,
+) {
+    let owners = owner_scopes(pkg);
+    let owner_map = owner_index_map(pkg);
+    for (index, owner) in owners.iter().enumerate() {
+        let source = supporting_part(pkg, owner.as_deref(), kind, ct);
+        if source.is_none() && discovery_unavailable(pkg, owner.as_deref()) {
+            continue;
+        }
+        if source.is_some_and(|e| e.content_unavailable || xml.story_incomplete_parts.contains(&e.name.to_ascii_lowercase())) {
+            continue;
+        }
+        let defs: HashSet<String> =
+            definitions.iter().filter(|(_, part)| source.is_some_and(|e| e.name.eq_ignore_ascii_case(part))).map(|(id, _)| id.clone()).collect();
+        let refs: Vec<_> = references.iter().filter(|(_, part)| part_owner(&owner_map, part) == Some(index)).cloned().collect();
+        match kind {
+            "comments" => report_missing(acc, "ID-COMMENT-REF", &refs, &defs, "w:commentReference id"),
+            "footnotes" => report_missing_note(acc, &refs, &defs, "footnote"),
+            "endnotes" => report_missing_note(acc, &refs, &defs, "endnote"),
+            _ => {}
+        }
+    }
 }
 
-/// Record a coverage note for each comment definition that is never referenced in the document.
-fn report_unreferenced_comments(facts: &scan::StoryFacts, acc: &mut Acc) {
-    let refs = id_set(&facts.comment_refs);
+/// Record unreferenced comments within their document owner's ID space.
+fn report_unreferenced_comments(pkg: &Package, facts: &scan::StoryFacts, acc: &mut Acc) {
+    let owner_map = owner_index_map(pkg);
+    let refs: HashSet<_> = facts.comment_refs.iter().map(|(id, part)| (part_owner(&owner_map, part), id)).collect();
     let mut seen = HashSet::new();
     for (id, part) in &facts.comment_defs {
-        if !refs.contains(id) && seen.insert(id.as_str()) {
+        if !refs.contains(&(part_owner(&owner_map, part), id)) && seen.insert((part, id)) {
             acc.note(format!("w:comment id {id} in {part} is never referenced"));
         }
     }
@@ -1863,6 +1903,7 @@ fn check_header_footer_refs(pkg: &Package, facts: &scan::StoryFacts, acc: &mut A
                 continue;
             }
             match by_id.get(id.as_str()) {
+                None if rp.incomplete => {}
                 None => acc.add("REF-HEADER", Some(part.clone()), format!("w:{element} r:id {id} in {part} has no matching relationship")),
                 Some(rel) if tail(&rel.kind) != kind => acc.add(
                     "REF-HEADER",
@@ -1877,7 +1918,7 @@ fn check_header_footer_refs(pkg: &Package, facts: &scan::StoryFacts, acc: &mut A
                 Some(rel) => {
                     if let Some(target) = &rel.target_abs {
                         let ct = pkg.content_types.of(target);
-                        if ct != Some(want_ct) {
+                        if (!pkg.content_types.incomplete || ct.is_some()) && ct != Some(want_ct) {
                             acc.add(
                                 "REF-HEADER",
                                 Some(part.clone()),
@@ -1946,8 +1987,8 @@ fn supporting_part<'a>(pkg: &'a Package, owner: Option<&str>, kind: &str, ct: &s
 /// manifest that [`find_by_type`] reads.
 fn discovery_unavailable(pkg: &Package, owner: Option<&str>) -> bool {
     match owner {
-        Some(owner) => package::content_unavailable(pkg, &rels_part_name(owner)),
-        None => package::content_unavailable(pkg, "[Content_Types].xml"),
+        Some(owner) => package::relationships_incomplete(pkg, owner),
+        None => package::content_unavailable(pkg, "[Content_Types].xml") || pkg.content_types.incomplete,
     }
 }
 
@@ -3462,7 +3503,7 @@ mod budget_tests {
             ("[Content_Types].xml", content_types_with_override("word/comments.xml", package::COMMENTS_CONTENT_TYPE)),
             ("_rels/.rels", package_rels()),
             ("word/document.xml", doc),
-            ("word/_rels/document.xml.rels", doc_rels()),
+            ("word/_rels/document.xml.rels", br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rC" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments" Target="comments.xml"/></Relationships>"#.to_vec()),
             ("word/comments.xml", comments),
         ]);
         let report = validate_bytes_limited(&zip, Limits { facts: 3, ..Limits::default() });
@@ -3789,5 +3830,35 @@ mod budget_tests {
             "the duplicate must still be reported under a generous budget: {:?}",
             full.findings
         );
+    }
+    /// Finding 1: event and depth limits leave declaration lookups unknown, just like entry caps.
+    #[test]
+    fn fredapps_1_xml_budget_declaration_completeness() {
+        let doc = format!(r#"<w:document xmlns:w="{NS_W}" xmlns:r="{NS_R}"><w:body><w:p><w:hyperlink r:id="last"/></w:p></w:body></w:document>"#)
+            .into_bytes();
+        let last = r#"<Relationship Id="last" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="https://example.org" TargetMode="External"/>"#;
+        for (prefix, limits) in [
+            (
+                (0..40)
+                    .map(|i| format!(r#"<Relationship Id="r{i}" Type="urn:custom" Target="https://example.org" TargetMode="External"/>"#))
+                    .collect::<String>(),
+                Limits { events: 15, ..Limits::default() },
+            ),
+            ("<nested><nested><nested></nested></nested></nested>".to_string(), Limits { depth: 3, ..Limits::default() }),
+        ] {
+            let zip = tiny_zip(&[
+                ("[Content_Types].xml", content_types()),
+                ("_rels/.rels", package_rels()),
+                ("word/document.xml", doc.clone()),
+                (
+                    "word/_rels/document.xml.rels",
+                    format!(r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">{prefix}{last}</Relationships>"#)
+                        .into_bytes(),
+                ),
+            ]);
+            let report = validate_bytes_limited(&zip, limits);
+            assert_eq!(report.verdict, Verdict::Incomplete, "{report:?}");
+            assert!(!report.findings.iter().any(|f| f.rule == "REL-REF-MISSING"), "{report:?}");
+        }
     }
 }

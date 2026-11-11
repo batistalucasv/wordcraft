@@ -134,6 +134,8 @@ pub(crate) struct PartScan {
     pub note_capped: bool,
     /// The generic fact budget dropped at least one fact in this part.
     pub fact_capped: bool,
+    /// All XML events and story facts were examined; absence joins may use this part.
+    pub facts_complete: bool,
 }
 
 struct ElemId {
@@ -555,6 +557,7 @@ pub(crate) fn scan_part(part: &str, text: &str, role: PartRole, acc: &mut Acc) -
         note_listings: (Vec::new(), Vec::new()),
         note_capped: false,
         fact_capped: false,
+        facts_complete: false,
     };
     let mut root_count = 0usize;
     let mut events = 0usize;
@@ -724,6 +727,7 @@ pub(crate) fn scan_part(part: &str, text: &str, role: PartRole, acc: &mut Acc) -
     // that would have reported something marks the run INCOMPLETE below (the malformed part itself
     // is Warning-only by calibration).
     let scan_complete = out.malformed.is_none() && !budget_stopped && !state.fact_capped && !state.refs_capped;
+    out.facts_complete = scan_complete;
     finish_prefix(&state, part, acc);
     if scan_complete {
         finish_completion(&state, part, acc);
@@ -1053,7 +1057,7 @@ fn record_note_pr(state: &mut State, id: &ElemId, attrs: &[Attribute], res: &Nam
     if ((is_end && role.is_endnotes) || (!is_end && role.is_footnotes))
         && let Some(t) = attr_ns(attrs, res, NS_W, b"type")
         && matches!(t.as_str(), "separator" | "continuationSeparator" | "continuationNotice")
-        && let Some(x) = attr_ns(attrs, res, NS_W, b"id")
+        && let Some(x) = attr_ns(attrs, res, NS_W, b"id").map(decimal_ident)
     {
         if state.special_notes.len() >= state.fact_cap {
             state.note_capped = true;
@@ -1065,7 +1069,7 @@ fn record_note_pr(state: &mut State, id: &ElemId, attrs: &[Attribute], res: &Nam
         && let Some(parent) = state.frames.last()
     {
         let listed = if is_end { parent.is_endnote_pr } else { parent.is_footnote_pr };
-        if listed && let Some(x) = attr_ns(attrs, res, NS_W, b"id") {
+        if listed && let Some(x) = attr_ns(attrs, res, NS_W, b"id").map(decimal_ident) {
             let list = if is_end { &mut state.note_listings_e } else { &mut state.note_listings_f };
             if list.len() >= state.fact_cap {
                 state.note_capped = true;
@@ -1366,24 +1370,35 @@ fn collect_range_id(set: &mut BTreeSet<String>, cap: usize, capped: &mut bool, i
     }
 }
 
+/// Collect canonical decimal comment IDs and range endpoints within the scan budget.
 fn record_comment_ids(state: &mut State, id: &ElemId, attrs: &[Attribute], res: &NamespaceResolver, role: PartRole, part: &str) {
     let cap = state.fact_cap;
     match id.local.as_str() {
         "comment" if id.w() && role.is_comments => {
-            push_capped(&mut state.facts.comment_defs, cap, &mut state.fact_capped, attr_ns(attrs, res, NS_W, b"id"), part);
+            push_capped(&mut state.facts.comment_defs, cap, &mut state.fact_capped, attr_ns(attrs, res, NS_W, b"id").map(decimal_ident), part);
         }
         "commentReference" if id.w() => {
-            push_capped(&mut state.facts.comment_refs, cap, &mut state.fact_capped, attr_ns(attrs, res, NS_W, b"id"), part);
+            push_capped(&mut state.facts.comment_refs, cap, &mut state.fact_capped, attr_ns(attrs, res, NS_W, b"id").map(decimal_ident), part);
         }
         "commentRangeStart" if id.w() => {
             state.facts.comment_range_starts += 1;
             if range_scope(state, role) {
-                collect_range_id(&mut state.comment_range_start_ids, state.fact_cap, &mut state.fact_capped, attr_ns(attrs, res, NS_W, b"id"));
+                collect_range_id(
+                    &mut state.comment_range_start_ids,
+                    state.fact_cap,
+                    &mut state.fact_capped,
+                    attr_ns(attrs, res, NS_W, b"id").map(decimal_ident),
+                );
             }
         }
         "commentRangeEnd" if id.w() => {
             if range_scope(state, role) {
-                collect_range_id(&mut state.comment_range_end_ids, state.fact_cap, &mut state.fact_capped, attr_ns(attrs, res, NS_W, b"id"));
+                collect_range_id(
+                    &mut state.comment_range_end_ids,
+                    state.fact_cap,
+                    &mut state.fact_capped,
+                    attr_ns(attrs, res, NS_W, b"id").map(decimal_ident),
+                );
             }
         }
         "p" if id.w() && role.is_comments => {
@@ -1393,21 +1408,39 @@ fn record_comment_ids(state: &mut State, id: &ElemId, attrs: &[Attribute], res: 
     }
 }
 
+/// Canonicalize the value of an ST_DecimalNumber without a fixed-width integer parse.
+/// Invalid lexical forms are retained verbatim: this join does not validate their syntax.
+fn decimal_ident(value: String) -> String {
+    let lexical = value.trim_matches([' ', '\t', '\r', '\n']);
+    let digits = lexical.strip_prefix(['+', '-']).unwrap_or(lexical);
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return value;
+    }
+    let digits = digits.trim_start_matches('0');
+    if digits.is_empty() {
+        "0".to_string()
+    } else if lexical.starts_with('-') {
+        format!("-{digits}")
+    } else {
+        digits.to_string()
+    }
+}
+
 /// Record footnote and endnote definitions and references.
 fn record_note_ids(state: &mut State, id: &ElemId, attrs: &[Attribute], res: &NamespaceResolver, role: PartRole, part: &str) {
     let cap = state.fact_cap;
     match id.local.as_str() {
         "footnoteReference" if id.w() => {
-            push_capped(&mut state.facts.footnote_refs, cap, &mut state.fact_capped, attr_ns(attrs, res, NS_W, b"id"), part);
+            push_capped(&mut state.facts.footnote_refs, cap, &mut state.fact_capped, attr_ns(attrs, res, NS_W, b"id").map(decimal_ident), part);
         }
         "endnoteReference" if id.w() => {
-            push_capped(&mut state.facts.endnote_refs, cap, &mut state.fact_capped, attr_ns(attrs, res, NS_W, b"id"), part);
+            push_capped(&mut state.facts.endnote_refs, cap, &mut state.fact_capped, attr_ns(attrs, res, NS_W, b"id").map(decimal_ident), part);
         }
         "footnote" if id.w() && role.is_footnotes => {
-            push_capped(&mut state.facts.footnote_defs, cap, &mut state.fact_capped, attr_ns(attrs, res, NS_W, b"id"), part);
+            push_capped(&mut state.facts.footnote_defs, cap, &mut state.fact_capped, attr_ns(attrs, res, NS_W, b"id").map(decimal_ident), part);
         }
         "endnote" if id.w() && role.is_endnotes => {
-            push_capped(&mut state.facts.endnote_defs, cap, &mut state.fact_capped, attr_ns(attrs, res, NS_W, b"id"), part);
+            push_capped(&mut state.facts.endnote_defs, cap, &mut state.fact_capped, attr_ns(attrs, res, NS_W, b"id").map(decimal_ident), part);
         }
         _ => {}
     }

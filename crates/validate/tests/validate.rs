@@ -1091,6 +1091,9 @@ fn a_matching_footnote_reference_is_fine() {
         format!(r#"<?xml version="1.0"?><w:footnotes xmlns:w="{W_NS}"><w:footnote w:id="1"><w:p/></w:footnote></w:footnotes>"#),
     );
     d.set_document(r#"<w:p><w:r><w:footnoteReference w:id="1"/></w:r></w:p>"#);
+    d.set_doc_rels(
+        r#"<Relationship Id="rF" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/footnotes" Target="footnotes.xml"/>"#,
+    );
     let report = validate(&d);
     assert!(!has(&report, "REF-NOTE"));
 }
@@ -4615,4 +4618,253 @@ fn ct_mismatch_native_ink_exemption_stays_scoped() {
     let report = validate(&d);
     assert_finding(&report, "CONTENTPART-TYPE", Some("word/document.xml"));
     assert!(!has(&report, "CT-MISMATCH"), "{:?}", report.findings);
+}
+
+/// Finding 1: an unrecorded relationship is unknown, not missing.
+#[test]
+fn fredapps_1_truncated_relationships() {
+    let mut d = Doc::minimal();
+    let rels: String = (0..20_001).map(|i| format!(r#"<Relationship Id="r{i}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="https://example.org/" TargetMode="External"/>"#)).collect();
+    d.set_doc_rels(&rels);
+    d.set_document(r#"<w:p><w:hyperlink r:id="r20000"><w:r><w:t>Link</w:t></w:r></w:hyperlink></w:p>"#);
+    let report = validate_bytes(&d.build());
+    assert_eq!(report.verdict, Verdict::Incomplete, "{report:?}");
+    assert!(!has(&report, "REL-REF-MISSING"), "{report:?}");
+}
+
+/// Finding 1: an omitted Override may supersede a recorded Default.
+#[test]
+fn fredapps_1_truncated_content_types() {
+    let mut d = Doc::minimal();
+    let defaults: Vec<_> = (0..20_000).map(|i| (format!("ext{i}"), "application/xml")).collect();
+    let defaults: Vec<_> = defaults.iter().map(|(ext, ct)| (ext.as_str(), *ct)).collect();
+    d.set("[Content_Types].xml", content_types_xml(&defaults, &[]));
+    let report = validate_bytes(&d.build());
+    assert_eq!(report.verdict, Verdict::Incomplete, "{report:?}");
+    assert!(!has(&report, "CT-MAIN-TYPE"), "{report:?}");
+}
+
+/// Finding 2: relationship types are complete URIs, with both standard families supported.
+#[test]
+fn fredapps_2_office_document_uri() {
+    for (kind, valid) in [
+        ("urn:custom/officeDocument", false),
+        ("http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument", true),
+        ("http://purl.oclc.org/ooxml/officeDocument/relationships/officeDocument", true),
+    ] {
+        let mut d = Doc::minimal();
+        d.set("_rels/.rels", rels_xml(&format!(r#"<Relationship Id="r1" Type="{kind}" Target="word/document.xml"/>"#)));
+        let report = validate_bytes(&d.build());
+        assert_eq!(has(&report, "PKG-NO-MAIN"), !valid, "{kind}: {report:?}");
+        if valid {
+            assert_eq!(report.verdict, Verdict::Pass, "{report:?}");
+        }
+    }
+}
+
+/// Finding 3: declarations must have the OPC namespace and direct OPC container.
+#[test]
+fn fredapps_3_relationship_namespaces_and_container() {
+    let ns = "http://schemas.openxmlformats.org/package/2006/relationships";
+    let rel = r#"<Relationship Id="r1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>"#;
+    for xml in [
+        format!(r#"<Relationships xmlns="urn:not-opc">{rel}</Relationships>"#),
+        format!(r#"<Relationships xmlns="{ns}">{}</Relationships>"#, rel.replace("<Relationship ", r#"<Relationship xmlns="urn:not-opc" "#)),
+        format!(r#"<Other xmlns="{ns}">{rel}</Other>"#),
+        format!(r#"<Relationships xmlns="{ns}"><Other>{rel}</Other></Relationships>"#),
+    ] {
+        let mut d = Doc::minimal();
+        d.set("_rels/.rels", xml.clone());
+        let report = validate_bytes(&d.build());
+        assert!(has(&report, "PKG-NO-MAIN"), "{xml}: {report:?}");
+    }
+}
+
+/// Finding 3: a foreign content-types root must not declare the main part's type.
+#[test]
+fn fredapps_3_content_type_namespaces_and_container() {
+    let mut d = Doc::minimal();
+    let original = String::from_utf8(d.get("[Content_Types].xml").to_vec()).unwrap();
+    for xml in [
+        original.replace("http://schemas.openxmlformats.org/package/2006/content-types", "urn:not-opc"),
+        original.replace("<Override ", r#"<Override xmlns="urn:not-opc" "#),
+        original.replace("<Override ", "<Other><Override ").replace("</Types>", "</Other></Types>"),
+    ] {
+        d.set("[Content_Types].xml", xml.clone());
+        let report = validate_bytes(&d.build());
+        assert!(has(&report, "CT-MAIN-TYPE"), "{xml}: {report:?}");
+    }
+}
+
+/// A correctly typed and related decimal-ID definition with a matching reference.
+fn fredapps_id_doc(kind: &str, ct: &str, def: &str, reference: &str, duplicate: Option<&str>) -> Doc {
+    let mut d = Doc::minimal();
+    let definitions = format!(
+        r#"<w:{kind} w:id="{def}"><w:p/></w:{kind}>{}"#,
+        duplicate.map(|id| format!(r#"<w:{kind} w:id="{id}"><w:p/></w:{kind}>"#)).unwrap_or_default()
+    );
+    d.add_with_override(&format!("word/{kind}s.xml"), ct, format!(r#"<w:{kind}s xmlns:w="{W_NS}">{definitions}</w:{kind}s>"#));
+    d.set_doc_rels(&format!(
+        r#"<Relationship Id="rN" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/{kind}s" Target="{kind}s.xml"/>"#
+    ));
+    d.set_document(&format!(r#"<w:p><w:r><w:{kind}Reference w:id="{reference}"/></w:r></w:p>"#));
+    d
+}
+
+/// Finding 4: decimal joins accept signed and leading-zero forms without integer overflow.
+#[test]
+fn fredapps_4_decimal_joins() {
+    for (kind, ct) in [("footnote", CT_FOOTNOTES), ("endnote", CT_ENDNOTES), ("comment", CT_COMMENTS)] {
+        for (def, reference) in
+            [("1", "01"), ("+0001", "1"), ("-01", "-1"), ("-0", "+000"), ("999999999999999999999999999999", "+0999999999999999999999999999999")]
+        {
+            let report = validate_bytes(&fredapps_id_doc(kind, ct, def, reference, None).build());
+            assert_eq!(report.verdict, Verdict::Pass, "{kind} {def}/{reference}: {report:?}");
+            assert!(!report.coverage_notes.iter().any(|n| n.contains("never referenced")), "{report:?}");
+        }
+    }
+}
+
+/// Finding 4: equivalent decimal spellings also collide within a definition part.
+#[test]
+fn fredapps_4_decimal_duplicates() {
+    for (kind, ct, rule) in [("footnote", CT_FOOTNOTES, "NOTE-DUP"), ("endnote", CT_ENDNOTES, "NOTE-DUP"), ("comment", CT_COMMENTS, "ID-COMMENT-DUP")]
+    {
+        let report = validate_bytes(&fredapps_id_doc(kind, ct, "1", "1", Some("+01")).build());
+        assert!(has(&report, rule), "{kind}: {report:?}");
+    }
+}
+
+/// Main and glossary each reach their own definition part and reference their own ID.
+fn fredapps_owner_doc(kind: &str, ct: &str, main_id: &str, gloss_id: &str) -> Doc {
+    let mut d = fredapps_id_doc(kind, ct, main_id, "1", None);
+    let main_rels = String::from_utf8(d.get("word/_rels/document.xml.rels").to_vec()).unwrap();
+    d.set("word/_rels/document.xml.rels", main_rels.replace("</Relationships>", r#"<Relationship Id="rG" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/glossaryDocument" Target="glossary.xml"/></Relationships>"#));
+    d.add_with_override("word/glossary.xml", CT_GLOSSARY, format!(r#"<w:glossaryDocument xmlns:w="{W_NS}"><w:docParts><w:docPart><w:docPartBody><w:p><w:r><w:{kind}Reference w:id="1"/></w:r></w:p></w:docPartBody></w:docPart></w:docParts></w:glossaryDocument>"#));
+    d.add_with_override(
+        &format!("word/gloss-{kind}s.xml"),
+        ct,
+        format!(r#"<w:{kind}s xmlns:w="{W_NS}"><w:{kind} w:id="{gloss_id}"><w:p/></w:{kind}></w:{kind}s>"#),
+    );
+    d.set(
+        "word/_rels/glossary.xml.rels",
+        rels_xml(&format!(
+            r#"<Relationship Id="rN" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/{kind}s" Target="gloss-{kind}s.xml"/>"#
+        )),
+    );
+    d
+}
+
+/// Finding 5: IDs may repeat between independently owned definition parts.
+#[test]
+fn fredapps_5_owner_duplicates() {
+    for (kind, ct) in [("footnote", CT_FOOTNOTES), ("endnote", CT_ENDNOTES), ("comment", CT_COMMENTS)] {
+        let report = validate_bytes(&fredapps_owner_doc(kind, ct, "1", "1").build());
+        assert_eq!(report.verdict, Verdict::Pass, "{kind}: {report:?}");
+    }
+}
+
+/// Finding 5: another owner's definition cannot satisfy a missing reference in either direction.
+#[test]
+fn fredapps_5_owner_missing() {
+    for (kind, ct, rule) in [("footnote", CT_FOOTNOTES, "REF-NOTE"), ("endnote", CT_ENDNOTES, "REF-NOTE"), ("comment", CT_COMMENTS, "ID-COMMENT-REF")]
+    {
+        for (main_id, gloss_id, part) in [("2", "1", "word/document.xml"), ("1", "2", "word/glossary.xml")] {
+            let report = validate_bytes(&fredapps_owner_doc(kind, ct, main_id, gloss_id).build());
+            assert_finding(&report, rule, Some(part));
+        }
+    }
+}
+
+/// Finding 1: known duplicate declarations remain errors even when later ones are unexamined.
+#[test]
+fn fredapps_1_partial_sets_retain_proven_errors() {
+    let mut d = Doc::minimal();
+    let rels: String = (0usize..20_001).map(|i| format!(r#"<Relationship Id="r{}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="https://example.org/" TargetMode="External"/>"#, i.saturating_sub(1))).collect();
+    d.set_doc_rels(&rels);
+    let report = validate_bytes(&d.build());
+    assert_eq!(report.verdict, Verdict::Fail, "{report:?}");
+    assert_finding(&report, "REL-DUP-ID", Some("word/_rels/document.xml.rels"));
+    assert!(report.coverage_notes.iter().any(|n| n.contains("later ones were not recorded")));
+
+    let defaults: Vec<_> = (0..20_000).map(|i| (format!("ext{i}"), "application/xml")).collect();
+    let mut defaults: Vec<_> = defaults.iter().map(|(ext, ct)| (ext.as_str(), *ct)).collect();
+    defaults.insert(0, ("xml", "application/xml"));
+    d.set_doc_rels("");
+    d.set("[Content_Types].xml", content_types_xml(&defaults, &[]));
+    let report = validate_bytes(&d.build());
+    assert_eq!(report.verdict, Verdict::Fail, "{report:?}");
+    assert_finding(&report, "CT-DUP-DEFAULT", Some("[Content_Types].xml"));
+    assert!(!has(&report, "CT-MAIN-TYPE"), "{report:?}");
+}
+
+/// Finding 1: a main relationship beyond the scan limit is unknown, not absent.
+#[test]
+fn fredapps_1_truncated_package_relationships() {
+    let mut d = Doc::minimal();
+    let mut rels: String =
+        (0..20_000).map(|i| format!(r#"<Relationship Id="r{i}" Type="urn:custom" Target="https://example.org/" TargetMode="External"/>"#)).collect();
+    rels.push_str(r#"<Relationship Id="rMain" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>"#);
+    d.set("_rels/.rels", rels_xml(&rels));
+    let report = validate_bytes(&d.build());
+    assert_eq!(report.verdict, Verdict::Incomplete, "{report:?}");
+    assert!(!has(&report, "PKG-NO-MAIN"), "{report:?}");
+}
+
+/// Finding 3: prefix spelling and empty versus expanded declaration syntax do not affect OPC identity.
+#[test]
+fn fredapps_3_prefixed_opc_declarations() {
+    let mut d = Doc::minimal();
+    for name in ["_rels/.rels", "[Content_Types].xml"] {
+        let mut xml = String::from_utf8(d.get(name).to_vec()).unwrap();
+        xml = xml.replace("xmlns=", "xmlns:opc=");
+        for tag in ["Relationships", "Relationship", "Types", "Override", "Default"] {
+            xml = xml.replace(&format!("<{tag} "), &format!("<opc:{tag} ")).replace(&format!("</{tag}>"), &format!("</opc:{tag}>"));
+        }
+        // Exercise nonempty child-element syntax as well as self-closing syntax.
+        xml = xml.replace("/>", "></opc:Relationship>");
+        if name == "[Content_Types].xml" {
+            xml = xml.replace("></opc:Relationship>", "/>");
+        }
+        d.set(name, xml);
+    }
+    let report = validate_bytes(&d.build());
+    assert_eq!(report.verdict, Verdict::Pass, "{report:?}");
+}
+
+/// Finding 5: an unreadable glossary definition cannot suppress a proven missing main ID.
+#[test]
+fn fredapps_5_unreadable_definition_is_local() {
+    for (kind, ct, rule) in [("footnote", CT_FOOTNOTES, "REF-NOTE"), ("endnote", CT_ENDNOTES, "REF-NOTE"), ("comment", CT_COMMENTS, "ID-COMMENT-REF")]
+    {
+        let d = fredapps_owner_doc(kind, ct, "2", "1");
+        let bytes = corrupt_entry_data(&d.build(), &format!("word/gloss-{kind}s.xml"));
+        let report = validate_bytes(&bytes);
+        assert_finding(&report, rule, Some("word/document.xml"));
+        assert!(!report.findings.iter().any(|f| f.rule == rule && f.part.as_deref() == Some("word/glossary.xml")), "{report:?}");
+    }
+}
+
+/// Finding 5: an unreadable definition source leaves its owner's unresolved reference INCOMPLETE.
+#[test]
+fn fredapps_5_unreadable_definition_is_incomplete() {
+    for (kind, ct, rule) in [("footnote", CT_FOOTNOTES, "REF-NOTE"), ("endnote", CT_ENDNOTES, "REF-NOTE"), ("comment", CT_COMMENTS, "ID-COMMENT-REF")]
+    {
+        let d = fredapps_owner_doc(kind, ct, "1", "2");
+        let bytes = corrupt_entry_data(&d.build(), &format!("word/gloss-{kind}s.xml"));
+        let report = validate_bytes(&bytes);
+        assert_eq!(report.verdict, Verdict::Incomplete, "{report:?}");
+        assert!(!has(&report, rule), "{report:?}");
+    }
+}
+
+/// Finding 5: a glossary reference cannot mark a main-owned comment as referenced.
+#[test]
+fn fredapps_5_unreferenced_comments_are_scoped() {
+    let mut d = fredapps_owner_doc("comment", CT_COMMENTS, "1", "1");
+    d.set_document("<w:p/>");
+    let report = validate_bytes(&d.build());
+    assert_eq!(report.verdict, Verdict::Pass, "{report:?}");
+    assert!(report.coverage_notes.iter().any(|n| n.contains("in word/comments.xml is never referenced")), "{report:?}");
+    assert!(!report.coverage_notes.iter().any(|n| n.contains("in word/gloss-comments.xml is never referenced")), "{report:?}");
 }
