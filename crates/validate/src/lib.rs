@@ -1178,7 +1178,7 @@ fn check_note_pr(pkg: &Package, xml: &XmlScan, acc: &mut Acc) {
     let owner_map = owner_index_map(pkg);
     let roles = story_roles(pkg);
     for (index, owner) in owner_scopes(pkg).iter().enumerate() {
-        let discovered = !discovery_unavailable(pkg, owner.as_deref());
+        let discovered = !discovery_unavailable(pkg, owner.as_deref()) && !descendant_discovery_incomplete(pkg, &owner_map, index);
         let forward_ok = discovered && note_sources_complete(pkg, xml, &owner_map, &roles, index, false);
         let reverse_ok = forward_ok && note_sources_complete(pkg, xml, &owner_map, &roles, index, true);
         if !forward_ok || !reverse_ok {
@@ -1197,7 +1197,7 @@ fn check_note_pr(pkg: &Package, xml: &XmlScan, acc: &mut Acc) {
 
 /// Whether every relevant settings or notes source for an owner is available and uncapped.
 /// Unknown parts do not veto a fully discovered owner's established sources; callers
-/// suppress the owner whose own relationship discovery is incomplete.
+/// suppress the owner whose direct or descendant relationship discovery is incomplete.
 fn note_sources_complete(
     pkg: &Package,
     xml: &XmlScan,
@@ -2094,6 +2094,19 @@ fn part_owners<'a>(owner_map: &'a HashMap<String, Vec<usize>>, part: &str) -> &'
     owner_map.get(&part.to_ascii_lowercase()).map(Vec::as_slice).unwrap_or_default()
 }
 
+/// Whether an established traversal branch has unresolved outgoing relationships. A failed
+/// descendant can hide further contributing sources from both an owner's pooled join and its
+/// source-completeness loop. Check every reached part, including a shared part in each context;
+/// another owner's disjoint branch must not invalidate this owner's absence conclusions.
+fn descendant_discovery_incomplete(pkg: &Package, owner_map: &HashMap<String, Vec<usize>>, owner: usize) -> bool {
+    if pkg.main.is_none() && pkg.glossary.is_none() {
+        // The fallback map includes every part only after complete package discovery. An empty
+        // map after discovery loss is unknown membership, not a complete empty contributing set.
+        return !ownership_discovery_complete(pkg);
+    }
+    owner_map.iter().any(|(part, contexts)| contexts.contains(&owner) && package::relationships_incomplete(pkg, part))
+}
+
 /// Verify that style references in story parts resolve to a defined style in their owner scope.
 fn check_style_refs(pkg: &Package, xml: &XmlScan, acc: &mut Acc) {
     let facts = &xml.facts;
@@ -2360,7 +2373,6 @@ fn check_numbering(pkg: &Package, xml: &XmlScan, acc: &mut Acc) {
     // (H8).
     let mut num_sets: Vec<Option<HashSet<String>>> = Vec::with_capacity(owners.len());
     let mut style_checks: Vec<(String, HashSet<String>)> = Vec::new();
-    let mut seen_styles: HashSet<String> = HashSet::new();
     for owner in &owners {
         let num_part = supporting_part(pkg, owner.as_deref(), "numbering", package::NUMBERING_CONTENT_TYPE).map(|e| e.name.clone());
         let num_set: Option<HashSet<String>> = match &num_part {
@@ -2384,7 +2396,6 @@ fn check_numbering(pkg: &Package, xml: &XmlScan, acc: &mut Acc) {
         // Each owner's styles are checked against that owner's own numbering set, and only when it
         // could actually be examined.
         if let Some(entry) = supporting_part(pkg, owner.as_deref(), "styles", package::STYLES_CONTENT_TYPE)
-            && seen_styles.insert(entry.name.to_ascii_lowercase())
             && let Some(set) = &num_set
         {
             style_checks.push((entry.name.clone(), set.clone()));
@@ -2392,8 +2403,11 @@ fn check_numbering(pkg: &Package, xml: &XmlScan, acc: &mut Acc) {
         num_sets.push(num_set);
     }
     report_num_refs(acc, facts, &num_sets, &owner_map);
+    // A shared styles source can be valid for one owner and dangling for another. Deduplicate
+    // only established findings, after evaluating every available owner/definition-set pairing.
+    let mut reported = HashSet::new();
     for (name, num_set) in &style_checks {
-        report_style_num_refs(pkg, name, num_set, cap, acc);
+        report_style_num_refs(pkg, name, num_set, cap, &mut reported, acc);
     }
 }
 
@@ -2446,7 +2460,14 @@ fn process_numbering_part(pkg: &Package, xml: &XmlScan, name: &str, cap: usize, 
 
 /// `NUM-DANGLING` for `w:numPr/w:numId` references in a styles part, checked against its owner's
 /// numbering part. `numId` `0` is the "remove numbering" sentinel and is never a reference.
-fn report_style_num_refs(pkg: &Package, styles_name: &str, num_set: &HashSet<String>, cap: usize, acc: &mut Acc) {
+fn report_style_num_refs(
+    pkg: &Package,
+    styles_name: &str,
+    num_set: &HashSet<String>,
+    cap: usize,
+    reported: &mut HashSet<(String, String)>,
+    acc: &mut Acc,
+) {
     let Some(entry) = entry_by_name(pkg, styles_name) else { return };
     let Some(text) = entry.decoded.as_deref() else {
         acc.note(format!("{styles_name} could not be read; style numbering references were not checked"));
@@ -2467,12 +2488,11 @@ fn report_style_num_refs(pkg: &Package, styles_name: &str, num_set: &HashSet<Str
         acc.note(format!("{styles_name} exceeded the {cap}-entry budget; later numbering references were not recorded"));
         acc.set_incomplete();
     }
-    let mut reported: HashSet<&str> = HashSet::new();
     for val in &vals {
         if val == "0" {
             continue;
         }
-        if !num_set.contains(val.as_str()) && reported.insert(val.as_str()) {
+        if !num_set.contains(val.as_str()) && reported.insert((entry.name.to_ascii_lowercase(), val.clone())) {
             acc.add(
                 "NUM-DANGLING",
                 Some(entry.name.clone()),
@@ -2528,7 +2548,7 @@ fn check_commentex(pkg: &Package, xml: &XmlScan, acc: &mut Acc) {
     for (i, owner) in owners.iter().enumerate() {
         // This join pools every comments source in the context, including shared sources after
         // the first relationship target. Every contributing source must establish completeness.
-        let mut comments_complete = !discovery_unavailable(pkg, owner.as_deref());
+        let mut comments_complete = !discovery_unavailable(pkg, owner.as_deref()) && !descendant_discovery_incomplete(pkg, &owner_map, i);
         for entry in pkg.entries.iter().filter(|e| {
             !e.is_dir && roles.get(&e.name.to_ascii_lowercase()).is_some_and(|r| r.is_comments) && part_owners(&owner_map, &e.name).contains(&i)
         }) {
@@ -4916,5 +4936,410 @@ mod round6_tests {
         ] {
             assert_eq!(relationship_kind(uri), None, "{uri}");
         }
+    }
+}
+
+#[cfg(test)]
+mod round7_owner_discovery_tests {
+    //! Descendant discovery and shared auxiliary sources retain each owner's absence predicate.
+    use super::*;
+    use std::io::{Cursor, Write};
+
+    /// Wrap relationship declarations without relying on conventional supporting-part names.
+    fn rels(children: &str) -> String {
+        format!(r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">{children}</Relationships>"#)
+    }
+
+    /// A unique internal relationship in the supported namespace.
+    fn rel(kind: &str, target: &str) -> String {
+        format!(r#"<Relationship Id="{target}" Type="{NS_R}/{kind}" Target="{target}"/>"#)
+    }
+
+    /// Build an entirely synthetic package with explicit content types.
+    fn fixture(parts: Vec<(&str, &str, String)>, main_rels: String) -> Vec<u8> {
+        let mut overrides = format!(r#"<Override PartName="/word/document.xml" ContentType="{}"/>"#, package::MAIN_CONTENT_TYPE);
+        for (name, ct, _) in &parts {
+            if !ct.is_empty() {
+                overrides.push_str(&format!(r#"<Override PartName="/{name}" ContentType="{ct}"/>"#));
+            }
+        }
+        let manifest = format!(
+            r#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/>{overrides}</Types>"#
+        );
+        let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        for (name, text) in [
+            ("[Content_Types].xml", manifest),
+            ("_rels/.rels", rels(&rel("officeDocument", "word/document.xml"))),
+            ("word/document.xml", format!(r#"<w:document xmlns:w="{NS_W}"><w:body><w:p/></w:body></w:document>"#)),
+            ("word/_rels/document.xml.rels", rels(&main_rels)),
+        ]
+        .into_iter()
+        .chain(parts.into_iter().map(|(name, _, text)| (name, text)))
+        {
+            zip.start_file(name, zip::write::SimpleFileOptions::default()).unwrap();
+            zip.write_all(text.as_bytes()).unwrap();
+        }
+        zip.finish().unwrap().into_inner()
+    }
+
+    /// Fail before the downstream edge, or retain it in the complete control.
+    fn discovery(mode: &str, children: &str) -> String {
+        match mode {
+            "encoding" => r#"<?xml version="1.0" encoding="unsupported-test-encoding"?><Relationships/>"#.into(),
+            "malformed" => "<Relationships><broken></Relationships>".into(),
+            _ => rels(children),
+        }
+    }
+
+    /// Paragraph definitions are pooled through ownership traversal, unlike selected direct sources.
+    fn comment_case(mode: &str, genuine: bool, shared: bool) -> Report {
+        let para = if genuine { "00000009" } else { "00000003" };
+        let mut glossary_rels = rel("commentsExtended", "gloss-ex.xml");
+        if shared {
+            glossary_rels += &rel("header", "header.xml");
+        }
+        validate_bytes(&fixture(
+            vec![
+                ("word/header.xml", package::HEADER_CONTENT_TYPE, format!(r#"<w:hdr xmlns:w="{NS_W}"><w:p/></w:hdr>"#)),
+                ("word/_rels/header.xml.rels", "", discovery(mode, &rel("customXml", "bridge.xml"))),
+                ("word/bridge.xml", "application/xml", "<bridge/>".into()),
+                ("word/_rels/bridge.xml.rels", "", rels(&rel("comments", "comments.xml"))),
+                (
+                    "word/comments.xml",
+                    package::COMMENTS_CONTENT_TYPE,
+                    format!(
+                        r#"<w:comments xmlns:w="{NS_W}" xmlns:w14="{NS_W14}"><w:comment w:id="1"><w:p w14:paraId="00000003"/></w:comment></w:comments>"#
+                    ),
+                ),
+                (
+                    "word/ex.xml",
+                    package::COMMENTS_EXTENDED_CONTENT_TYPE,
+                    format!(
+                        r#"<w15:commentsEx xmlns:w15="{NS_W15}"><w15:commentEx w15:paraId="{para}" w15:paraIdParent="00000008"/></w15:commentsEx>"#
+                    ),
+                ),
+                (
+                    "word/glossary.xml",
+                    package::GLOSSARY_CONTENT_TYPE,
+                    format!(r#"<w:glossaryDocument xmlns:w="{NS_W}"><w:docParts/></w:glossaryDocument>"#),
+                ),
+                ("word/_rels/glossary.xml.rels", "", rels(&glossary_rels)),
+                (
+                    "word/gloss-ex.xml",
+                    package::COMMENTS_EXTENDED_CONTENT_TYPE,
+                    format!(r#"<w15:commentsEx xmlns:w15="{NS_W15}"><w15:commentEx w15:paraId="00000009"/></w15:commentsEx>"#),
+                ),
+            ],
+            rel("header", "header.xml") + &rel("commentsExtended", "ex.xml") + &rel("glossaryDocument", "glossary.xml"),
+        ))
+    }
+
+    /// The affected owner's paragraph absence is unknown; its parent and the other owner survive.
+    fn assert_comments(mode: &str) {
+        let report = comment_case(mode, false, false);
+        eprintln!("comments {mode}: {report:?}");
+        assert!(!report.findings.iter().any(|f| f.part.as_deref() == Some("word/ex.xml") && f.message.contains("no paragraph")), "{report:?}");
+        assert!(
+            report.findings.iter().any(|f| f.part.as_deref() == Some("word/ex.xml") && f.message.contains("paraIdParent 00000008")),
+            "{report:?}"
+        );
+        assert!(report.findings.iter().any(|f| f.part.as_deref() == Some("word/gloss-ex.xml") && f.message.contains("no paragraph")), "{report:?}");
+        if mode != "complete" {
+            assert!(report.coverage_notes.iter().any(|n| n.contains("comment-threading paragraphs for word/document.xml")), "{report:?}");
+        }
+    }
+
+    /// Unsupported encoding on a descendant cuts off a deeper comments branch.
+    #[test]
+    fn round7_comments_descendant_encoding() {
+        assert_comments("encoding");
+    }
+
+    /// Malformed descendant relationships leave the same branch undiscovered.
+    #[test]
+    fn round7_comments_descendant_malformed() {
+        assert_comments("malformed");
+    }
+
+    /// Complete traversal resolves the actual paragraph; genuine missing paragraphs still warn.
+    #[test]
+    fn round7_comments_complete_and_genuine_absence() {
+        assert_comments("complete");
+        let report = comment_case("complete", true, false);
+        assert!(report.findings.iter().any(|f| f.part.as_deref() == Some("word/ex.xml") && f.message.contains("no paragraph")), "{report:?}");
+    }
+
+    /// A failed descendant shared by both contexts invalidates both pooled paragraph joins.
+    #[test]
+    fn round7_shared_descendant_affects_each_owner() {
+        let report = comment_case("encoding", false, true);
+        assert!(!report.findings.iter().any(|f| f.message.contains("no paragraph")), "{report:?}");
+        assert!(report.findings.iter().any(|f| f.message.contains("paraIdParent")), "{report:?}");
+    }
+
+    /// Settings and definitions can each arrive through a descendant relationship.
+    fn note_case(mode: &str, reverse: bool, genuine: bool, glossary: bool) -> Report {
+        let id = if genuine { "2" } else { "1" };
+        let notes = format!(r#"<w:footnotes xmlns:w="{NS_W}"><w:footnote w:id="1" w:type="separator"><w:p/></w:footnote></w:footnotes>"#);
+        let settings = format!(r#"<w:settings xmlns:w="{NS_W}"><w:footnotePr><w:footnote w:id="{id}"/></w:footnotePr></w:settings>"#);
+        let mut parts = vec![
+            ("word/header.xml", package::HEADER_CONTENT_TYPE, format!(r#"<w:hdr xmlns:w="{NS_W}"><w:p/></w:hdr>"#)),
+            (
+                "word/_rels/header.xml.rels",
+                "",
+                discovery(mode, &if reverse { rel("footnotes", "notes.xml") } else { rel("settings", "settings.xml") }),
+            ),
+            ("word/notes.xml", package::FOOTNOTES_CONTENT_TYPE, notes),
+            ("word/settings.xml", package::SETTINGS_CONTENT_TYPE, settings),
+        ];
+        let mut main_rels = rel("header", "header.xml") + &if reverse { rel("settings", "settings.xml") } else { rel("footnotes", "notes.xml") };
+        if glossary {
+            main_rels += &rel("glossaryDocument", "glossary.xml");
+            parts.extend([
+                (
+                    "word/glossary.xml",
+                    package::GLOSSARY_CONTENT_TYPE,
+                    format!(r#"<w:glossaryDocument xmlns:w="{NS_W}"><w:docParts/></w:glossaryDocument>"#),
+                ),
+                ("word/_rels/glossary.xml.rels", "", rels(&(rel("footnotes", "gloss-notes.xml") + &rel("settings", "gloss-settings.xml")))),
+                (
+                    "word/gloss-notes.xml",
+                    package::FOOTNOTES_CONTENT_TYPE,
+                    format!(r#"<w:footnotes xmlns:w="{NS_W}"><w:footnote w:id="7" w:type="separator"><w:p/></w:footnote></w:footnotes>"#),
+                ),
+                (
+                    "word/gloss-settings.xml",
+                    package::SETTINGS_CONTENT_TYPE,
+                    format!(r#"<w:settings xmlns:w="{NS_W}"><w:footnotePr><w:footnote w:id="8"/></w:footnotePr></w:settings>"#),
+                ),
+            ]);
+        }
+        validate_bytes(&fixture(parts, main_rels))
+    }
+
+    /// No manufactured main-owned absence; a complete glossary retains both genuine directions.
+    fn assert_notes(mode: &str, reverse: bool) {
+        let report = note_case(mode, reverse, false, false);
+        eprintln!("notes {mode} reverse={reverse}: {report:?}");
+        assert!(!report.findings.iter().any(|f| f.rule.starts_with("NOTE-PR-")), "{report:?}");
+        assert_eq!(report.verdict, Verdict::Incomplete, "{report:?}");
+        let independent = note_case(mode, reverse, false, true);
+        let findings: Vec<_> = independent.findings.iter().filter(|f| f.rule.starts_with("NOTE-PR-")).collect();
+        assert_eq!(findings.len(), 2, "{independent:?}");
+        assert!(findings.iter().any(|f| f.rule == "NOTE-PR-LISTING" && f.part.as_deref() == Some("word/gloss-notes.xml")), "{independent:?}");
+        assert!(findings.iter().any(|f| f.rule == "NOTE-PR-DANGLING" && f.message.contains("id 8,")), "{independent:?}");
+    }
+
+    /// Unreadable indirect settings cannot establish an unlisted special note.
+    #[test]
+    fn round7_note_listing_descendant_encoding() {
+        assert_notes("encoding", false);
+    }
+
+    /// Malformed indirect settings discovery has the same absence guard.
+    #[test]
+    fn round7_note_listing_descendant_malformed() {
+        assert_notes("malformed", false);
+    }
+
+    /// Unreadable indirect definitions cannot establish a dangling settings listing.
+    #[test]
+    fn round7_note_dangling_descendant_encoding() {
+        assert_notes("encoding", true);
+    }
+
+    /// Malformed indirect definition discovery has the same absence guard.
+    #[test]
+    fn round7_note_dangling_descendant_malformed() {
+        assert_notes("malformed", true);
+    }
+
+    /// Both complete-discovery controls PASS and both genuine-absence directions remain active.
+    #[test]
+    fn round7_notes_complete_and_genuine_absence() {
+        for reverse in [false, true] {
+            let report = note_case("complete", reverse, false, false);
+            assert_eq!(report.verdict, Verdict::Pass, "{report:?}");
+            let report = note_case("complete", reverse, true, false);
+            assert!(report.findings.iter().any(|f| f.rule == "NOTE-PR-LISTING"), "{report:?}");
+            assert!(report.findings.iter().any(|f| f.rule == "NOTE-PR-DANGLING"), "{report:?}");
+        }
+    }
+
+    /// A single styles source is shared, but each owner's selected numbering set is independent.
+    fn shared_styles(main: &str, glossary: &str) -> Report {
+        let numbering = |mode| match mode {
+            "unavailable" => r#"<?xml version="1.0" encoding="unsupported-test-encoding"?><w:numbering/>"#.into(),
+            "defined" => format!(
+                r#"<w:numbering xmlns:w="{NS_W}"><w:abstractNum w:abstractNumId="1"/><w:num w:numId="2"><w:abstractNumId w:val="1"/></w:num></w:numbering>"#
+            ),
+            _ => format!(r#"<w:numbering xmlns:w="{NS_W}"/>"#),
+        };
+        validate_bytes(&fixture(
+            vec![
+                (
+                    "word/glossary.xml",
+                    package::GLOSSARY_CONTENT_TYPE,
+                    format!(r#"<w:glossaryDocument xmlns:w="{NS_W}"><w:docParts/></w:glossaryDocument>"#),
+                ),
+                ("word/_rels/glossary.xml.rels", "", rels(&(rel("styles", "shared.xml") + &rel("numbering", "gloss-num.xml")))),
+                (
+                    "word/shared.xml",
+                    package::STYLES_CONTENT_TYPE,
+                    format!(
+                        r#"<w:styles xmlns:w="{NS_W}"><w:style w:styleId="A"><w:pPr><w:numPr><w:numId w:val="2"/></w:numPr></w:pPr></w:style></w:styles>"#
+                    ),
+                ),
+                ("word/main-num.xml", package::NUMBERING_CONTENT_TYPE, numbering(main)),
+                ("word/gloss-num.xml", package::NUMBERING_CONTENT_TYPE, numbering(glossary)),
+            ],
+            rel("glossaryDocument", "glossary.xml") + &rel("styles", "shared.xml") + &rel("numbering", "main-num.xml"),
+        ))
+    }
+
+    /// Each owner/definition pairing is checked regardless of which owner is first.
+    #[test]
+    fn round7_shared_styles_each_numbering_pairing() {
+        for (main, gloss, count) in [("defined", "empty", 1), ("empty", "defined", 1), ("defined", "defined", 0), ("empty", "empty", 1)] {
+            let report = shared_styles(main, gloss);
+            eprintln!("shared styles {main}/{gloss}: {report:?}");
+            assert_eq!(
+                report.findings.iter().filter(|f| f.rule == "NUM-DANGLING" && f.part.as_deref() == Some("word/shared.xml")).count(),
+                count,
+                "{main}/{gloss}: {report:?}"
+            );
+        }
+    }
+
+    /// An unavailable first set must never consume scheduling for the second complete owner.
+    #[test]
+    fn round7_shared_styles_unavailable_first_owner() {
+        let report = shared_styles("unavailable", "empty");
+        eprintln!("shared styles unavailable/empty: {report:?}");
+        assert_eq!(report.findings.iter().filter(|f| f.rule == "NUM-DANGLING").count(), 1, "{report:?}");
+        let report = shared_styles("unavailable", "defined");
+        assert!(!report.findings.iter().any(|f| f.rule == "NUM-DANGLING"), "{report:?}");
+    }
+    /// Directly selected definitions remain authoritative despite a different failed descendant.
+    #[test]
+    fn round7_selected_sources_keep_independent_absence_checks() {
+        for mode in ["complete", "encoding", "malformed"] {
+            let bytes = fixture(vec![
+                ("word/header.xml", package::HEADER_CONTENT_TYPE, format!(r#"<w:hdr xmlns:w="{NS_W}"><w:p><w:pPr><w:pStyle w:val="Missing"/><w:numPr><w:numId w:val="2"/></w:numPr></w:pPr><w:r><w:commentReference w:id="3"/><w:footnoteReference w:id="3"/><w:endnoteReference w:id="3"/></w:r></w:p></w:hdr>"#)),
+                ("word/_rels/header.xml.rels", "", discovery(mode, "")),
+                ("word/styles.xml", package::STYLES_CONTENT_TYPE, format!(r#"<w:styles xmlns:w="{NS_W}"/>"#)),
+                ("word/numbering.xml", package::NUMBERING_CONTENT_TYPE, format!(r#"<w:numbering xmlns:w="{NS_W}"><w:num w:numId="1"><w:abstractNumId w:val="9"/></w:num><w:num w:numId="4"/></w:numbering>"#)),
+                ("word/comments.xml", package::COMMENTS_CONTENT_TYPE, format!(r#"<w:comments xmlns:w="{NS_W}"/>"#)),
+                ("word/footnotes.xml", package::FOOTNOTES_CONTENT_TYPE, format!(r#"<w:footnotes xmlns:w="{NS_W}"/>"#)),
+                ("word/endnotes.xml", package::ENDNOTES_CONTENT_TYPE, format!(r#"<w:endnotes xmlns:w="{NS_W}"/>"#)),
+                ("word/settings.xml", package::SETTINGS_CONTENT_TYPE, format!(r#"<w:settings xmlns:w="{NS_W}"/>"#)),
+                ("word/props.xml", package::CUSTOM_XML_PROPS_CONTENT_TYPE, format!(r#"<ds:datastoreItem xmlns:ds="{NS_DS}"><ds:schemaRefs><ds:schemaRef ds:uri="urn:Missing"/></ds:schemaRefs></ds:datastoreItem>"#)),
+                ("word/ex.xml", package::COMMENTS_EXTENDED_CONTENT_TYPE, format!(r#"<w15:commentsEx xmlns:w15="{NS_W15}"><w15:commentEx w15:paraId="00000003" w15:paraIdParent="00000008"/></w15:commentsEx>"#)),
+                ("word/ids.xml", package::COMMENTS_IDS_CONTENT_TYPE, r#"<w16cid:commentsIds xmlns:w16cid="http://schemas.microsoft.com/office/word/2016/wordml/cid"><w16cid:commentId w16cid:paraId="00000004" w16cid:durableId="00000001"/></w16cid:commentsIds>"#.into()),
+            ], rel("header", "header.xml") + &rel("styles", "styles.xml") + &rel("numbering", "numbering.xml") + &rel("comments", "comments.xml") + &rel("footnotes", "footnotes.xml") + &rel("endnotes", "endnotes.xml") + &rel("settings", "settings.xml") + &rel("customXmlProps", "props.xml") + &rel("commentsExtended", "ex.xml") + &rel("commentsIds", "ids.xml"));
+            let report = validate_bytes(&bytes);
+            for (rule, count) in [("ID-COMMENT-REF", 1), ("REF-NOTE", 2), ("REF-STYLE", 1), ("NUM-DANGLING", 3), ("CUSTOMXML-SCHEMA", 1)] {
+                assert_eq!(report.findings.iter().filter(|f| f.rule == rule).count(), count, "{mode}: {report:?}");
+            }
+            for message in ["paraIdParent 00000008", "commentsIds paraId 00000004 has no commentEx", "commentEx paraId 00000003 has no commentsIds"] {
+                assert!(report.findings.iter().any(|f| f.message.contains(message)), "{mode}: {report:?}");
+            }
+        }
+    }
+
+    /// Reverse comment accounting already rejects unresolved discovery, even behind several edges.
+    #[test]
+    fn round7_unreferenced_comments_require_descendant_discovery() {
+        for mode in ["complete", "encoding", "malformed"] {
+            let bytes = fixture(
+                vec![
+                    (
+                        "word/comments.xml",
+                        package::COMMENTS_CONTENT_TYPE,
+                        format!(
+                            r#"<w:comments xmlns:w="{NS_W}"><w:comment w:id="1"><w:p/></w:comment><w:comment w:id="2"><w:p/></w:comment></w:comments>"#
+                        ),
+                    ),
+                    ("word/header.xml", package::HEADER_CONTENT_TYPE, format!(r#"<w:hdr xmlns:w="{NS_W}"><w:p/></w:hdr>"#)),
+                    ("word/_rels/header.xml.rels", "", discovery(mode, &rel("header", "deeper.xml"))),
+                    (
+                        "word/deeper.xml",
+                        package::HEADER_CONTENT_TYPE,
+                        format!(r#"<w:hdr xmlns:w="{NS_W}"><w:p><w:r><w:commentReference w:id="1"/></w:r></w:p></w:hdr>"#),
+                    ),
+                ],
+                rel("comments", "comments.xml") + &rel("header", "header.xml"),
+            );
+            let report = validate_bytes(&bytes);
+            assert!(!report.coverage_notes.iter().any(|n| n.contains("id 1 in word/comments.xml is never referenced")), "{mode}: {report:?}");
+            assert_eq!(
+                report.coverage_notes.iter().any(|n| n.contains("id 2 in word/comments.xml is never referenced")),
+                mode == "complete",
+                "{mode}: {report:?}"
+            );
+        }
+    }
+    /// Without an established document, the fallback context includes all parts only after discovery.
+    fn fallback_comments(mode: &str) -> Report {
+        let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let manifest = format!(
+            r#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/comments.xml" ContentType="{}"/><Override PartName="/ex.xml" ContentType="{}"/></Types>"#,
+            package::COMMENTS_CONTENT_TYPE,
+            package::COMMENTS_EXTENDED_CONTENT_TYPE
+        );
+        for (name, text) in [
+            ("[Content_Types].xml", manifest),
+            (
+                "comments.xml",
+                format!(
+                    r#"<w:comments xmlns:w="{NS_W}" xmlns:w14="{NS_W14}"><w:comment w:id="1"><w:p w14:paraId="00000003"/></w:comment></w:comments>"#
+                ),
+            ),
+            (
+                "ex.xml",
+                format!(
+                    r#"<w15:commentsEx xmlns:w15="{NS_W15}"><w15:commentEx w15:paraId="00000003" w15:paraIdParent="00000008"/></w15:commentsEx>"#
+                ),
+            ),
+            ("header.xml", format!(r#"<w:hdr xmlns:w="{NS_W}"><w:p/></w:hdr>"#)),
+            ("_rels/header.xml.rels", discovery(mode, &rel("comments", "comments.xml"))),
+        ] {
+            zip.start_file(name, zip::write::SimpleFileOptions::default()).unwrap();
+            zip.write_all(text.as_bytes()).unwrap();
+        }
+        let bytes = zip.finish().unwrap().into_inner();
+        let mut acc = Acc::default();
+        let pkg = package::load(&bytes, &mut acc).unwrap();
+        assert_eq!(owner_scopes(&pkg), vec![None]);
+        validate_bytes(&bytes)
+    }
+
+    /// Unknown fallback ownership must not turn an existing paragraph into an absent one.
+    fn assert_fallback_comments(mode: &str) {
+        let report = fallback_comments(mode);
+        eprintln!("fallback comments {mode}: {report:?}");
+        assert!(!report.findings.iter().any(|f| f.message.contains("no paragraph")), "{report:?}");
+        assert!(report.findings.iter().any(|f| f.message.contains("paraIdParent 00000008")), "{report:?}");
+        if mode != "complete" {
+            assert!(report.coverage_notes.iter().any(|n| n.contains("comment-threading paragraphs for the package")), "{report:?}");
+        }
+    }
+
+    /// Unsupported descendant declarations invalidate the fallback ownership assignment too.
+    #[test]
+    fn round7_fallback_descendant_encoding() {
+        assert_fallback_comments("encoding");
+    }
+
+    /// Malformed descendant declarations leave the fallback's contributing set unknown.
+    #[test]
+    fn round7_fallback_descendant_malformed() {
+        assert_fallback_comments("malformed");
+    }
+
+    /// Complete fallback discovery still resolves the paragraph and checks the genuine parent link.
+    #[test]
+    fn round7_fallback_complete_control() {
+        assert_fallback_comments("complete");
     }
 }
