@@ -120,7 +120,7 @@ pub(super) fn layout(app: &mut WordApp, ui: &mut Ui) {
                 },
             );
         });
-        big(ui, app, "shrinkOnePage", "Shrink\nOne Page", "layout.shrinkOnePage", json!({}), false);
+        big(ui, app, "fitOnePage", "Fit\nOne Page", "layout.fitOnePage", json!({}), false);
     });
     group(ui, "Paragraph", Some("para.dialog"), app, |ui, app| {
         let rp = app.session.doc.para_at(&app.session.sel.focus).map(|_| wordcraft_engine::cmd::para::selection_para(&app.session));

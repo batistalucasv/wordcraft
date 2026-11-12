@@ -126,20 +126,20 @@ fn every_keytip_command_is_registered() {
     assert!(missing.is_empty(), "unregistered: {missing:#?}");
 }
 
-/// #6: layout.shrinkOnePage has a KeyTip badge on the Layout tab.
+/// layout.fitOnePage has a KeyTip badge on the Layout tab.
 #[test]
-fn layout_tab_includes_shrink_one_page_keytip() {
+fn layout_tab_includes_fit_one_page_keytip() {
     let a = app();
     let (_, cmds) = letters(&a);
     let layout_cmds = cmds.iter().find(|(t, _)| t == "Layout").expect("Layout tab exists");
     let ctrls = controls("Layout");
-    let shrink_idx = ctrls.iter().position(|c| match &c.target {
-        Target::Cmd { id, .. } => *id == "layout.shrinkOnePage",
+    let fit_idx = ctrls.iter().position(|c| match &c.target {
+        Target::Cmd { id, .. } => *id == "layout.fitOnePage",
         _ => false,
     });
-    assert!(shrink_idx.is_some(), "layout.shrinkOnePage must be present in Layout controls");
-    let badge = layout_cmds.1.get(shrink_idx.unwrap()).expect("badge exists");
-    assert!(!badge.is_empty(), "shrinkOnePage badge must not be empty");
+    assert!(fit_idx.is_some(), "layout.fitOnePage must be present in Layout controls");
+    let badge = layout_cmds.1.get(fit_idx.unwrap()).expect("badge exists");
+    assert!(!badge.is_empty(), "fitOnePage badge must not be empty");
 }
 
 #[test]

@@ -43,11 +43,14 @@ fn scale_spacing(val: f32, space_factor: f32) -> f32 {
 fn scale_line_spacing(ls: LineSpacing, space_factor: f32) -> LineSpacing {
     match ls {
         LineSpacing::Multiple(m) => {
-            let new_m = (m * space_factor).clamp(0.5, 132.0);
+            // Guard against ascender/descender collisions: keep line spacing at or above
+            // single-line proportion (1.0), unless the document already defined a tighter custom multiple.
+            let floor = m.min(1.0);
+            let new_m = (m * space_factor).max(floor).clamp(0.5, 132.0);
             LineSpacing::Multiple((new_m * 100.0).round() / 100.0)
         }
         LineSpacing::AtLeast(pts) => LineSpacing::AtLeast(scale_spacing(pts, space_factor)),
-        LineSpacing::Exactly(pts) => LineSpacing::Exactly(scale_spacing(pts, space_factor).max(0.7)),
+        LineSpacing::Exactly(pts) => LineSpacing::Exactly(scale_spacing(pts, space_factor).max(pts * 0.95)),
     }
 }
 
@@ -76,6 +79,17 @@ fn scale_para_props(p: &mut ParaProps, space_factor: f32) {
             *ls = scale_line_spacing(*ls, space_factor);
         }
     }
+}
+
+/// Fits font sizes across the document by `delta_pt` points and scales paragraph
+/// spacing by `space_factor`.
+///
+/// Clean-room typographical helper for Fit One Page. Preserves relative typography
+/// hierarchies, clamps line spacing above single-line collision floors, and excludes
+/// headers and footers.
+#[inline]
+pub fn fit_document_typography(doc: &mut Document, delta_pt: f32, space_factor: f32) {
+    shrink_document_typography(doc, delta_pt, space_factor);
 }
 
 /// Shrinks font sizes across the document by `delta_pt` points and scales paragraph
@@ -336,6 +350,20 @@ mod tests {
         assert_eq!(p_after.props.space_after, Some(11.0));
         // 1.15 * 0.9 = 1.035 -> round to 2 decimals = 1.04
         assert_eq!(p_after.props.line_spacing, Some(LineSpacing::Multiple(1.04)));
+    }
+
+    #[test]
+    fn test_line_spacing_floor_prevents_overlap() {
+        let mut doc = Document::new();
+        let mut p = Paragraph::with_text("Single spaced text", CharProps::default());
+        p.props.line_spacing = Some(LineSpacing::Multiple(1.0));
+        doc.body = vec![para_block(p)];
+
+        // Even with aggressive space_factor = 0.5, line spacing multiple must not fall below 1.0
+        fit_document_typography(&mut doc, 0.5, 0.5);
+
+        let p_after = doc.body[0].as_para().unwrap();
+        assert_eq!(p_after.props.line_spacing, Some(LineSpacing::Multiple(1.0)));
     }
 
     #[test]

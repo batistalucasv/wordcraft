@@ -292,7 +292,7 @@ fn controls(tab: &str) -> Vec<Control> {
             m("Breaks", "layout.break"),
             m("Line Numbers", "layout.lineNumbers"),
             m("Hyphenation", "layout.hyphenation"),
-            c("Shrink One Page", "layout.shrinkOnePage"),
+            c("Fit One Page", "layout.fitOnePage"),
             c("Position", "arrange.position"),
             c("Wrap Text", "arrange.wrap"),
             c("Bring Forward", "arrange.bringForward"),

@@ -1,0 +1,178 @@
+use serde_json::json;
+use wordcraft_doc::Document;
+use wordcraft_doc::para::PAGE_BREAK;
+use wordcraft_doc::props::CharProps;
+
+use crate::Session;
+
+/// Creates a document with `lines` lines of text.
+fn create_multiline_doc(lines: usize) -> Session {
+    let mut text = String::new();
+    for i in 1..=lines {
+        text.push_str(&format!("Line {i}: The quick brown fox jumps over the lazy dog.\n"));
+    }
+    Session::new(Document::from_text(&text))
+}
+
+#[test]
+fn fit_one_page_fails_on_single_page() {
+    let mut s = create_multiline_doc(5);
+    let before = s.doc.clone();
+    let res = s.run("layout.fitOnePage", &json!({}));
+    assert!(res.is_err());
+    let err = res.unwrap_err().to_string();
+    assert!(err.contains("already fits on one page"), "unexpected error: {err}");
+    assert_eq!(s.doc, before, "document must not change on failure");
+}
+
+#[test]
+fn fit_one_page_fails_on_hard_page_break() {
+    let text = format!("Page 1 content\n{PAGE_BREAK}Page 2 content\n");
+    let mut s = Session::new(Document::from_text(&text));
+    let before = s.doc.clone();
+    let res = s.run("layout.fitOnePage", &json!({}));
+    assert!(res.is_err());
+    let err = res.unwrap_err().to_string();
+    assert!(err.contains("explicit page or section breaks"), "unexpected error: {err}");
+    assert_eq!(s.doc, before, "document must not change on failure");
+}
+
+#[test]
+fn fit_one_page_fails_on_next_page_section_break() {
+    let mut s = Session::new(Document::from_text("First section body text"));
+    s.run("layout.break", &json!({"kind": "nextPage"})).unwrap();
+    s.run("text.insert", &json!({"text": "Second section text on next page"})).unwrap();
+    assert_eq!(s.layout().pages.len(), 2, "break must cause 2 pages");
+
+    let before = s.doc.clone();
+    let res = s.run("layout.fitOnePage", &json!({}));
+    assert!(res.is_err());
+    let err = res.unwrap_err().to_string();
+    assert!(err.contains("explicit page or section breaks"), "unexpected error: {err}");
+    assert_eq!(s.doc, before, "document must not change on failure");
+}
+
+#[test]
+fn fit_one_page_condenses_slight_overflow_and_undoes() {
+    // Find the boundary where the document just spills onto page 2
+    let mut lines = 30;
+    let mut s = create_multiline_doc(lines);
+    while s.layout().pages.len() < 2 && lines < 80 {
+        lines += 2;
+        s = create_multiline_doc(lines);
+    }
+    assert_eq!(s.layout().pages.len(), 2, "must start as a 2-page document with {lines} lines");
+
+    let doc_before = s.doc.clone();
+    let res = s.run("layout.fitOnePage", &json!({}));
+    assert!(res.is_ok(), "fit should succeed on slight overflow: {res:?}");
+    assert_eq!(s.layout().pages.len(), 1, "document must now fit on 1 page");
+    assert!(s.status.contains("Document fitted to 1 page"), "status was: {}", s.status);
+
+    // Test single atomic undo
+    let undo_res = s.run("edit.undo", &json!({}));
+    assert!(undo_res.is_ok(), "undo must succeed");
+    assert_eq!(s.layout().pages.len(), 2, "undo must restore 2-page layout");
+    assert_eq!(s.doc, doc_before, "undo must restore exact pre-fit document state");
+
+    // Test redo
+    let redo_res = s.run("edit.redo", &json!({}));
+    assert!(redo_res.is_ok(), "redo must succeed");
+    assert_eq!(s.layout().pages.len(), 1, "redo must restore 1-page layout");
+}
+
+#[test]
+fn fit_one_page_alias_shrink_one_page_works() {
+    let mut lines = 30;
+    let mut s = create_multiline_doc(lines);
+    while s.layout().pages.len() < 2 && lines < 80 {
+        lines += 2;
+        s = create_multiline_doc(lines);
+    }
+    assert_eq!(s.layout().pages.len(), 2);
+    let res = s.run("layout.shrinkOnePage", &json!({}));
+    assert!(res.is_ok(), "shrink alias should succeed: {res:?}");
+    assert_eq!(s.layout().pages.len(), 1);
+}
+
+#[test]
+fn fit_one_page_respects_max_delta() {
+    let mut lines = 30;
+    let mut s = create_multiline_doc(lines);
+    while s.layout().pages.len() < 2 && lines < 80 {
+        lines += 2;
+        s = create_multiline_doc(lines);
+    }
+    for i in 1..=15 {
+        s.run("text.insert", &json!({"text": format!("Extra line {i} to force font reduction.\n")})).unwrap();
+    }
+    assert_eq!(s.layout().pages.len(), 2);
+
+    let res = s.run("layout.fitOnePage", &json!({"maxDeltaPt": 0.0, "adjustSpacing": false}));
+    assert!(res.is_err(), "must fail when font delta is capped at 0.0 and spacing is disabled");
+}
+
+#[test]
+fn fit_one_page_respects_step_pt() {
+    let mut lines = 28;
+    let mut s = create_multiline_doc(lines);
+    while s.layout().pages.len() < 2 && lines < 80 {
+        lines += 1;
+        s = create_multiline_doc(lines);
+    }
+    assert_eq!(s.layout().pages.len(), 2, "must start as 2-page document with {lines} lines");
+
+    let doc_backup = s.doc.clone();
+    let default_res = s.run("layout.fitOnePage", &json!({"maxDeltaPt": 0.4, "adjustSpacing": false}));
+    assert!(default_res.is_err(), "default step 0.5 must skip all candidates when maxDelta is 0.4");
+    s.doc = doc_backup;
+
+    let res = s.run("layout.fitOnePage", &json!({"maxDeltaPt": 2.0, "stepPt": 0.1}));
+    assert!(res.is_ok(), "stepPt=0.1 must generate fine-grained candidates: {res:?}");
+    assert_eq!(s.layout().pages.len(), 1);
+}
+
+#[test]
+fn fit_one_page_fails_when_body_font_already_at_minimum_readable_size() {
+    let mut lines = 30;
+    let mut s = create_multiline_doc(lines);
+    while s.layout().pages.len() < 2 && lines < 80 {
+        lines += 2;
+        s = create_multiline_doc(lines);
+    }
+    assert_eq!(s.layout().pages.len(), 2);
+
+    // Set body text to 8.0 pt (below MIN_COMFORTABLE_BODY_FONT_SIZE = 8.5 pt)
+    for b in &mut s.doc.body {
+        if let wordcraft_doc::Block::Para(p) = std::sync::Arc::make_mut(b) {
+            for r in &mut p.runs {
+                r.props = CharProps { size: Some(8.0), ..Default::default() };
+            }
+        }
+    }
+
+    let res = s.run("layout.fitOnePage", &json!({}));
+    assert!(res.is_err(), "must refuse to shrink font when already <= 8.5 pt");
+    let err = res.unwrap_err().to_string();
+    assert!(err.contains("minimum readable size"), "unexpected error message: {err}");
+}
+
+#[test]
+fn fit_one_page_fails_when_overflow_exceeds_limits() {
+    let mut lines = 28;
+    let mut s = create_multiline_doc(lines);
+    while s.layout().pages.len() < 2 {
+        lines += 1;
+        s = create_multiline_doc(lines);
+    }
+    // Add 16 extra lines to page 2: this overflow is too large to fit into page 1 with maxDeltaPt = 0.5
+    for i in 1..=16 {
+        s.run("text.insert", &json!({"text": format!("Overflow line {i}\n")})).unwrap();
+    }
+    assert_eq!(s.layout().pages.len(), 2, "must be a 2-page document");
+
+    let res = s.run("layout.fitOnePage", &json!({"maxDeltaPt": 0.5}));
+    assert!(res.is_err(), "must refuse when overflow exceeds aesthetic reduction limits");
+    let err = res.unwrap_err().to_string();
+    assert!(err.contains("exceeds limits for aesthetic page reduction"), "unexpected error message: {err}");
+}

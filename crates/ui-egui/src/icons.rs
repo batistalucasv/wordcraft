@@ -726,7 +726,7 @@ fn paint_draw_to_review(pen: &Pen, name: &str) -> bool {
             pen.text(7.0, 7.0, 8.0, "ab-", c, false);
             pen.text(9.0, 14.5, 8.0, "cd", a, false);
         }
-        "shrinkOnePage" => {
+        "fitOnePage" | "shrinkOnePage" => {
             pen.page(4.0, 2.0, 16.0, 18.0);
             pen.lines(6.5, 13.5, &[6.0, 8.5, 11.0]);
             pen.line_c(&[(10.0, 16.5), (10.0, 13.0)], a);
@@ -1736,14 +1736,16 @@ mod tests {
         assert!(!has_default_highlight_bar("shadingNoBar"));
     }
 
-    /// Verify that the shrinkOnePage vector icon renders without panics and emits shapes.
+    /// Verify that the fitOnePage and shrinkOnePage vector icons render without panics and emit shapes.
     #[test]
-    fn shrink_one_page_icon_paints_without_panic() {
+    fn fit_one_page_icon_paints_without_panic() {
         let ctx = egui::Context::default();
-        let output = ctx.run_ui(egui::RawInput::default(), |ui| {
-            paint(ui.painter(), Rect::from_min_size(Pos2::ZERO, egui::vec2(20.0, 20.0)), "shrinkOnePage", Color32::BLACK, Color32::BLUE);
-        });
-        assert!(!output.shapes.is_empty(), "shrinkOnePage icon must emit shapes");
-        output.drop_without_applying_deltas();
+        for key in ["fitOnePage", "shrinkOnePage"] {
+            let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                paint(ui.painter(), Rect::from_min_size(Pos2::ZERO, egui::vec2(20.0, 20.0)), key, Color32::BLACK, Color32::BLUE);
+            });
+            assert!(!output.shapes.is_empty(), "{key} icon must emit shapes");
+            output.drop_without_applying_deltas();
+        }
     }
 }

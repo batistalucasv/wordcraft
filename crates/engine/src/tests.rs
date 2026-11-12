@@ -13,12 +13,12 @@ use crate::{Session, cmd};
 mod bidi;
 mod documents;
 mod find_apostrophes;
+mod fit_one_page;
 mod font_sizes;
 mod fonts;
 mod ime_noop;
 mod para_tools;
 mod revision_checks;
-mod shrink_one_page;
 mod typing;
 mod wordart;
 

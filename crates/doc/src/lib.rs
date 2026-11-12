@@ -65,7 +65,10 @@ pub use numbering::{ListKind, Numbering};
 pub use para::{InlineObject, Paragraph, Run};
 pub use props::{Align, CharProps, ParaProps, Rgb, TextColor};
 pub use section::SectionProps;
-pub use shrink::{MAX_SHRINK_FONT_SIZE, MIN_SHRINK_FONT_SIZE, round_half_pt, shrink_document_typography};
+pub use shrink::{MAX_SHRINK_FONT_SIZE, MIN_SHRINK_FONT_SIZE, fit_document_typography, round_half_pt, shrink_document_typography};
+pub mod fit_page {
+    pub use super::shrink::*;
+}
 pub use styles::{Style, StyleKind, StyleSheet};
 pub use table::{Cell, Row, Table};
 
