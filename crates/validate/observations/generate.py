@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Generate and audit the validator's observation contracts using only Python's stdlib.
+"""Generate and audit the validator's observation contracts with a fail-closed Rust syntax recognizer.
 
 The audit checks declared collection consumption, typed-accessor bypasses and register drift.
 It deliberately does not certify the semantic truth of a declaration; fixtures do that.
 """
 from pathlib import Path
-import argparse, json, re, sys
+import argparse, atexit, json, re, subprocess, sys
 from collections import Counter
 
 FIELDS = {
@@ -16,6 +16,15 @@ FIELDS = {
 }
 BASE_FIELDS = frozenset(FIELDS)
 ACCESSORS = {'prefix','is_complete','project','into_complete_set','missing','append','retain_budget','push_bounded','invalidate'}
+# Input here is the recognizer's canonical Rust token stream, with literals masked.
+# Non-ASCII token characters are identifier characters; Python's \w omits Rust XID
+# continuations (combining marks) and some XID starts. Never split such an identifier.
+IDENT_CHAR = r'[\w\x80-\U0010ffff]'
+IDENT = IDENT_CHAR + '+'
+IDENT_START = r'(?<![\w\x80-\U0010ffff])'
+IDENT_END = r'(?![\w\x80-\U0010ffff])'
+MEMBERSHIP = IDENT_START + r'((?:' + IDENT + r'\s*\.\s*)*' + IDENT + r')\s*\.\s*contains(?:_key)?\s*\('
+
 
 
 def mask(text):
@@ -60,100 +69,70 @@ def production(text):
     return text
 
 
-def functions(text):
-    code = mask(production(text))
-    text = production(text)
-    for m in re.finditer(r'\bfn\s+(\w+)\b', code):
-        opening = -1
-        parens = brackets = 0
-        for at in range(m.end(), len(code)):
-            char=code[at]
-            if char == '(': parens += 1
-            elif char == ')': parens -= 1
-            elif char == '[': brackets += 1
-            elif char == ']': brackets -= 1
-            elif char == '{' and parens == brackets == 0:
-                opening=at; break
-            elif char == ';' and parens == brackets == 0:
-                break
-        if opening < 0: continue
-        end = close_brace(code, opening)
-        yield m.group(1), m.start(), opening, end, text[opening+1:end], code[opening+1:end]
+def normalized(code):
+    """Raw Rust identifiers have the same audit identity as ordinary identifiers."""
+    return re.sub(r'\br#(?=[^\W\d])', '', code)
 
 
-def consumption(code):
-    fields = ['field.'+m.group(1) for m in re.finditer(r'\.\s*(\w+)\b',code) if m.group(1) in FIELDS]
-    methods = ['access.'+m.group(1) for m in re.finditer(r'\.\s*(\w+)\s*(?:\(|::)',code) if m.group(1) in ACCESSORS]
-    parsers = ['parser.'+m.group(1) for m in re.finditer(r'\b(?:scan::)?(parse_\w+)\s*\(',code)]
-    types = ['type.'+m.group() for m in re.finditer(r'\b(?:Observed|CompleteSet|Vec|HashSet|HashMap|BTreeSet|BTreeMap)\b', code)]
+_RECOGNIZER = None
+
+
+def recognize(sources):
+    """Parse every audited token; an unsupported body or grammar node is an error.
+
+    The helper is a standalone, locked build-time tool, never a validator dependency.
+    It stays alive for in-memory self-tests so every mutation uses the real parser.
+    """
+    global _RECOGNIZER
+    if _RECOGNIZER is None:
+        root = Path(__file__).resolve().parents[3]
+        manifest = Path(__file__).parent / 'recognizer/Cargo.toml'
+        target = root / 'target/observation-recognizer'
+        subprocess.run(['cargo', 'build', '--locked', '--quiet', '--manifest-path', str(manifest),
+                        '--target-dir', str(target)], check=True)
+        _RECOGNIZER = subprocess.Popen([str(target / 'debug/observation-recognizer')],
+                                      stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        atexit.register(_RECOGNIZER.terminate)
+    _RECOGNIZER.stdin.write(json.dumps(sources) + '\n')
+    _RECOGNIZER.stdin.flush()
+    line = _RECOGNIZER.stdout.readline()
+    if not line:
+        raise ValueError('syntax recognizer terminated without accepting the sources')
+    response = json.loads(line)
+    if 'error' in response:
+        raise ValueError(response['error'])
+    return response['ok']
+
+
+def consumption(code, enum_variants=()):
+    # Qualified enum values are expressions, not collection types. Infer these
+    # identities from recognized enum definitions instead of naming source exceptions.
+    type_code = code
+    for variant in enum_variants:
+        if variant.rsplit('::', 1)[-1] not in {'Observed','CompleteSet','Vec','HashSet','HashMap','BTreeSet','BTreeMap'}:
+            continue
+        path = r'\s*::\s*'.join(map(re.escape, variant.split('::')))
+        type_code = re.sub(IDENT_START + path + IDENT_END, '', type_code)
+    fields = ['field.'+m.group(1) for m in re.finditer(r'\.\s*(' + IDENT + r')',code) if m.group(1) in FIELDS]
+    methods = ['access.'+m.group(1) for m in re.finditer(r'\.\s*(' + IDENT + r')\s*(?:\(|::)',code) if m.group(1) in ACCESSORS]
+    parsers = ['parser.'+m.group(1) for m in re.finditer(IDENT_START + r'(parse_' + IDENT + r')\s*\(',code)]
+    types = ['type.'+m.group() for m in re.finditer(IDENT_START + r'(?:Observed|CompleteSet|Vec|HashSet|HashMap|BTreeSet|BTreeMap)' + IDENT_END, type_code)]
     return [f'{name}*{count}' for name,count in sorted(Counter(fields + methods + parsers + types).items())]
+
+
+def representation_footprint(header, code):
+    private = Counter(re.findall(r'\bobserved_(?:value|status)\b', code))
+    membership = Counter(re.sub(r'\s+', '', m.group(1)) for m in re.finditer(MEMBERSHIP, code))
+    return sorted(consumption(header+code) + [f'repr.{k}*{v}' for k,v in sorted(private.items())]
+                  + [f'membership.{k}*{v}' for k,v in sorted(membership.items())])
 
 
 def discover_fields(sources):
     for name,text in sources.items():
         if name in {"model.rs", "reserved.rs", "contracts_generated.rs"} or name.endswith("_tests.rs"): continue
-        code=mask(production(text))
+        code=normalized(mask(production(text)))
         FIELDS.update(re.findall(r'^[ \t]*(?:pub(?:\(crate\))?[ \t]+)?(\w+)[ \t]*:[^\n]*(?:Observed|Vec|HashSet|HashMap|BTreeSet|BTreeMap)',code,re.M))
 
-
-def audit_shapes(name, text):
-    """Reject indirection shapes the lexical collection/access audit cannot follow.
-
-    This is deliberately conservative, not Rust name resolution or dataflow analysis.
-    Keep registry names at function scope so an alias or method pointer cannot escape
-    the named consumer audit. Named-field patterns must not hide reads behind locals.
-    """
-    code = mask(production(text))
-    # Inspect every pipe-delimited parameter candidate, independent of the closure's
-    # expression position. Balance groups so tuple/slice/nested struct patterns and
-    # parameter attributes cannot hide a field read. A path followed by braces may
-    # be a struct pattern, so conservatively reject it; this is not a Rust parser.
-    tokens = list(re.finditer(r'\|\||=>|[|;()[\]{}]', code))
-    pairs = {'(': ')', '[': ']', '{': '}'}
-    for index, token in enumerate(tokens):
-        if token.group() not in {'|', '||'}: continue
-        # A block or return arrow directly after a closing pipe starts the body,
-        # not another parameter list. Also inspect `||`: it can join an outer
-        # closure's closing pipe to an inner closure's opening pipe without spaces.
-        if re.match(r'\s*(?:\{|->)', code[token.end():]): continue
-        stack = []; braces = False
-        for at in range(index + 1, len(tokens)):
-            char = tokens[at].group()
-            if char in pairs:
-                stack.append(pairs[char])
-                # Rust identifier continuations include Unicode combining marks,
-                # which Python's \w alone does not recognize.
-                if char == '{' and re.search(r'(?:\w|>|[^\x00-\x7f])\s*$', code[:tokens[at].start()]):
-                    braces = True
-            elif char in ')]}':
-                if not stack or stack.pop() != char: break
-            elif not stack:
-                if char in {';', '=>'}: break
-                if char in {'|', '||'}:
-                    if braces:
-                        raise ValueError(f'{name}: destructured closure parameters are unsupported in audited production code')
-                    break
-    for_patterns = list(re.finditer(r'\bfor\s+(?:(?!\bin\b)[^;={}])*\{', code))
-    # Trait implementations also spell `for Type {`, but bind no field pattern.
-    for_patterns = [m for m in for_patterns if not re.search(
-        r'\bimpl\b', code[max(code.rfind(c, 0, m.start()) for c in ';{}')+1:m.start()])]
-    match_patterns = any(re.match(r'[\]),\s]*(?:if[^{};]*)?=>', code[close_brace(code, m.end()-1)+1:])
-                         for m in re.finditer(r'\b\w+\s*\{', code))
-    if (re.search(r'\blet\b[^;={}]*\{', code)
-        or for_patterns
-        or match_patterns):
-        raise ValueError(f'{name}: struct destructuring is unsupported in audited production code')
-    module = list(code)
-    for func, start, opening, end, body, masked in functions(text):
-        if '{' in code[start:opening]:
-            raise ValueError(f'{name}::{func}: destructured parameters are unsupported in audited production code')
-        module[start:end+1] = ' ' * (end+1-start)
-    module = ''.join(module)
-    if name == 'ownership.rs':
-        # Only the actual declaration and inherent impl may name the registry outside functions.
-        module = re.sub(r'\b(?:struct|impl)\s+PackageRegistryContext\b', '', module)
-    if re.search(r'\bPackageRegistryContext\b|(?:\.|::)\s*contexts\b', module):
-        raise ValueError(f'{name}: module-scope package-registry aliases/queries are unsupported')
 
 
 def rule_registry(sources):
@@ -162,26 +141,55 @@ def rule_registry(sources):
 
 def declarations(sources):
     rows=[];errors=[]
+    providers = json.loads((Path(__file__).parent / 'representation-contracts.json').read_text())
+    seen_providers = set()
     FIELDS.clear(); FIELDS.update(BASE_FIELDS)
     discover_fields(sources)
     known_rules=rule_registry(sources)
+    audited = {name: text for name, text in sources.items()
+               if not name.endswith('_tests.rs') and name not in {'model.rs','reserved.rs','contracts_generated.rs'}}
+    recognized = recognize(audited)
+    FIELDS.update(f for file in recognized.values() for f in file['collection_fields'])
+    enum_variants = [v for file in recognized.values() for v in file['enum_variants']]
     for name,text in sorted(sources.items()):
         if name.endswith('_tests.rs') or name in {'model.rs','reserved.rs','contracts_generated.rs'}:
             continue
-        audit_shapes(name, text)
-        for func,start,opening,end,body,code in functions(text):
-            uses = consumption(mask(text[start:opening])+code)
-            decl = re.search(r'observation_contract!\s*\{([\s\S]*?)\}', body)
-            if name == 'observed.rs':
-                # The implementation alone may inspect the representation. Callers cannot.
-                continue
-            if re.search(r'\.\s*(?:observed_value|observed_status)\b',code):
+        for module in recognized[name]['modules']:
+            if module + '.rs' not in sources:
+                errors.append(f'{name}: external module {module} has no supplied audited source or explicit excluded table/test/policy source')
+        surface = normalized(mask(' '.join(recognized[name]['surface'])))
+        if re.search(r'\bPackageRegistryContext\b|(?:\.|::)\s*contexts\b', surface):
+            errors.append(f'{name}: module-scope package-registry aliases/queries are unsupported')
+        # A template and an invocation may yield identical units. Audit all instances;
+        # emit a single row only when the entire normalized header/body is identical.
+        seen = set()
+        for unit in recognized[name]['units']:
+            func, header, body = unit['name'], unit['header'], unit['body']
+            header = normalized(mask(header)); code = normalized(mask(body))
+            uses = consumption(header+code)
+            bounded_uses = consumption(header+code, enum_variants)
+            decl = re.search(r'observation_contract\s*!\s*\{', code)
+            declaration = body[decl.end():close_brace(code, decl.end()-1)] if decl else ''
+            if name != 'observed.rs' and re.search(r'\.\s*(?:observed_value|observed_status)\b',code):
                 errors.append(f'{name}::{func}: bypasses private observation representation')
-            if 'PackageRegistryContext' in mask(text[start:opening])+code or re.search(r'(?:\.|::)\s*contexts\b',code):
+            if 'PackageRegistryContext' in header+code or re.search(r'(?:\.|::)\s*contexts\b',code):
                 if (name,func) not in {('lib.rs','report_unreferenced_comments'),('lib.rs','check_custom_xml'),('ownership.rs','contexts')}:
                     errors.append(f'{name}::{func}: undeclared package-registry exception')
             if re.search(r'\.\s*difference\s*\(', code):
                 errors.append(f'{name}::{func}: raw absence difference bypasses CompleteSet')
+            if name == 'observed.rs':
+                # The private implementation has explicit build-time contracts too.
+                # No function, initializer or consuming body can escape by file name.
+                footprint = representation_footprint(header, code)
+                if providers.get(func) != dict(header=header, collections=footprint) or func in seen_providers:
+                    errors.append(f'{name}::{func}: representation contract differs or is missing')
+                seen_providers.add(func)
+                rows.append(dict(helper=f'{name}::{func}', rules='-', collections=','.join(footprint) or '-',
+                    scope='private Observed/CompleteSet representation provider; signature and footprint pinned in observations/representation-contracts.json',
+                    loss='local completeness and allocation budgets carried by the typed representation',
+                    fallback='retain prefix; incomplete observations cannot construct CompleteSet; fixtures check semantics',
+                    package_loss='independent'))
+                continue
             # Raw definition membership must not bypass CompleteSet, even after copying a prefix.
             # These receivers are structural metadata, lexical validation, or allocation guards.
             structural_membership = {
@@ -203,16 +211,16 @@ def declarations(sources):
                 ('ownership.rs', 'with_budget', 'roots'),
                 ('ownership.rs', 'parts', 'owners'),
             }
-            for access in re.finditer(r'\b((?:\w+\s*\.\s*)*\w+)\s*\.\s*contains(?:_key)?\s*\(', code):
+            for access in re.finditer(MEMBERSHIP, code):
                 receiver=re.sub(r'\s+', '', access.group(1))
                 if (name,func,receiver) not in structural_membership:
                     errors.append(f'{name}::{func}: raw membership {receiver} bypasses CompleteSet or undeclared structural scope')
-            if not uses and not decl and not re.search(r'\bacc\.(?:add|add_graded|ran)\(', code):
+            if not bounded_uses and not decl and not re.search(r'\bacc\s*\.\s*(?:add|add_graded|ran)\s*\(', code):
                 continue
             if not decl:
                 errors.append(f'{name}::{func}: bounded consumption has no observation contract: {uses}')
                 continue
-            data=dict(re.findall(r'(\w+)\s*:\s*"((?:\\.|[^"\\])*)"\s*;',decl.group(1)))
+            data=dict(re.findall(r'(\w+)\s*:\s*"((?:\\.|[^"\\])*)"\s*;',declaration))
             required={'rules','collections','scope','loss','fallback','package_loss'}
             if set(data)!=required or any(not data.get(k,'').strip() for k in required):
                 errors.append(f'{name}::{func}: missing contract field/fallback')
@@ -228,7 +236,11 @@ def declarations(sources):
                 errors.append(f'{name}::{func}: unknown rule IDs: {declared_rules-known_rules}')
             if data['package_loss'] != 'independent' and not set(data['package_loss'].split(',')) <= declared_rules:
                 errors.append(f'{name}::{func}: undeclared unknown-package-identity rule policy')
-            rows.append(dict(helper=f'{name}::{func}', **data))
+            key = (func, header, code, tuple(sorted(data.items())))
+            if key not in seen:
+                rows.append(dict(helper=f'{name}::{func}', **data))
+                seen.add(key)
+    if seen_providers != set(providers): errors.append('representation contracts missing providers')
     covered={rule for row in rows for rule in row['rules'].split(',')}
     if known_rules-covered: errors.append(f'rule registry lacks observation contracts: {sorted(known_rules-covered)}')
     if errors:
@@ -240,7 +252,11 @@ def outputs(rows):
     header = ('# Validator observation contracts\n\n'
         'Generated by `python3 crates/validate/observations/generate.py`; do not edit.\n'
         'Run with `--check` to audit consumers and drift; `--self-test` exercises rejection paths.\n\n'
-        'Contracts record scope and loss policies for consumers recognized by the lexical audit; fixtures check their semantics.\nThe audit includes structural adapters and collection-typed locals, rejects named-field destructuring and module-scope registry aliases/queries, and checks exact declared footprints. It is not a general Rust alias or dataflow proof; Rust privacy seals the observation representation.\n'
+        'The gate enforces fail-closed syntax recognition over the production Rust in `src/lib.rs`, `src/observed.rs`, `src/ownership.rs`, `src/package.rs`, `src/resolution.rs`, and `src/scan.rs`. Inline `#[cfg(test)]` modules, separate test files, generated policy, and the non-consuming `model.rs`/`reserved.rs` tables are outside this boundary.\n'
+        'Every item, expression body and pattern in those files must match the closed grammar in `observations/recognizer/src/main.rs`; unsupported syntax fails. External module declarations must resolve to a supplied source file or an explicit table/test/policy exclusion. Functions and impl methods, nested closures, const/static initializers, discriminants and type-level expressions are audited. Named-field patterns in binding, parameter, closure, match and assignment positions, pattern macros, traits and unaudited item/body kinds are rejected. Raw identifiers are normalized before footprint and registry checks.\n'
+        'Single-arm item macro templates with ident/literal fragments and no repetition are instantiated and audited, both at definition and invocation; all other definitions and item macros fail. `observation_contract!` must expand to no code. The recognized `format!`, `vec!`, `matches!` and `debug_assert!` argument grammars are parsed and traversed, including their patterns and nested bodies; other expression macros and local definitions/imports shadowing these standard macros and glob imports fail. Named collection fields are discovered from recognized expansions too. Footprint identifiers retain complete Unicode identifiers, including combining marks; Python word boundaries are not Rust identifier boundaries.\n'
+        'Exact declared lexical footprints cover structural adapters and collection-typed locals; enum values alone do not trigger a collection declaration. Private representation providers have explicit signature/footprint contracts in `observations/representation-contracts.json`, with no file-wide function exemption. Macro instances with identical normalized bodies/headers/contracts share a register row. Fixtures check semantic truth; this is not Rust name resolution or an alias/dataflow proof.\n'
+        'Build scripts, compiler expansion and procedural-macro implementations are outside the audit: recognized built-in derives and the existing serde `Serialize` derive are accepted by attribute name, without auditing their generated code. Other attribute macros and `cfg_attr` fail. Rust privacy seals the observation representation. The standalone locked recognizer is build-time tooling and does not enter validator/WASM dependencies.\n'
         'Only `check_custom_xml` (CUSTOMXML-SCHEMA) and `report_unreferenced_comments` (informational coverage) may consult PackageRegistryContext.\n'
         'That context admits established-unowned declarations to the primary package registry; it never grants story ownership.\n'
         'Duplicate relationship IDs bind the first XML declaration in every reference path; swapping duplicates changes binding evidence.\n\n'
@@ -297,26 +313,85 @@ fn unregistered_registry(graph: &PartGraph) -> bool {
       'module registry type alias': ('lib.rs',lambda s:s+'\ntype HiddenRegistry = ownership::PackageRegistryContext;\n'),
       'module registry method pointer': ('lib.rs',lambda s:s+"\nconst QUERY: for<'a> fn(&'a ownership::PackageRegistryContext, &str) -> &'a [OwnerId] = ownership::PackageRegistryContext::contexts;\n"),
     }
+    mutations.update({
+      'delta16 destructuring assignment': ('lib.rs', lambda s:s+'\nfn unregistered_read(pkg: Package) -> usize { let items; Package { entries: items, .. } = pkg; items.len() }'),
+      'delta16 parenthesized destructuring assignment': ('lib.rs', lambda s:s+'\nfn unregistered_read(pkg: Package) -> usize { let items; (Package { entries: items, .. }) = pkg; items.len() }'),
+      'delta16 macro-produced closure pattern': ('lib.rs', lambda s:s+'''
+macro_rules! package_pattern { ($items:ident) => { Package { entries: $items, .. } }; }
+fn unregistered_read(pkg: &Package) -> usize { (|package_pattern!(items): &Package| items.len())(pkg) }
+'''),
+      'delta16 raw field read': ('lib.rs', lambda s:s+'\nfn unregistered_read(pkg: &Package) -> usize { pkg.r#entries.len() }'),
+      'delta16 raw registry method': ('ownership.rs', lambda s:s.replace('impl PackageRegistryContext {', 'impl PackageRegistryContext { fn unregistered_registry(&self) -> usize { self.r#contexts("x").len() }', 1)),
+      'delta16 module callback body': ('lib.rs', lambda s:s+'\nconst UNREGISTERED_READ: fn(&Package) -> usize = |pkg| pkg.entries.len();'),
+      'static callback body': ('lib.rs', lambda s:s+'\nstatic UNREGISTERED_READ: fn(&Package) -> usize = |pkg| (|p: &Package| p.entries.len())(pkg);'),
+      'raw private representation': ('lib.rs', lambda s:s+'\nfn invented(value: u8) { let _ = value.r#observed_value; }'),
+      'raw accessor': ('lib.rs', lambda s:s+'\nfn invented(value: u8) { let _ = value.r#prefix(); }'),
+      'raw registry type alias': ('lib.rs', lambda s:s+'\ntype Hidden = ownership::r#PackageRegistryContext;'),
+      'raw registry function name': ('ownership.rs', lambda s:s.replace('impl PackageRegistryContext {', 'impl PackageRegistryContext { fn r#unregistered_registry(&self) -> usize { self.contexts("x").len() }', 1)),
+      'registry in representation provider': ('observed.rs', lambda s:s+'\nfn hidden() { let _ = x.r#contexts("x"); }'),
+      'unsupported union item': ('lib.rs', lambda s:s+'\nunion Unsupported { field: usize }'),
+      'unsupported trait body': ('lib.rs', lambda s:s+'\ntrait Hidden { fn read(pkg: &Package) -> usize { pkg.entries.len() } }'),
+      'unsupported foreign item': ('lib.rs', lambda s:s+'\nunsafe extern "C" { fn hidden(); }'),
+      'unsupported production module': ('lib.rs', lambda s:s+'\nmod hidden { fn read(pkg: &super::Package) -> usize { pkg.entries.len() } }'),
+      'unsupported attribute macro': ('lib.rs', lambda s:s+'\n#[hidden] fn read() {}'),
+      'unsupported pattern macro in binding': ('lib.rs', lambda s:s+'\nfn read(pkg: &Package) { let hidden!(items) = pkg; }'),
+      'unsupported pattern macro in parameter': ('lib.rs', lambda s:s+'\nfn read(hidden!(items): &Package) {}'),
+      'unsupported pattern macro in match': ('lib.rs', lambda s:s+'\nfn read(pkg: &Package) { match pkg { hidden!(items) => {} } }'),
+      'unsupported pattern macro in assignment': ('lib.rs', lambda s:s+'\nfn read(pkg: Package) { hidden!(items) = pkg; }'),
+      'unsupported expression macro': ('lib.rs', lambda s:s+'\nfn read(pkg: &Package) { hidden!(pkg.entries); }'),
+      'unsupported macro repetition': ('lib.rs', lambda s:s+'\nmacro_rules! hidden { ($($x:ident),*) => { $($x)* }; }'),
+      'unsupported async body': ('lib.rs', lambda s:s+'\nfn read(pkg: &Package) { let _ = async { pkg.entries.len() }; }'),
+      'nested closure body': ('lib.rs', lambda s:s+'\nfn read(pkg: &Package) { consume(|| (|p: &Package| p.entries.len())(pkg)); }'),
+      'impl callback initializer': ('lib.rs', lambda s:s+'\nimpl Package { const READ: fn(&Package) -> usize = |pkg| pkg.entries.len(); }'),
+      'enum discriminant body': ('lib.rs', lambda s:s+'\nenum Hidden { Value = (|pkg: &Package| pkg.entries.len())(PKG) }'),
+      'type-level constant body': ('lib.rs', lambda s:s+'\ntype Hidden = [u8; (|pkg: &Package| pkg.entries.len())(PKG)];'),
+      'macro-generated consumer': ('lib.rs', lambda s:s+'\nmacro_rules! hidden { ($f:ident) => { fn $f(pkg: &Package) -> usize { pkg.entries.len() } }; } hidden!(read);'),
+      'macro-captured collection field': ('lib.rs', lambda s:s+'\nmacro_rules! hidden { ($f:ident) => { struct Hidden { $f: Vec<u8> } fn read(p: &Hidden) -> usize { p.$f.len() } }; } hidden!(brand_new);'),
+      'contract macro starts emitting code': ('lib.rs', lambda s:s.replace('package_loss:literal;) => {};', 'package_loss:literal;) => { let _ = pkg.entries; };', 1)),
+    })
+    mutations.update({
+      'contract text in literal is not a declaration': ('lib.rs', lambda s:s+'\nfn invented(pkg: &Package) { let text = r#"observation_contract! { rules: \"-\"; collections: \"field.entries*1\"; scope: \"x\"; loss: \"x\"; fallback: \"x\"; package_loss: \"independent\"; }"#; pkg.entries.len(); }'),
+      'standard macro shadow hides consuming expansion': ('lib.rs', lambda s:s+'\nmacro_rules! format { ($field:ident) => { fn hidden(pkg: &Package) -> usize { pkg.$field.len() } }; } fn outer(pkg: &Package) -> usize { format!(entries); hidden(pkg) }'),
+      'standard macro import shadow': ('lib.rs', lambda s:s+'\nuse external::format;'),
+      'standard macro alias shadow': ('lib.rs', lambda s:s+'\nuse external::hidden as r#matches;'),
+      'glob import could hide standard macro shadow': ('lib.rs', lambda s:s+'\nuse external::*;'),
+      'attribute macro on item invocation': ('scan.rs', lambda s:s.replace('numeric_id!(DecimalId, 10);', '#[hidden] numeric_id!(DecimalId, 10);', 1)),
+      'attribute macro on definition': ('scan.rs', lambda s:s.replace('macro_rules! numeric_id', '#[hidden] macro_rules! numeric_id', 1)),
+      'external module without supplied source': ('lib.rs', lambda s:s+'\nmod hidden;'),
+      'Unicode combining collection field': ('lib.rs', lambda s:s+'\nstruct UnicodeCollection { fresh\u0301: Vec<u8> } fn hidden(p: &UnicodeCollection) -> usize { p.fresh\u0301.len() }'),
+      'Unicode combining membership receiver': ('lib.rs', lambda s:s+'\nfn hidden(fresh\u0301: &[u8]) -> bool { fresh\u0301.contains(&1) }'),
+      'Unicode combining parser identifier': ('lib.rs', lambda s:s+'\nfn parse_fresh\u0301() -> usize { 1 } fn hidden() -> usize { parse_fresh\u0301() }'),
+      'undeclared representation consumer': ('observed.rs', lambda s:s+'\nfn read(pkg: &Package) -> usize { pkg.entries.len() }'),
+      'representation membership bypass': ('observed.rs', lambda s:s.replace('!self.0.contains(key)', '!self.0.contains(key) || raw.contains(key)', 1)),
+    })
     # The new-accessor mutation must introduce a different access kind to test exact declaration matching.
     mutations['new undeclared accessor']=('lib.rs', lambda s:s.replace('acc.ran("CUSTOMXML-SCHEMA");','acc.ran("CUSTOMXML-SCHEMA"); let _ = new_collection.retain_budget(n, cap);',1))
     for label,(name,mutation) in mutations.items():
         changed=dict(sources);changed[name]=mutation(changed[name])
+        if changed[name] == sources[name]: raise ValueError('mutation did not change source: '+label)
         try: declarations(changed)
-        except ValueError: print('rejected:',label)
+        except ValueError as error: print('rejected:',label, '-', str(error).splitlines()[0])
         else: raise ValueError('audit accepted mutation: '+label)
+    print(f'{len(mutations)} source mutations rejected')
     assert declarations(sources)==rows, "mutation audit contaminated the original sources"
-    # Ordinary closures and masked non-production pattern text remain supported.
+    # Positive corpus: every current production construct is parsed and audited above.
+    # Additional non-consuming bodies exercise recognition without declarations.
     for control in [
-        'fn explicit_read() { consume(|pkg: &Package| { pkg.entries.len() }); }',
         'fn multiple() { consume(|a| { a }, |b| { b }); consume(|| { 1 }); }',
         'fn nested() { consume(|a| consume(|b| { a + b })); }',
+        'fn r#raw_name(r#value: u8) -> u8 { r#value }',
+        'fn fresh\u0301(value\u0301: u8) -> u8 { value\u0301 } fn script(℘: u8) -> u8 { ℘ }',
+        'macro_rules! make_item { ($name:ident) => { fn $name(x: u8) -> u8 { x } }; } make_item!(fresh);',
+        'const C: usize = { 1 }; enum Extra { A = 1 } type Array = [u8; 1];',
         'fn boolean() { if a || !matches!(b, A | B) { return; } consume(|x| { x }); }',
         'const TEXT: &str = r#"|Package { entries, .. }|"#; // |Package { entries, .. }|',
         '/* outer /* inner */ |Package { entries, .. }| */ fn explicit() {}',
         '#[cfg(test)] mod tests { fn read() { consume(|Package { entries, .. }| entries.len()); } }',
+        'const F: fn(u8) -> u8 = |x| x; static S: fn(u8) -> u8 = |x| (|y| y)(x);',
     ]:
-        audit_shapes('closure-control.rs', control)
-    print('accepted: ordinary closures and masked pattern controls')
+        changed = dict(sources); changed['lib.rs'] += '\n' + control
+        assert declarations(changed) == rows
+    print('accepted: current production corpus and non-consuming body controls')
     original=outputs(rows)
     try: verify_output('in-memory register', original[0]+'drift', original[0])
     except ValueError: print('rejected: generated register drift (exact byte comparison)')
@@ -346,5 +421,5 @@ def main():
 
 if __name__=='__main__':
     try: main()
-    except (ValueError,AssertionError) as error:
+    except (ValueError,AssertionError,OSError,subprocess.SubprocessError) as error:
         print(error,file=sys.stderr);sys.exit(1)
