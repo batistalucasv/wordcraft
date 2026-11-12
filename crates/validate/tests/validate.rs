@@ -5296,7 +5296,10 @@ fn round4_shared_unreferenced_comments() {
     let single = validate_bytes(&d.build());
     assert_eq!(single.verdict, Verdict::Pass, "{single:?}");
     assert!(single.coverage_notes.iter().any(|n| n.contains("id 1 in word/comments.xml is never referenced")), "{single:?}");
-    round3_add_rel(&mut d, "glossary", "rShared", "comments", "comments.xml");
+    // Sharing selects the same source for both owners; a second distinct target is ambiguous.
+    let glossary_rels = String::from_utf8(d.get("word/_rels/glossary.xml.rels").to_vec()).unwrap();
+    d.set("word/_rels/glossary.xml.rels", glossary_rels.replace("gloss-comments.xml", "comments.xml"));
+    d.remove("word/gloss-comments.xml");
     let shared = validate_bytes(&d.build());
     assert_eq!(shared.verdict, Verdict::Pass, "{shared:?}");
     assert!(!shared.coverage_notes.iter().any(|n| n.contains("never referenced")), "{shared:?}");

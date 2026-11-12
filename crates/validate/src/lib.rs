@@ -689,15 +689,17 @@ pub(crate) fn validate_bytes_limited(bytes: &[u8], limits: Limits) -> Report {
     let Some(pkg) = package::load(bytes, &mut acc) else {
         return acc.finish();
     };
-    if package::uses_strict_profile(&pkg) {
-        // The XML scanner understands Transitional WML only. Running it on Strict markup would
-        // silently skip its elements and could manufacture a PASS without checking that profile.
-        acc.note("the Strict OOXML profile is unsupported; document checks require the Transitional profile".to_string());
-        acc.set_incomplete();
-        return acc.finish();
-    }
-    if !owner_roots_supported(&pkg, &mut acc) {
-        return acc.finish();
+    if !pkg.roots_ambiguous {
+        if package::uses_strict_profile(&pkg) {
+            // The XML scanner understands Transitional WML only. Running it on Strict markup would
+            // silently skip its elements and could manufacture a PASS without checking that profile.
+            acc.note("the Strict OOXML profile is unsupported; document checks require the Transitional profile".to_string());
+            acc.set_incomplete();
+            return acc.finish();
+        }
+        if !owner_roots_supported(&pkg, &mut acc) {
+            return acc.finish();
+        }
     }
     check_content_types(&pkg, &mut acc);
     let xml = check_xml(&pkg, &mut acc);
@@ -711,8 +713,10 @@ pub(crate) fn validate_bytes_limited(bytes: &[u8], limits: Limits) -> Report {
         &mut acc,
     );
     check_content_part_types(&pkg, &xml.content_parts, xml.content_part_capped_any, &mut acc);
-    check_story(&pkg, &xml, &mut acc);
-    check_note_pr(&pkg, &xml, &mut acc);
+    if !pkg.roots_ambiguous {
+        check_story(&pkg, &xml, &mut acc);
+        check_note_pr(&pkg, &xml, &mut acc);
+    }
     check_media(&pkg, &mut acc);
     acc.finish()
 }
@@ -849,11 +853,14 @@ fn check_dup_main(pkg: &Package, acc: &mut Acc) {
         if anchor.is_some_and(|a| a.eq_ignore_ascii_case(name)) {
             continue;
         }
-        acc.add(
-            "CT-DUP-MAIN",
-            Some(name.to_string()),
-            format!("{name} carries the main document content type, but the package's officeDocument relationship reaches a different part; a package may have only one main document"),
-        );
+        let message = if pkg.roots_ambiguous && pkg.main.is_none() {
+            format!("{name} carries a main document content type alongside another part; a package may have only one main document")
+        } else {
+            format!(
+                "{name} carries the main document content type, but the package's officeDocument relationship reaches a different part; a package may have only one main document"
+            )
+        };
+        acc.add("CT-DUP-MAIN", Some(name.to_string()), message);
     }
 }
 
@@ -1220,17 +1227,23 @@ fn check_note_pr(pkg: &Package, xml: &XmlScan, acc: &mut Acc) {
     let roles = story_roles(pkg);
     for (index, owner) in owner_scopes(pkg).iter().enumerate() {
         let selected = [
-            supporting_part(pkg, owner.as_deref(), "settings", package::SETTINGS_CONTENT_TYPE),
-            supporting_part(pkg, owner.as_deref(), "footnotes", package::FOOTNOTES_CONTENT_TYPE),
-            supporting_part(pkg, owner.as_deref(), "endnotes", package::ENDNOTES_CONTENT_TYPE),
+            supporting_part(pkg, owner.as_deref(), "settings", package::SETTINGS_CONTENT_TYPE, acc),
+            supporting_part(pkg, owner.as_deref(), "footnotes", package::FOOTNOTES_CONTENT_TYPE, acc),
+            supporting_part(pkg, owner.as_deref(), "endnotes", package::ENDNOTES_CONTENT_TYPE, acc),
         ];
         let discovered = !discovery_unavailable(pkg, owner.as_deref());
         let complete = |source: Option<&package::Entry>| {
             source.is_none_or(|entry| xml_source_complete(xml, entry) && !xml.note_incomplete_parts.contains(&entry.name.to_ascii_lowercase()))
         };
         let (forward_ok, reverse_ok) = if owner.is_some() {
-            let forward = discovered && complete(selected[0]);
-            (forward, [forward && complete(selected[1]), forward && complete(selected[2])])
+            let forward = discovered && !selected[0].ambiguous() && complete(selected[0].entry());
+            (
+                forward,
+                [
+                    forward && !selected[1].ambiguous() && complete(selected[1].entry()),
+                    forward && !selected[2].ambiguous() && complete(selected[2].entry()),
+                ],
+            )
         } else {
             let discovered = discovered && !descendant_discovery_incomplete(pkg, &owner_map, index);
             let forward = discovered && note_sources_complete(pkg, xml, &owner_map, &roles, index, |r| r.is_settings);
@@ -1246,7 +1259,15 @@ fn check_note_pr(pkg: &Package, xml: &XmlScan, acc: &mut Acc) {
             acc.note(format!("the footnotePr/endnotePr listings for {} could not be fully joined (ownership, declarations, or source facts were not fully examined)", owner.as_deref().unwrap_or("the package")));
             acc.set_incomplete();
         }
-        check_owner_note_pr(xml, &owner_map, index, owner.is_some().then_some(selected), forward_ok, reverse_ok, acc);
+        check_owner_note_pr(
+            xml,
+            &owner_map,
+            index,
+            owner.is_some().then_some(selected.map(PartSelection::entry)),
+            [forward_ok && !selected[1].ambiguous(), forward_ok && !selected[2].ambiguous()],
+            reverse_ok,
+            acc,
+        );
     }
     if owner_scopes(pkg) == [None]
         && (xml.special_notes.iter().any(|(part, ..)| part_owners(&owner_map, part).is_empty())
@@ -1281,7 +1302,7 @@ fn check_owner_note_pr(
     owner_map: &HashMap<String, Vec<usize>>,
     owner: usize,
     selected: Option<[Option<&package::Entry>; 3]>,
-    forward_ok: bool,
+    forward_ok: [bool; 2],
     reverse_ok: [bool; 2],
     acc: &mut Acc,
 ) {
@@ -1291,16 +1312,16 @@ fn check_owner_note_pr(
     };
     let listed_f: HashSet<&str> = xml.note_listings.0.iter().filter(|(_, part)| owned(part, 0)).map(|(id, _)| id.as_str()).collect();
     let listed_e: HashSet<&str> = xml.note_listings.1.iter().filter(|(_, part)| owned(part, 0)).map(|(id, _)| id.as_str()).collect();
-    if forward_ok {
-        for (part, id, is_end, t) in xml.special_notes.iter().filter(|(part, _, end, _)| owned(part, if *end { 2 } else { 1 })) {
-            let listed = if *is_end { &listed_e } else { &listed_f };
-            if !listed.contains(id.as_str()) {
-                let (note, pr) = if *is_end { ("endnote", "endnotePr") } else { ("footnote", "footnotePr") };
-                acc.add_graded(
-                    "NOTE-PR-LISTING", Severity::Error, Evidence::Observed, Some(part.clone()),
-                    format!("the {note} with id {id} in {part} has type {t} but is not listed in its owner's {pr}; ECMA-376 says such a note shall not be loaded"),
-                );
-            }
+    for (part, id, is_end, t) in
+        xml.special_notes.iter().filter(|(part, _, end, _)| forward_ok[usize::from(*end)] && owned(part, if *end { 2 } else { 1 }))
+    {
+        let listed = if *is_end { &listed_e } else { &listed_f };
+        if !listed.contains(id.as_str()) {
+            let (note, pr) = if *is_end { ("endnote", "endnotePr") } else { ("footnote", "footnotePr") };
+            acc.add_graded(
+                "NOTE-PR-LISTING", Severity::Error, Evidence::Observed, Some(part.clone()),
+                format!("the {note} with id {id} in {part} has type {t} but is not listed in its owner's {pr}; ECMA-376 says such a note shall not be loaded"),
+            );
         }
     }
     for (role, (complete, (note, listings, defs))) in reverse_ok
@@ -1926,7 +1947,11 @@ fn check_owned_ids(
     let owners = owner_scopes(pkg);
     let owner_map = owner_index_map(pkg);
     for (index, owner) in owners.iter().enumerate() {
-        let source = supporting_part(pkg, owner.as_deref(), kind, ct);
+        let source = supporting_part(pkg, owner.as_deref(), kind, ct, acc);
+        if source.ambiguous() {
+            continue;
+        }
+        let source = source.entry();
         if source.is_none() && discovery_unavailable(pkg, owner.as_deref()) {
             continue;
         }
@@ -1958,6 +1983,12 @@ fn report_unreferenced_comments(pkg: &Package, xml: &XmlScan, acc: &mut Acc) {
             if e.content_unavailable || xml.story_incomplete_parts.contains(&e.name.to_ascii_lowercase()) {
                 incomplete_owners.extend(contexts.iter().copied());
             }
+        }
+    }
+    for (index, owner) in owner_scopes(pkg).iter().enumerate() {
+        if supporting_part(pkg, owner.as_deref(), "comments", package::COMMENTS_CONTENT_TYPE, acc).ambiguous() {
+            // Neither candidate's use as the owner's comments source is established.
+            incomplete_owners.insert(index);
         }
     }
     let refs: HashSet<_> =
@@ -2054,35 +2085,77 @@ fn owner_scopes(pkg: &Package) -> Vec<Option<String>> {
     v
 }
 
-/// The part `owner` reaches through a relationship of `kind`. `None` when the owner has no such
-/// relationship.
-fn owner_rel_part<'a>(pkg: &'a Package, owner: &str, kind: &str) -> Option<&'a package::Entry> {
-    let want = rels_part_name(owner);
-    let rp = pkg.rels.iter().find(|r| r.name.eq_ignore_ascii_case(&want))?;
-    for r in &rp.rels {
-        if relationship_kind(&r.kind) != Some(kind) {
-            continue;
-        }
-        if let Some(t) = &r.target_abs
-            && let Some(name) = canonical_entry(pkg, t)
-            && let Some(e) = entry_by_name(pkg, &name)
-        {
-            return Some(e);
-        }
-    }
-    None
+/// A role can be absent, uniquely selected, or ambiguous. Ambiguity must not become an empty
+/// definition set: neither presence nor absence conclusions may use an arbitrary candidate.
+#[derive(Clone, Copy)]
+enum PartSelection<'a> {
+    /// No internal target part was established.
+    Absent,
+    /// All matching relationships identify this one target part.
+    Selected(&'a package::Entry),
+    /// Distinct internal targets compete; no source may be chosen.
+    Ambiguous,
 }
 
-/// The part an owner resolves `kind` to. Inside an established owner scope this is the owner's own
-/// relationship target and nothing else (J2): a first-by-content-type fallback would let ZIP order
-/// change which references are accepted, and a glossary's own parts could be mistaken for the main
-/// document's. The package-wide first-by-type fallback is a separate, explicit path used only when
-/// no owner scope exists at all (`owner` is `None`), preserving the lone-supporting-part fixtures.
-fn supporting_part<'a>(pkg: &'a Package, owner: Option<&str>, kind: &str, ct: &str) -> Option<&'a package::Entry> {
-    if let Some(owner) = owner {
-        return owner_rel_part(pkg, owner, kind);
+impl<'a> PartSelection<'a> {
+    /// The uniquely established source, if any; callers that infer absence must also check ambiguity.
+    fn entry(self) -> Option<&'a package::Entry> {
+        match self {
+            Self::Selected(entry) => Some(entry),
+            Self::Absent | Self::Ambiguous => None,
+        }
     }
-    find_by_type(pkg, ct)
+
+    /// Whether competing distinct targets prevent selecting this role's source.
+    fn ambiguous(self) -> bool {
+        matches!(self, Self::Ambiguous)
+    }
+}
+
+/// Select an owner's official role target, deduplicating canonical part identities. Even an
+/// unreadable candidate competes: its bytes cannot justify choosing a different source for Word.
+fn owner_rel_part<'a>(pkg: &'a Package, owner: &str, kind: &str) -> PartSelection<'a> {
+    let want = rels_part_name(owner);
+    let Some(rp) = pkg.rels.iter().find(|r| r.name.eq_ignore_ascii_case(&want)) else { return PartSelection::Absent };
+    let mut target: Option<&str> = None;
+    for r in &rp.rels {
+        if r.external || relationship_kind(&r.kind) != Some(kind) {
+            continue;
+        }
+        if let Some(t) = r.target_abs.as_deref() {
+            if target.is_some_and(|first| !first.eq_ignore_ascii_case(t)) {
+                return PartSelection::Ambiguous;
+            }
+            target = Some(t);
+        }
+    }
+    target.and_then(|name| entry_by_name(pkg, name)).map_or(PartSelection::Absent, PartSelection::Selected)
+}
+
+/// Resolve a role without recording coverage, including the explicit no-owner fallback.
+fn owner_rel_selection<'a>(pkg: &'a Package, owner: Option<&str>, kind: &str, ct: &str) -> PartSelection<'a> {
+    match owner {
+        Some(owner) => owner_rel_part(pkg, owner, kind),
+        None => find_by_type(pkg, ct).map_or(PartSelection::Absent, PartSelection::Selected),
+    }
+}
+
+/// Select only the owner's own role target (J2), with an explicit unknown outcome when distinct
+/// official targets compete. The no-owner first-by-content-type fallback remains separate: it
+/// serves lone-supporting-part fixtures and does not assert an owner relationship selection.
+fn supporting_part<'a>(pkg: &'a Package, owner: Option<&str>, kind: &str, ct: &str, acc: &mut Acc) -> PartSelection<'a> {
+    let selection = owner_rel_selection(pkg, owner, kind, ct);
+    if selection.ambiguous() {
+        let note = format!(
+            "ambiguous {kind} selection for {}: distinct official targets compete; dependent checks were skipped",
+            owner.unwrap_or("the package")
+        );
+        if !acc.coverage.contains(&note) {
+            acc.note(note);
+        }
+        acc.set_incomplete();
+    }
+    selection
 }
 
 /// Whether the source that would discover an owner's supporting part could not be read, so the
@@ -2199,8 +2272,11 @@ fn check_style_refs(pkg: &Package, xml: &XmlScan, acc: &mut Acc) {
     let mut present = false;
     let mut capped = false;
     let mut parsed_any = false;
+    let mut selection_ambiguous = false;
     for owner in &owners {
-        let Some(entry) = supporting_part(pkg, owner.as_deref(), "styles", package::STYLES_CONTENT_TYPE) else {
+        let selection = supporting_part(pkg, owner.as_deref(), "styles", package::STYLES_CONTENT_TYPE, acc);
+        selection_ambiguous |= selection.ambiguous();
+        let Some(entry) = selection.entry() else {
             per_owner.push(None);
             continue;
         };
@@ -2237,13 +2313,13 @@ fn check_style_refs(pkg: &Package, xml: &XmlScan, acc: &mut Acc) {
         acc.set_incomplete();
     }
     if !present {
-        if !facts.style_refs.is_empty() {
+        if !selection_ambiguous && !facts.style_refs.is_empty() {
             acc.note("no styles part is reachable; w:pStyle/w:rStyle references were not checked".to_string());
         }
         return;
     }
     if !parsed_any {
-        if !facts.style_refs.is_empty() {
+        if !selection_ambiguous && !facts.style_refs.is_empty() {
             acc.note("a styles part is present but does not parse; w:pStyle/w:rStyle references were not checked".to_string());
         }
         return;
@@ -2269,10 +2345,10 @@ fn check_vocabulary(pkg: &Package, acc: &mut Acc) {
     let cap = acc.limits.facts;
     let owners = owner_scopes(pkg);
     for owner in &owners {
-        if let Some(entry) = supporting_part(pkg, owner.as_deref(), "styles", package::STYLES_CONTENT_TYPE) {
+        if let Some(entry) = supporting_part(pkg, owner.as_deref(), "styles", package::STYLES_CONTENT_TYPE, acc).entry() {
             check_styles_vocabulary(entry, cap, acc);
         }
-        if let Some(entry) = supporting_part(pkg, owner.as_deref(), "fontTable", package::FONT_TABLE_CONTENT_TYPE) {
+        if let Some(entry) = supporting_part(pkg, owner.as_deref(), "fontTable", package::FONT_TABLE_CONTENT_TYPE, acc).entry() {
             check_name_dups(entry, cap, acc, true);
         }
     }
@@ -2456,7 +2532,8 @@ fn check_numbering(pkg: &Package, xml: &XmlScan, acc: &mut Acc) {
     let mut num_sets: Vec<Option<HashSet<String>>> = Vec::with_capacity(owners.len());
     let mut style_checks: Vec<(String, HashSet<String>)> = Vec::new();
     for owner in &owners {
-        let num_part = supporting_part(pkg, owner.as_deref(), "numbering", package::NUMBERING_CONTENT_TYPE).map(|e| e.name.clone());
+        let selection = supporting_part(pkg, owner.as_deref(), "numbering", package::NUMBERING_CONTENT_TYPE, acc);
+        let num_part = selection.entry().map(|e| e.name.clone());
         let num_set: Option<HashSet<String>> = match &num_part {
             Some(np) => {
                 if let Some(cached) = numbering_cache.get(np) {
@@ -2472,12 +2549,12 @@ fn check_numbering(pkg: &Package, xml: &XmlScan, acc: &mut Acc) {
                 // owner has none (an empty set, exactly as before). When the discovery source
                 // itself could not be read, the owner's numbering is unknown, not absent: its
                 // references must not be reported against an empty set (H8).
-                if discovery_unavailable(pkg, owner.as_deref()) { None } else { Some(HashSet::new()) }
+                if selection.ambiguous() || discovery_unavailable(pkg, owner.as_deref()) { None } else { Some(HashSet::new()) }
             }
         };
         // Each owner's styles are checked against that owner's own numbering set, and only when it
         // could actually be examined.
-        if let Some(entry) = supporting_part(pkg, owner.as_deref(), "styles", package::STYLES_CONTENT_TYPE)
+        if let Some(entry) = supporting_part(pkg, owner.as_deref(), "styles", package::STYLES_CONTENT_TYPE, acc).entry()
             && let Some(set) = &num_set
         {
             style_checks.push((entry.name.clone(), set.clone()));
@@ -2622,23 +2699,26 @@ fn check_commentex(pkg: &Package, xml: &XmlScan, acc: &mut Acc) {
     let owners = owner_scopes(pkg);
     let owner_map = owner_index_map(pkg);
     let roles = story_roles(pkg);
-    let any_ext = owners.iter().any(|o| supporting_part(pkg, o.as_deref(), "commentsExtended", package::COMMENTS_EXTENDED_CONTENT_TYPE).is_some());
+    let any_ext = owners.iter().any(|o| {
+        !matches!(owner_rel_selection(pkg, o.as_deref(), "commentsExtended", package::COMMENTS_EXTENDED_CONTENT_TYPE), PartSelection::Absent)
+    });
     if !any_ext {
         return;
     }
     acc.ran("COMMENTEX-LINK");
     for (i, owner) in owners.iter().enumerate() {
-        let comments_source = supporting_part(pkg, owner.as_deref(), "comments", package::COMMENTS_CONTENT_TYPE);
+        let comments_source = supporting_part(pkg, owner.as_deref(), "comments", package::COMMENTS_CONTENT_TYPE, acc);
         let selected = owner.is_some();
         let contributes = |part: &str| {
             if selected {
-                comments_source.is_some_and(|entry| entry.name.eq_ignore_ascii_case(part))
+                comments_source.entry().is_some_and(|entry| entry.name.eq_ignore_ascii_case(part))
             } else {
                 part_owners(&owner_map, part).contains(&i)
             }
         };
-        let mut comments_complete =
-            !discovery_unavailable(pkg, owner.as_deref()) && (selected || !descendant_discovery_incomplete(pkg, &owner_map, i));
+        let mut comments_complete = !comments_source.ambiguous()
+            && !discovery_unavailable(pkg, owner.as_deref())
+            && (selected || !descendant_discovery_incomplete(pkg, &owner_map, i));
         for entry in pkg.entries.iter().filter(|e| {
             !e.is_dir
                 && if selected {
@@ -2666,11 +2746,11 @@ fn check_commentex(pkg: &Package, xml: &XmlScan, acc: &mut Acc) {
         // Paragraphs come from the owner's selected comments target. A shared target is checked
         // independently in every owner that selects it; unrelated discovery cannot add sources.
         let comment_para: HashSet<&str> = facts.comment_para_ids.iter().filter(|(_, p)| contributes(p)).map(|(p, _)| p.as_str()).collect();
-        let ext_source = supporting_part(pkg, owner.as_deref(), "commentsExtended", package::COMMENTS_EXTENDED_CONTENT_TYPE);
-        let ext = ext_source.and_then(|entry| read_comments_ext(entry, xml, cap, acc).map(|e| (entry.name.clone(), e)));
+        let ext_source = supporting_part(pkg, owner.as_deref(), "commentsExtended", package::COMMENTS_EXTENDED_CONTENT_TYPE, acc);
+        let ext = ext_source.entry().and_then(|entry| read_comments_ext(entry, xml, cap, acc).map(|e| (entry.name.clone(), e)));
         let ext_complete = match &ext {
             Some((_, e)) => !e.capped,
-            None => ext_source.is_none() && !discovery_unavailable(pkg, owner.as_deref()),
+            None => matches!(ext_source, PartSelection::Absent) && !discovery_unavailable(pkg, owner.as_deref()),
         };
         let ex_para: HashSet<&str> = match &ext {
             Some((_, e)) => e.entries.iter().map(|(p, _)| p.as_str()).collect(),
@@ -2699,7 +2779,8 @@ fn check_commentex(pkg: &Package, xml: &XmlScan, acc: &mut Acc) {
         }
         // commentsIds ids keep their own part name, so an unmatched id is reported at the part it
         // came from, never at another owner's (H9).
-        let cid = supporting_part(pkg, owner.as_deref(), "commentsIds", package::COMMENTS_IDS_CONTENT_TYPE)
+        let cid = supporting_part(pkg, owner.as_deref(), "commentsIds", package::COMMENTS_IDS_CONTENT_TYPE, acc)
+            .entry()
             .and_then(|entry| read_comments_ids(entry, xml, cap, acc));
         let Some((cid_name, cid_ids, cid_complete)) = &cid else { continue };
         let cid_set: HashSet<&str> = cid_ids.iter().map(String::as_str).collect();
@@ -2826,7 +2907,12 @@ fn check_custom_xml(pkg: &Package, xml: &XmlScan, acc: &mut Acc) {
             per_owner.push(None);
             continue;
         }
-        let Some(entry) = supporting_part(pkg, owner.as_deref(), "settings", package::SETTINGS_CONTENT_TYPE) else {
+        let selection = supporting_part(pkg, owner.as_deref(), "settings", package::SETTINGS_CONTENT_TYPE, acc);
+        if selection.ambiguous() {
+            per_owner.push(None);
+            continue;
+        }
+        let Some(entry) = selection.entry() else {
             // The owner's `.rels` was readable and holds no settings relationship: there is
             // genuinely no settings part for this owner, so the attached-schema set is empty.
             per_owner.push(Some(HashSet::new()));

@@ -1,5 +1,7 @@
 # File-format parity with Microsoft Word
 
+> **Validation status:** 2026-11-12 · trivial · Competing distinct official relationship targets leave validator role selection ambiguous (#5875); coverage explains skipped dependent joins in either relationship order. Repeated targets remain unique. Synthetic checks only; readiness and format-fidelity estimates unchanged.
+
 > **2026-11-08:** `wordcraft-cli convert --strict` refuses a PDF or PNG that would draw an empty box for a character or leave out a picture, including those a DOCX names outside the file or not at all (#6005); never fetched.
 > **2026-11-05:** A Word template opened from the file manager starts a new document based on it, and is never saved over (#3433).
 > **2026-11-05:** Strict Open XML documents open with their shapes, text boxes, groups and canvases (#3548).
@@ -338,6 +340,7 @@ For field results, the engine parser treats a backslash in quoted arguments as e
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-11-12 | trivial | Validator: competing official role targets produce coverage and suppress dependent findings; both-order, repeated-target, malformed-source and owner-isolation controls (#5875). No parity estimate changed. |
 | 2026-11-08 | trivial | ODT row corrected: a file whose tab stops are measured from the indent is saved measuring from it, not always from the margin (the 2026-11-03 change); the default stops are counted from the indent |
 | 2026-11-05 | trivial | ODT: a table's columns stating only their share (`style:rel-column-width`, as LibreOffice's CV template does) keep their proportions; they opened and saved as equal columns. An aligned table's stated width is what they divide, columns with only a width take it first, and the default style can give a share. In an aligned table whose every column has a share, the shares win over any widths stated with them, as LibreOffice 26.8 reads them, and a share too small for a column gives the narrowest one (6 pt) instead of losing the grid. A table in a cell, frame or narrower column with widths stated as well as shares, or with nothing to divide, splits equally as before. |
 | 2026-11-05 | trivial | ODT: a size is written for Asian and complex-script text too (`style:font-size-asian`, `style:font-size-complex`), as bold and italic are. Chinese text set to 24 pt stayed at the default size in LibreOffice. A complex-script size like the text's stays where a style or default underneath states another, or where a size stated alone over it would show it. A run or paragraph style stating only a size keeps the complex size above it when saved, rather than getting its own size for it. |

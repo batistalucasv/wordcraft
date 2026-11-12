@@ -141,6 +141,8 @@ pub(crate) struct Package {
     pub main: Option<String>,
     /// The glossary document part, reached from the main document's relationships.
     pub glossary: Option<String>,
+    /// Competing document roots leave owner-dependent checks without an established scope.
+    pub roots_ambiguous: bool,
     /// Lowercased names of parts reachable from the package root.
     pub reachable: HashSet<String>,
     /// Lowercased names of parts classified as XML by the single classification shared by loading,
@@ -297,11 +299,20 @@ pub(crate) fn load(bytes: &[u8], acc: &mut Acc) -> Option<Package> {
 
     acc.ran("PKG-NO-MAIN");
     let package_rels = rels.iter().find(|r| r.name.eq_ignore_ascii_case("_rels/.rels"));
+    let main_ambiguous = competing_targets(package_rels, is_office_document_relationship);
+    if main_ambiguous {
+        acc.note(
+            "ambiguous officeDocument selection for the package: distinct official targets compete; owner-dependent document checks were skipped"
+                .to_string(),
+        );
+        acc.set_incomplete();
+    }
     let main = package_rels
         .and_then(|rp| rp.rels.iter().find(|r| !r.external && is_office_document_relationship(&r.kind)))
         .and_then(|r| r.target_abs.as_deref())
         .and_then(|t| canonical(&entries, t));
-    if main.is_none() {
+    let main = if main_ambiguous { None } else { main };
+    if main.is_none() && !main_ambiguous {
         // If `_rels/.rels` is present but its content could not be read, its officeDocument
         // relationship is unknown, not absent: no absence conclusion is established.
         let package_rels_unavailable = entries.iter().any(|e| !e.is_dir && e.name.eq_ignore_ascii_case("_rels/.rels") && e.content_unavailable);
@@ -310,10 +321,38 @@ pub(crate) fn load(bytes: &[u8], acc: &mut Acc) -> Option<Package> {
         }
     }
 
-    let glossary = glossary_part(&entries, &content_types, &rels, main.as_deref());
+    let glossary_rels = main.as_deref().and_then(|m| rels.iter().find(|rp| rp.name.eq_ignore_ascii_case(&rels_part_name(m))));
+    let glossary_ambiguous = competing_targets(glossary_rels, |kind| relationship_kind(kind) == Some("glossaryDocument"));
+    if glossary_ambiguous {
+        acc.note("ambiguous glossaryDocument selection: distinct official targets compete; owner-dependent document checks were skipped".to_string());
+        acc.set_incomplete();
+    }
+    let roots_ambiguous = main_ambiguous || glossary_ambiguous;
+    // Retain no arbitrary root identity: the validation entry point gates owner-dependent work.
+    let glossary = if roots_ambiguous { None } else { glossary_part(&entries, &content_types, &rels, main.as_deref()) };
 
     let reachable = reachability(&rels, main.as_deref());
-    Some(Package { entries, content_types, content_types_present, rels, main, glossary, reachable, xml_parts, entries_truncated })
+    Some(Package { entries, content_types, content_types_present, rels, main, glossary, roots_ambiguous, reachable, xml_parts, entries_truncated })
+}
+
+/// Whether official relationships for one singleton role name distinct internal target parts.
+/// Normalized paths identify parts case-insensitively; repeated edges to one part are harmless.
+/// Missing or unreadable targets still compete, independently of their own package/XML findings.
+fn competing_targets(rp: Option<&RelsPart>, matches: impl Fn(&str) -> bool) -> bool {
+    let Some(rp) = rp else { return false };
+    let mut target: Option<&str> = None;
+    for r in &rp.rels {
+        if r.external || !matches(&r.kind) {
+            continue;
+        }
+        if let Some(t) = r.target_abs.as_deref() {
+            if target.is_some_and(|first| !first.eq_ignore_ascii_case(t)) {
+                return true;
+            }
+            target = Some(t);
+        }
+    }
+    false
 }
 
 /// The glossary document part: the main document's `glossaryDocument` relationship target, else the

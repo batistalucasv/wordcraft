@@ -1,5 +1,7 @@
 # WordCraft roadmap
 
+> **Validation status:** 2026-11-12 · trivial · Competing distinct official relationship targets leave validator role selection ambiguous (#5875); coverage explains skipped dependent joins in either relationship order. Repeated targets remain unique. Synthetic checks only; readiness and format-fidelity estimates unchanged.
+
 > **Last reviewed:** 2026-10-31 · **Last updated:** 2026-10-31 · **Change:** minor (#3398: persistent screen paper colors; parity estimates unchanged); previously minor (#3693: additional Delete Previous Sentence command and shortcut; Word-parity estimates unchanged)
 > **CLI path update:** 2026-11-04 · Options before a non-Unicode input filename no longer make the CLI reject that filename; text option values still require Unicode; `run --file` and `run --script` retain native paths. No ranked gap or readiness estimate changes.
 > **Floating anchor row segments:** 2026-11-07 · A floating anchor after a manual page/column break counts visible content on the far side of the same wrapped row. Marker-only cover anchors retain their previous-page rule. Synthetic picture spacing, placement and history controls; no new native Word measurement. Readiness estimates unchanged.
@@ -150,6 +152,7 @@ Ranked, to beta (detail and remaining milestones in [docs/roadmap.md](docs/roadm
 
 ## Progress log
 
+- 2026-11-12: Competing distinct official relationship targets leave validator role selection ambiguous (#5875); coverage explains skipped dependent joins in either relationship order. Repeated targets remain unique. Synthetic checks only; readiness and format-fidelity estimates unchanged.
 - 2026-11-08: `wordcraft-cli convert --strict` (#6005) and `render --strict` (#6008): a PDF or PNG export (render: the page it writes) refuses, exit 3 and nothing written, when it would draw a character no font has or leave out a picture (missing part, external target, link only, undecodable or unsupported format); the report is on stderr with one JSON line. Engine: `strict: true` on `file.save`, `file.saveAs`, `file.exportPdf` and `file.exportPng`, and the pure `file.strictReport`. External picture targets are never fetched. The result depends on the host's installed fonts (#5624); readiness estimates unchanged.
 - 2026-11-05: ODT tables with a usable width keep their column proportions when the file gives only shares (gap 19): LibreOffice's CV template opened and saved with equal columns.
 - 2026-11-05: ODT font sizes reach Asian and complex-script text (gap 19): Chinese text set to 24 pt stayed at the default size in LibreOffice.
@@ -908,6 +911,7 @@ MATH glyphs that reference the same construction now share its immutable variant
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-11-12 | trivial | Validator: competing official role targets produce coverage and suppress dependent findings; both-order, repeated-target, malformed-source and owner-isolation controls (#5875). No parity estimate changed. |
 | 2026-11-06 | trivial | Progress log: edited ODT paragraphs keep custom styles with an outline level (gap 19) |
 | 2026-10-31 | trivial | Control/MCP #2596 review fixes; readiness estimates unchanged |
 | 2026-11-08 | trivial | Progress log: XML line ends in text normalised (#5897) |
