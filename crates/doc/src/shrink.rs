@@ -2,8 +2,9 @@
 //!
 //! Adjusts font sizes and paragraph spacing across styles and editable stories
 //! while preserving visual hierarchy, clamping to safe bounds, and excluding
-//! fixed framing stories like headers and footers.
+//! fixed framing stories like headers, footers, and text boxes anchored in them.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use crate::Document;
@@ -40,12 +41,17 @@ pub fn round_half_pt(size: f32) -> f32 {
 }
 
 /// Scale a font size down by `delta_pt`. Normalizes non-finite values to `MIN_SHRINK_FONT_SIZE`.
+/// Ensures the selected half-point size never exceeds the original size when within supported bounds.
 #[inline]
 fn scale_size(size: f32, delta_pt: f32) -> f32 {
     if !size.is_finite() || !delta_pt.is_finite() {
         return MIN_SHRINK_FONT_SIZE;
     }
-    round_half_pt(size - delta_pt)
+    let mut scaled = round_half_pt(size - delta_pt);
+    if (MIN_SHRINK_FONT_SIZE..=MAX_SHRINK_FONT_SIZE).contains(&size) && scaled > size {
+        scaled = (scaled - 0.5).max(MIN_SHRINK_FONT_SIZE);
+    }
+    scaled
 }
 
 /// Scale a spacing value (e.g. `space_before`, `space_after`) by `space_factor`.
@@ -141,7 +147,7 @@ fn scale_para_props(p: &mut ParaProps, space_factor: f32) {
 }
 
 /// Freeze paragraph runs and paragraph spacing in a header/footer paragraph using
-/// table-aware resolution when inside a table cell.
+/// table-aware resolution when inside a table cell. Preserves inherited automatic spacing.
 fn freeze_para_typography(p: &mut Paragraph, old_styles: &StyleSheet, table_ctx: Option<(&CharProps, &ParaProps)>) {
     let style = p.props.style.clone();
     let (t_chr, t_para) = match table_ctx {
@@ -168,10 +174,18 @@ fn freeze_para_typography(p: &mut Paragraph, old_styles: &StyleSheet, table_ctx:
     }
     let resolved_p = old_styles.resolve_para_in(&p.props, t_para);
     if p.props.space_before.is_none() && p.props.space_before_auto != Some(true) {
-        p.props.space_before = Some(resolved_p.space_before);
+        if resolved_p.before_auto {
+            p.props.space_before_auto = Some(true);
+        } else {
+            p.props.space_before = Some(resolved_p.space_before);
+        }
     }
     if p.props.space_after.is_none() && p.props.space_after_auto != Some(true) {
-        p.props.space_after = Some(resolved_p.space_after);
+        if resolved_p.after_auto {
+            p.props.space_after_auto = Some(true);
+        } else {
+            p.props.space_after = Some(resolved_p.space_after);
+        }
     }
     if p.props.line_spacing.is_none() {
         p.props.line_spacing = Some(resolved_p.line_spacing);
@@ -182,7 +196,7 @@ fn freeze_para_typography(p: &mut Paragraph, old_styles: &StyleSheet, table_ctx:
 fn freeze_table_typography(table: &mut Table, old_styles: &StyleSheet, depth: usize) {
     let st_props = table.props.style.as_deref().and_then(|id| old_styles.table_style(id));
     let nrows = table.rows.len();
-    let ncols = table.grid.len().max(1);
+    let ncols = table.cols().max(1);
     let band_rows = st_props.as_ref().and_then(|s| s.parts.band_size).unwrap_or(0);
     let band_cols = st_props.as_ref().and_then(|s| s.parts.col_band_size).unwrap_or(0);
 
@@ -236,14 +250,54 @@ fn freeze_header_footer_block(block: &mut Block, old_styles: &StyleSheet, table_
     }
 }
 
+/// Identify all text-box story IDs transitively reached from headers and footers.
+fn header_footer_text_boxes(doc: &Document) -> BTreeSet<u32> {
+    let mut header_boxes = BTreeSet::new();
+    let mut queue = Vec::new();
+
+    for part in doc.parts.values() {
+        if matches!(part.kind, PartKind::Header | PartKind::Footer) {
+            for b in &part.blocks {
+                crate::edit::each_para(b, 0, &mut |p| {
+                    for obj in &p.objects {
+                        for box_id in obj.text_boxes() {
+                            if header_boxes.insert(box_id) {
+                                queue.push(box_id);
+                            }
+                        }
+                    }
+                });
+            }
+        }
+    }
+
+    while let Some(box_id) = queue.pop() {
+        if let Some(part) = doc.parts.get(&box_id) {
+            for b in &part.blocks {
+                crate::edit::each_para(b, 0, &mut |p| {
+                    for obj in &p.objects {
+                        for child_id in obj.text_boxes() {
+                            if header_boxes.insert(child_id) {
+                                queue.push(child_id);
+                            }
+                        }
+                    }
+                });
+            }
+        }
+    }
+
+    header_boxes
+}
+
 /// Shrinks font sizes across the document by `delta_pt` points and scales paragraph
 /// spacing by `space_factor`.
 ///
 /// Preserves relative typography hierarchies between headings, body text, and direct run formatting.
 /// Clamps font sizes to `[4.0, 1638.0]` pt and rounds to 0.5 pt (half-points).
 /// Spacing factor is clamped to `[0.80, 1.0]`.
-/// Headers and footers are explicitly excluded and retain their exact original sizes and spacing.
-/// Footnotes are included and shrink alongside body text.
+/// Headers, footers, and text boxes anchored within them are explicitly excluded and retain their exact original sizes and spacing.
+/// Footnotes and body text boxes are included and shrink alongside body text.
 pub fn shrink_document_typography(doc: &mut Document, delta_pt: f32, space_factor: f32) {
     if !delta_pt.is_finite() || !space_factor.is_finite() {
         return;
@@ -255,12 +309,15 @@ pub fn shrink_document_typography(doc: &mut Document, delta_pt: f32, space_facto
         return;
     }
 
-    // 1. Freeze header and footer font sizes and spacing before modifying styles,
-    // so headers and footers never shrink even if they inherit from default or shared styles.
+    // Identify text boxes anchored within headers or footers so they are frozen and excluded from shrinking.
+    let hf_text_boxes = header_footer_text_boxes(doc);
+
+    // 1. Freeze header, footer, and header-anchored text box typography before modifying styles,
+    // so fixed framing stories never shrink even if they inherit from default or shared styles.
     // Table-aware resolution ensures cells in header tables preserve their table style typography.
     let old_styles = doc.styles.clone();
-    for part in doc.parts.values_mut() {
-        if matches!(part.kind, PartKind::Header | PartKind::Footer) {
+    for (id, part) in &mut doc.parts {
+        if matches!(part.kind, PartKind::Header | PartKind::Footer) || hf_text_boxes.contains(id) {
             for b in &mut part.blocks {
                 freeze_header_footer_block(Arc::make_mut(b), &old_styles, None, 0);
             }
@@ -323,9 +380,10 @@ pub fn shrink_document_typography(doc: &mut Document, delta_pt: f32, space_facto
         each_para_mut(Arc::make_mut(b), 0, &mut shrink_paragraph);
     }
 
-    // 5. Traverse secondary editable stories (footnotes, text boxes), excluding headers and footers.
-    for part in doc.parts.values_mut() {
-        if matches!(part.kind, PartKind::Header | PartKind::Footer) {
+    // 5. Traverse secondary editable stories (footnotes, text boxes), excluding headers, footers,
+    // and text boxes anchored within headers or footers.
+    for (id, part) in &mut doc.parts {
+        if matches!(part.kind, PartKind::Header | PartKind::Footer) || hf_text_boxes.contains(id) {
             continue;
         }
         for b in &mut part.blocks {
@@ -569,5 +627,91 @@ mod tests {
         let tbl = h_part.blocks[0].as_table().unwrap();
         let frozen_cell_p = tbl.rows[0].cells[0].blocks[0].as_para().unwrap();
         assert_eq!(frozen_cell_p.runs[0].props.size, Some(16.0));
+    }
+
+    #[test]
+    fn test_scale_size_never_increases() {
+        // Fractional font sizes: rounding to 0.5 pt must never increase the original size
+        assert_eq!(scale_size(12.4, 0.1), 12.0);
+        assert_eq!(scale_size(12.4, 0.0), 12.0);
+        assert_eq!(scale_size(12.5, 0.0), 12.5);
+        assert_eq!(scale_size(12.6, 0.1), 12.5);
+        assert_eq!(scale_size(4.3, 0.0), 4.0);
+        assert_eq!(scale_size(4.0, 0.5), 4.0);
+    }
+
+    #[test]
+    fn test_freeze_preserves_inherited_auto_spacing() {
+        let mut doc = Document::new();
+        // Style with automatic spacing
+        let auto_style = Style {
+            id: "AutoStyle".into(),
+            name: "Auto Style".into(),
+            kind: StyleKind::Paragraph,
+            para: ParaProps { space_before_auto: Some(true), space_after_auto: Some(true), ..Default::default() },
+            ..Default::default()
+        };
+        Arc::make_mut(&mut doc.styles).upsert(auto_style);
+
+        let p = Paragraph::with_text("Header auto text", CharProps::default()).styled("AutoStyle");
+        let h_id = doc.add_part(PartKind::Header, vec![para_block(p)]);
+
+        shrink_document_typography(&mut doc, 0.5, 0.9);
+
+        let h_part = doc.parts.get(&h_id).unwrap();
+        let h_p = h_part.blocks[0].as_para().unwrap();
+        // Inherited auto flags are preserved on the header paragraph
+        assert_eq!(h_p.props.space_before_auto, Some(true));
+        assert_eq!(h_p.props.space_after_auto, Some(true));
+    }
+
+    #[test]
+    fn test_shrink_excludes_header_text_boxes() {
+        use crate::para::{InlineObject, ShapeKind};
+
+        let shape = |story| InlineObject::Shape {
+            kind: ShapeKind::TextBox,
+            w: 50.0,
+            h: 20.0,
+            fill: None,
+            stroke: None,
+            stroke_width: 0.0,
+            float: Default::default(),
+            story: Some(story),
+            freeform: None,
+            effects: Default::default(),
+            extra: Default::default(),
+        };
+
+        let mut doc = Document::new();
+        // Text box anchored in header
+        let h_box_id = doc.add_part(
+            PartKind::TextBox,
+            vec![para_block(Paragraph::with_text("Header box text", CharProps { size: Some(14.0), ..Default::default() }))],
+        );
+        let mut h_para = Paragraph::with_text("Header text with box", CharProps::default());
+        h_para.objects.push(shape(h_box_id));
+        doc.add_part(PartKind::Header, vec![para_block(h_para)]);
+
+        // Text box anchored in body
+        let b_box_id = doc.add_part(
+            PartKind::TextBox,
+            vec![para_block(Paragraph::with_text("Body box text", CharProps { size: Some(14.0), ..Default::default() }))],
+        );
+        let mut b_para = Paragraph::with_text("Body text with box", CharProps::default());
+        b_para.objects.push(shape(b_box_id));
+        doc.body = vec![para_block(b_para)];
+
+        shrink_document_typography(&mut doc, 1.0, 1.0);
+
+        // Header text box retained its 14.0 pt size
+        let h_box = doc.parts.get(&h_box_id).unwrap();
+        let h_box_p = h_box.blocks[0].as_para().unwrap();
+        assert_eq!(h_box_p.runs[0].props.size, Some(14.0));
+
+        // Body text box was shrunk down to 13.0 pt
+        let b_box = doc.parts.get(&b_box_id).unwrap();
+        let b_box_p = b_box.blocks[0].as_para().unwrap();
+        assert_eq!(b_box_p.runs[0].props.size, Some(13.0));
     }
 }
