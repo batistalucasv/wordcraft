@@ -152,6 +152,17 @@ pub(crate) struct Rel {
     pub external: bool,
 }
 
+/// Bind lexical relationship IDs consistently: the first declaration in XML order wins.
+/// Duplicate declarations still produce REL-DUP-ID, and every declaration retains its
+/// independent target/type checks. Reordering duplicate declarations changes binding evidence.
+pub(crate) fn relationship_bindings(rp: &RelsPart) -> HashMap<&str, &Rel> {
+    let mut bindings = HashMap::new();
+    for rel in &rp.rels {
+        bindings.entry(rel.id.as_str()).or_insert(rel);
+    }
+    bindings
+}
+
 /// One `.rels` part.
 pub(crate) struct RelsPart {
     pub name: String,

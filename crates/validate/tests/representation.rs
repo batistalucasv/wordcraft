@@ -156,3 +156,49 @@ fn unreached_story_references_never_borrow_main_definitions() {
         assert!(reached.findings.iter().any(|f| f.rule == rule && f.part.as_deref() == Some("word/orphan.xml")), "{reached:?}");
     }
 }
+
+#[test]
+fn either_comment_extension_activates_only_its_established_directions() {
+    for ids in [false, true] {
+        let mut d = Doc::minimal();
+        if ids {
+            d.add_with_override("word/ids.xml", CT_COMMENTS_IDS, r#"<w16cid:commentsIds xmlns:w16cid="http://schemas.microsoft.com/office/word/2016/wordml/cid"><w16cid:commentId w16cid:paraId="1"/></w16cid:commentsIds>"#);
+            d.set_doc_rels(&rel("commentsIds", "ids.xml"));
+        } else {
+            d.add_with_override("word/ext.xml", CT_COMMENTS_EXT, r#"<w15:commentsEx xmlns:w15="http://schemas.microsoft.com/office/word/2012/wordml"><w15:commentEx w15:paraId="1" w15:paraIdParent="2"/></w15:commentsEx>"#);
+            d.set_doc_rels(&rel("commentsExtended", "ext.xml"));
+        }
+        let report = report_in_all_orders(&mut d);
+        assert!(report.checks_run.contains(&"COMMENTEX-LINK"), "{report:?}");
+        if ids {
+            // Amendment 1: established-absent optional counterpart is not a mismatch.
+            without(&report, &["COMMENTEX-LINK"]);
+        } else {
+            assert!(report.findings.iter().any(|f| f.rule == "COMMENTEX-LINK" && f.message.contains("no paragraph")), "{report:?}");
+            assert!(report.findings.iter().any(|f| f.rule == "COMMENTEX-LINK" && f.message.contains("paraIdParent")), "{report:?}");
+            assert!(!report.findings.iter().any(|f| f.message.contains("no commentsIds")), "{report:?}");
+        }
+    }
+}
+
+#[test]
+fn every_relationship_reference_binds_the_first_duplicate_declaration() {
+    use common::CT_HEADER;
+    for image_first in [false, true] {
+        let mut d = Doc::minimal();
+        d.set_document(r#"<w:p xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><w:r><a:blip r:embed="same"/></w:r></w:p><w:sectPr><w:headerReference r:id="same"/></w:sectPr>"#);
+        d.add_with_override("word/header.xml", CT_HEADER, format!(r#"<w:hdr {NS}><w:p/></w:hdr>"#));
+        d.add_with_override("word/pic.png", "image/png", b"\x89PNG\r\n\x1a\n".to_vec());
+        let header =
+            r#"<Relationship Id="same" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/header" Target="header.xml"/>"#;
+        let image = r#"<Relationship Id="same" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="pic.png"/>"#;
+        d.set_doc_rels(&if image_first { format!("{image}{header}") } else { format!("{header}{image}") });
+        let report = validate_bytes(&d.build());
+        assert!(report.findings.iter().any(|f| f.rule == "REL-DUP-ID"), "{report:?}");
+        assert_eq!(report.findings.iter().any(|f| f.rule == "REL-TYPED" && f.message.contains("an image element")), !image_first, "{report:?}");
+        assert_eq!(report.findings.iter().any(|f| f.rule == "REF-HEADER"), image_first, "{report:?}");
+        // ZIP order is immaterial. XML declaration order for duplicate bindings is evidence.
+        d.entries.reverse();
+        assert_eq!(serde_json::to_vec(&validate_bytes(&d.build())).unwrap(), serde_json::to_vec(&report).unwrap());
+    }
+}

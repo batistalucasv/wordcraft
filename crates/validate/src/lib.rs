@@ -47,7 +47,9 @@ use std::path::Path;
 
 use serde::Serialize;
 
-use package::{Package, RelsPart, canonical_entry, entry_by_name, relationship_kind, rels_part_name};
+#[cfg(test)]
+use package::relationship_kind;
+use package::{Package, RelsPart, canonical_entry, entry_by_name, rels_part_name};
 use scan::{DecodeError, RefFact};
 
 /// The WordprocessingML main namespace.
@@ -1266,10 +1268,7 @@ fn retain_skipped_text_xml_refs(pkg: &Package, owner: &str, ids: &mut Vec<RelId>
         ids.clear();
         return;
     };
-    let mut by_id = HashMap::new();
-    for rel in &rp.rels {
-        by_id.entry(rel.id.as_str()).or_insert(rel);
-    }
+    let by_id = package::relationship_bindings(rp);
     ids.retain(|id| {
         by_id
             .get(id.as_str())
@@ -1290,10 +1289,7 @@ fn retain_native_ink_refs(pkg: &Package, owner: &str, ids: &mut Vec<RelId>, capp
         ids.clear();
         return false;
     };
-    let mut by_id = HashMap::new();
-    for rel in &rp.rels {
-        by_id.entry(rel.id.as_str()).or_insert(rel);
-    }
+    let by_id = package::relationship_bindings(rp);
     let is_ink = |rel: &package::Rel| {
         rel.target_abs.as_deref().and_then(|target| pkg.content_types.of(target)).is_some_and(|ct| ct.eq_ignore_ascii_case("application/inkml+xml"))
     };
@@ -1493,16 +1489,7 @@ fn check_content_part_types(pkg: &Package, content_parts: &[(String, Vec<RelId>)
     for (owner, ids) in content_parts {
         let rels_name = package::rels_part_name(owner);
         let Some(rp) = pkg.rels.iter().find(|rp| rp.name.eq_ignore_ascii_case(&rels_name)) else { continue };
-        // Index the owner's relationships by id once (first wins, as a
-        // linear find would return), and dedupe ids in a set: with a
-        // Vec both were quadratic in the number of references.
-        let by_id: std::collections::HashMap<&str, &package::Rel> = {
-            let mut map = std::collections::HashMap::new();
-            for r in &rp.rels {
-                map.entry(r.id.as_str()).or_insert(r);
-            }
-            map
-        };
+        let by_id = package::relationship_bindings(rp);
         let mut seen: std::collections::HashSet<&RelId> = std::collections::HashSet::new();
         for id in ids {
             if !seen.insert(id) {
@@ -1555,7 +1542,7 @@ fn story_roles(pkg: &Package) -> HashMap<String, scan::PartRole> {
     }
     for rp in &pkg.rels {
         for r in &rp.rels {
-            let Some(role) = relationship_role(&r.kind) else { continue };
+            let Some(role) = relationship_role(r.role.kind()) else { continue };
             let Some(target) = &r.target_abs else { continue };
             if let Some(name) = package::canonical_entry(pkg, target) {
                 roles.entry(name.to_ascii_lowercase()).and_modify(|existing| *existing = existing.merge(role)).or_insert(role);
@@ -1580,8 +1567,8 @@ fn content_type_role(ct: Option<&str>) -> Option<scan::PartRole> {
 }
 
 /// Classify a part role from the relationship type that targets it.
-fn relationship_role(kind: &str) -> Option<scan::PartRole> {
-    Some(match relationship_kind(kind)? {
+fn relationship_role(kind: Option<&str>) -> Option<scan::PartRole> {
+    Some(match kind? {
         "settings" => scan::PartRole::Settings,
         "glossaryDocument" => scan::PartRole::Glossary,
         "comments" => scan::PartRole::Comments,
@@ -1673,7 +1660,7 @@ fn check_part_refs(pkg: &Package, refs: &[(String, Vec<RefFact>)], acc: &mut Acc
 fn check_typed_image_refs(pkg: &Package, refs: &[(String, Vec<RefFact>)], acc: &mut Acc) {
     for (part, values) in refs {
         let Some(rp) = pkg.rels.iter().find(|r| r.name.eq_ignore_ascii_case(&rels_part_name(part))) else { continue };
-        let by_id: HashMap<&str, &package::Rel> = rp.rels.iter().map(|r| (r.id.as_str(), r)).collect();
+        let by_id = package::relationship_bindings(rp);
         let mut reported: HashSet<&str> = HashSet::new();
         for r in values.iter().filter(|r| r.image) {
             if !reported.insert(r.value.as_str()) {
@@ -1779,7 +1766,7 @@ fn header_footer_message(kind: &str, id: &str, target: &str, ct: Option<&str>) -
 }
 
 /// The content type each fixed-type relationship requires of its internal target, keyed by the
-/// official relationship's namespace-checked local kind (see [`relationship_kind`]). This is the
+/// official relationship's namespace-checked local kind (see [`package::relationship_kind`]). This is the
 /// ECMA-376 Part 1 part catalogue (§11.3 and §15.2, plus the MS-DOCX extension parts), so
 /// CT-MISMATCH is a table lookup rather than a
 /// hand-picked list.
@@ -1918,11 +1905,9 @@ fn check_typed_content(
     for rp in &pkg.rels {
         let is_non_main_owner = non_main_owner_rels.contains(&rp.name.to_ascii_lowercase());
         let rp_key = rp.name.to_ascii_lowercase();
-        // First occurrence of each relationship id in this part, in
-        // document order: the occurrence CONTENTPART-TYPE resolves.
-        let mut seen_ids: HashSet<&str> = HashSet::new();
+        let bindings = package::relationship_bindings(rp);
         for r in &rp.rels {
-            let first_with_id = seen_ids.insert(r.id.as_str());
+            let first_with_id = bindings.get(r.id.as_str()).is_some_and(|bound| std::ptr::eq(*bound, r));
             let Some(target) = &r.target_abs else { continue };
             let Some(kind) = r.role.kind() else { continue };
             let Some(want) = fixed_rel_content_type(kind) else { continue };
@@ -2174,7 +2159,7 @@ fn check_header_footer_refs(pkg: &Package, facts: &scan::StoryFacts, acc: &mut A
         }
         return;
     };
-    let by_id: HashMap<&str, &package::Rel> = rp.rels.iter().map(|r| (r.id.as_str(), r)).collect();
+    let by_id = package::relationship_bindings(rp);
     let groups: [(&str, &str, &str, &[(RelId, String)]); 2] = [
         ("header", package::HEADER_CONTENT_TYPE, "headerReference", facts.header_refs.prefix()),
         ("footer", package::FOOTER_CONTENT_TYPE, "footerReference", facts.footer_refs.prefix()),
@@ -2781,14 +2766,18 @@ fn check_commentex(pkg: &Package, xml: &XmlScan, acc: &mut Acc) {
     let owners = owner_scopes(pkg);
     let owner_map = owner_index_map(pkg);
     let roles = story_roles(pkg);
-    let any_ext = owners
-        .iter()
-        .any(|o| !matches!(owner_rel_selection(pkg, o.root(), "commentsExtended", package::COMMENTS_EXTENDED_CONTENT_TYPE), Resolution::Absent));
-    if !any_ext {
+    let active = |owner: &OwnerContext| {
+        !matches!(owner_rel_selection(pkg, owner.root(), "commentsExtended", package::COMMENTS_EXTENDED_CONTENT_TYPE), Resolution::Absent)
+            || !matches!(owner_rel_selection(pkg, owner.root(), "commentsIds", package::COMMENTS_IDS_CONTENT_TYPE), Resolution::Absent)
+    };
+    if !owners.iter().any(active) {
         return;
     }
     acc.ran("COMMENTEX-LINK");
     for (i, owner) in owners.iter().enumerate() {
+        if !active(owner) {
+            continue;
+        }
         let i = OwnerId(i);
         let comments_source = supporting_part(pkg, owner.root(), "comments", package::COMMENTS_CONTENT_TYPE, acc);
         let selected = owner.root().is_some();
@@ -2833,32 +2822,34 @@ fn check_commentex(pkg: &Package, xml: &XmlScan, acc: &mut Acc) {
         }
         // Paragraphs come from the owner's selected comments target. A shared target is checked
         // independently in every owner that selects it; unrelated discovery cannot add sources.
-        let comment_para: HashSet<&HexId> = facts.comment_para_ids.prefix().iter().filter(|(_, p)| contributes(p)).map(|(p, _)| p).collect();
+        let comment_para = Observed::with_status(
+            facts.comment_para_ids.prefix().iter().filter(|(_, p)| contributes(p)).map(|(p, _)| p.clone()).collect::<HashSet<_>>(),
+            if comments_complete { Completeness::Complete } else { Completeness::Incomplete("comments paragraphs unavailable") },
+        )
+        .into_complete_set();
         let ext_source = supporting_part(pkg, owner.root(), "commentsExtended", package::COMMENTS_EXTENDED_CONTENT_TYPE, acc);
         let ext = match ext_source {
             Resolution::One(entry) => read_comments_ext(entry, xml, cap, acc).map(|e| (entry.name.clone(), e)),
             Resolution::Absent | Resolution::Ambiguous(_) | Resolution::Unknown(_) => None,
         };
-        let ext_complete = match &ext {
-            Some((_, e)) => !e.capped,
-            None => matches!(ext_source, Resolution::Absent) && !discovery_unavailable(pkg, owner.root()),
-        };
-        let ex_para: HashSet<&HexId> = match &ext {
-            Some((_, e)) => e.entries.iter().map(|(p, _)| p).collect(),
-            None => HashSet::new(),
-        };
+        let ex_para = ext.as_ref().and_then(|(_, e)| {
+            Observed::with_status(
+                e.entries.iter().map(|(p, _)| p.clone()).collect::<HashSet<_>>(),
+                if e.capped { Completeness::Incomplete("commentEx budget") } else { Completeness::Complete },
+            )
+            .into_complete_set()
+        });
         if let Some((name, e)) = &ext {
             for (para, parent) in &e.entries {
-                if comments_complete && !comment_para.contains(para) {
+                if comment_para.as_ref().is_some_and(|set| set.missing(para)) {
                     acc.add(
                         "COMMENTEX-LINK",
                         Some(name.clone()),
                         format!("w15:commentEx paraId {para} has no paragraph with that w14:paraId in comments.xml"),
                     );
                 }
-                if ext_complete
-                    && let Some(p) = parent
-                    && !ex_para.contains(p)
+                if let Some(p) = parent
+                    && ex_para.as_ref().is_some_and(|set| set.missing(p))
                 {
                     acc.add(
                         "COMMENTEX-LINK",
@@ -2875,15 +2866,19 @@ fn check_commentex(pkg: &Package, xml: &XmlScan, acc: &mut Acc) {
             Resolution::Absent | Resolution::Ambiguous(_) | Resolution::Unknown(_) => None,
         };
         let Some((cid_name, cid_ids, cid_complete)) = &cid else { continue };
-        let cid_set: HashSet<&HexId> = cid_ids.iter().collect();
+        let cid_set = Observed::with_status(
+            cid_ids.iter().cloned().collect::<HashSet<_>>(),
+            if *cid_complete { Completeness::Complete } else { Completeness::Incomplete("commentsIds budget") },
+        )
+        .into_complete_set();
         for id in cid_ids {
-            if ext_complete && !ex_para.contains(id) {
+            if ex_para.as_ref().is_some_and(|set| set.missing(id)) {
                 acc.add("COMMENTEX-LINK", Some(cid_name.clone()), format!("commentsIds paraId {id} has no commentEx counterpart"));
             }
         }
         if let Some((name, e)) = &ext {
             for (para, _) in &e.entries {
-                if *cid_complete && !cid_set.contains(para) {
+                if cid_set.as_ref().is_some_and(|set| set.missing(para)) {
                     acc.add("COMMENTEX-LINK", Some(name.clone()), format!("commentEx paraId {para} has no commentsIds paraId counterpart"));
                 }
             }
@@ -5146,7 +5141,7 @@ mod round6_tests {
     /// A vendor comments edge grants neither a story role nor XML decoding by suffix.
     #[test]
     fn round6_custom_comment_role_and_xml_classification_are_unknown() {
-        assert!(relationship_role("urn:vendor/comments").is_none());
+        assert!(relationship_role(package::relationship_kind("urn:vendor/comments")).is_none());
         let bytes = fixture("urn:vendor/comments", "application/octet-stream", &[0xff]);
         let mut acc = Acc::default();
         let pkg = package::load(&bytes, &mut acc).unwrap();
