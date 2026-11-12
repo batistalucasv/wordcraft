@@ -173,19 +173,16 @@ fn freeze_para_typography(p: &mut Paragraph, old_styles: &StyleSheet, table_ctx:
         p.mark.size_cs = Some(resolved_cs);
     }
     let resolved_p = old_styles.resolve_para_in(&p.props, t_para);
-    if p.props.space_before.is_none() && p.props.space_before_auto != Some(true) {
-        if resolved_p.before_auto {
-            p.props.space_before_auto = Some(true);
-        } else {
-            p.props.space_before = Some(resolved_p.space_before);
-        }
+    if resolved_p.before_auto {
+        p.props.space_before_auto = Some(true);
+    } else if p.props.space_before.is_none() {
+        p.props.space_before = Some(resolved_p.space_before);
     }
-    if p.props.space_after.is_none() && p.props.space_after_auto != Some(true) {
-        if resolved_p.after_auto {
-            p.props.space_after_auto = Some(true);
-        } else {
-            p.props.space_after = Some(resolved_p.space_after);
-        }
+
+    if resolved_p.after_auto {
+        p.props.space_after_auto = Some(true);
+    } else if p.props.space_after.is_none() {
+        p.props.space_after = Some(resolved_p.space_after);
     }
     if p.props.line_spacing.is_none() {
         p.props.line_spacing = Some(resolved_p.line_spacing);
@@ -361,8 +358,37 @@ pub fn shrink_document_typography(doc: &mut Document, delta_pt: f32, space_facto
     }
 
     // 3. Helper to shrink editable paragraph content (runs, mark, spacing).
-    let mut shrink_paragraph = |p: &mut Paragraph| {
-        scale_para_props(&mut p.props, space_factor);
+    // The first paragraph of each story retains zero space before when automatic spacing is used.
+    let shrink_paragraph = |p: &mut Paragraph, is_first: bool| {
+        let resolved_p = old_styles.resolve_para(&p.props);
+
+        if space_factor < 1.0 - f32::EPSILON {
+            if resolved_p.before_auto {
+                p.props.space_before_auto = Some(false);
+                p.props.space_before = Some(if is_first { 0.0 } else { scale_spacing(AUTO_SPACING, space_factor) });
+            } else if let Some(sb) = p.props.space_before.as_mut() {
+                if sb.is_finite() {
+                    *sb = scale_spacing(*sb, space_factor);
+                } else {
+                    *sb = 0.0;
+                }
+            }
+
+            if resolved_p.after_auto {
+                p.props.space_after_auto = Some(false);
+                p.props.space_after = Some(scale_spacing(AUTO_SPACING, space_factor));
+            } else if let Some(sa) = p.props.space_after.as_mut() {
+                if sa.is_finite() {
+                    *sa = scale_spacing(*sa, space_factor);
+                } else {
+                    *sa = 0.0;
+                }
+            }
+
+            if let Some(ls) = p.props.line_spacing.as_mut() {
+                *ls = scale_line_spacing(*ls, space_factor);
+            }
+        }
 
         // Scale explicit paragraph mark size
         scale_char_props(&mut p.mark, delta_pt);
@@ -376,8 +402,12 @@ pub fn shrink_document_typography(doc: &mut Document, delta_pt: f32, space_facto
     };
 
     // 4. Traverse main body story.
+    let mut is_first = true;
     for b in &mut doc.body {
-        each_para_mut(Arc::make_mut(b), 0, &mut shrink_paragraph);
+        each_para_mut(Arc::make_mut(b), 0, &mut |p| {
+            shrink_paragraph(p, is_first);
+            is_first = false;
+        });
     }
 
     // 5. Traverse secondary editable stories (footnotes, text boxes), excluding headers, footers,
@@ -386,8 +416,12 @@ pub fn shrink_document_typography(doc: &mut Document, delta_pt: f32, space_facto
         if matches!(part.kind, PartKind::Header | PartKind::Footer) || hf_text_boxes.contains(id) {
             continue;
         }
+        let mut is_first = true;
         for b in &mut part.blocks {
-            each_para_mut(Arc::make_mut(b), 0, &mut shrink_paragraph);
+            each_para_mut(Arc::make_mut(b), 0, &mut |p| {
+                shrink_paragraph(p, is_first);
+                is_first = false;
+            });
         }
     }
 }
@@ -545,24 +579,31 @@ mod tests {
     #[test]
     fn test_shrink_automatic_spacing() {
         let mut doc = Document::new();
-        let mut p = Paragraph::with_text("Auto spaced paragraph", CharProps::default());
-        p.props.space_before_auto = Some(true);
-        p.props.space_after_auto = Some(true);
-        doc.body = vec![para_block(p)];
+        let mut p1 = Paragraph::with_text("First auto spaced paragraph", CharProps::default());
+        p1.props.space_before_auto = Some(true);
+        p1.props.space_after_auto = Some(true);
+
+        let mut p2 = Paragraph::with_text("Second auto spaced paragraph", CharProps::default());
+        p2.props.space_before_auto = Some(true);
+        p2.props.space_after_auto = Some(true);
+
+        doc.body = vec![para_block(p1), para_block(p2)];
 
         shrink_document_typography(&mut doc, 0.5, 0.9);
 
-        let p_after = doc.body[0].as_para().unwrap();
-        // AUTO_SPACING is 14.0 pt. 14.0 * 0.9 = 12.6 -> 12.5 pt
-        assert_eq!(p_after.props.space_before_auto, Some(false));
-        assert_eq!(p_after.props.space_before, Some(12.5));
-        assert_eq!(p_after.props.space_after_auto, Some(false));
-        assert_eq!(p_after.props.space_after, Some(12.5));
+        let p1_after = doc.body[0].as_para().unwrap();
+        // First paragraph of story retains zero space before
+        assert_eq!(p1_after.props.space_before_auto, Some(false));
+        assert_eq!(p1_after.props.space_before, Some(0.0));
+        assert_eq!(p1_after.props.space_after_auto, Some(false));
+        assert_eq!(p1_after.props.space_after, Some(12.5));
 
-        // When resolved, paragraph resolves to 12.5 pt spacing rather than unscaled 14.0 pt
-        let resolved = doc.styles.resolve_para(&p_after.props);
-        assert_eq!(resolved.space_before, 12.5);
-        assert_eq!(resolved.space_after, 12.5);
+        let p2_after = doc.body[1].as_para().unwrap();
+        // Second paragraph gets scaled automatic spacing (14.0 * 0.9 = 12.6 -> 12.5 pt)
+        assert_eq!(p2_after.props.space_before_auto, Some(false));
+        assert_eq!(p2_after.props.space_before, Some(12.5));
+        assert_eq!(p2_after.props.space_after_auto, Some(false));
+        assert_eq!(p2_after.props.space_after, Some(12.5));
     }
 
     #[test]
@@ -653,14 +694,16 @@ mod tests {
         };
         Arc::make_mut(&mut doc.styles).upsert(auto_style);
 
-        let p = Paragraph::with_text("Header auto text", CharProps::default()).styled("AutoStyle");
+        // Header paragraph with direct space_before: Some(5.0) that inherits space_before_auto: Some(true)
+        let mut p = Paragraph::with_text("Header auto text", CharProps::default()).styled("AutoStyle");
+        p.props.space_before = Some(5.0);
         let h_id = doc.add_part(PartKind::Header, vec![para_block(p)]);
 
         shrink_document_typography(&mut doc, 0.5, 0.9);
 
         let h_part = doc.parts.get(&h_id).unwrap();
         let h_p = h_part.blocks[0].as_para().unwrap();
-        // Inherited auto flags are preserved on the header paragraph
+        // Inherited auto flags are preserved on the header paragraph even with direct spacing
         assert_eq!(h_p.props.space_before_auto, Some(true));
         assert_eq!(h_p.props.space_after_auto, Some(true));
     }
