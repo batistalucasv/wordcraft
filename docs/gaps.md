@@ -1,6 +1,6 @@
 # Where WordCraft falls short of Word
 
-> **Validation status:** 2026-11-12 · minor · #5875 representation redesign: typed numeric identities, explicit singleton outcomes, per-part observations and proof-bearing absence sets; each glossary has its own owner and unreached references do not borrow main definitions. Only custom-XML declarations and informational unused-comment coverage use the named package-registry exception. Either comment-extension source activates its check; duplicate relationship IDs bind the first XML declaration. Observation contracts are declared beside helpers; their generated register has a drift and access gate. Synthetic controls only; independent endpoint review remains required and readiness estimates are unchanged.
+> **Validation status:** 2026-11-12 · minor · #5875 round 15: all established owner roots are checked by the Transitional root gate; custom-property ambiguity and unknown discovery report skipped coverage; incomplete graph memberships cannot prove an unused comment. Established-unowned reference exclusions receive one out-of-scope count without changing their verdict. The observation gate rejects destructuring and module-scope registry indirection; its documented guarantee is lexical, not general Rust alias analysis. Synthetic controls only; independent endpoint review remains required and readiness estimates are unchanged.
 
 > **CLI path update:** 2026-11-04 · Options before a non-Unicode input filename no longer make the CLI reject that filename; text option values still require Unicode; `run --file` and `run --script` retain native paths. No ranked gap or readiness estimate changes.
 
@@ -199,6 +199,7 @@ Page Setup's margin, paper-size and document-grid number boxes scroll long text 
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-11-12 | minor | #5875 round 15: gate every owner root, report unresolved custom-property checks, suppress unused-comment absence on incomplete memberships, count unowned exclusions as out of scope, and harden the lexical contract gate; synthetic controls only, readiness estimates unchanged |
 | 2026-11-12 | minor | #5875 W6: generated observation contracts and access gate, per-part auxiliary completeness, explicit package-registry exception; independent endpoint review required, estimates unchanged |
 | 2026-11-12 | minor | #5875 W5: symmetric extension activation and one duplicate-ID binding policy; estimates unchanged |
 | 2026-11-12 | minor | #5875 W3/W4: per-part observations, distinct glossary memberships and established-unowned declarations scoped only to the named package registry; estimates unchanged |

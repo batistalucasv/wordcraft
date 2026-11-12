@@ -87,6 +87,7 @@ pub(crate) fn owner_scopes(pkg: &Package) -> Vec<OwnerContext> {
 pub(crate) struct PartGraph {
     memberships: BTreeMap<PartId, Membership>,
     budget_exhausted: bool,
+    memberships_complete: bool,
 }
 impl PartGraph {
     /// Traverse each context independently, stopping at every other story root.
@@ -117,7 +118,7 @@ impl PartGraph {
                     *member = Membership::Owned(vec![OwnerId(0)]);
                 }
             }
-            return Self { memberships, budget_exhausted: false };
+            return Self { memberships, budget_exhausted: false, memberships_complete: complete };
         }
         let roots: BTreeSet<_> = owners.iter().filter_map(OwnerContext::root).map(PartId::new).collect();
         // Root ownership itself is established even if descendant traversal later exhausts its allowance.
@@ -172,13 +173,17 @@ impl PartGraph {
                 }
             }
         }
-        Self { memberships, budget_exhausted }
+        Self { memberships, budget_exhausted, memberships_complete: complete && !budget_exhausted }
     }
     /// Whether ownership coverage was limited by graph fanout, independent of XML/ZIP loss.
     pub(crate) fn budget_exhausted(&self) -> bool {
         self.budget_exhausted
     }
-    /// Every independently established context of this part.
+    /// Whether each retained owner set is exhaustive, rather than only a proven prefix.
+    pub(crate) fn memberships_complete(&self) -> bool {
+        self.memberships_complete
+    }
+    /// Proven contexts of this part; negative conclusions also require memberships_complete.
     pub(crate) fn owners(&self, part: &str) -> &[OwnerId] {
         observation_contract! {
             rules: "-";

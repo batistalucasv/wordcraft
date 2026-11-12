@@ -805,7 +805,7 @@ fn owner_roots_supported(pkg: &Package, acc: &mut Acc) -> bool {
     observation_contract! {
         rules: "-";
         collections: "type.Vec*1";
-        scope: "source-local bounded extraction; no implicit document owner";
+        scope: "every independently established main/glossary owner root; Transitional namespace and expected root element";
         loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
         fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
         package_loss: "independent";
@@ -813,23 +813,13 @@ fn owner_roots_supported(pkg: &Package, acc: &mut Acc) -> bool {
 
     use quick_xml::{NsReader, events::Event, name::ResolveResult};
     let mut supported = true;
-    for (name, expected) in [
-        (
-            (match &pkg.main {
-                Resolution::One(name) => Some(name.as_str()),
-                Resolution::Absent | Resolution::Ambiguous(_) | Resolution::Unknown(_) => None,
-            }),
-            "document",
-        ),
-        (
-            (match &pkg.glossary {
-                Resolution::One(name) => Some(name.as_str()),
-                Resolution::Absent | Resolution::Ambiguous(_) | Resolution::Unknown(_) => None,
-            }),
-            "glossaryDocument",
-        ),
-    ] {
-        let Some(entry) = name.and_then(|name| entry_by_name(pkg, name)) else { continue };
+    for owner in owner_scopes(pkg) {
+        let (name, expected) = match &owner {
+            OwnerContext::Main(name) => (name, "document"),
+            OwnerContext::Glossary(name) => (name, "glossaryDocument"),
+            OwnerContext::Fallback => continue,
+        };
+        let Some(entry) = entry_by_name(pkg, name) else { continue };
         let Some(text) = entry.decoded.as_deref() else { continue };
         let mut reader = NsReader::from_str(text);
         let mut buf = Vec::new();
@@ -2422,6 +2412,38 @@ fn check_story(pkg: &Package, xml: &XmlScan, acc: &mut Acc) {
     acc.ran("STRUCT-DELTEXT");
     acc.ran("STRUCT-MOVE-UNPAIRED");
     check_custom_xml(pkg, xml, acc);
+    report_unowned_reference_scope(xml, acc);
+}
+
+/// One bounded count explains established exclusions without treating non-ownership as loss.
+fn report_unowned_reference_scope(xml: &XmlScan, acc: &mut Acc) {
+    observation_contract! {
+        rules: "-";
+        collections: "access.prefix*5,field.comment_refs*1,field.endnote_refs*1,field.footnote_refs*1,field.num_ids*1,field.parts*1,field.style_refs*1";
+        scope: "established-unowned reference exclusions from owner-local note/comment/style/numbering joins; out of scope";
+        loss: "unknown ownership is not an exclusion; only retained positive references are counted";
+        fallback: "one bounded coverage count; established non-ownership never marks Incomplete";
+        package_loss: "independent";
+    }
+
+    let excluded = xml
+        .parts
+        .values()
+        .filter(|part| {
+            xml.graph.owners(&part.name).is_empty()
+                && !xml.graph.unknown(&part.name)
+                && (!part.facts.footnote_refs.prefix().is_empty()
+                    || !part.facts.endnote_refs.prefix().is_empty()
+                    || !part.facts.comment_refs.prefix().is_empty()
+                    || !part.facts.style_refs.prefix().is_empty()
+                    || !part.facts.num_ids.prefix().is_empty())
+        })
+        .count();
+    if excluded > 0 {
+        acc.note(format!(
+            "{excluded} established-unowned parts contain references excluded from owner-local note/comment/style/numbering joins (out of scope)"
+        ));
+    }
 }
 
 /// Duplicate decimal IDs are forbidden within a definition part, not between independent owners.
@@ -2502,7 +2524,7 @@ fn report_unreferenced_comments(pkg: &Package, xml: &XmlScan, acc: &mut Acc) {
         rules: "ID-COMMENT-REF";
         collections: "access.into_complete_set*1,access.missing*1,access.prefix*2,field.comment_defs*1,field.comment_refs*2,field.contexts*3,field.entries*1,type.HashMap*1,type.HashSet*3,type.Observed*1";
         scope: "DECLARED EXCEPTION: PackageRegistryContext for established-unowned own declarations; reached declarations keep their selected registry; never grants story ownership";
-        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap; ownership discovery loss; graph traversal/fanout budget";
         fallback: "unknown membership or registry source suppresses dependent absence; custom-XML Errors and informational unused-comment coverage retain the shipped package-registry policy";
         package_loss: "independent";
     }
@@ -2512,7 +2534,12 @@ fn report_unreferenced_comments(pkg: &Package, xml: &XmlScan, acc: &mut Acc) {
     let package_registry = ownership::PackageRegistryContext::new(owner_map);
     let roles = story_roles(pkg);
     let mut incomplete_owners = HashSet::new();
-    let mut unknown = !ownership_discovery_complete(pkg);
+    // A retained membership is positive evidence only: traversal loss can hide another owner
+    // whose story contains the reference. Never turn that prefix into a complete reference set.
+    let mut unknown = !owner_map.memberships_complete();
+    if owner_map.budget_exhausted() {
+        acc.note("ownership graph memberships are incomplete; unreferenced-comment absence was not checked".to_string());
+    }
     for e in pkg.entries.iter().filter(|e| !e.is_dir) {
         if roles.get(&e.name.to_ascii_lowercase()).is_some_and(|r| r.is_story()) {
             let contexts = package_registry.contexts(&e.name);
@@ -2902,9 +2929,23 @@ fn check_vocabulary(pkg: &Package, acc: &mut Acc) {
             check_name_dups(entry, cap, acc, true);
         }
     }
-    if let Resolution::One(entry) = find_by_type(pkg, package::CUSTOM_PROPERTIES_CONTENT_TYPE) {
-        check_name_dups(entry, cap, acc, false);
-    }
+    let custom_properties_checked = match find_by_type(pkg, package::CUSTOM_PROPERTIES_CONTENT_TYPE) {
+        Resolution::One(entry) => {
+            check_name_dups(entry, cap, acc, false);
+            true
+        }
+        Resolution::Absent => true,
+        Resolution::Ambiguous(reason) => {
+            acc.note(format!("custom-properties selection is ambiguous ({reason}); PROP-DUP-NAME was not checked"));
+            acc.set_incomplete();
+            false
+        }
+        Resolution::Unknown(reason) => {
+            acc.note(format!("custom-properties selection is unknown ({reason}); PROP-DUP-NAME was not checked"));
+            acc.set_incomplete();
+            false
+        }
+    };
     acc.ran("STYLE-DUP-ID");
     acc.ran("STYLE-DUP-NAME");
     acc.ran("STYLE-RESERVED-NAME");
@@ -2912,7 +2953,9 @@ fn check_vocabulary(pkg: &Package, acc: &mut Acc) {
     acc.ran("STYLE-COUNT");
     acc.ran("STYLE-ID-LENGTH");
     acc.ran("FONT-DUP-NAME");
-    acc.ran("PROP-DUP-NAME");
+    if custom_properties_checked {
+        acc.ran("PROP-DUP-NAME");
+    }
 }
 
 /// Evaluate the six styles-part vocabulary rules for one styles part.
