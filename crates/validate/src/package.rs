@@ -139,7 +139,7 @@ pub(crate) struct Package {
     pub content_types_present: bool,
     pub rels: Vec<RelsPart>,
     pub main: Option<String>,
-    /// The glossary document part, reached from the main document's relationships.
+    /// The uniquely selected glossary, from the main document's relationships or content type.
     pub glossary: Option<String>,
     /// Competing document roots leave owner-dependent checks without an established scope.
     pub roots_ambiguous: bool,
@@ -321,15 +321,17 @@ pub(crate) fn load(bytes: &[u8], acc: &mut Acc) -> Option<Package> {
         }
     }
 
-    let glossary_rels = main.as_deref().and_then(|m| rels.iter().find(|rp| rp.name.eq_ignore_ascii_case(&rels_part_name(m))));
-    let glossary_ambiguous = competing_targets(glossary_rels, |kind| relationship_kind(kind) == Some("glossaryDocument"));
-    if glossary_ambiguous {
-        acc.note("ambiguous glossaryDocument selection: distinct official targets compete; owner-dependent document checks were skipped".to_string());
-        acc.set_incomplete();
-    }
+    let selection = if main_ambiguous { GlossarySelection::Absent } else { glossary_part(&entries, &content_types, &rels, main.as_deref()) };
+    let (glossary, glossary_ambiguous) = match selection {
+        GlossarySelection::Selected(name) => (Some(name), false),
+        GlossarySelection::Absent => (None, false),
+        GlossarySelection::Ambiguous(reason) => {
+            acc.note(format!("ambiguous glossaryDocument selection: {reason}; owner-dependent document checks were skipped"));
+            acc.set_incomplete();
+            (None, true)
+        }
+    };
     let roots_ambiguous = main_ambiguous || glossary_ambiguous;
-    // Retain no arbitrary root identity: the validation entry point gates owner-dependent work.
-    let glossary = if roots_ambiguous { None } else { glossary_part(&entries, &content_types, &rels, main.as_deref()) };
 
     let reachable = reachability(&rels, main.as_deref());
     Some(Package { entries, content_types, content_types_present, rels, main, glossary, roots_ambiguous, reachable, xml_parts, entries_truncated })
@@ -355,20 +357,39 @@ fn competing_targets(rp: Option<&RelsPart>, matches: impl Fn(&str) -> bool) -> b
     false
 }
 
-/// The glossary document part: the main document's `glossaryDocument` relationship target, else the
-/// first part whose effective content type is the glossary type.
-fn glossary_part(entries: &[Entry], ct: &ContentTypes, rels: &[RelsPart], main: Option<&str>) -> Option<String> {
+/// A glossary root is absent, uniquely selected, or ambiguous; ambiguity retains no owner anchor.
+enum GlossarySelection {
+    /// No relationship target or glossary-content-typed candidate was found.
+    Absent,
+    /// The official relationship target, or the sole content-type fallback candidate.
+    Selected(String),
+    /// Why competing candidates prevent selecting a root.
+    Ambiguous(&'static str),
+}
+
+/// Select the main document's official glossary target, else the unique glossary-content-typed
+/// part. Multiple fallback candidates are unknown selection, never a ZIP-order tie-break.
+fn glossary_part(entries: &[Entry], ct: &ContentTypes, rels: &[RelsPart], main: Option<&str>) -> GlossarySelection {
     if let Some(main) = main {
         let want = rels_part_name(main);
-        if let Some(rp) = rels.iter().find(|r| r.name.eq_ignore_ascii_case(&want))
+        let rp = rels.iter().find(|r| r.name.eq_ignore_ascii_case(&want));
+        if competing_targets(rp, |kind| relationship_kind(kind) == Some("glossaryDocument")) {
+            return GlossarySelection::Ambiguous("distinct official targets compete");
+        }
+        if let Some(rp) = rp
             && let Some(r) = rp.rels.iter().find(|r| !r.external && relationship_kind(&r.kind) == Some("glossaryDocument"))
             && let Some(t) = &r.target_abs
             && let Some(name) = canonical(entries, t)
         {
-            return Some(name);
+            return GlossarySelection::Selected(name);
         }
     }
-    entries.iter().find(|e| !e.is_dir && ct.of(&e.name) == Some(GLOSSARY_CONTENT_TYPE)).map(|e| e.name.clone())
+    let mut candidates = entries.iter().filter(|e| !e.is_dir && ct.of(&e.name) == Some(GLOSSARY_CONTENT_TYPE));
+    let Some(first) = candidates.next() else { return GlossarySelection::Absent };
+    if candidates.next().is_some() {
+        return GlossarySelection::Ambiguous("multiple glossary-content-typed fallback candidates compete");
+    }
+    GlossarySelection::Selected(first.name.clone())
 }
 
 /// A directory entry, or one whose bytes were skipped. A skipped file entry's content is

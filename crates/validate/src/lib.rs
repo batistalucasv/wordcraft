@@ -16,6 +16,8 @@
 
 // Step 0 of the grammar work: the tables land before any check reads them. This allow is
 // removed when the first grammar rule uses the module.
+#[cfg(test)]
+mod glossary_tests;
 #[allow(dead_code)]
 mod model;
 #[cfg(test)]
@@ -2185,10 +2187,10 @@ fn discovery_unavailable(pkg: &Package, owner: Option<&str>) -> bool {
 }
 
 /// Map each part (lowercased) to every owner context that reaches it, indexed in
-/// [`owner_scopes`]. A glossary subtree is attributed to the glossary even though the glossary part
-/// is reached from the main document, so its references are never checked against main definitions.
+/// [`owner_scopes`]. Glossary-typed parts are never traversed into or fallback-assigned to main;
+/// only the selected glossary seeds its own subtree, so its references cannot use main definitions.
 /// A shared story is checked in each established context, never silently assigned to the first.
-/// When there is no owner scope at all, every part belongs to the single `None` scope.
+/// With no owner scope, the single `None` pool still excludes glossary-typed parts.
 fn owner_index_map(pkg: &Package) -> HashMap<String, Vec<usize>> {
     let owners = owner_scopes(pkg);
     let mut map: HashMap<String, Vec<usize>> = HashMap::new();
@@ -2196,7 +2198,7 @@ fn owner_index_map(pkg: &Package) -> HashMap<String, Vec<usize>> {
         if !ownership_discovery_complete(pkg) {
             return map;
         }
-        for e in pkg.entries.iter().filter(|e| !e.is_dir) {
+        for e in pkg.entries.iter().filter(|e| !e.is_dir && pkg.content_types.of(&e.name) != Some(package::GLOSSARY_CONTENT_TYPE)) {
             map.insert(e.name.to_ascii_lowercase(), vec![0]);
         }
         return map;
@@ -2220,8 +2222,11 @@ fn owner_index_map(pkg: &Package) -> HashMap<String, Vec<usize>> {
                     if let Some(t) = &r.target_abs
                         && let Some(name) = canonical_entry(pkg, t)
                     {
-                        // A content-type-selected glossary is its own owner even through a custom or Strict edge.
-                        if !pkg.glossary.as_deref().is_some_and(|g| g.eq_ignore_ascii_case(&name)) {
+                        // Every glossary-typed target is a boundary, including an unselected one
+                        // reached through a custom or Strict edge; pooling it would invent main joins.
+                        if pkg.content_types.of(&name) != Some(package::GLOSSARY_CONTENT_TYPE)
+                            && !pkg.glossary.as_deref().is_some_and(|g| g.eq_ignore_ascii_case(&name))
+                        {
                             queue.push(name);
                         }
                     }
@@ -2232,7 +2237,7 @@ fn owner_index_map(pkg: &Package) -> HashMap<String, Vec<usize>> {
     // Only complete discovery can assign an unreached supporting part to the primary scope.
     // Otherwise an omitted glossary edge could own it; a missing map entry represents unknown.
     if ownership_discovery_complete(pkg) {
-        for e in pkg.entries.iter().filter(|e| !e.is_dir) {
+        for e in pkg.entries.iter().filter(|e| !e.is_dir && pkg.content_types.of(&e.name) != Some(package::GLOSSARY_CONTENT_TYPE)) {
             map.entry(e.name.to_ascii_lowercase()).or_insert_with(|| vec![0]);
         }
     }
@@ -2253,8 +2258,9 @@ fn part_owners<'a>(owner_map: &'a HashMap<String, Vec<usize>>, part: &str) -> &'
 }
 
 /// Whether a source could enter this owner's pool through the primary fallback assignment.
-/// `owner_index_map` assigns every unreached entry to context zero after complete discovery;
-/// an empty membership therefore means discovery is incomplete, not that this source is absent.
+/// `owner_index_map` assigns unreached non-glossary entries to context zero after complete discovery;
+/// an empty membership means discovery is incomplete or the source is an unselected glossary,
+/// never that the source is absent.
 /// Only the primary pool accepts fallback sources, so independent owners must remain checkable.
 fn unresolved_fallback_contributor(owner_map: &HashMap<String, Vec<usize>>, owner: usize, part: &str) -> bool {
     owner == 0 && part_owners(owner_map, part).is_empty()

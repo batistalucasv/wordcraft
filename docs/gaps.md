@@ -1,6 +1,6 @@
 # Where WordCraft falls short of Word
 
-> **Validation status:** 2026-11-12 · trivial · Mixed Transitional/Strict package entry points leave the validator profile uncertain (#5875), including repeated targets; either relationship order yields coverage and skips document checks. Agreeing profiles retain their existing behavior. Synthetic checks only; readiness and format-fidelity estimates unchanged.
+> **Validation status:** 2026-11-12 · trivial · Glossary-typed parts stay outside main ownership, and multiple content-type fallback candidates leave glossary selection ambiguous (#5875). Synthetic controls only; readiness and format-fidelity estimates unchanged. Mixed Transitional/Strict package entry points to the same target leave the validator profile uncertain (#5875); either relationship order yields coverage and skips document checks. Distinct competing roots retain ambiguity treatment and independent per-part checks; the profile gate is not evaluated there.
 
 > **CLI path update:** 2026-11-04 · Options before a non-Unicode input filename no longer make the CLI reject that filename; text option values still require Unicode; `run --file` and `run --script` retain native paths. No ranked gap or readiness estimate changes.
 
@@ -199,7 +199,8 @@ Page Setup's margin, paper-size and document-grid number boxes scroll long text 
 
 | Date | Change | Summary |
 |---|---|---|
-| 2026-11-12 | trivial | Validator: resolve all recognized entry-point profiles by agreement; mixed Transitional/Strict entry points skip document checks with coverage in either order (#5875). No parity estimate changed. |
+| 2026-11-12 | trivial | Validator: exclude every glossary-typed part from main traversal and fallback assignment; multiple content-type fallback candidates are ambiguous, with no selected anchor (#5875). Synthetic controls; no parity estimate changed. |
+| 2026-11-12 | trivial | Validator: mixed Transitional/Strict entry points to the same target skip document checks with coverage in either order (#5875); distinct competing roots retain ambiguity treatment without evaluating the profile gate. No parity estimate changed. |
 | 2026-11-12 | trivial | Validator: competing official role targets produce coverage and suppress dependent findings; both-order, repeated-target, malformed-source and owner-isolation controls (#5875). No parity estimate changed. |
 | 2026-11-08 | trivial | #10 narrowed: a turned inline picture with no recorded effect extent keeps its line to its frame (exchanged near a quarter turn in Word 2013+ layout), cut at the line; gap stays open |
 | 2026-11-08 | trivial | #4 narrowed: a cell's last Normal paragraph drops its contextual space after, the end-of-cell mark counting as a Normal paragraph (#5450) |

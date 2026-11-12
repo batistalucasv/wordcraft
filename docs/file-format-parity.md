@@ -1,6 +1,6 @@
 # File-format parity with Microsoft Word
 
-> **Validation status:** 2026-11-12 · trivial · Mixed Transitional/Strict package entry points leave the validator profile uncertain (#5875), including repeated targets; either relationship order yields coverage and skips document checks. Agreeing profiles retain their existing behavior. Synthetic checks only; readiness and format-fidelity estimates unchanged.
+> **Validation status:** 2026-11-12 · trivial · Glossary-typed parts stay outside main ownership, and multiple content-type fallback candidates leave glossary selection ambiguous (#5875). Synthetic controls only; readiness and format-fidelity estimates unchanged. Mixed Transitional/Strict package entry points to the same target leave the validator profile uncertain (#5875); either relationship order yields coverage and skips document checks. Distinct competing roots retain ambiguity treatment and independent per-part checks; the profile gate is not evaluated there.
 
 > **2026-11-08:** `wordcraft-cli convert --strict` refuses a PDF or PNG that would draw an empty box for a character or leave out a picture, including those a DOCX names outside the file or not at all (#6005); never fetched.
 > **2026-11-05:** A Word template opened from the file manager starts a new document based on it, and is never saved over (#3433).
@@ -340,7 +340,8 @@ For field results, the engine parser treats a backslash in quoted arguments as e
 
 | Date | Change | Summary |
 |---|---|---|
-| 2026-11-12 | trivial | Validator: resolve all recognized entry-point profiles by agreement; mixed Transitional/Strict entry points skip document checks with coverage in either order (#5875). No parity estimate changed. |
+| 2026-11-12 | trivial | Validator: exclude every glossary-typed part from main traversal and fallback assignment; multiple content-type fallback candidates are ambiguous, with no selected anchor (#5875). Synthetic controls; no parity estimate changed. |
+| 2026-11-12 | trivial | Validator: mixed Transitional/Strict entry points to the same target skip document checks with coverage in either order (#5875); distinct competing roots retain ambiguity treatment without evaluating the profile gate. No parity estimate changed. |
 | 2026-11-12 | trivial | Validator: competing official role targets produce coverage and suppress dependent findings; both-order, repeated-target, malformed-source and owner-isolation controls (#5875). No parity estimate changed. |
 | 2026-11-08 | trivial | ODT row corrected: a file whose tab stops are measured from the indent is saved measuring from it, not always from the margin (the 2026-11-03 change); the default stops are counted from the indent |
 | 2026-11-05 | trivial | ODT: a table's columns stating only their share (`style:rel-column-width`, as LibreOffice's CV template does) keep their proportions; they opened and saved as equal columns. An aligned table's stated width is what they divide, columns with only a width take it first, and the default style can give a share. In an aligned table whose every column has a share, the shares win over any widths stated with them, as LibreOffice 26.8 reads them, and a share too small for a column gives the narrowest one (6 pt) instead of losing the grid. A table in a cell, frame or narrower column with widths stated as well as shares, or with nothing to divide, splits equally as before. |

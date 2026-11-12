@@ -1,6 +1,6 @@
 # WordCraft roadmap
 
-> **Validation status:** 2026-11-12 · trivial · Mixed Transitional/Strict package entry points leave the validator profile uncertain (#5875), including repeated targets; either relationship order yields coverage and skips document checks. Agreeing profiles retain their existing behavior. Synthetic checks only; readiness and format-fidelity estimates unchanged.
+> **Validation status:** 2026-11-12 · trivial · Glossary-typed parts stay outside main ownership, and multiple content-type fallback candidates leave glossary selection ambiguous (#5875). Synthetic controls only; readiness and format-fidelity estimates unchanged. Mixed Transitional/Strict package entry points to the same target leave the validator profile uncertain (#5875); either relationship order yields coverage and skips document checks. Distinct competing roots retain ambiguity treatment and independent per-part checks; the profile gate is not evaluated there.
 
 > **Last reviewed:** 2026-10-31 · **Last updated:** 2026-10-31 · **Change:** minor (#3398: persistent screen paper colors; parity estimates unchanged); previously minor (#3693: additional Delete Previous Sentence command and shortcut; Word-parity estimates unchanged)
 > **CLI path update:** 2026-11-04 · Options before a non-Unicode input filename no longer make the CLI reject that filename; text option values still require Unicode; `run --file` and `run --script` retain native paths. No ranked gap or readiness estimate changes.
@@ -152,7 +152,8 @@ Ranked, to beta (detail and remaining milestones in [docs/roadmap.md](docs/roadm
 
 ## Progress log
 
-- 2026-11-12: Mixed Transitional/Strict package entry points leave the validator profile uncertain (#5875), even when targets repeat. Both orders skip document checks with coverage; agreeing profiles keep their existing scan or Strict gate. Synthetic controls only; readiness estimates unchanged.
+- 2026-11-12: Glossary-typed parts stay outside main ownership; multiple content-type fallback candidates produce glossary ambiguity with no chosen anchor (#5875). Synthetic controls cover both ZIP orders and no-main discovery; readiness estimates unchanged.
+- 2026-11-12: Mixed Transitional/Strict package entry points to the same target leave the validator profile uncertain (#5875). Both orders skip document checks with coverage. Distinct competing roots retain ambiguity treatment and independent per-part checks without evaluating the profile gate. Synthetic controls only; readiness estimates unchanged.
 - 2026-11-12: Competing distinct official relationship targets leave validator role selection ambiguous (#5875); coverage explains skipped dependent joins in either relationship order. Repeated targets remain unique. Synthetic checks only; readiness and format-fidelity estimates unchanged.
 - 2026-11-08: `wordcraft-cli convert --strict` (#6005) and `render --strict` (#6008): a PDF or PNG export (render: the page it writes) refuses, exit 3 and nothing written, when it would draw a character no font has or leave out a picture (missing part, external target, link only, undecodable or unsupported format); the report is on stderr with one JSON line. Engine: `strict: true` on `file.save`, `file.saveAs`, `file.exportPdf` and `file.exportPng`, and the pure `file.strictReport`. External picture targets are never fetched. The result depends on the host's installed fonts (#5624); readiness estimates unchanged.
 - 2026-11-05: ODT tables with a usable width keep their column proportions when the file gives only shares (gap 19): LibreOffice's CV template opened and saved with equal columns.
@@ -912,7 +913,8 @@ MATH glyphs that reference the same construction now share its immutable variant
 
 | Date | Change | Summary |
 |---|---|---|
-| 2026-11-12 | trivial | Validator: resolve all recognized entry-point profiles by agreement; mixed Transitional/Strict entry points skip document checks with coverage in either order (#5875). No parity estimate changed. |
+| 2026-11-12 | trivial | Validator: exclude every glossary-typed part from main traversal and fallback assignment; multiple content-type fallback candidates are ambiguous, with no selected anchor (#5875). Synthetic controls; no parity estimate changed. |
+| 2026-11-12 | trivial | Validator: mixed Transitional/Strict entry points to the same target skip document checks with coverage in either order (#5875); distinct competing roots retain ambiguity treatment without evaluating the profile gate. No parity estimate changed. |
 | 2026-11-12 | trivial | Validator: competing official role targets produce coverage and suppress dependent findings; both-order, repeated-target, malformed-source and owner-isolation controls (#5875). No parity estimate changed. |
 | 2026-11-06 | trivial | Progress log: edited ODT paragraphs keep custom styles with an outline level (gap 19) |
 | 2026-10-31 | trivial | Control/MCP #2596 review fixes; readiness estimates unchanged |
