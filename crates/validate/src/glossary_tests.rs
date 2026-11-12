@@ -95,7 +95,7 @@ fn mb3_two_strict_glossaries_are_ambiguous_in_both_zip_orders() {
         let d = fixture(Some(STRICT), Some(STRICT), reverse, true);
         ambiguous(&validate_bytes(&d.build()));
         let pkg = loaded(&d);
-        assert!(pkg.glossary.is_none());
+        assert!(!matches!(pkg.glossary, Resolution::One(_)));
         assert!(pkg.roots_ambiguous);
     }
 }
@@ -139,7 +139,13 @@ fn single_glossary_fallback_and_official_selection_preserve_m1_m2() {
             let report = validate_bytes(&d.build());
             assert_eq!(report.verdict, Verdict::Pass, "{report:?}");
             let pkg = loaded(&d);
-            assert_eq!(pkg.glossary.as_deref(), Some("word/glossary/document.xml"));
+            assert_eq!(
+                (match &pkg.glossary {
+                    Resolution::One(name) => Some(name.as_str()),
+                    Resolution::Absent | Resolution::Ambiguous(_) | Resolution::Unknown(_) => None,
+                }),
+                Some("word/glossary/document.xml")
+            );
             assert_eq!(part_owners(&owner_index_map(&pkg), "word/glossary/document.xml"), &[1]);
         }
     }
@@ -159,8 +165,14 @@ fn no_main_single_glossary_fallback_remains_the_primary_glossary_owner() {
         d.remove("_rels/.rels");
         d.remove("word/document.xml");
         let pkg = loaded(&d);
-        assert!(pkg.main.is_none());
-        assert_eq!(pkg.glossary.as_deref(), Some("word/glossary/document.xml"));
+        assert!(!matches!(pkg.main, Resolution::One(_)));
+        assert_eq!(
+            (match &pkg.glossary {
+                Resolution::One(name) => Some(name.as_str()),
+                Resolution::Absent | Resolution::Ambiguous(_) | Resolution::Unknown(_) => None,
+            }),
+            Some("word/glossary/document.xml")
+        );
         let map = owner_index_map(&pkg);
         assert_eq!(part_owners(&map, "word/glossary/document.xml"), &[0]);
         assert_eq!(part_owners(&map, "word/glossary/footnotes.xml"), &[0]);
@@ -182,8 +194,8 @@ fn no_main_multiple_fallback_glossaries_have_no_owner_anchor() {
         d.remove("_rels/.rels");
         d.remove("word/document.xml");
         let pkg = loaded(&d);
-        assert!(pkg.main.is_none());
-        assert!(pkg.glossary.is_none());
+        assert!(!matches!(pkg.main, Resolution::One(_)));
+        assert!(!matches!(pkg.glossary, Resolution::One(_)));
         assert!(pkg.roots_ambiguous);
         let map = owner_index_map(&pkg);
         for part in ["word/glossary/document.xml", "word/g2/document.xml"] {

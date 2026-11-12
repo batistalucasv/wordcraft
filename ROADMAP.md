@@ -1,6 +1,6 @@
 # WordCraft roadmap
 
-> **Validation status:** 2026-11-12 · minor · Representation lane: numeric identities are typed at extraction; the ownership migration is stopped at the brief's existing-expectation limit pending owner disposition (#5875). Synthetic identity controls only; the representation redesign is incomplete. Selected glossary traversal retains nested glossary descendants; fallback pools exclude every glossary subtree (#5875). Glossary-typed parts stay outside main ownership, and multiple content-type fallback candidates leave glossary selection ambiguous (#5875). Synthetic controls only; readiness and format-fidelity estimates unchanged. Mixed Transitional/Strict package entry points to the same target leave the validator profile uncertain (#5875); either relationship order yields coverage and skips document checks. Distinct competing roots retain ambiguity treatment and independent per-part checks; the profile gate is not evaluated there.
+> **Validation status:** 2026-11-12 · minor · Representation lane: typed numeric identities and explicit singleton resolution are implemented; incomplete discovery cannot establish absence and competing content-type fallback sources remain ambiguous (#5875). Ownership and observation migration remain outstanding; synthetic controls only and readiness estimates unchanged. Selected glossary traversal retains nested glossary descendants; fallback pools exclude every glossary subtree (#5875). Glossary-typed parts stay outside main ownership, and multiple content-type fallback candidates leave glossary selection ambiguous (#5875). Synthetic controls only; readiness and format-fidelity estimates unchanged. Mixed Transitional/Strict package entry points to the same target leave the validator profile uncertain (#5875); either relationship order yields coverage and skips document checks. Distinct competing roots retain ambiguity treatment and independent per-part checks; the profile gate is not evaluated there.
 
 > **Last reviewed:** 2026-10-31 · **Last updated:** 2026-10-31 · **Change:** minor (#3398: persistent screen paper colors; parity estimates unchanged); previously minor (#3693: additional Delete Previous Sentence command and shortcut; Word-parity estimates unchanged)
 > **CLI path update:** 2026-11-04 · Options before a non-Unicode input filename no longer make the CLI reject that filename; text option values still require Unicode; `run --file` and `run --script` retain native paths. No ranked gap or readiness estimate changes.
@@ -151,6 +151,8 @@ Ranked, to beta (detail and remaining milestones in [docs/roadmap.md](docs/roadm
    (20–30 h).
 
 ## Progress log
+
+- 2026-11-12 · #5875 W2: main/glossary/profile and supporting-part selections distinguish one, absent, ambiguous and unknown; fallback has no first-by-ZIP selection. W3–W6 remain outstanding.
 
 - 2026-11-12: Representation lane introduces decimal/hex identity keys and lexical relationship/style types; seven existing ownership expectations exceed the lane's change limit, so ownership migration awaits owner disposition (#5875).
 - 2026-11-12: Selected glossary traversal retains nested glossary descendants; main and no-owner fallback exclude transitive glossary subtrees. Direct main reachability still establishes main ownership (#5875). Synthetic controls only; readiness estimates unchanged.
@@ -915,6 +917,7 @@ MATH glyphs that reference the same construction now share its immutable variant
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-11-12 | minor | #5875 W2: roots, profile and supporting sources use explicit resolution states; content-type fallback rejects competing candidates. Remaining redesign work is outstanding; synthetic controls only. |
 | 2026-11-12 | minor | Validator representation lane: decimal/hex identity keys and lexical relationship/style types; ownership migration stopped before changing seven conflicting existing test expectations (#5875). Synthetic controls; no readiness estimate changed. |
 | 2026-11-12 | trivial | Validator: keep nested glossary descendants in the selected glossary scope; exclude boundary-crossed subtrees from main and no-owner fallback while retaining direct main reachability (#5875). Synthetic controls; readiness estimates unchanged. |
 | 2026-11-12 | trivial | Validator: exclude every glossary-typed part from main traversal and fallback assignment; multiple content-type fallback candidates are ambiguous, with no selected anchor (#5875). Synthetic controls; no parity estimate changed. |

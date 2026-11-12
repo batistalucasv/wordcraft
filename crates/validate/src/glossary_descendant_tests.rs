@@ -102,7 +102,13 @@ fn selected_glossary_traverses_a_second_official_glossary_edge() {
         }
         assert_pass(&d);
         let pkg = loaded(&d);
-        assert_eq!(pkg.glossary.as_deref(), Some("word/glossary/document.xml"));
+        assert_eq!(
+            (match &pkg.glossary {
+                Resolution::One(name) => Some(name.as_str()),
+                Resolution::Absent | Resolution::Ambiguous(_) | Resolution::Unknown(_) => None,
+            }),
+            Some("word/glossary/document.xml")
+        );
         assert_eq!(part_owners(&owner_index_map(&pkg), HEADER), &[1]);
     }
 }
@@ -124,8 +130,8 @@ fn boundary_only_descendants_never_fallback_to_main_or_no_owner() {
             let mut pkg = loaded(&d);
             for no_owner in [false, true] {
                 if no_owner {
-                    pkg.main = None;
-                    pkg.glossary = None;
+                    pkg.main = Resolution::Absent;
+                    pkg.glossary = Resolution::Absent;
                 }
                 let map = owner_index_map(&pkg);
                 for part in ["word/g2/document.xml", "word/g2/footnotes.xml", "word/g2/comments.xml", HEADER, "word/g2/tail.xml"] {
@@ -195,8 +201,8 @@ fn no_main_selected_glossary_still_traverses_nested_glossaries_as_owner_zero() {
             d.entries.reverse();
         }
         let mut pkg = loaded(&d);
-        pkg.glossary = Some("word/glossary/document.xml".to_string());
-        assert!(pkg.main.is_none());
+        pkg.glossary = Resolution::One("word/glossary/document.xml".to_string());
+        assert!(!matches!(pkg.main, Resolution::One(_)));
         let map = owner_index_map(&pkg);
         assert_eq!(part_owners(&map, "word/g2/document.xml"), &[0]);
         assert_eq!(part_owners(&map, HEADER), &[0]);

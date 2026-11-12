@@ -9,6 +9,7 @@ use quick_xml::name::ResolveResult;
 use quick_xml::reader::NsReader;
 
 use crate::Acc;
+use crate::resolution::Resolution;
 use crate::scan::ParseGuard;
 
 /// The main document part's content type (ECMA-376 Part 1 §11.3.10).
@@ -138,9 +139,9 @@ pub(crate) struct Package {
     pub content_types: ContentTypes,
     pub content_types_present: bool,
     pub rels: Vec<RelsPart>,
-    pub main: Option<String>,
+    pub main: Resolution<String>,
     /// The uniquely selected glossary, from the main document's relationships or content type.
-    pub glossary: Option<String>,
+    pub glossary: Resolution<String>,
     /// Competing document roots leave owner-dependent checks without an established scope.
     pub roots_ambiguous: bool,
     /// Lowercased names of parts reachable from the package root.
@@ -152,6 +153,8 @@ pub(crate) struct Package {
     /// examined entry list is a prefix, so a part absent from
     /// `entries` is not proven absent from the archive.
     pub entries_truncated: bool,
+    /// An unreadable archive entry had no recoverable identity and could be any source.
+    pub identity_incomplete: bool,
 }
 
 /// Load a zip into the package model. Returns `None` only when the input is not a readable zip
@@ -311,30 +314,42 @@ pub(crate) fn load(bytes: &[u8], acc: &mut Acc) -> Option<Package> {
         .and_then(|rp| rp.rels.iter().find(|r| !r.external && is_office_document_relationship(&r.kind)))
         .and_then(|r| r.target_abs.as_deref())
         .and_then(|t| canonical(&entries, t));
-    let main = if main_ambiguous { None } else { main };
-    if main.is_none() && !main_ambiguous {
-        // If `_rels/.rels` is present but its content could not be read, its officeDocument
-        // relationship is unknown, not absent: no absence conclusion is established.
-        let package_rels_unavailable = entries.iter().any(|e| !e.is_dir && e.name.eq_ignore_ascii_case("_rels/.rels") && e.content_unavailable);
-        if !entries_truncated && !package_rels_unavailable && !package_rels.is_some_and(|rp| rp.incomplete) {
-            acc.add("PKG-NO-MAIN", None, no_main_message(package_rels));
-        }
+    let package_rels_unavailable = entries.iter().any(|e| !e.is_dir && e.name.eq_ignore_ascii_case("_rels/.rels") && e.content_unavailable);
+    let discovery_complete = !entries_truncated && !unknown_unreadable && !package_rels_unavailable && !package_rels.is_some_and(|rp| rp.incomplete);
+    let main =
+        if main_ambiguous { Resolution::Ambiguous("distinct official targets compete") } else { Resolution::discovered(main, discovery_complete) };
+    if matches!(main, Resolution::Absent) {
+        acc.add("PKG-NO-MAIN", None, no_main_message(package_rels));
     }
-
-    let selection = if main_ambiguous { GlossarySelection::Absent } else { glossary_part(&entries, &content_types, &rels, main.as_deref()) };
-    let (glossary, glossary_ambiguous) = match selection {
-        GlossarySelection::Selected(name) => (Some(name), false),
-        GlossarySelection::Absent => (None, false),
-        GlossarySelection::Ambiguous(reason) => {
-            acc.note(format!("ambiguous glossaryDocument selection: {reason}; owner-dependent document checks were skipped"));
-            acc.set_incomplete();
-            (None, true)
-        }
+    let main_name = match &main {
+        Resolution::One(name) => Some(name.as_str()),
+        Resolution::Absent | Resolution::Ambiguous(_) | Resolution::Unknown(_) => None,
     };
+    let glossary = if main_ambiguous {
+        Resolution::Unknown("package main is ambiguous")
+    } else {
+        glossary_part(&entries, &content_types, &rels, main_name, !entries_truncated && !unknown_unreadable)
+    };
+    let glossary_ambiguous = matches!(glossary, Resolution::Ambiguous(_));
+    if let Resolution::Ambiguous(reason) = &glossary {
+        acc.note(format!("ambiguous glossaryDocument selection: {reason}; owner-dependent document checks were skipped"));
+        acc.set_incomplete();
+    }
     let roots_ambiguous = main_ambiguous || glossary_ambiguous;
-
-    let reachable = reachability(&rels, main.as_deref());
-    Some(Package { entries, content_types, content_types_present, rels, main, glossary, roots_ambiguous, reachable, xml_parts, entries_truncated })
+    let reachable = reachability(&rels, main_name);
+    Some(Package {
+        entries,
+        content_types,
+        content_types_present,
+        rels,
+        main,
+        glossary,
+        roots_ambiguous,
+        reachable,
+        xml_parts,
+        entries_truncated,
+        identity_incomplete: unknown_unreadable,
+    })
 }
 
 /// Whether official relationships for one singleton role name distinct internal target parts.
@@ -357,39 +372,39 @@ fn competing_targets(rp: Option<&RelsPart>, matches: impl Fn(&str) -> bool) -> b
     false
 }
 
-/// A glossary root is absent, uniquely selected, or ambiguous; ambiguity retains no owner anchor.
-enum GlossarySelection {
-    /// No relationship target or glossary-content-typed candidate was found.
-    Absent,
-    /// The official relationship target, or the sole content-type fallback candidate.
-    Selected(String),
-    /// Why competing candidates prevent selecting a root.
-    Ambiguous(&'static str),
-}
-
 /// Select the main document's official glossary target, else the unique glossary-content-typed
 /// part. Multiple fallback candidates are unknown selection, never a ZIP-order tie-break.
-fn glossary_part(entries: &[Entry], ct: &ContentTypes, rels: &[RelsPart], main: Option<&str>) -> GlossarySelection {
+fn glossary_part(entries: &[Entry], ct: &ContentTypes, rels: &[RelsPart], main: Option<&str>, entries_complete: bool) -> Resolution<String> {
     if let Some(main) = main {
         let want = rels_part_name(main);
         let rp = rels.iter().find(|r| r.name.eq_ignore_ascii_case(&want));
         if competing_targets(rp, |kind| relationship_kind(kind) == Some("glossaryDocument")) {
-            return GlossarySelection::Ambiguous("distinct official targets compete");
+            return Resolution::Ambiguous("distinct official targets compete");
         }
         if let Some(rp) = rp
             && let Some(r) = rp.rels.iter().find(|r| !r.external && relationship_kind(&r.kind) == Some("glossaryDocument"))
             && let Some(t) = &r.target_abs
             && let Some(name) = canonical(entries, t)
         {
-            return GlossarySelection::Selected(name);
+            return Resolution::One(name);
         }
     }
     let mut candidates = entries.iter().filter(|e| !e.is_dir && ct.of(&e.name) == Some(GLOSSARY_CONTENT_TYPE));
-    let Some(first) = candidates.next() else { return GlossarySelection::Absent };
+    let Some(first) = candidates.next() else {
+        let complete = entries_complete
+            && !ct.incomplete
+            && !entries.iter().any(|e| e.name.eq_ignore_ascii_case("[Content_Types].xml") && e.content_unavailable)
+            && main.is_none_or(|owner| {
+                let want = rels_part_name(owner);
+                !rels.iter().any(|r| r.name.eq_ignore_ascii_case(&want) && r.incomplete)
+                    && !entries.iter().any(|e| e.name.eq_ignore_ascii_case(&want) && e.content_unavailable)
+            });
+        return Resolution::discovered(None, complete);
+    };
     if candidates.next().is_some() {
-        return GlossarySelection::Ambiguous("multiple glossary-content-typed fallback candidates compete");
+        return Resolution::Ambiguous("multiple glossary-content-typed fallback candidates compete");
     }
-    GlossarySelection::Selected(first.name.clone())
+    Resolution::One(first.name.clone())
 }
 
 /// A directory entry, or one whose bytes were skipped. A skipped file entry's content is
@@ -887,7 +902,7 @@ fn is_office_document_relationship(kind: &str) -> bool {
 pub(crate) fn relationships_incomplete(pkg: &Package, part: &str) -> bool {
     let name = rels_part_name(part);
     // An unexamined archive suffix may hold the missing relationships part.
-    (pkg.entries_truncated && entry_by_name(pkg, &name).is_none())
+    ((pkg.entries_truncated || pkg.identity_incomplete) && entry_by_name(pkg, &name).is_none())
         || content_unavailable(pkg, &name)
         || pkg.rels.iter().any(|rp| rp.name.eq_ignore_ascii_case(&name) && rp.incomplete)
 }
@@ -913,16 +928,20 @@ pub(crate) enum EntryPointProfile {
     Transitional,
     /// Every recognized entry point declares Strict, whose markup is unsupported.
     Strict,
-    /// Recognized entry points disagree, even if they name the same target part.
-    Mixed,
 }
 
 /// Resolve the profile across all recognized internal entry points, without choosing a target.
 /// Repeated targets cannot excuse profile disagreement: first-match scanning could manufacture
 /// a Transitional verdict for an uncertain package. The relationship loader bounds this walk.
 /// Recognition remains separate from supported kind classification and Strict markup support.
-pub(crate) fn entry_point_profile(pkg: &Package) -> Option<EntryPointProfile> {
-    let rp = pkg.rels.iter().find(|rp| rp.name.eq_ignore_ascii_case("_rels/.rels"))?;
+pub(crate) fn entry_point_profile(pkg: &Package) -> Resolution<EntryPointProfile> {
+    let complete = !pkg.entries_truncated
+        && !pkg.identity_incomplete
+        && !content_unavailable(pkg, "_rels/.rels")
+        && !pkg.rels.iter().any(|rp| rp.name.eq_ignore_ascii_case("_rels/.rels") && rp.incomplete);
+    let Some(rp) = pkg.rels.iter().find(|rp| rp.name.eq_ignore_ascii_case("_rels/.rels")) else {
+        return Resolution::discovered(None, complete);
+    };
     let mut transitional = false;
     let mut strict = false;
     for r in rp.rels.iter().filter(|r| !r.external && is_office_document_relationship(&r.kind)) {
@@ -933,10 +952,10 @@ pub(crate) fn entry_point_profile(pkg: &Package) -> Option<EntryPointProfile> {
         }
     }
     match (transitional, strict) {
-        (true, true) => Some(EntryPointProfile::Mixed),
-        (true, false) => Some(EntryPointProfile::Transitional),
-        (false, true) => Some(EntryPointProfile::Strict),
-        (false, false) => None,
+        (true, true) => Resolution::Ambiguous("mixed Transitional/Strict entry points"),
+        (true, false) => Resolution::One(EntryPointProfile::Transitional),
+        (false, true) => Resolution::One(EntryPointProfile::Strict),
+        (false, false) => Resolution::discovered(None, complete),
     }
 }
 
