@@ -20,10 +20,26 @@ ACCESSORS = {'prefix','is_complete','project','into_complete_set','missing','app
 
 def mask(text):
     """Blank Rust comments and literals, preserving all byte offsets and newlines."""
-    pattern = r'//[^\n]*|/\*[\s\S]*?\*/|r(#+)?"[\s\S]*?"\1|"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])\''
+    pattern = r'//[^\n]*|/\*|r(#+)?"[\s\S]*?"\1|"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])\''
     # Raw strings need a backreference with an empty group rather than an unmatched optional one.
     pattern = pattern.replace('(#+)?', '(#*)')
-    return re.sub(pattern, lambda m: re.sub(r'[^\n]', ' ', m.group()), text)
+    # Rust block comments nest. Stopping at the first */ leaves comment tokens
+    # visible, where a semicolon or pipe could split a closure-parameter candidate.
+    pieces = []; at = 0
+    token = re.compile(pattern)
+    while match := token.search(text, at):
+        end = match.end()
+        if match.group() == '/*':
+            depth = 1
+            end = len(text)
+            for delimiter in re.finditer(r'/\*|\*/', text[match.end():]):
+                depth += 1 if delimiter.group() == '/*' else -1
+                if depth == 0:
+                    end = match.end() + delimiter.end()
+                    break
+        pieces.extend((text[at:match.start()], re.sub(r'[^\n]', ' ', text[match.start():end])))
+        at = end
+    return ''.join(pieces) + text[at:]
 
 
 def close_brace(code, opening):
@@ -88,6 +104,35 @@ def audit_shapes(name, text):
     the named consumer audit. Named-field patterns must not hide reads behind locals.
     """
     code = mask(production(text))
+    # Inspect every pipe-delimited parameter candidate, independent of the closure's
+    # expression position. Balance groups so tuple/slice/nested struct patterns and
+    # parameter attributes cannot hide a field read. A path followed by braces may
+    # be a struct pattern, so conservatively reject it; this is not a Rust parser.
+    tokens = list(re.finditer(r'\|\||=>|[|;()[\]{}]', code))
+    pairs = {'(': ')', '[': ']', '{': '}'}
+    for index, token in enumerate(tokens):
+        if token.group() not in {'|', '||'}: continue
+        # A block or return arrow directly after a closing pipe starts the body,
+        # not another parameter list. Also inspect `||`: it can join an outer
+        # closure's closing pipe to an inner closure's opening pipe without spaces.
+        if re.match(r'\s*(?:\{|->)', code[token.end():]): continue
+        stack = []; braces = False
+        for at in range(index + 1, len(tokens)):
+            char = tokens[at].group()
+            if char in pairs:
+                stack.append(pairs[char])
+                # Rust identifier continuations include Unicode combining marks,
+                # which Python's \w alone does not recognize.
+                if char == '{' and re.search(r'(?:\w|>|[^\x00-\x7f])\s*$', code[:tokens[at].start()]):
+                    braces = True
+            elif char in ')]}':
+                if not stack or stack.pop() != char: break
+            elif not stack:
+                if char in {';', '=>'}: break
+                if char in {'|', '||'}:
+                    if braces:
+                        raise ValueError(f'{name}: destructured closure parameters are unsupported in audited production code')
+                    break
     for_patterns = list(re.finditer(r'\bfor\s+(?:(?!\bin\b)[^;={}])*\{', code))
     # Trait implementations also spell `for Type {`, but bind no field pattern.
     for_patterns = [m for m in for_patterns if not re.search(
@@ -231,6 +276,24 @@ fn unregistered_registry(graph: &PartGraph) -> bool {
       'destructured parameter read': ('lib.rs',lambda s:s+'\nfn unregistered_parameter(Package { entries: items, .. }: &Package) -> usize { items.len() }\n'),
       'destructured match read': ('lib.rs',lambda s:s+'\nfn unregistered_match(pkg: &Package) -> usize { match pkg { Package { entries: items, .. } => items.len() } }\n'),
       'destructured for read': ('lib.rs',lambda s:s+'\nfn unregistered_for(packages: &[Package]) { for Package { entries: items, .. } in packages { use_items(items); } }\n'),
+      'immediately invoked destructured closure': ('lib.rs',lambda s:s+'\nfn unregistered_read(pkg: &Package) -> usize { (|Package { entries: items, .. }: &Package| items.len())(pkg) }\n'),
+      'let-bound destructured closure': ('lib.rs',lambda s:s+'\nfn unregistered_read(pkg: &Package) -> usize { let count = |Package { entries: items, .. }: &Package| items.len(); count(pkg) }\n'),
+      'const fn-pointer destructured closure': ('lib.rs',lambda s:s+'\nconst UNREGISTERED_READ: fn(&Package) -> usize = |Package { entries: items, .. }| items.len();\n'),
+      'closure argument with nested pattern': ('lib.rs',lambda s:s+'\nfn unregistered_read() { consume(move |(_, [Package { entries: items, .. }]): ((), [&Package; 1])| items.len()); }\n'),
+      'returned closure with later parameter': ('lib.rs',lambda s:s+'\nfn unregistered_read() -> impl Fn((), &Package) -> usize { move |_, &Package { ref entries, .. }| entries.len() }\n'),
+      'static fn-pointer destructured closure': ('lib.rs',lambda s:s+'\nstatic UNREGISTERED_READ: fn(&Package) -> usize = |crate::package::Package { entries: items, .. }| items.len();\n'),
+      'array-element destructured closure': ('lib.rs',lambda s:s+'\nfn unregistered_read() { consume([|whole @ Package { entries: _, .. }: &Package| use_items(whole)]); }\n'),
+      'async destructured closure': ('lib.rs',lambda s:s+'\nfn unregistered_read() { consume(async move |Package { entries, .. }: &Package| entries.len()); }\n'),
+      'nested struct closure pattern': ('lib.rs',lambda s:s+'\nfn unregistered_read() { consume(|Wrapper { inner: Package { entries: items, .. } }| items.len()); }\n'),
+      'closure pattern after associated-type constraint': ('lib.rs',lambda s:s+'\nfn unregistered_read() { consume(|_: &dyn Trait<Item = ()>, Package { entries, .. }: &Package| entries.len()); }\n'),
+      'closure pattern with attributes and comments': ('lib.rs',lambda s:s+'\nfn unregistered_read() { consume(|#[allow(unused)] /* pattern */ (Package { entries, .. },): (&Package,)| entries.len()); }\n'),
+      'destructured closure returning adjacent closure': ('lib.rs',lambda s:s+'\nfn unregistered_read() { consume(|Package { entries, .. }: &Package||()| entries.len()); }\n'),
+      'adjacent inner destructured closure': ('lib.rs',lambda s:s+'\nfn unregistered_read() { consume(|()||Package { entries, .. }: &Package| entries.len()); }\n'),
+      'closure with parenthesized or-pattern': ('lib.rs',lambda s:s+'\nfn unregistered_read() { consume(|(Package { entries, .. } | Package { entries, .. })| entries.len()); }\n'),
+      'closure with generic struct path': ('lib.rs',lambda s:s+'\nfn unregistered_read() { consume(|Package::<Vec<u8>> { entries, .. }| entries.len()); }\n'),
+      'closure with qualified struct path': ('lib.rs',lambda s:s+'\nfn unregistered_read() { consume(|<Container as Trait>::Package { entries, .. }| entries.len()); }\n'),
+      'closure with Unicode identifier continuation': ('lib.rs',lambda s:s+'\ntype Package\u0301 = Package;\nfn unregistered_read() { consume(|Package\u0301 { entries, .. }| entries.len()); }\n'),
+      'closure with nested block comment': ('lib.rs',lambda s:s+'\nfn unregistered_read() { consume(|Package /* outer /* inner */ ; */ { entries, .. }| entries.len()); }\n'),
       'module registry type alias': ('lib.rs',lambda s:s+'\ntype HiddenRegistry = ownership::PackageRegistryContext;\n'),
       'module registry method pointer': ('lib.rs',lambda s:s+"\nconst QUERY: for<'a> fn(&'a ownership::PackageRegistryContext, &str) -> &'a [OwnerId] = ownership::PackageRegistryContext::contexts;\n"),
     }
@@ -242,6 +305,18 @@ fn unregistered_registry(graph: &PartGraph) -> bool {
         except ValueError: print('rejected:',label)
         else: raise ValueError('audit accepted mutation: '+label)
     assert declarations(sources)==rows, "mutation audit contaminated the original sources"
+    # Ordinary closures and masked non-production pattern text remain supported.
+    for control in [
+        'fn explicit_read() { consume(|pkg: &Package| { pkg.entries.len() }); }',
+        'fn multiple() { consume(|a| { a }, |b| { b }); consume(|| { 1 }); }',
+        'fn nested() { consume(|a| consume(|b| { a + b })); }',
+        'fn boolean() { if a || !matches!(b, A | B) { return; } consume(|x| { x }); }',
+        'const TEXT: &str = r#"|Package { entries, .. }|"#; // |Package { entries, .. }|',
+        '/* outer /* inner */ |Package { entries, .. }| */ fn explicit() {}',
+        '#[cfg(test)] mod tests { fn read() { consume(|Package { entries, .. }| entries.len()); } }',
+    ]:
+        audit_shapes('closure-control.rs', control)
+    print('accepted: ordinary closures and masked pattern controls')
     original=outputs(rows)
     try: verify_output('in-memory register', original[0]+'drift', original[0])
     except ValueError: print('rejected: generated register drift (exact byte comparison)')
