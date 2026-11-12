@@ -29,6 +29,8 @@ mod package;
 mod reserved;
 mod scan;
 
+use scan::{DecimalId, HexId, RelId, StyleId};
+
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::hash_map::Entry;
@@ -896,9 +898,9 @@ struct XmlScan {
     facts: scan::StoryFacts,
     refs: Vec<(String, Vec<RefFact>)>,
     /// `w:contentPart` relationship ids per owning part (for `CONTENTPART-TYPE`).
-    content_parts: Vec<(String, Vec<String>)>,
+    content_parts: Vec<(String, Vec<RelId>)>,
     /// Skipped text/xml contentPart and native InkML ids per owner, used only for the CT-MISMATCH exemption.
-    content_part_exemptions: Vec<(String, Vec<String>)>,
+    content_part_exemptions: Vec<(String, Vec<RelId>)>,
     /// A contentPart collection (per part or pooled) hit the fact budget.
     content_part_capped_any: bool,
     /// Owning parts whose contentPart consumption is NOT fully
@@ -915,9 +917,9 @@ struct XmlScan {
     /// Parts whose story facts were only partially examined.
     story_incomplete_parts: HashSet<String>,
     /// (ID, source part) listed by `w:footnotePr` / `w:endnotePr` in settings parts.
-    note_listings: (Vec<(String, String)>, Vec<(String, String)>),
+    note_listings: (Vec<(DecimalId, String)>, Vec<(DecimalId, String)>),
     /// Special note definitions: (owning part, id, is_endnote, w:type).
-    special_notes: Vec<(String, String, bool, String)>,
+    special_notes: Vec<(String, DecimalId, bool, String)>,
     /// Note definition or listing parts with an incomplete scan or pooled collection.
     note_incomplete_parts: HashSet<String>,
 }
@@ -953,9 +955,9 @@ fn check_xml(pkg: &Package, acc: &mut Acc) -> XmlScan {
     let mut facts = scan::StoryFacts::default();
     let mut story_incomplete_parts = HashSet::new();
     let mut refs: Vec<(String, Vec<RefFact>)> = Vec::new();
-    let mut content_parts: Vec<(String, Vec<String>)> = Vec::new();
+    let mut content_parts: Vec<(String, Vec<RelId>)> = Vec::new();
     let mut content_part_total = 0usize;
-    let mut content_part_exemptions: Vec<(String, Vec<String>)> = Vec::new();
+    let mut content_part_exemptions: Vec<(String, Vec<RelId>)> = Vec::new();
     let mut content_part_exemptions_total = 0usize;
     let mut content_part_capped_any = false;
     let mut content_part_incomplete_owners: HashSet<String> = HashSet::new();
@@ -963,7 +965,7 @@ fn check_xml(pkg: &Package, acc: &mut Acc) -> XmlScan {
     let mut compat_on = false;
     let mut compat_unknown = false;
     let mut note_listings = (Vec::new(), Vec::new());
-    let mut special_notes: Vec<(String, String, bool, String)> = Vec::new();
+    let mut special_notes: Vec<(String, DecimalId, bool, String)> = Vec::new();
     let mut note_incomplete_parts = HashSet::new();
     let mut pooled_capped = false;
     let mut facts_pooled_part: Option<String> = None;
@@ -1139,11 +1141,11 @@ fn check_xml(pkg: &Package, acc: &mut Acc) -> XmlScan {
 /// accumulated collections never exceed `cap`, however many parts
 /// contribute. Returns true when any entry was discarded.
 fn append_note_items(
-    note_listings: &mut (Vec<(String, String)>, Vec<(String, String)>),
-    special_notes: &mut Vec<(String, String, bool, String)>,
+    note_listings: &mut (Vec<(DecimalId, String)>, Vec<(DecimalId, String)>),
+    special_notes: &mut Vec<(String, DecimalId, bool, String)>,
     part: &str,
-    listings: (Vec<String>, Vec<String>),
-    specials: Vec<(String, bool, String)>,
+    listings: (Vec<DecimalId>, Vec<DecimalId>),
+    specials: Vec<(DecimalId, bool, String)>,
     cap: usize,
 ) -> bool {
     let mut capped = false;
@@ -1168,7 +1170,7 @@ fn append_note_items(
 /// Append one part's contentPart validation or exemption ids under the pooled fact
 /// budget, enforcing the allowance while appending (see
 /// `append_note_items`). Returns true when any id was discarded.
-fn append_content_parts(content_parts: &mut Vec<(String, Vec<String>)>, total: &mut usize, part: &str, mut ids: Vec<String>, cap: usize) -> bool {
+fn append_content_parts(content_parts: &mut Vec<(String, Vec<RelId>)>, total: &mut usize, part: &str, mut ids: Vec<RelId>, cap: usize) -> bool {
     let room = cap.saturating_sub(*total);
     let capped = ids.len() > room;
     if capped {
@@ -1184,7 +1186,7 @@ fn append_content_parts(content_parts: &mut Vec<(String, Vec<String>)>, total: &
 /// Retain only skipped references whose first-wins relationship resolves to text/xml.
 /// Word for the web opens that pairing but refuses editing an application/octet-stream target;
 /// skipped content must retain CT-MISMATCH for other types without gaining CONTENTPART-TYPE.
-fn retain_skipped_text_xml_refs(pkg: &Package, owner: &str, ids: &mut Vec<String>) {
+fn retain_skipped_text_xml_refs(pkg: &Package, owner: &str, ids: &mut Vec<RelId>) {
     if ids.is_empty() {
         return;
     }
@@ -1208,7 +1210,7 @@ fn retain_skipped_text_xml_refs(pkg: &Package, owner: &str, ids: &mut Vec<String
 
 /// Retain first-wins native references to InkML (MS-ODRAWXML §2.1.4) and report whether this owner has any InkML target.
 /// A capped native collection matters only for such an owner; documents without ink keep their existing checks and verdicts.
-fn retain_native_ink_refs(pkg: &Package, owner: &str, ids: &mut Vec<String>, capped: bool) -> bool {
+fn retain_native_ink_refs(pkg: &Package, owner: &str, ids: &mut Vec<RelId>, capped: bool) -> bool {
     if ids.is_empty() && !capped {
         return false;
     }
@@ -1325,13 +1327,13 @@ fn check_owner_note_pr(
         Some(sources) => sources[role].is_some_and(|entry| entry.name.eq_ignore_ascii_case(part)),
         None => part_owners(owner_map, part).contains(&owner),
     };
-    let listed_f: HashSet<&str> = xml.note_listings.0.iter().filter(|(_, part)| owned(part, 0)).map(|(id, _)| id.as_str()).collect();
-    let listed_e: HashSet<&str> = xml.note_listings.1.iter().filter(|(_, part)| owned(part, 0)).map(|(id, _)| id.as_str()).collect();
+    let listed_f: HashSet<&DecimalId> = xml.note_listings.0.iter().filter(|(_, part)| owned(part, 0)).map(|(id, _)| id).collect();
+    let listed_e: HashSet<&DecimalId> = xml.note_listings.1.iter().filter(|(_, part)| owned(part, 0)).map(|(id, _)| id).collect();
     for (part, id, is_end, t) in
         xml.special_notes.iter().filter(|(part, _, end, _)| forward_ok[usize::from(*end)] && owned(part, if *end { 2 } else { 1 }))
     {
         let listed = if *is_end { &listed_e } else { &listed_f };
-        if !listed.contains(id.as_str()) {
+        if !listed.contains(id) {
             let (note, pr) = if *is_end { ("endnote", "endnotePr") } else { ("footnote", "footnotePr") };
             acc.add_graded(
                 "NOTE-PR-LISTING", Severity::Error, Evidence::Observed, Some(part.clone()),
@@ -1345,9 +1347,9 @@ fn check_owner_note_pr(
         .enumerate()
     {
         if complete {
-            let defined: HashSet<&str> = defs.iter().filter(|(_, part)| owned(part, role + 1)).map(|(id, _)| id.as_str()).collect();
+            let defined: HashSet<&DecimalId> = defs.iter().filter(|(_, part)| owned(part, role + 1)).map(|(id, _)| id).collect();
             for (id, _) in listings.iter().filter(|(_, part)| owned(part, 0)) {
-                if !defined.contains(id.as_str()) {
+                if !defined.contains(id) {
                     acc.add(
                         "NOTE-PR-DANGLING",
                         None,
@@ -1366,7 +1368,7 @@ fn check_owner_note_pr(
 /// beats the extension Default (OPC §9.1.2). A relationship id the owner
 /// does not define is REL-REF-MISSING's finding, and an undeclared target
 /// is CT-UNDECLARED's; this check judges only a resolved, declared type.
-fn check_content_part_types(pkg: &Package, content_parts: &[(String, Vec<String>)], capped: bool, acc: &mut Acc) {
+fn check_content_part_types(pkg: &Package, content_parts: &[(String, Vec<RelId>)], capped: bool, acc: &mut Acc) {
     acc.ran("CONTENTPART-TYPE");
     if capped {
         acc.note(
@@ -1387,7 +1389,7 @@ fn check_content_part_types(pkg: &Package, content_parts: &[(String, Vec<String>
             }
             map
         };
-        let mut seen: std::collections::HashSet<&String> = std::collections::HashSet::new();
+        let mut seen: std::collections::HashSet<&RelId> = std::collections::HashSet::new();
         for id in ids {
             if !seen.insert(id) {
                 continue;
@@ -1476,8 +1478,8 @@ fn relationship_role(kind: &str) -> Option<scan::PartRole> {
 fn check_rels(
     pkg: &Package,
     refs: &[(String, Vec<RefFact>)],
-    content_parts: &[(String, Vec<String>)],
-    content_part_exemptions: &[(String, Vec<String>)],
+    content_parts: &[(String, Vec<RelId>)],
+    content_part_exemptions: &[(String, Vec<RelId>)],
     content_part_incomplete_owners: &HashSet<String>,
     content_part_scanned_owners: &HashSet<String>,
     acc: &mut Acc,
@@ -1606,7 +1608,7 @@ fn check_typed_image_refs(pkg: &Package, refs: &[(String, Vec<RefFact>)], acc: &
 }
 
 /// Collect the set of relationship IDs declared in `part`'s `.rels` file.
-fn part_rel_ids(pkg: &Package, part: &str) -> HashSet<String> {
+fn part_rel_ids(pkg: &Package, part: &str) -> HashSet<RelId> {
     let want = rels_part_name(part);
     match pkg.rels.iter().find(|r| r.name.eq_ignore_ascii_case(&want)) {
         Some(rp) => rp.rels.iter().map(|r| r.id.clone()).collect(),
@@ -1736,8 +1738,8 @@ fn rels_owner_name(rels_name: &str) -> Option<String> {
 /// w14:contentPart references to InkML join only this exemption collection (MS-ODRAWXML §2.1.4).
 fn check_typed_content(
     pkg: &Package,
-    content_parts: &[(String, Vec<String>)],
-    content_part_exemptions: &[(String, Vec<String>)],
+    content_parts: &[(String, Vec<RelId>)],
+    content_part_exemptions: &[(String, Vec<RelId>)],
     content_part_incomplete_owners: &HashSet<String>,
     content_part_scanned_owners: &HashSet<String>,
     acc: &mut Acc,
@@ -1747,7 +1749,7 @@ fn check_typed_content(
     // owning part's relationships-part name (compared case-insensitively).
     let mut consumed: HashMap<String, HashSet<&str>> = HashMap::new();
     for (owner, ids) in content_parts.iter().chain(content_part_exemptions) {
-        consumed.entry(rels_part_name(owner).to_ascii_lowercase()).or_default().extend(ids.iter().map(String::as_str));
+        consumed.entry(rels_part_name(owner).to_ascii_lowercase()).or_default().extend(ids.iter().map(RelId::as_str));
     }
     // Relationships-part names whose owner's consumption collection is
     // incomplete (budget-capped or unparseable): non-consumption is not
@@ -1938,7 +1940,7 @@ fn check_story(pkg: &Package, xml: &XmlScan, acc: &mut Acc) {
 }
 
 /// Duplicate decimal IDs are forbidden within a definition part, not between independent owners.
-fn report_definition_dups(acc: &mut Acc, rule: &'static str, items: &[(String, String)], what: &str) {
+fn report_definition_dups(acc: &mut Acc, rule: &'static str, items: &[(DecimalId, String)], what: &str) {
     let mut seen = HashSet::new();
     let mut reported = HashSet::new();
     for (id, part) in items {
@@ -1955,8 +1957,8 @@ fn check_owned_ids(
     xml: &XmlScan,
     kind: &str,
     ct: &str,
-    definitions: &[(String, String)],
-    references: &[(String, String)],
+    definitions: &[(DecimalId, String)],
+    references: &[(DecimalId, String)],
     acc: &mut Acc,
 ) {
     let owners = owner_scopes(pkg);
@@ -1973,7 +1975,7 @@ fn check_owned_ids(
         if source.is_some_and(|e| e.content_unavailable || xml.story_incomplete_parts.contains(&e.name.to_ascii_lowercase())) {
             continue;
         }
-        let defs: HashSet<String> =
+        let defs: HashSet<DecimalId> =
             definitions.iter().filter(|(_, part)| source.is_some_and(|e| e.name.eq_ignore_ascii_case(part))).map(|(id, _)| id.clone()).collect();
         let refs: Vec<_> = references.iter().filter(|(_, part)| part_owners(&owner_map, part).contains(&index)).cloned().collect();
         match kind {
@@ -2039,7 +2041,7 @@ fn check_header_footer_refs(pkg: &Package, facts: &scan::StoryFacts, acc: &mut A
         return;
     };
     let by_id: HashMap<&str, &package::Rel> = rp.rels.iter().map(|r| (r.id.as_str(), r)).collect();
-    let groups: [(&str, &str, &str, &[(String, String)]); 2] = [
+    let groups: [(&str, &str, &str, &[(RelId, String)]); 2] = [
         ("header", package::HEADER_CONTENT_TYPE, "headerReference", &facts.header_refs),
         ("footer", package::FOOTER_CONTENT_TYPE, "footerReference", &facts.footer_refs),
     ];
@@ -2321,7 +2323,7 @@ fn check_style_refs(pkg: &Package, xml: &XmlScan, acc: &mut Acc) {
     let cap = acc.limits.facts;
     let owners = owner_scopes(pkg);
     let owner_map = owner_index_map(pkg);
-    let mut per_owner: Vec<Option<HashSet<String>>> = Vec::with_capacity(owners.len());
+    let mut per_owner: Vec<Option<HashSet<StyleId>>> = Vec::with_capacity(owners.len());
     let mut present = false;
     let mut capped = false;
     let mut parsed_any = false;
@@ -2444,7 +2446,7 @@ fn check_styles_vocabulary(entry: &package::Entry, cap: usize, acc: &mut Acc) {
             format!("{part} defines {total} styles; MS-OI29500 states Word does not open a document containing more than 4,079 styles (Word for the web was observed opening 4,080 cleanly)"),
         );
     }
-    let mut ids: HashMap<String, String> = HashMap::new();
+    let mut ids: HashMap<String, StyleId> = HashMap::new();
     let mut names: HashMap<String, String> = HashMap::new();
     let mut reported_keys: HashSet<(&'static str, String)> = HashSet::new();
     for def in &defs {
@@ -2574,7 +2576,7 @@ fn check_numbering(pkg: &Package, xml: &XmlScan, acc: &mut Acc) {
     let cap = acc.limits.facts;
     let owners = owner_scopes(pkg);
     let owner_map = owner_index_map(pkg);
-    let mut numbering_cache: HashMap<String, Option<HashSet<String>>> = HashMap::new();
+    let mut numbering_cache: HashMap<String, Option<HashSet<DecimalId>>> = HashMap::new();
     // Each owner's numbering set, in owner order. `Some(set)` = the owner's numbering part was
     // examined, so `set` is the definitions it declares (empty when the owner has no numbering part
     // — established absent, so its references are genuinely dangling). `None` = the owner's
@@ -2582,12 +2584,12 @@ fn check_numbering(pkg: &Package, xml: &XmlScan, acc: &mut Acc) {
     // discovery source (its `.rels`, or the manifest in the no-owner scope) could not be read, so
     // that owner's references are not established as dangling and its dependent checks are skipped
     // (H8).
-    let mut num_sets: Vec<Option<HashSet<String>>> = Vec::with_capacity(owners.len());
-    let mut style_checks: Vec<(String, HashSet<String>)> = Vec::new();
+    let mut num_sets: Vec<Option<HashSet<DecimalId>>> = Vec::with_capacity(owners.len());
+    let mut style_checks: Vec<(String, HashSet<DecimalId>)> = Vec::new();
     for owner in &owners {
         let selection = supporting_part(pkg, owner.as_deref(), "numbering", package::NUMBERING_CONTENT_TYPE, acc);
         let num_part = selection.entry().map(|e| e.name.clone());
-        let num_set: Option<HashSet<String>> = match &num_part {
+        let num_set: Option<HashSet<DecimalId>> = match &num_part {
             Some(np) => {
                 if let Some(cached) = numbering_cache.get(np) {
                     cached.clone()
@@ -2626,7 +2628,7 @@ fn check_numbering(pkg: &Package, xml: &XmlScan, acc: &mut Acc) {
 /// Parse a numbering part, reporting duplicate definitions and dangling `w:abstractNumId`
 /// references. `None` when the part could not be read, did not parse, or exceeded a budget (its
 /// references must not be checked).
-fn process_numbering_part(pkg: &Package, xml: &XmlScan, name: &str, cap: usize, acc: &mut Acc) -> Option<HashSet<String>> {
+fn process_numbering_part(pkg: &Package, xml: &XmlScan, name: &str, cap: usize, acc: &mut Acc) -> Option<HashSet<DecimalId>> {
     let entry = entry_by_name(pkg, name)?;
     if !xml_source_complete(xml, entry) {
         acc.note(format!("{name} was not fully examined; list numbering absence was not checked"));
@@ -2654,10 +2656,10 @@ fn process_numbering_part(pkg: &Package, xml: &XmlScan, name: &str, cap: usize, 
     }
     report_dups_values(acc, &defs.num_ids, &entry.name, "w:num numId");
     report_dups_values(acc, &defs.abstract_ids, &entry.name, "w:abstractNum abstractNumId");
-    let abstract_set: HashSet<&str> = defs.abstract_ids.iter().map(String::as_str).collect();
+    let abstract_set: HashSet<&DecimalId> = defs.abstract_ids.iter().collect();
     for (num, abs) in &defs.num_to_abstract {
         match abs {
-            Some(a) if !defs.capped && !abstract_set.contains(a.as_str()) => acc.add(
+            Some(a) if !defs.capped && !abstract_set.contains(a) => acc.add(
                 "NUM-DANGLING",
                 Some(entry.name.clone()),
                 format!("w:num numId {num} references w:abstractNumId {a}, which has no w:abstractNum"),
@@ -2675,9 +2677,9 @@ fn process_numbering_part(pkg: &Package, xml: &XmlScan, name: &str, cap: usize, 
 fn report_style_num_refs(
     pkg: &Package,
     styles_name: &str,
-    num_set: &HashSet<String>,
+    num_set: &HashSet<DecimalId>,
     cap: usize,
-    reported: &mut HashSet<(String, String)>,
+    reported: &mut HashSet<(String, DecimalId)>,
     acc: &mut Acc,
 ) {
     let Some(entry) = entry_by_name(pkg, styles_name) else { return };
@@ -2701,10 +2703,10 @@ fn report_style_num_refs(
         acc.set_incomplete();
     }
     for val in &vals {
-        if val == "0" {
+        if val.is_zero() {
             continue;
         }
-        if !num_set.contains(val.as_str()) && reported.insert((entry.name.to_ascii_lowercase(), val.clone())) {
+        if !num_set.contains(val) && reported.insert((entry.name.to_ascii_lowercase(), val.clone())) {
             acc.add(
                 "NUM-DANGLING",
                 Some(entry.name.clone()),
@@ -2717,28 +2719,28 @@ fn report_style_num_refs(
 /// `NUM-DANGLING` for `w:numPr/w:numId` references in story parts, each checked against its owner's
 /// own numbering set. A reference whose owner's numbering could not be examined is skipped, so an
 /// unavailable numbering part never manufactures a dangling finding (H2/H8).
-fn report_num_refs(acc: &mut Acc, facts: &scan::StoryFacts, num_sets: &[Option<HashSet<String>>], owner_map: &HashMap<String, Vec<usize>>) {
-    let mut reported: HashSet<(&str, &str)> = HashSet::new();
+fn report_num_refs(acc: &mut Acc, facts: &scan::StoryFacts, num_sets: &[Option<HashSet<DecimalId>>], owner_map: &HashMap<String, Vec<usize>>) {
+    let mut reported: HashSet<(&DecimalId, &str)> = HashSet::new();
     for (val, part) in &facts.num_ids {
-        if val == "0" {
+        if val.is_zero() {
             continue;
         }
         for &owner in part_owners(owner_map, part) {
             let Some(Some(set)) = num_sets.get(owner) else { continue };
-            if !set.contains(val) && reported.insert((val.as_str(), part.as_str())) {
+            if !set.contains(val) && reported.insert((val, part.as_str())) {
                 acc.add("NUM-DANGLING", Some(part.clone()), format!("w:numPr references numId {val}, which has no w:num definition"));
             }
         }
     }
 }
 
-/// Report duplicate string values within a part for a specified attribute/construct name.
-fn report_dups_values(acc: &mut Acc, values: &[String], part: &str, what: &str) {
-    let mut counts: HashMap<&str, usize> = HashMap::new();
+/// Report duplicate numeric identities within a part for a specified attribute/construct name.
+fn report_dups_values(acc: &mut Acc, values: &[DecimalId], part: &str, what: &str) {
+    let mut counts: HashMap<&DecimalId, usize> = HashMap::new();
     for v in values {
-        *counts.entry(v.as_str()).or_default() += 1;
+        *counts.entry(v).or_default() += 1;
     }
-    let mut dups: Vec<&str> = counts.into_iter().filter(|(_, c)| *c > 1).map(|(v, _)| v).collect();
+    let mut dups: Vec<&DecimalId> = counts.into_iter().filter(|(_, c)| *c > 1).map(|(v, _)| v).collect();
     dups.sort_unstable();
     for v in dups {
         acc.add("NUM-DANGLING", Some(part.to_string()), format!("duplicate {what} {v} in {part}"));
@@ -2798,20 +2800,20 @@ fn check_commentex(pkg: &Package, xml: &XmlScan, acc: &mut Acc) {
         }
         // Paragraphs come from the owner's selected comments target. A shared target is checked
         // independently in every owner that selects it; unrelated discovery cannot add sources.
-        let comment_para: HashSet<&str> = facts.comment_para_ids.iter().filter(|(_, p)| contributes(p)).map(|(p, _)| p.as_str()).collect();
+        let comment_para: HashSet<&HexId> = facts.comment_para_ids.iter().filter(|(_, p)| contributes(p)).map(|(p, _)| p).collect();
         let ext_source = supporting_part(pkg, owner.as_deref(), "commentsExtended", package::COMMENTS_EXTENDED_CONTENT_TYPE, acc);
         let ext = ext_source.entry().and_then(|entry| read_comments_ext(entry, xml, cap, acc).map(|e| (entry.name.clone(), e)));
         let ext_complete = match &ext {
             Some((_, e)) => !e.capped,
             None => matches!(ext_source, PartSelection::Absent) && !discovery_unavailable(pkg, owner.as_deref()),
         };
-        let ex_para: HashSet<&str> = match &ext {
-            Some((_, e)) => e.entries.iter().map(|(p, _)| p.as_str()).collect(),
+        let ex_para: HashSet<&HexId> = match &ext {
+            Some((_, e)) => e.entries.iter().map(|(p, _)| p).collect(),
             None => HashSet::new(),
         };
         if let Some((name, e)) = &ext {
             for (para, parent) in &e.entries {
-                if comments_complete && !comment_para.contains(para.as_str()) {
+                if comments_complete && !comment_para.contains(para) {
                     acc.add(
                         "COMMENTEX-LINK",
                         Some(name.clone()),
@@ -2820,7 +2822,7 @@ fn check_commentex(pkg: &Package, xml: &XmlScan, acc: &mut Acc) {
                 }
                 if ext_complete
                     && let Some(p) = parent
-                    && !ex_para.contains(p.as_str())
+                    && !ex_para.contains(p)
                 {
                     acc.add(
                         "COMMENTEX-LINK",
@@ -2836,15 +2838,15 @@ fn check_commentex(pkg: &Package, xml: &XmlScan, acc: &mut Acc) {
             .entry()
             .and_then(|entry| read_comments_ids(entry, xml, cap, acc));
         let Some((cid_name, cid_ids, cid_complete)) = &cid else { continue };
-        let cid_set: HashSet<&str> = cid_ids.iter().map(String::as_str).collect();
+        let cid_set: HashSet<&HexId> = cid_ids.iter().collect();
         for id in cid_ids {
-            if ext_complete && !ex_para.contains(id.as_str()) {
+            if ext_complete && !ex_para.contains(id) {
                 acc.add("COMMENTEX-LINK", Some(cid_name.clone()), format!("commentsIds paraId {id} has no commentEx counterpart"));
             }
         }
         if let Some((name, e)) = &ext {
             for (para, _) in &e.entries {
-                if *cid_complete && !cid_set.contains(para.as_str()) {
+                if *cid_complete && !cid_set.contains(para) {
                     acc.add("COMMENTEX-LINK", Some(name.clone()), format!("commentEx paraId {para} has no commentsIds paraId counterpart"));
                 }
             }
@@ -2887,7 +2889,7 @@ fn read_comments_ext(entry: &package::Entry, xml: &XmlScan, cap: usize, acc: &mu
 
 /// Parse a commentsIds part, returning its part name and `w16cid:paraId` values. `None` when the part's link
 /// checks must be skipped. The returned boolean says whether the definition set is complete.
-fn read_comments_ids(entry: &package::Entry, xml: &XmlScan, cap: usize, acc: &mut Acc) -> Option<(String, Vec<String>, bool)> {
+fn read_comments_ids(entry: &package::Entry, xml: &XmlScan, cap: usize, acc: &mut Acc) -> Option<(String, Vec<HexId>, bool)> {
     let name = &entry.name;
     if !xml_source_complete(xml, entry) {
         acc.note(format!("{name} was not fully examined; commentsIds definition absence was not checked"));
@@ -3037,16 +3039,16 @@ fn check_custom_xml(pkg: &Package, xml: &XmlScan, acc: &mut Acc) {
 }
 
 /// Report duplicate identifier findings for a given rule across items.
-fn report_dups(acc: &mut Acc, rule: &'static str, items: &[(String, String)], what: &str) {
-    let mut first: HashMap<&str, &str> = HashMap::new();
-    let mut reported: HashSet<&str> = HashSet::new();
+fn report_dups<K: Eq + std::hash::Hash + std::fmt::Display>(acc: &mut Acc, rule: &'static str, items: &[(K, String)], what: &str) {
+    let mut first: HashMap<&K, &str> = HashMap::new();
+    let mut reported: HashSet<&K> = HashSet::new();
     for (id, part) in items {
-        match first.entry(id.as_str()) {
+        match first.entry(id) {
             Entry::Vacant(v) => {
                 v.insert(part.as_str());
             }
             Entry::Occupied(o) => {
-                if reported.insert(id.as_str()) {
+                if reported.insert(id) {
                     acc.add(rule, Some(part.clone()), format!("duplicate {what} {id} (first in {})", o.get()));
                 }
             }
@@ -3055,20 +3057,20 @@ fn report_dups(acc: &mut Acc, rule: &'static str, items: &[(String, String)], wh
 }
 
 /// Report missing definitions for references collected from story elements.
-fn report_missing(acc: &mut Acc, rule: &'static str, refs: &[(String, String)], defs: &HashSet<String>, what: &str) {
-    let mut reported: HashSet<&str> = HashSet::new();
+fn report_missing(acc: &mut Acc, rule: &'static str, refs: &[(DecimalId, String)], defs: &HashSet<DecimalId>, what: &str) {
+    let mut reported: HashSet<&DecimalId> = HashSet::new();
     for (id, part) in refs {
-        if !defs.contains(id) && reported.insert(id.as_str()) {
+        if !defs.contains(id) && reported.insert(id) {
             acc.add(rule, Some(part.clone()), format!("{what} {id} in {part} has no definition in the package"));
         }
     }
 }
 
 /// Report missing footnote or endnote definitions.
-fn report_missing_note(acc: &mut Acc, refs: &[(String, String)], defs: &HashSet<String>, kind: &str) {
-    let mut reported: HashSet<&str> = HashSet::new();
+fn report_missing_note(acc: &mut Acc, refs: &[(DecimalId, String)], defs: &HashSet<DecimalId>, kind: &str) {
+    let mut reported: HashSet<&DecimalId> = HashSet::new();
     for (id, part) in refs {
-        if !defs.contains(id) && reported.insert(id.as_str()) {
+        if !defs.contains(id) && reported.insert(id) {
             acc.add(
                 "REF-NOTE",
                 Some(part.clone()),

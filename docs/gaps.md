@@ -1,6 +1,6 @@
 # Where WordCraft falls short of Word
 
-> **Validation status:** 2026-11-12 · trivial · Selected glossary traversal retains nested glossary descendants; fallback pools exclude every glossary subtree (#5875). Glossary-typed parts stay outside main ownership, and multiple content-type fallback candidates leave glossary selection ambiguous (#5875). Synthetic controls only; readiness and format-fidelity estimates unchanged. Mixed Transitional/Strict package entry points to the same target leave the validator profile uncertain (#5875); either relationship order yields coverage and skips document checks. Distinct competing roots retain ambiguity treatment and independent per-part checks; the profile gate is not evaluated there.
+> **Validation status:** 2026-11-12 · minor · Representation lane: numeric identities are typed at extraction; the ownership migration is stopped at the brief's existing-expectation limit pending owner disposition (#5875). Synthetic identity controls only; the representation redesign is incomplete. Selected glossary traversal retains nested glossary descendants; fallback pools exclude every glossary subtree (#5875). Glossary-typed parts stay outside main ownership, and multiple content-type fallback candidates leave glossary selection ambiguous (#5875). Synthetic controls only; readiness and format-fidelity estimates unchanged. Mixed Transitional/Strict package entry points to the same target leave the validator profile uncertain (#5875); either relationship order yields coverage and skips document checks. Distinct competing roots retain ambiguity treatment and independent per-part checks; the profile gate is not evaluated there.
 
 > **CLI path update:** 2026-11-04 · Options before a non-Unicode input filename no longer make the CLI reject that filename; text option values still require Unicode; `run --file` and `run --script` retain native paths. No ranked gap or readiness estimate changes.
 
@@ -199,6 +199,7 @@ Page Setup's margin, paper-size and document-grid number boxes scroll long text 
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-11-12 | minor | Validator representation lane: decimal/hex identity keys and lexical relationship/style types; ownership migration stopped before changing seven conflicting existing test expectations (#5875). Synthetic controls; no readiness estimate changed. |
 | 2026-11-12 | trivial | Validator: keep nested glossary descendants in the selected glossary scope; exclude boundary-crossed subtrees from main and no-owner fallback while retaining direct main reachability (#5875). Synthetic controls; readiness estimates unchanged. |
 | 2026-11-12 | trivial | Validator: exclude every glossary-typed part from main traversal and fallback assignment; multiple content-type fallback candidates are ambiguous, with no selected anchor (#5875). Synthetic controls; no parity estimate changed. |
 | 2026-11-12 | trivial | Validator: mixed Transitional/Strict entry points to the same target skip document checks with coverage in either order (#5875); distinct competing roots retain ambiguity treatment without evaluating the profile gate. No parity estimate changed. |

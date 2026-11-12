@@ -117,7 +117,7 @@ impl ContentTypes {
 
 /// One relationship.
 pub(crate) struct Rel {
-    pub id: String,
+    pub id: crate::scan::RelId,
     pub kind: String,
     /// Resolved package path for internal targets; `None` for external ones.
     pub target_abs: Option<String>,
@@ -1050,7 +1050,7 @@ fn parse_rel(dir: &str, e: &BytesStart) -> Option<Rel> {
     let target = attr_plain(e, b"Target").unwrap_or_default();
     let external = attr_plain(e, b"TargetMode").is_some_and(|m| m.eq_ignore_ascii_case("External"));
     let target_abs = (!external).then(|| resolve(dir, &target));
-    Some(Rel { id, kind, target_abs, external })
+    Some(Rel { id: id.into(), kind, target_abs, external })
 }
 
 /// An unqualified OPC attribute; foreign qualified lookalikes never declare OPC metadata.

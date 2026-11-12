@@ -12,6 +12,142 @@ use quick_xml::reader::NsReader;
 
 use crate::{Acc, NS_DS, NS_M, NS_MC, NS_R, NS_W, NS_W14, NS_W15, NS_W16CID, NS_WP};
 
+/// Parsed numeric value; invalid spellings remain explicitly separate from valid keys.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum NumericKey {
+    Valid(String),
+    Invalid(String),
+}
+
+macro_rules! numeric_id {
+    ($name:ident, $radix:literal) => {
+        /// A schema numeric identity, parsed at extraction; raw spelling is diagnostic only.
+        #[derive(Clone, Debug)]
+        pub(crate) struct $name {
+            key: NumericKey,
+            raw: String,
+        }
+        impl $name {
+            /// Parse without a machine-integer bound or allocation proportional to numeric value.
+            fn parse(raw: String) -> Self {
+                let lexical = raw.trim_matches([' ', '\t', '\r', '\n']);
+                let digits = if $radix == 10 { lexical.strip_prefix(['+', '-']).unwrap_or(lexical) } else { lexical };
+                let valid = !digits.is_empty() && digits.bytes().all(|b| if $radix == 10 { b.is_ascii_digit() } else { b.is_ascii_hexdigit() });
+                let key = if valid {
+                    let digits = digits.trim_start_matches('0').to_ascii_lowercase();
+                    NumericKey::Valid(if digits.is_empty() {
+                        "0".into()
+                    } else if $radix == 10 && lexical.starts_with('-') {
+                        format!("-{digits}")
+                    } else {
+                        digits
+                    })
+                } else {
+                    NumericKey::Invalid(raw.clone())
+                };
+                Self { key, raw }
+            }
+        }
+        impl PartialEq for $name {
+            fn eq(&self, other: &Self) -> bool {
+                self.key == other.key
+            }
+        }
+        impl Eq for $name {}
+        impl PartialOrd for $name {
+            fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+                Some(self.cmp(other))
+            }
+        }
+        impl Ord for $name {
+            fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+                self.key.cmp(&other.key)
+            }
+        }
+        impl std::hash::Hash for $name {
+            fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+                self.key.hash(state);
+            }
+        }
+        impl std::fmt::Display for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(&self.raw)
+            }
+        }
+        impl From<String> for $name {
+            fn from(raw: String) -> Self {
+                Self::parse(raw)
+            }
+        }
+        impl From<&str> for $name {
+            fn from(raw: &str) -> Self {
+                Self::parse(raw.into())
+            }
+        }
+    };
+}
+numeric_id!(DecimalId, 10);
+numeric_id!(HexId, 16);
+
+impl DecimalId {
+    /// Numeric zero is the remove-numbering sentinel, regardless of spelling or sign.
+    pub(crate) fn is_zero(&self) -> bool {
+        matches!(&self.key, NumericKey::Valid(v) if v == "0")
+    }
+}
+
+impl HexId {
+    /// ST_LongHexNumber range validation uses the already parsed identity.
+    fn out_of_range(&self) -> bool {
+        match &self.key {
+            NumericKey::Valid(v) => u32::from_str_radix(v, 16).map_or(true, |n| n == 0 || n >= 0x8000_0000),
+            NumericKey::Invalid(_) => true,
+        }
+    }
+}
+
+macro_rules! lexical_id {
+    ($name:ident) => {
+        /// A lexical identity: numeric-looking spellings deliberately remain distinct.
+        #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        pub(crate) struct $name(String);
+        impl $name {
+            /// The exact XML spelling, with no numeric normalization.
+            pub(crate) fn as_str(&self) -> &str {
+                &self.0
+            }
+        }
+        impl From<String> for $name {
+            fn from(raw: String) -> Self {
+                Self(raw)
+            }
+        }
+        impl From<&str> for $name {
+            fn from(raw: &str) -> Self {
+                Self(raw.into())
+            }
+        }
+        impl std::fmt::Display for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(&self.0)
+            }
+        }
+        impl std::borrow::Borrow<str> for $name {
+            fn borrow(&self) -> &str {
+                &self.0
+            }
+        }
+        impl std::ops::Deref for $name {
+            type Target = str;
+            fn deref(&self) -> &str {
+                &self.0
+            }
+        }
+    };
+}
+lexical_id!(RelId);
+lexical_id!(StyleId);
+
 /// What a part is, for the checks that apply to it.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct PartRole {
@@ -30,8 +166,8 @@ pub(crate) struct PartRole {
 /// Ids collected from the story parts, pooled document-wide.
 #[derive(Default)]
 pub(crate) struct StoryFacts {
-    pub comment_defs: Vec<(String, String)>,
-    pub comment_refs: Vec<(String, String)>,
+    pub comment_defs: Vec<(DecimalId, String)>,
+    pub comment_refs: Vec<(DecimalId, String)>,
     /// `w:commentRangeStart` occurrences across this part. A plain counter, not
     /// a pooled fact: 32k ranges must not consume the pooled fact budget.
     pub comment_range_starts: usize,
@@ -43,26 +179,26 @@ pub(crate) struct StoryFacts {
     /// (compat-count counter).
     pub move_range_starts: usize,
     /// `w14:paraId` values on paragraphs in comments.xml (for `COMMENTEX-LINK`).
-    pub comment_para_ids: Vec<(String, String)>,
-    pub docpr: Vec<(String, String)>,
-    pub bookmarks: Vec<(String, String)>,
-    pub revisions: Vec<(String, String)>,
-    pub footnote_refs: Vec<(String, String)>,
-    pub endnote_refs: Vec<(String, String)>,
-    pub footnote_defs: Vec<(String, String)>,
-    pub endnote_defs: Vec<(String, String)>,
-    pub header_refs: Vec<(String, String)>,
-    pub footer_refs: Vec<(String, String)>,
-    pub style_refs: Vec<(String, String)>,
+    pub comment_para_ids: Vec<(HexId, String)>,
+    pub docpr: Vec<(DecimalId, String)>,
+    pub bookmarks: Vec<(DecimalId, String)>,
+    pub revisions: Vec<(DecimalId, String)>,
+    pub footnote_refs: Vec<(DecimalId, String)>,
+    pub endnote_refs: Vec<(DecimalId, String)>,
+    pub footnote_defs: Vec<(DecimalId, String)>,
+    pub endnote_defs: Vec<(DecimalId, String)>,
+    pub header_refs: Vec<(RelId, String)>,
+    pub footer_refs: Vec<(RelId, String)>,
+    pub style_refs: Vec<(StyleId, String)>,
     /// `w:numId/@w:val` values used by `w:numPr` in story parts (for `NUM-DANGLING`).
-    pub num_ids: Vec<(String, String)>,
+    pub num_ids: Vec<(DecimalId, String)>,
 }
 
 /// One `r:id`/`r:embed`/`r:link` value found in a part, with the element identity needed to
 /// verify typed references (an image element must resolve to an image relationship).
 pub(crate) struct RefFact {
     pub attr: String,
-    pub value: String,
+    pub value: RelId,
     /// The reference is the image target of an image element (`a:blip`, `v:imagedata`).
     pub image: bool,
 }
@@ -113,11 +249,11 @@ pub(crate) struct PartScan {
     pub refs: Vec<RefFact>,
     pub facts: StoryFacts,
     /// Relationship ids named by `w:contentPart` elements in this part.
-    pub content_parts: Vec<String>,
+    pub content_parts: Vec<RelId>,
     /// Skipped contentPart ids used only to exempt CT-MISMATCH, never for CONTENTPART-TYPE.
-    pub content_part_exemptions: Vec<String>,
+    pub content_part_exemptions: Vec<RelId>,
     /// Native Word 2010 contentPart ids; only resolved InkML targets may exempt CT-MISMATCH.
-    pub ink_content_parts: Vec<String>,
+    pub ink_content_parts: Vec<RelId>,
     /// The fact budget dropped at least one native ink reference.
     pub ink_content_part_capped: bool,
     /// The fact budget dropped at least one exemption-only id.
@@ -127,9 +263,9 @@ pub(crate) struct PartScan {
     /// This (settings) part carries `w:uiCompat97to2003`.
     pub compat_97_2003: bool,
     /// Special note definitions in this part: (id, is_endnote, w:type).
-    pub special_notes: Vec<(String, bool, String)>,
+    pub special_notes: Vec<(DecimalId, bool, String)>,
     /// Ids listed by `w:footnotePr` / `w:endnotePr` elements in this part.
-    pub note_listings: (Vec<String>, Vec<String>),
+    pub note_listings: (Vec<DecimalId>, Vec<DecimalId>),
     /// A note definition or listing was dropped at the fact budget.
     pub note_capped: bool,
     /// The generic fact budget dropped at least one fact in this part.
@@ -357,11 +493,11 @@ struct State {
     /// compatibility flag the count limits key on).
     compat_97: bool,
     /// Special note definitions in this part: (id, is_endnote, w:type).
-    special_notes: Vec<(String, bool, String)>,
+    special_notes: Vec<(DecimalId, bool, String)>,
     /// Ids listed by `w:footnotePr` elements in this part.
-    note_listings_f: Vec<String>,
+    note_listings_f: Vec<DecimalId>,
     /// Ids listed by `w:endnotePr` elements in this part.
-    note_listings_e: Vec<String>,
+    note_listings_e: Vec<DecimalId>,
     /// A note definition or listing was dropped at the fact budget.
     note_capped: bool,
     declared: Vec<Vec<String>>,
@@ -370,24 +506,24 @@ struct State {
     wrapper_depth: i64,
     fld_depth: i64,
     fld_extra_end: usize,
-    move_from_start: BTreeSet<String>,
-    move_from_end: BTreeSet<String>,
-    move_to_start: BTreeSet<String>,
-    move_to_end: BTreeSet<String>,
+    move_from_start: BTreeSet<DecimalId>,
+    move_from_end: BTreeSet<DecimalId>,
+    move_to_start: BTreeSet<DecimalId>,
+    move_to_end: BTreeSet<DecimalId>,
     move_from_names: BTreeSet<String>,
     move_to_names: BTreeSet<String>,
-    move_start_ids: Vec<String>,
-    bookmark_starts: BTreeSet<String>,
-    bookmark_ends: BTreeSet<String>,
+    move_start_ids: Vec<DecimalId>,
+    bookmark_starts: BTreeSet<DecimalId>,
+    bookmark_ends: BTreeSet<DecimalId>,
     /// Comment range ids in the parts where Word honours ranges (main and
     /// glossary stories, outside text boxes); paired at scan completion.
-    comment_range_start_ids: BTreeSet<String>,
-    comment_range_end_ids: BTreeSet<String>,
+    comment_range_start_ids: BTreeSet<DecimalId>,
+    comment_range_end_ids: BTreeSet<DecimalId>,
     /// Canonical `w14:paraId` values seen in this part, with their
     /// occurrence contexts (PARAID-DUP; judged at the prefix report —
     /// a repeat across one block's Choice and Fallback is excused,
     /// every other repeat is a duplicate).
-    para_ids: BTreeMap<String, ParaOcc>,
+    para_ids: BTreeMap<HexId, ParaOcc>,
     /// The stack of enclosing `mc:AlternateContent` blocks: a sequence
     /// number per block and the branch instance the scan is currently
     /// inside it (0 = inside no branch element).
@@ -1057,7 +1193,7 @@ fn record_note_pr(state: &mut State, id: &ElemId, attrs: &[Attribute], res: &Nam
     if ((is_end && role.is_endnotes) || (!is_end && role.is_footnotes))
         && let Some(t) = attr_ns(attrs, res, NS_W, b"type")
         && matches!(t.as_str(), "separator" | "continuationSeparator" | "continuationNotice")
-        && let Some(x) = attr_ns(attrs, res, NS_W, b"id").map(decimal_ident)
+        && let Some(x) = attr_ns(attrs, res, NS_W, b"id").map(DecimalId::parse)
     {
         if state.special_notes.len() >= state.fact_cap {
             state.note_capped = true;
@@ -1069,7 +1205,7 @@ fn record_note_pr(state: &mut State, id: &ElemId, attrs: &[Attribute], res: &Nam
         && let Some(parent) = state.frames.last()
     {
         let listed = if is_end { parent.is_endnote_pr } else { parent.is_footnote_pr };
-        if listed && let Some(x) = attr_ns(attrs, res, NS_W, b"id").map(decimal_ident) {
+        if listed && let Some(x) = attr_ns(attrs, res, NS_W, b"id").map(DecimalId::parse) {
             let list = if is_end { &mut state.note_listings_e } else { &mut state.note_listings_f };
             if list.len() >= state.fact_cap {
                 state.note_capped = true;
@@ -1092,39 +1228,6 @@ fn check_header_source(state: &State, id: &ElemId, role: PartRole, part: &str, a
             Some(part.to_string()),
             format!("w:headerSource is present under w:mailMerge in {part}; Word fails to open documents in which this element is present"),
         );
-    }
-}
-
-/// Parse an ST_LongHexNumber value lexically: the (trimmed) text must
-/// be non-empty and all hexadecimal digits before it is read as a
-/// number. (`u32::from_str_radix` alone would also accept a leading
-/// `+`, which is not a hexadecimal digit.)
-fn parse_hex_value(raw: &str) -> Option<u32> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() || !trimmed.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return None;
-    }
-    u32::from_str_radix(trimmed, 16).ok()
-}
-
-/// The canonical identity of a `w14:paraId` / `w14:textId` value: the
-/// parsed hex number without leading zeros, or the trimmed lowercased
-/// text when the value is not a hex number at all.
-fn hex_value_key(raw: &str) -> String {
-    match parse_hex_value(raw) {
-        Some(v) => format!("{v:x}"),
-        None => raw.trim().to_ascii_lowercase(),
-    }
-}
-
-/// Whether an ST_LongHexNumber value is outside the range MS-DOCX
-/// requires for paraId and textId: greater than 0 and less than
-/// 0x80000000. A value that is not a hex number is out of range by
-/// construction.
-fn hex_value_out_of_range(raw: &str) -> bool {
-    match parse_hex_value(raw) {
-        Some(v) => v == 0 || v >= 0x8000_0000,
-        None => true,
     }
 }
 
@@ -1216,10 +1319,10 @@ fn check_para_ids(state: &mut State, id: &ElemId, attrs: &[Attribute], res: &Nam
     if !role.is_story {
         return;
     }
-    let para = attr_ns(attrs, res, NS_W14, b"paraId");
-    let text = attr_ns(attrs, res, NS_W14, b"textId");
+    let para = attr_ns(attrs, res, NS_W14, b"paraId").map(HexId::parse);
+    let text = attr_ns(attrs, res, NS_W14, b"textId").map(HexId::parse);
     if let Some(raw) = &para {
-        if hex_value_out_of_range(raw) {
+        if raw.out_of_range() {
             acc.add(
                 "PARAID-VALUE",
                 Some(part.to_string()),
@@ -1229,7 +1332,7 @@ fn check_para_ids(state: &mut State, id: &ElemId, attrs: &[Attribute], res: &Nam
                 ),
             );
         }
-        let key = hex_value_key(raw);
+        let key = raw.clone();
         if state.para_ids.len() >= state.fact_cap && !state.para_ids.contains_key(&key) {
             state.fact_capped = true;
         } else {
@@ -1242,7 +1345,7 @@ fn check_para_ids(state: &mut State, id: &ElemId, attrs: &[Attribute], res: &Nam
         }
     }
     if let Some(raw) = &text {
-        if hex_value_out_of_range(raw) {
+        if raw.out_of_range() {
             acc.add(
                 "PARAID-VALUE",
                 Some(part.to_string()),
@@ -1345,7 +1448,7 @@ fn record_ids(state: &mut State, id: &ElemId, attrs: &[Attribute], res: &Namespa
     record_reference_ids(state, id, attrs, res, role, part);
     if id.wp() && id.local == "docPr" {
         let cap = state.fact_cap;
-        push_capped(&mut state.facts.docpr, cap, &mut state.fact_capped, attr_plain(attrs, b"id"), part);
+        push_capped(&mut state.facts.docpr, cap, &mut state.fact_capped, attr_plain(attrs, b"id").map(DecimalId::parse), part);
     }
 }
 
@@ -1360,7 +1463,7 @@ fn range_scope(state: &State, role: PartRole) -> bool {
 
 /// Collect one comment range id under the fact budget (the bookmark
 /// pairing sets' discipline: at the cap, record the cap and stop).
-fn collect_range_id(set: &mut BTreeSet<String>, cap: usize, capped: &mut bool, id: Option<String>) {
+fn collect_range_id(set: &mut BTreeSet<DecimalId>, cap: usize, capped: &mut bool, id: Option<DecimalId>) {
     if let Some(x) = id {
         if set.len() >= cap {
             *capped = true;
@@ -1375,10 +1478,10 @@ fn record_comment_ids(state: &mut State, id: &ElemId, attrs: &[Attribute], res: 
     let cap = state.fact_cap;
     match id.local.as_str() {
         "comment" if id.w() && role.is_comments => {
-            push_capped(&mut state.facts.comment_defs, cap, &mut state.fact_capped, attr_ns(attrs, res, NS_W, b"id").map(decimal_ident), part);
+            push_capped(&mut state.facts.comment_defs, cap, &mut state.fact_capped, attr_ns(attrs, res, NS_W, b"id").map(DecimalId::parse), part);
         }
         "commentReference" if id.w() => {
-            push_capped(&mut state.facts.comment_refs, cap, &mut state.fact_capped, attr_ns(attrs, res, NS_W, b"id").map(decimal_ident), part);
+            push_capped(&mut state.facts.comment_refs, cap, &mut state.fact_capped, attr_ns(attrs, res, NS_W, b"id").map(DecimalId::parse), part);
         }
         "commentRangeStart" if id.w() => {
             state.facts.comment_range_starts += 1;
@@ -1387,7 +1490,7 @@ fn record_comment_ids(state: &mut State, id: &ElemId, attrs: &[Attribute], res: 
                     &mut state.comment_range_start_ids,
                     state.fact_cap,
                     &mut state.fact_capped,
-                    attr_ns(attrs, res, NS_W, b"id").map(decimal_ident),
+                    attr_ns(attrs, res, NS_W, b"id").map(DecimalId::parse),
                 );
             }
         }
@@ -1397,32 +1500,20 @@ fn record_comment_ids(state: &mut State, id: &ElemId, attrs: &[Attribute], res: 
                     &mut state.comment_range_end_ids,
                     state.fact_cap,
                     &mut state.fact_capped,
-                    attr_ns(attrs, res, NS_W, b"id").map(decimal_ident),
+                    attr_ns(attrs, res, NS_W, b"id").map(DecimalId::parse),
                 );
             }
         }
         "p" if id.w() && role.is_comments => {
-            push_capped(&mut state.facts.comment_para_ids, cap, &mut state.fact_capped, attr_ns(attrs, res, NS_W14, b"paraId").map(hex_ident), part);
+            push_capped(
+                &mut state.facts.comment_para_ids,
+                cap,
+                &mut state.fact_capped,
+                attr_ns(attrs, res, NS_W14, b"paraId").map(HexId::parse),
+                part,
+            );
         }
         _ => {}
-    }
-}
-
-/// Canonicalize the value of an ST_DecimalNumber without a fixed-width integer parse.
-/// Invalid lexical forms are retained verbatim: this join does not validate their syntax.
-fn decimal_ident(value: String) -> String {
-    let lexical = value.trim_matches([' ', '\t', '\r', '\n']);
-    let digits = lexical.strip_prefix(['+', '-']).unwrap_or(lexical);
-    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
-        return value;
-    }
-    let digits = digits.trim_start_matches('0');
-    if digits.is_empty() {
-        "0".to_string()
-    } else if lexical.starts_with('-') {
-        format!("-{digits}")
-    } else {
-        digits.to_string()
     }
 }
 
@@ -1431,16 +1522,16 @@ fn record_note_ids(state: &mut State, id: &ElemId, attrs: &[Attribute], res: &Na
     let cap = state.fact_cap;
     match id.local.as_str() {
         "footnoteReference" if id.w() => {
-            push_capped(&mut state.facts.footnote_refs, cap, &mut state.fact_capped, attr_ns(attrs, res, NS_W, b"id").map(decimal_ident), part);
+            push_capped(&mut state.facts.footnote_refs, cap, &mut state.fact_capped, attr_ns(attrs, res, NS_W, b"id").map(DecimalId::parse), part);
         }
         "endnoteReference" if id.w() => {
-            push_capped(&mut state.facts.endnote_refs, cap, &mut state.fact_capped, attr_ns(attrs, res, NS_W, b"id").map(decimal_ident), part);
+            push_capped(&mut state.facts.endnote_refs, cap, &mut state.fact_capped, attr_ns(attrs, res, NS_W, b"id").map(DecimalId::parse), part);
         }
         "footnote" if id.w() && role.is_footnotes => {
-            push_capped(&mut state.facts.footnote_defs, cap, &mut state.fact_capped, attr_ns(attrs, res, NS_W, b"id").map(decimal_ident), part);
+            push_capped(&mut state.facts.footnote_defs, cap, &mut state.fact_capped, attr_ns(attrs, res, NS_W, b"id").map(DecimalId::parse), part);
         }
         "endnote" if id.w() && role.is_endnotes => {
-            push_capped(&mut state.facts.endnote_defs, cap, &mut state.fact_capped, attr_ns(attrs, res, NS_W, b"id").map(decimal_ident), part);
+            push_capped(&mut state.facts.endnote_defs, cap, &mut state.fact_capped, attr_ns(attrs, res, NS_W, b"id").map(DecimalId::parse), part);
         }
         _ => {}
     }
@@ -1457,13 +1548,13 @@ fn record_bookmark_ids(state: &mut State, id: &ElemId, attrs: &[Attribute], res:
                 state.fact_capped = true;
                 return;
             }
-            if let Some(x) = attr_ns(attrs, res, NS_W, b"id") {
+            if let Some(x) = attr_ns(attrs, res, NS_W, b"id").map(DecimalId::parse) {
                 state.bookmark_starts.insert(x.clone());
                 push_capped(&mut state.facts.bookmarks, state.fact_cap, &mut state.fact_capped, Some(x), part);
             }
         }
         "bookmarkEnd" if id.w() => {
-            if let Some(x) = attr_ns(attrs, res, NS_W, b"id") {
+            if let Some(x) = attr_ns(attrs, res, NS_W, b"id").map(DecimalId::parse) {
                 if state.bookmark_ends.len() >= state.fact_cap {
                     state.fact_capped = true;
                 } else {
@@ -1480,7 +1571,7 @@ fn record_revision_ids(state: &mut State, id: &ElemId, attrs: &[Attribute], res:
     let is_revision =
         matches!(id.local.as_str(), "ins" | "del" | "moveFrom" | "moveTo" | "rPrChange" | "pPrChange" | "sectPrChange" | "cellIns" | "cellDel");
     if id.w() && is_revision {
-        push_capped(&mut state.facts.revisions, state.fact_cap, &mut state.fact_capped, attr_ns(attrs, res, NS_W, b"id"), part);
+        push_capped(&mut state.facts.revisions, state.fact_cap, &mut state.fact_capped, attr_ns(attrs, res, NS_W, b"id").map(DecimalId::parse), part);
     }
 }
 
@@ -1489,23 +1580,23 @@ fn record_reference_ids(state: &mut State, id: &ElemId, attrs: &[Attribute], res
     let cap = state.fact_cap;
     match id.local.as_str() {
         "headerReference" if id.w() && role.is_main => {
-            push_capped(&mut state.facts.header_refs, cap, &mut state.fact_capped, attr_ns(attrs, res, NS_R, b"id"), part);
+            push_capped(&mut state.facts.header_refs, cap, &mut state.fact_capped, attr_ns(attrs, res, NS_R, b"id").map(RelId::from), part);
         }
         "footerReference" if id.w() && role.is_main => {
-            push_capped(&mut state.facts.footer_refs, cap, &mut state.fact_capped, attr_ns(attrs, res, NS_R, b"id"), part);
+            push_capped(&mut state.facts.footer_refs, cap, &mut state.fact_capped, attr_ns(attrs, res, NS_R, b"id").map(RelId::from), part);
         }
         "pStyle" | "rStyle" if id.w() => {
-            push_capped(&mut state.facts.style_refs, cap, &mut state.fact_capped, attr_ns(attrs, res, NS_W, b"val"), part);
+            push_capped(&mut state.facts.style_refs, cap, &mut state.fact_capped, attr_ns(attrs, res, NS_W, b"val").map(StyleId::from), part);
         }
         "numId" if id.w() => {
-            push_capped(&mut state.facts.num_ids, cap, &mut state.fact_capped, attr_ns(attrs, res, NS_W, b"val"), part);
+            push_capped(&mut state.facts.num_ids, cap, &mut state.fact_capped, attr_ns(attrs, res, NS_W, b"val").map(DecimalId::parse), part);
         }
         _ => {}
     }
 }
 
 /// Insert a collected id/name into a set, honouring the fact budget.
-fn insert_name(into: &mut BTreeSet<String>, cap: usize, capped: &mut bool, value: Option<String>) {
+fn insert_name<T: Ord>(into: &mut BTreeSet<T>, cap: usize, capped: &mut bool, value: Option<T>) {
     if let Some(v) = value {
         if into.len() >= cap {
             *capped = true;
@@ -1516,7 +1607,7 @@ fn insert_name(into: &mut BTreeSet<String>, cap: usize, capped: &mut bool, value
 }
 
 /// Push a `(value, part)` pair into a vector, bounded by the fact capacity limit.
-fn push_capped(into: &mut Vec<(String, String)>, cap: usize, capped: &mut bool, value: Option<String>, part: &str) {
+fn push_capped<T>(into: &mut Vec<(T, String)>, cap: usize, capped: &mut bool, value: Option<T>, part: &str) {
     if into.len() >= cap {
         *capped = true;
         return;
@@ -1549,7 +1640,7 @@ fn record_structure(state: &mut State, id: &ElemId, attrs: &[Attribute], res: &N
         }
         "moveFromRangeStart" => {
             state.facts.move_range_starts += 1;
-            if let Some(x) = attr_ns(attrs, res, NS_W, b"id") {
+            if let Some(x) = attr_ns(attrs, res, NS_W, b"id").map(DecimalId::parse) {
                 if state.move_from_start.len() >= state.fact_cap || state.move_start_ids.len() >= state.fact_cap {
                     state.fact_capped = true;
                 } else {
@@ -1560,11 +1651,11 @@ fn record_structure(state: &mut State, id: &ElemId, attrs: &[Attribute], res: &N
             insert_name(&mut state.move_from_names, state.fact_cap, &mut state.fact_capped, attr_ns(attrs, res, NS_W, b"name"));
         }
         "moveFromRangeEnd" => {
-            insert_name(&mut state.move_from_end, state.fact_cap, &mut state.fact_capped, attr_ns(attrs, res, NS_W, b"id"));
+            insert_name(&mut state.move_from_end, state.fact_cap, &mut state.fact_capped, attr_ns(attrs, res, NS_W, b"id").map(DecimalId::parse));
         }
         "moveToRangeStart" => {
             state.facts.move_range_starts += 1;
-            if let Some(x) = attr_ns(attrs, res, NS_W, b"id") {
+            if let Some(x) = attr_ns(attrs, res, NS_W, b"id").map(DecimalId::parse) {
                 if state.move_to_start.len() >= state.fact_cap || state.move_start_ids.len() >= state.fact_cap {
                     state.fact_capped = true;
                 } else {
@@ -1575,7 +1666,7 @@ fn record_structure(state: &mut State, id: &ElemId, attrs: &[Attribute], res: &N
             insert_name(&mut state.move_to_names, state.fact_cap, &mut state.fact_capped, attr_ns(attrs, res, NS_W, b"name"));
         }
         "moveToRangeEnd" => {
-            insert_name(&mut state.move_to_end, state.fact_cap, &mut state.fact_capped, attr_ns(attrs, res, NS_W, b"id"));
+            insert_name(&mut state.move_to_end, state.fact_cap, &mut state.fact_capped, attr_ns(attrs, res, NS_W, b"id").map(DecimalId::parse));
         }
         "ins" | "del" | "moveFrom" | "moveTo" => {
             if !empty {
@@ -1607,7 +1698,7 @@ const NS_A: &str = "http://schemas.openxmlformats.org/drawingml/2006/main";
 const NS_V: &str = "urn:schemas-microsoft-com:vml";
 
 /// Collect the relationship id named by a `w:contentPart` element, if any.
-fn collect_content_part(id: &ElemId, attrs: &[Attribute], res: &NamespaceResolver, out: &mut Vec<String>, cap: usize, capped: &mut bool) {
+fn collect_content_part(id: &ElemId, attrs: &[Attribute], res: &NamespaceResolver, out: &mut Vec<RelId>, cap: usize, capped: &mut bool) {
     if id.w()
         && id.local == "contentPart"
         && let Some(v) = attr_ns(attrs, res, NS_R, b"id")
@@ -1616,7 +1707,7 @@ fn collect_content_part(id: &ElemId, attrs: &[Attribute], res: &NamespaceResolve
             *capped = true;
             return;
         }
-        out.push(v);
+        out.push(v.into());
     }
 }
 
@@ -1629,7 +1720,7 @@ fn collect_ink_content_part(id: &ElemId, attrs: &[Attribute], res: &NamespaceRes
         if out.ink_content_parts.len() >= cap {
             out.ink_content_part_capped = true;
         } else {
-            out.ink_content_parts.push(value);
+            out.ink_content_parts.push(value.into());
         }
     }
 }
@@ -1657,13 +1748,13 @@ fn collect_refs(id: &ElemId, attrs: &[Attribute], res: &NamespaceResolver, out: 
                 *capped = true;
                 return;
             }
-            out.push(RefFact { attr: String::from_utf8_lossy(l).into_owned(), value: v.into_owned(), image });
+            out.push(RefFact { attr: String::from_utf8_lossy(l).into_owned(), value: v.into_owned().into(), image });
         }
     }
 }
 
 /// Report `STRUCT-MOVE-UNPAIRED` findings for items present in `set` but missing from `counterpart`.
-fn report_unpaired(acc: &mut Acc, part: &str, tag: &str, set: &BTreeSet<String>, counterpart: &BTreeSet<String>, want: &str) {
+fn report_unpaired(acc: &mut Acc, part: &str, tag: &str, set: &BTreeSet<DecimalId>, counterpart: &BTreeSet<DecimalId>, want: &str) {
     for id in set.difference(counterpart) {
         acc.add("STRUCT-MOVE-UNPAIRED", Some(part.to_string()), format!("{tag} with w:id {id} in {part} has no matching {want}"));
     }
@@ -1677,11 +1768,11 @@ fn report_name_pairs(acc: &mut Acc, part: &str, tag: &str, names: &BTreeSet<Stri
 }
 
 /// Report `STRUCT-MOVE-UNPAIRED` findings when a move start ID is reused within a single part.
-fn report_duplicate_move_ids(acc: &mut Acc, part: &str, ids: &[String]) {
+fn report_duplicate_move_ids(acc: &mut Acc, part: &str, ids: &[DecimalId]) {
     let mut seen = BTreeSet::new();
     let mut reported = BTreeSet::new();
     for id in ids {
-        if !seen.insert(id.as_str()) && reported.insert(id.as_str()) {
+        if !seen.insert(id) && reported.insert(id) {
             acc.add("STRUCT-MOVE-UNPAIRED", Some(part.to_string()), format!("move range-start id {id} appears more than once in {part}"));
         }
     }
@@ -1690,7 +1781,7 @@ fn report_duplicate_move_ids(acc: &mut Acc, part: &str, ids: &[String]) {
 /// Report `COMMENT-RANGE-UNPAIRED` findings for comment ranges that have a
 /// start without an end or vice versa (collected only where Word honours
 /// ranges — see `range_scope`).
-fn report_comment_ranges(acc: &mut Acc, part: &str, starts: &BTreeSet<String>, ends: &BTreeSet<String>) {
+fn report_comment_ranges(acc: &mut Acc, part: &str, starts: &BTreeSet<DecimalId>, ends: &BTreeSet<DecimalId>) {
     for id in starts.difference(ends) {
         acc.add(
             "COMMENT-RANGE-UNPAIRED",
@@ -1708,7 +1799,7 @@ fn report_comment_ranges(acc: &mut Acc, part: &str, starts: &BTreeSet<String>, e
 }
 
 /// Report `BOOKMARK-UNPAIRED` findings for bookmarks that have a start tag without an end or vice versa.
-fn report_bookmarks(acc: &mut Acc, part: &str, starts: &BTreeSet<String>, ends: &BTreeSet<String>) {
+fn report_bookmarks(acc: &mut Acc, part: &str, starts: &BTreeSet<DecimalId>, ends: &BTreeSet<DecimalId>) {
     for id in starts.difference(ends) {
         acc.add("BOOKMARK-UNPAIRED", Some(part.to_string()), format!("w:bookmarkStart with w:id {id} in {part} has no matching w:bookmarkEnd"));
     }
@@ -1850,16 +1941,6 @@ fn lossy(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
 
-/// Canonicalise a hex identifier value (`w14:paraId`, `w15:paraIdParent`, `w16cid:paraId`:
-/// ST_LongHexNumber). The same number may be written in either case, so it is case-folded at
-/// collection. The joins that compare these values are the ones `COMMENTEX-LINK` actually performs:
-/// a commentEx `paraId` against a comments paragraph's `w14:paraId`; a commentEx `paraIdParent`
-/// against another commentEx `paraId`; and a commentsIds `w16cid:paraId` against a commentEx
-/// `paraId`. The `w16cid:durableId` attribute is not read and no durable-id value is compared.
-fn hex_ident(v: String) -> String {
-    v.to_ascii_lowercase()
-}
-
 /// Check whether the text event consists entirely of XML whitespace characters.
 fn is_whitespace(e: &quick_xml::events::BytesText) -> bool {
     e.as_ref().iter().all(|b| matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
@@ -1948,10 +2029,10 @@ fn digit(c: u8, radix: u32) -> Option<u32> {
 /// `w:num`/`w:abstractNum` definitions from a numbering part.
 #[derive(Default)]
 pub(crate) struct NumberingDefs {
-    pub num_ids: Vec<String>,
-    pub abstract_ids: Vec<String>,
+    pub num_ids: Vec<DecimalId>,
+    pub abstract_ids: Vec<DecimalId>,
     /// Each `w:num`'s `numId` and the `w:abstractNumId` it references, if any.
-    pub num_to_abstract: Vec<(String, Option<String>)>,
+    pub num_to_abstract: Vec<(DecimalId, Option<DecimalId>)>,
     /// The per-category budget was exhausted while parsing.
     pub capped: bool,
 }
@@ -2051,7 +2132,7 @@ fn numbering_open(
     }
     match id.local.as_str() {
         "abstractNum" => {
-            if let Some(x) = attr_ns(attrs, res, NS_W, b"abstractNumId") {
+            if let Some(x) = attr_ns(attrs, res, NS_W, b"abstractNumId").map(DecimalId::parse) {
                 if defs.abstract_ids.len() >= cap {
                     defs.capped = true;
                 } else {
@@ -2061,7 +2142,7 @@ fn numbering_open(
             false
         }
         "num" => {
-            if let Some(x) = attr_ns(attrs, res, NS_W, b"numId") {
+            if let Some(x) = attr_ns(attrs, res, NS_W, b"numId").map(DecimalId::parse) {
                 if defs.num_ids.len() >= cap {
                     defs.capped = true;
                     *in_num = None;
@@ -2079,7 +2160,7 @@ fn numbering_open(
             }
         }
         "abstractNumId" => {
-            if let (Some(i), Some(v)) = (*in_num, attr_ns(attrs, res, NS_W, b"val"))
+            if let (Some(i), Some(v)) = (*in_num, attr_ns(attrs, res, NS_W, b"val").map(DecimalId::parse))
                 && let Some(slot) = defs.num_to_abstract.get_mut(i)
             {
                 slot.1 = Some(v);
@@ -2093,7 +2174,7 @@ fn numbering_open(
 /// The `w:numId/@w:val` values referenced by `w:numPr` in a styles part. `None` when it does not
 /// parse. `w:numId` `0` is handled by the caller (it is a sentinel, not a reference). References
 /// inside a skipped `mc:AlternateContent` branch are not collected (H3).
-pub(crate) fn parse_style_num_ids(text: &str, cap: usize, guard: &mut ParseGuard) -> Option<(Vec<String>, bool)> {
+pub(crate) fn parse_style_num_ids(text: &str, cap: usize, guard: &mut ParseGuard) -> Option<(Vec<DecimalId>, bool)> {
     let mut reader = NsReader::from_reader(text.as_bytes());
     let mut buf = Vec::new();
     let mut out = Vec::new();
@@ -2134,10 +2215,10 @@ pub(crate) fn parse_style_num_ids(text: &str, cap: usize, guard: &mut ParseGuard
 }
 
 /// Extract and append a `w:numId/@w:val` reference to the list, respecting the capacity cap.
-fn push_style_num_id(out: &mut Vec<String>, capped: &mut bool, id: &ElemId, attrs: &[Attribute], res: &NamespaceResolver, cap: usize) {
+fn push_style_num_id(out: &mut Vec<DecimalId>, capped: &mut bool, id: &ElemId, attrs: &[Attribute], res: &NamespaceResolver, cap: usize) {
     if id.w()
         && id.local == "numId"
-        && let Some(v) = attr_ns(attrs, res, NS_W, b"val")
+        && let Some(v) = attr_ns(attrs, res, NS_W, b"val").map(DecimalId::parse)
     {
         if out.len() >= cap {
             *capped = true;
@@ -2149,7 +2230,7 @@ fn push_style_num_id(out: &mut Vec<String>, capped: &mut bool, id: &ElemId, attr
 
 /// The `w:style/@w:styleId` values of a styles part. `None` when it does not parse. Definitions
 /// inside a skipped `mc:AlternateContent` branch are not collected (H3).
-pub(crate) fn parse_style_ids(text: &str, cap: usize, guard: &mut ParseGuard) -> Option<(HashSet<String>, bool)> {
+pub(crate) fn parse_style_ids(text: &str, cap: usize, guard: &mut ParseGuard) -> Option<(HashSet<StyleId>, bool)> {
     let mut reader = NsReader::from_reader(text.as_bytes());
     let mut buf = Vec::new();
     let mut defs = HashSet::new();
@@ -2194,7 +2275,7 @@ pub(crate) fn parse_style_ids(text: &str, cap: usize, guard: &mut ParseGuard) ->
 #[derive(Default)]
 pub(crate) struct StyleDef {
     /// The `w:style/@w:styleId` value, if present.
-    pub id: Option<String>,
+    pub id: Option<StyleId>,
     /// The first `w:name/@w:val` inside the style, if present.
     pub name: Option<String>,
     /// Whether a `w:name` child was seen at all: the FIRST name
@@ -2251,7 +2332,7 @@ pub(crate) fn parse_style_defs(text: &str, cap: usize, guard: &mut ParseGuard) -
                         if id.w() && id.local == "style" && depth == 2 {
                             total += 1;
                             current = Some(StyleDef {
-                                id: attr_ns(&attrs, reader.resolver(), NS_W, b"styleId"),
+                                id: attr_ns(&attrs, reader.resolver(), NS_W, b"styleId").map(StyleId::from),
                                 style_type: attr_ns(&attrs, reader.resolver(), NS_W, b"type"),
                                 ..StyleDef::default()
                             });
@@ -2282,7 +2363,7 @@ pub(crate) fn parse_style_defs(text: &str, cap: usize, guard: &mut ParseGuard) -
                                 capped = true;
                             } else {
                                 defs.push(StyleDef {
-                                    id: attr_ns(&attrs, reader.resolver(), NS_W, b"styleId"),
+                                    id: attr_ns(&attrs, reader.resolver(), NS_W, b"styleId").map(StyleId::from),
                                     style_type: attr_ns(&attrs, reader.resolver(), NS_W, b"type"),
                                     ..StyleDef::default()
                                 });
@@ -2404,7 +2485,7 @@ fn parse_part_names(text: &str, cap: usize, guard: &mut ParseGuard, ns: &str, el
 }
 
 /// Extract and insert a `w:style/@w:styleId` definition into the set, respecting the capacity cap.
-fn push_style_id(defs: &mut HashSet<String>, capped: &mut bool, id: &ElemId, attrs: &[Attribute], res: &NamespaceResolver, cap: usize) {
+fn push_style_id(defs: &mut HashSet<StyleId>, capped: &mut bool, id: &ElemId, attrs: &[Attribute], res: &NamespaceResolver, cap: usize) {
     if id.w()
         && id.local == "style"
         && let Some(v) = attr_ns(attrs, res, NS_W, b"styleId")
@@ -2412,7 +2493,7 @@ fn push_style_id(defs: &mut HashSet<String>, capped: &mut bool, id: &ElemId, att
         if defs.len() >= cap {
             *capped = true;
         } else {
-            defs.insert(v);
+            defs.insert(v.into());
         }
     }
 }
@@ -2529,7 +2610,7 @@ fn push_custom_xml_schema(out: &mut Vec<String>, capped: &mut bool, id: &ElemId,
 /// `w15:commentEx` entries: `(paraId, paraIdParent)`.
 #[derive(Default)]
 pub(crate) struct CommentEx {
-    pub entries: Vec<(String, Option<String>)>,
+    pub entries: Vec<(HexId, Option<HexId>)>,
     /// The per-category budget was exhausted while parsing.
     pub capped: bool,
 }
@@ -2580,8 +2661,8 @@ fn push_comment_ex(out: &mut CommentEx, id: &ElemId, attrs: &[Attribute], res: &
         && id.local == "commentEx"
         && let Some(para) = attr_ns(attrs, res, NS_W15, b"paraId")
     {
-        let para = hex_ident(para);
-        let parent = attr_ns(attrs, res, NS_W15, b"paraIdParent").map(hex_ident);
+        let para = HexId::parse(para);
+        let parent = attr_ns(attrs, res, NS_W15, b"paraIdParent").map(HexId::parse);
         if out.entries.len() >= cap {
             out.capped = true;
         } else {
@@ -2592,7 +2673,7 @@ fn push_comment_ex(out: &mut CommentEx, id: &ElemId, attrs: &[Attribute], res: &
 
 /// The `w16cid:commentId/@w16cid:paraId` values of a commentsIds part. `None` when it does not
 /// parse.
-pub(crate) fn parse_comments_ids(text: &str, cap: usize, guard: &mut ParseGuard) -> Option<(Vec<String>, bool)> {
+pub(crate) fn parse_comments_ids(text: &str, cap: usize, guard: &mut ParseGuard) -> Option<(Vec<HexId>, bool)> {
     let mut reader = NsReader::from_reader(text.as_bytes());
     let mut buf = Vec::new();
     let mut out = Vec::new();
@@ -2633,7 +2714,7 @@ pub(crate) fn parse_comments_ids(text: &str, cap: usize, guard: &mut ParseGuard)
 }
 
 /// Extract and append a `w16cid:commentId/@w16cid:paraId` entry to the list, respecting capacity.
-fn push_comment_id(out: &mut Vec<String>, capped: &mut bool, id: &ElemId, attrs: &[Attribute], res: &NamespaceResolver, cap: usize) {
+fn push_comment_id(out: &mut Vec<HexId>, capped: &mut bool, id: &ElemId, attrs: &[Attribute], res: &NamespaceResolver, cap: usize) {
     if id.local_w(NS_W16CID)
         && id.local == "commentId"
         && let Some(v) = attr_ns(attrs, res, NS_W16CID, b"paraId")
@@ -2641,7 +2722,7 @@ fn push_comment_id(out: &mut Vec<String>, capped: &mut bool, id: &ElemId, attrs:
         if out.len() >= cap {
             *capped = true;
         } else {
-            out.push(hex_ident(v));
+            out.push(HexId::parse(v));
         }
     }
 }
