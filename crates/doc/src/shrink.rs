@@ -7,11 +7,12 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use crate::Document;
 use crate::edit::{each_para, each_para_mut};
 use crate::para::Paragraph;
 use crate::parts::PartKind;
 use crate::props::{CharProps, LineSpacing, ParaProps};
+use crate::styles::StyleSheet;
+use crate::{Block, Document};
 
 /// Minimum font size allowed in points (WordCraft floor).
 pub const MIN_SHRINK_FONT_SIZE: f32 = 4.0;
@@ -29,17 +30,51 @@ pub fn round_half_pt(size: f32) -> f32 {
     (clamped * 2.0).round() / 2.0
 }
 
+/// Cumulative fit-to-page typography reduction state.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct FitState {
+    /// Cumulative font reduction delta in points.
+    pub cum_delta: f32,
+    /// Cumulative line spacing scale factor.
+    pub cum_space: f32,
+    /// Unique effective body font sizes present immediately after the reduction was applied.
+    pub reduced_font_sizes: Vec<f32>,
+    /// Unique effective line spacing values present immediately after the reduction was applied.
+    pub reduced_line_spacings: Vec<LineSpacing>,
+}
+
 /// Scale a font size down by `delta_pt`.
 #[inline]
 fn scale_size(size: f32, delta_pt: f32) -> f32 {
-    round_half_pt(size - delta_pt)
+    if delta_pt == 0.0 {
+        return size;
+    }
+    // Round up so the reduction never exceeds `delta_pt`, and never enlarge.
+    let target = (size - delta_pt).clamp(MIN_SHRINK_FONT_SIZE, MAX_SHRINK_FONT_SIZE);
+    ((target * 2.0).ceil() / 2.0).min(size)
 }
 
 /// Scale a spacing value (e.g. `space_before`, `space_after`) by `space_factor`.
+///
+/// Rounds to half-points while capping at the original nonnegative spacing value so reduction never increases spacing.
 #[inline]
 fn scale_spacing(val: f32, space_factor: f32) -> f32 {
-    let scaled = (val * space_factor).clamp(0.0, 1584.0);
-    (scaled * 2.0).round() / 2.0
+    let non_neg = val.max(0.0);
+    let scaled = (non_neg * space_factor).clamp(0.0, 1584.0);
+    ((scaled * 2.0).round() / 2.0).min(non_neg)
+}
+
+/// Scale fixed line spacing in points respecting the safe readability floor and rounding upward to half-points.
+///
+/// Rounds upward to half-points so the result never falls below the 0.94 floor, and caps at `pts` so
+/// reduction never increases fixed line spacing.
+#[inline]
+fn scale_fixed_line_spacing(pts: f32, space_factor: f32) -> f32 {
+    let floor = pts * MIN_LINE_SPACING_FACTOR;
+    let scaled = (pts * space_factor).max(floor).clamp(0.0, 1584.0);
+    // Round upward to half-points (0.5 pt) so the resulting spacing never falls below the 0.94 floor.
+    ((scaled * 2.0).ceil() / 2.0).min(pts)
 }
 
 /// Scale line spacing by `space_factor` respecting the safe readability floor.
@@ -51,21 +86,24 @@ fn scale_line_spacing(ls: LineSpacing, space_factor: f32) -> LineSpacing {
             // safe readability floor of 0.94 factor (~6% max compression).
             let floor = m * MIN_LINE_SPACING_FACTOR;
             let new_m = (m * space_factor).max(floor).clamp(0.5, 132.0);
-            LineSpacing::Multiple((new_m * 100.0).round() / 100.0)
+            // Round upward to a hundredth so the resulting multiple never falls below the 0.94 floor.
+            LineSpacing::Multiple(((new_m * 100.0).ceil() / 100.0).min(m))
         }
-        LineSpacing::AtLeast(pts) => LineSpacing::AtLeast(scale_spacing(pts, space_factor.max(MIN_LINE_SPACING_FACTOR))),
-        LineSpacing::Exactly(pts) => LineSpacing::Exactly(scale_spacing(pts, space_factor.max(MIN_LINE_SPACING_FACTOR))),
+        LineSpacing::AtLeast(pts) => LineSpacing::AtLeast(scale_fixed_line_spacing(pts, space_factor)),
+        LineSpacing::Exactly(pts) => LineSpacing::Exactly(scale_fixed_line_spacing(pts, space_factor)),
     }
 }
 
 /// Scale explicit font sizes on a `CharProps`.
 #[inline]
 fn scale_char_props(c: &mut CharProps, delta_pt: f32) {
-    if let Some(s) = c.size.as_mut() {
-        *s = scale_size(*s, delta_pt);
-    }
-    if let Some(s) = c.size_cs.as_mut() {
-        *s = scale_size(*s, delta_pt);
+    if delta_pt > 0.0 {
+        if let Some(s) = c.size.as_mut() {
+            *s = scale_size(*s, delta_pt);
+        }
+        if let Some(s) = c.size_cs.as_mut() {
+            *s = scale_size(*s, delta_pt);
+        }
     }
 }
 
@@ -96,25 +134,9 @@ pub fn fit_document_typography(doc: &mut Document, delta_pt: f32, space_factor: 
     shrink_document_typography(doc, delta_pt, space_factor);
 }
 
-/// Shrinks font sizes across the document by `delta_pt` points and scales paragraph
-/// spacing by `space_factor`.
-///
-/// Preserves relative typography hierarchies between headings, body text, and direct run formatting.
-/// Clamps font sizes to `[4.0, 1638.0]` pt and rounds to 0.5 pt (half-points).
-/// Headers and footers are explicitly excluded and retain their exact original sizes.
-/// Footnotes are included and shrink alongside body text.
-pub fn shrink_document_typography(doc: &mut Document, delta_pt: f32, space_factor: f32) {
-    if !delta_pt.is_finite() || !space_factor.is_finite() {
-        return;
-    }
-    let delta_pt = delta_pt.max(0.0);
-    let space_factor = space_factor.clamp(0.1, 1.0);
-
-    if delta_pt == 0.0 && (space_factor - 1.0).abs() < f32::EPSILON {
-        return;
-    }
-
-    // 1. Find all text boxes reachable from Header and Footer parts (including nested text boxes and chains).
+/// Finds all text box IDs transitively reachable from Header and Footer parts
+/// (including linked text box chains and nested text boxes).
+pub fn header_footer_text_boxes(doc: &Document) -> BTreeSet<u32> {
     let mut hf_boxes: BTreeSet<u32> = BTreeSet::new();
     let mut queue: Vec<u32> = Vec::new();
 
@@ -154,56 +176,139 @@ pub fn shrink_document_typography(doc: &mut Document, delta_pt: f32, space_facto
             }
         }
     }
+    hf_boxes
+}
+
+/// Freezes resolved character and paragraph formatting on a single paragraph using the provided stylesheet and optional table-style context.
+fn freeze_para_formatting(
+    p: &mut Paragraph,
+    styles: &StyleSheet,
+    table_chr: Option<&CharProps>,
+    table_para: Option<&ParaProps>,
+    delta_pt: f32,
+    space_factor: f32,
+) {
+    let style = p.props.style.clone();
+    if delta_pt > 0.0 {
+        for r in &mut p.runs {
+            if r.props.size.is_none() {
+                let resolved = styles.resolve_char_in(style.as_deref(), table_chr, &r.props).size;
+                r.props.size = Some(resolved);
+            }
+            if r.props.size_cs.is_none() {
+                let resolved_cs = styles.resolve_char_in(style.as_deref(), table_chr, &r.props).size_cs;
+                r.props.size_cs = Some(resolved_cs);
+            }
+        }
+        if p.mark.size.is_none() {
+            let resolved = styles.resolve_char_in(style.as_deref(), table_chr, &p.mark).size;
+            p.mark.size = Some(resolved);
+        }
+        if p.mark.size_cs.is_none() {
+            let resolved_cs = styles.resolve_char_in(style.as_deref(), table_chr, &p.mark).size_cs;
+            p.mark.size_cs = Some(resolved_cs);
+        }
+    }
+    if space_factor < 1.0 - f32::EPSILON {
+        let resolved_p = styles.resolve_para_in(&p.props, table_para);
+        if p.props.space_before.is_none() {
+            p.props.space_before = Some(resolved_p.space_before);
+        }
+        if p.props.space_after.is_none() {
+            p.props.space_after = Some(resolved_p.space_after);
+        }
+        if p.props.line_spacing.is_none() {
+            p.props.line_spacing = Some(resolved_p.line_spacing);
+        }
+    }
+}
+
+/// Recursively freezes resolved formatting on blocks while preserving table-style context.
+fn freeze_blocks_formatting(
+    blocks: &mut [Arc<Block>],
+    styles: &StyleSheet,
+    table_chr: Option<&CharProps>,
+    table_para: Option<&ParaProps>,
+    delta_pt: f32,
+    space_factor: f32,
+) {
+    use crate::styles::PartSet;
+
+    for b in blocks {
+        let b = Arc::make_mut(b);
+        match b {
+            Block::Para(p) => {
+                freeze_para_formatting(p, styles, table_chr, table_para, delta_pt, space_factor);
+            }
+            Block::Table(tbl) => {
+                let style = tbl.props.style.as_deref().and_then(|id| styles.table_style(id));
+                let cell_para = style.as_ref().map(|st| &st.para);
+                let nrows = tbl.rows.len();
+                let ncols = tbl.cols();
+                let cell_grids: Vec<Vec<usize>> =
+                    (0..nrows).map(|ri| (0..tbl.rows[ri].cells.len()).map(|ci| tbl.grid_col(ri, ci)).collect()).collect();
+                for (ri, row) in tbl.rows.iter_mut().enumerate() {
+                    for (ci, cell) in row.cells.iter_mut().enumerate() {
+                        let mut cell_chr = CharProps::default();
+                        if let Some(st) = &style {
+                            let sizes = (st.parts.band_size.unwrap_or(0), st.parts.col_band_size.unwrap_or(0));
+                            let g = cell_grids.get(ri).and_then(|r| r.get(ci)).copied().unwrap_or(0);
+                            let span = cell.span();
+                            let region = PartSet::of_cell(&tbl.props.look, sizes, (ri, nrows), (g, span, ncols));
+                            cell_chr.overlay(&st.chr);
+                            for part in region.iter() {
+                                let f = st.part(part);
+                                cell_chr.overlay(&f.chr);
+                            }
+                        }
+                        freeze_blocks_formatting(&mut cell.blocks, styles, Some(&cell_chr), cell_para, delta_pt, space_factor);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Shrinks font sizes across the document by `delta_pt` points and scales paragraph
+/// spacing by `space_factor`.
+///
+/// Preserves relative typography hierarchies between headings, body text, and direct run formatting.
+/// Clamps font sizes to `[4.0, 1638.0]` pt and rounds to 0.5 pt (half-points).
+/// Headers and footers are explicitly excluded and retain their exact original sizes.
+/// Footnotes are included and shrink alongside body text.
+pub fn shrink_document_typography(doc: &mut Document, delta_pt: f32, space_factor: f32) {
+    if !delta_pt.is_finite() || !space_factor.is_finite() {
+        return;
+    }
+    let delta_pt = delta_pt.max(0.0);
+    let space_factor = space_factor.clamp(0.1, 1.0);
+
+    if delta_pt == 0.0 && (space_factor - 1.0).abs() < f32::EPSILON {
+        return;
+    }
+
+    // 1. Find all text boxes reachable from Header and Footer parts (including nested text boxes and chains).
+    let hf_boxes = header_footer_text_boxes(doc);
 
     // Freeze header and footer font sizes and spacing (and reachable text boxes) before modifying styles,
-    // so headers, footers, and their text boxes never shrink even if they inherit from default or shared styles.
+    // preserving table-style context so header/footer table cells retain their conditional table formatting.
     let old_styles = doc.styles.clone();
     for (id, part) in doc.parts.iter_mut() {
         if matches!(part.kind, PartKind::Header | PartKind::Footer) || hf_boxes.contains(id) {
-            for b in &mut part.blocks {
-                each_para_mut(Arc::make_mut(b), 0, &mut |p| {
-                    let style = p.props.style.clone();
-                    for r in &mut p.runs {
-                        if r.props.size.is_none() {
-                            let resolved = old_styles.resolve_char(style.as_deref(), &r.props).size;
-                            r.props.size = Some(resolved);
-                        }
-                        if r.props.size_cs.is_none() {
-                            let resolved_cs = old_styles.resolve_char(style.as_deref(), &r.props).size_cs;
-                            r.props.size_cs = Some(resolved_cs);
-                        }
-                    }
-                    if p.mark.size.is_none() {
-                        let resolved = old_styles.resolve_char(style.as_deref(), &p.mark).size;
-                        p.mark.size = Some(resolved);
-                    }
-                    if p.mark.size_cs.is_none() {
-                        let resolved_cs = old_styles.resolve_char(style.as_deref(), &p.mark).size_cs;
-                        p.mark.size_cs = Some(resolved_cs);
-                    }
-                    let resolved_p = old_styles.resolve_para(&p.props);
-                    if p.props.space_before.is_none() {
-                        p.props.space_before = Some(resolved_p.space_before);
-                    }
-                    if p.props.space_after.is_none() {
-                        p.props.space_after = Some(resolved_p.space_after);
-                    }
-                    if p.props.line_spacing.is_none() {
-                        p.props.line_spacing = Some(resolved_p.line_spacing);
-                    }
-                });
-            }
+            freeze_blocks_formatting(&mut part.blocks, &old_styles, None, None, delta_pt, space_factor);
         }
     }
 
     // 2. Adjust styles: document defaults, character styles, paragraph styles, table style regions.
     let st = Arc::make_mut(&mut doc.styles);
 
-    // Default character formatting
-    let default_size = st.default_chr.size.unwrap_or(crate::props::DEFAULT_FONT_SIZE);
-    st.default_chr.size = Some(scale_size(default_size, delta_pt));
-    if let Some(cs) = st.default_chr.size_cs.as_mut() {
-        *cs = scale_size(*cs, delta_pt);
+    if delta_pt > 0.0 {
+        // Default character formatting
+        let default_size = st.default_chr.size.unwrap_or(crate::props::DEFAULT_FONT_SIZE);
+        st.default_chr.size = Some(scale_size(default_size, delta_pt));
+        if let Some(cs) = st.default_chr.size_cs.as_mut() {
+            *cs = scale_size(*cs, delta_pt);
+        }
     }
 
     // Default paragraph formatting
@@ -219,10 +324,14 @@ pub fn shrink_document_typography(doc: &mut Document, delta_pt: f32, space_facto
             continue;
         }
 
-        scale_char_props(&mut style.chr, delta_pt);
+        if delta_pt > 0.0 {
+            scale_char_props(&mut style.chr, delta_pt);
+        }
         scale_para_props(&mut style.para, space_factor);
 
-        if let Some(t) = style.table.as_mut() {
+        if let Some(t) = style.table.as_mut()
+            && delta_pt > 0.0
+        {
             for c in [&mut t.header_chr, &mut t.band_chr, &mut t.first_col_chr, &mut t.last_col_chr, &mut t.total_chr, &mut t.col_band_chr] {
                 scale_char_props(c, delta_pt);
             }
@@ -236,12 +345,14 @@ pub fn shrink_document_typography(doc: &mut Document, delta_pt: f32, space_facto
     let mut shrink_paragraph = |p: &mut Paragraph| {
         scale_para_props(&mut p.props, space_factor);
 
-        // Scale explicit paragraph mark size
-        scale_char_props(&mut p.mark, delta_pt);
+        if delta_pt > 0.0 {
+            // Scale explicit paragraph mark size
+            scale_char_props(&mut p.mark, delta_pt);
 
-        // Scale explicit run sizes
-        for r in &mut p.runs {
-            scale_char_props(&mut r.props, delta_pt);
+            // Scale explicit run sizes
+            for r in &mut p.runs {
+                scale_char_props(&mut r.props, delta_pt);
+            }
         }
 
         p.touch();
@@ -252,10 +363,10 @@ pub fn shrink_document_typography(doc: &mut Document, delta_pt: f32, space_facto
         each_para_mut(Arc::make_mut(b), 0, &mut shrink_paragraph);
     }
 
-    // 5. Traverse secondary editable stories (footnotes, body text boxes), excluding headers and footers
-    // and text boxes reachable from headers or footers.
+    // 5. Traverse secondary editable stories (footnotes, body text boxes), excluding headers, footers,
+    // comments, and text boxes reachable from headers or footers.
     for (id, part) in doc.parts.iter_mut() {
-        if matches!(part.kind, PartKind::Header | PartKind::Footer) || hf_boxes.contains(id) {
+        if matches!(part.kind, PartKind::Header | PartKind::Footer | PartKind::Comment) || hf_boxes.contains(id) {
             continue;
         }
         for b in &mut part.blocks {
@@ -394,8 +505,8 @@ mod tests {
         assert_eq!(p_after.props.space_before, Some(16.0));
         // 12.0 * 0.9 = 10.8 -> round to 0.5 pt = 11.0
         assert_eq!(p_after.props.space_after, Some(11.0));
-        // 1.15 * 0.9 = 1.035 -> clamped to safe line spacing floor (1.15 * 0.94 = 1.081) -> 1.08
-        assert_eq!(p_after.props.line_spacing, Some(LineSpacing::Multiple(1.08)));
+        // 1.15 * 0.9 = 1.035 -> clamped to safe line spacing floor (1.15 * 0.94 = 1.081) -> ceil hundredth 1.09
+        assert_eq!(p_after.props.line_spacing, Some(LineSpacing::Multiple(1.09)));
     }
 
     #[test]
@@ -467,5 +578,126 @@ mod tests {
         let tbl = doc.body[0].as_table().unwrap();
         let cell_p_after = tbl.rows[0].cells[0].blocks[0].as_para().unwrap();
         assert_eq!(cell_p_after.runs[0].props.size, Some(11.5));
+    }
+
+    #[test]
+    fn test_exact_line_spacing_preserves_floor_upward() {
+        // LineSpacing::Exactly(7.5) with space_factor = 0.90 (below MIN_LINE_SPACING_FACTOR 0.94)
+        // Floor = 7.5 * 0.94 = 7.05 pt. Rounding upward to half-points yields 7.5 pt (>= 7.05 pt).
+        let ls = scale_line_spacing(LineSpacing::Exactly(7.5), 0.90);
+        assert_eq!(ls, LineSpacing::Exactly(7.5));
+
+        // LineSpacing::Exactly(10.0) with space_factor = 0.90:
+        // Floor = 10.0 * 0.94 = 9.4 pt. Rounding upward to half-points yields 9.5 pt (>= 9.4 pt).
+        let ls2 = scale_line_spacing(LineSpacing::Exactly(10.0), 0.90);
+        assert_eq!(ls2, LineSpacing::Exactly(9.5));
+    }
+
+    #[test]
+    fn test_spacing_only_leaves_unrounded_font_sizes_unchanged() {
+        let mut doc = Document::new();
+        // A run with fractional 9.3 pt font
+        let p = Paragraph::with_text("Unrounded size text", CharProps { size: Some(9.3), ..Default::default() });
+        doc.body = vec![para_block(p)];
+
+        // Spacing-only trial (delta_pt = 0.0, space_factor = 0.94)
+        shrink_document_typography(&mut doc, 0.0, 0.94);
+
+        let p_after = doc.body[0].as_para().unwrap();
+        assert_eq!(p_after.runs[0].props.size, Some(9.3), "spacing-only trial must not round or scale font size");
+    }
+
+    #[test]
+    fn test_scale_size_never_enlarges_sub_floor_font() {
+        // 2.0 pt run (below 4.0 pt floor) with delta 0.5 pt must not be enlarged to 4.0 pt
+        assert_eq!(scale_size(2.0, 0.5), 2.0);
+        // 3.0 pt run with delta 0.5 pt must not be enlarged to 4.0 pt
+        assert_eq!(scale_size(3.0, 0.5), 3.0);
+        // 5.0 pt run with delta 0.5 pt shrinks to 4.5 pt
+        assert_eq!(scale_size(5.0, 0.5), 4.5);
+        // 12.0 pt run with delta 0.3 pt rounds up to 12.0 pt so reduction (0.0 pt) never exceeds delta (0.3 pt)
+        assert_eq!(scale_size(12.0, 0.3), 12.0);
+        // Zero delta leaves size unchanged
+        assert_eq!(scale_size(2.0, 0.0), 2.0);
+    }
+
+    #[test]
+    fn test_shrink_excludes_comment_stories() {
+        let mut doc = Document::new();
+        let comment_p = Paragraph::with_text("Comment text", CharProps { size: Some(8.0), ..Default::default() });
+        let comment_id = doc.add_part(PartKind::Comment, vec![para_block(comment_p)]);
+
+        // Shrink with 1.0 pt delta
+        shrink_document_typography(&mut doc, 1.0, 0.94);
+
+        let comment_part = doc.parts.get(&comment_id).unwrap();
+        let p_after = comment_part.blocks[0].as_para().unwrap();
+        assert_eq!(p_after.runs[0].props.size, Some(8.0), "comments must be excluded from typography shrink pass");
+    }
+
+    #[test]
+    fn test_header_table_text_inherits_size_from_table_style() {
+        let mut doc = Document::new();
+        // Setup a custom table style with 9.0 pt font
+        let st = crate::styles::Style {
+            id: "HeaderTableStyle".into(),
+            name: "HeaderTableStyle".into(),
+            kind: crate::styles::StyleKind::Table,
+            chr: CharProps { size: Some(9.0), ..Default::default() },
+            table: Some(crate::styles::TableStyleParts::default()),
+            ..Default::default()
+        };
+        Arc::make_mut(&mut doc.styles).upsert(st);
+
+        // Create a table in a Header part that uses HeaderTableStyle
+        let mut table = crate::Table::new(1, 1, 100.0);
+        table.props.style = Some("HeaderTableStyle".to_string());
+        // Cell paragraph with no explicit font size on run (inherits from table style)
+        let cell_p = Paragraph::with_text("Header cell text", CharProps::default());
+        table.rows[0].cells[0].blocks = vec![crate::para_block(cell_p)];
+
+        let header_id = doc.add_part(PartKind::Header, vec![Arc::new(Block::Table(table))]);
+
+        // Run shrink with delta_pt = 1.0 (body font would shrink)
+        shrink_document_typography(&mut doc, 1.0, 0.95);
+
+        // Verify that the header table cell's run preserved the 9.0 pt size from the table style,
+        // and was not frozen to the document default (11.0 pt)
+        let header_part = doc.parts.get(&header_id).unwrap();
+        if let Block::Table(tbl) = header_part.blocks[0].as_ref() {
+            let p = tbl.rows[0].cells[0].blocks[0].as_para().unwrap();
+            assert_eq!(p.runs[0].props.size, Some(9.0), "header table text must inherit and freeze table style font size");
+        } else {
+            panic!("expected table in header part");
+        }
+    }
+
+    #[test]
+    fn test_scale_line_spacing_never_increases_fixed_or_multiple() {
+        // LineSpacing::Exactly(7.45) with space_factor = 0.94:
+        // 7.45 * 0.94 = 7.003 -> ceil to half-point would yield 7.5 pt, but capping at 7.45 ensures no enlargement
+        assert_eq!(scale_fixed_line_spacing(7.45, 0.94), 7.45);
+        // Regular scaling: 10.0 pt with 0.94 -> 9.4 -> ceil to half-point = 9.5 pt <= 10.0 pt
+        assert_eq!(scale_fixed_line_spacing(10.0, 0.94), 9.5);
+
+        // LineSpacing::Multiple with small factor never enlarges
+        let ls = LineSpacing::Multiple(0.942);
+        let scaled = scale_line_spacing(ls, 0.94);
+        if let LineSpacing::Multiple(m) = scaled {
+            assert!(m <= 0.942);
+        } else {
+            panic!("expected Multiple");
+        }
+    }
+
+    #[test]
+    fn test_scale_spacing_never_increases_value() {
+        // Spacing 0.3 pt scaled by 0.94 yields 0.282 pt.
+        // Rounding to half-points would yield 0.5 pt, but capping at 0.3 pt ensures no increase.
+        assert_eq!(scale_spacing(0.3, 0.94), 0.3);
+        // Regular spacing: 12.0 pt * 0.94 = 11.28 pt -> rounds to 11.5 pt <= 12.0 pt.
+        assert_eq!(scale_spacing(12.0, 0.94), 11.5);
+        // Zero spacing remains zero.
+        assert_eq!(scale_spacing(0.0, 0.94), 0.0);
     }
 }

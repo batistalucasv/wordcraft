@@ -395,6 +395,8 @@ fn check_formatting(s: &Session, id: &str, params: &Value) -> Result<(), CmdErro
         || matches!(
             id,
             "edit.pasteFormat"
+                | "layout.fitOnePage"
+                | "layout.shrinkOnePage"
                 | "table.shading"
                 | "table.borders"
                 | "table.borderPainter"
