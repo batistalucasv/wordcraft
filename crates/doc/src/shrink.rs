@@ -4,10 +4,11 @@
 //! while preserving visual hierarchy, clamping to safe bounds, and excluding
 //! fixed framing stories like headers and footers.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use crate::Document;
-use crate::edit::each_para_mut;
+use crate::edit::{each_para, each_para_mut};
 use crate::para::Paragraph;
 use crate::parts::PartKind;
 use crate::props::{CharProps, LineSpacing, ParaProps};
@@ -17,6 +18,9 @@ pub const MIN_SHRINK_FONT_SIZE: f32 = 4.0;
 
 /// Maximum font size allowed in points.
 pub const MAX_SHRINK_FONT_SIZE: f32 = 1638.0;
+
+/// Safe line spacing floor factor (preventing line collision / crowding per issue #15).
+pub const MIN_LINE_SPACING_FACTOR: f32 = 0.94;
 
 /// Clamp a font size to `[MIN_SHRINK_FONT_SIZE, MAX_SHRINK_FONT_SIZE]` and round to 0.5 pt (half-points).
 #[inline]
@@ -38,19 +42,19 @@ fn scale_spacing(val: f32, space_factor: f32) -> f32 {
     (scaled * 2.0).round() / 2.0
 }
 
-/// Scale line spacing by `space_factor`.
+/// Scale line spacing by `space_factor` respecting the safe readability floor.
 #[inline]
 fn scale_line_spacing(ls: LineSpacing, space_factor: f32) -> LineSpacing {
     match ls {
         LineSpacing::Multiple(m) => {
             // Guard against ascender/descender collisions: keep line spacing at or above
-            // single-line proportion (1.0), unless the document already defined a tighter custom multiple.
-            let floor = m.min(1.0);
+            // safe readability floor of 0.94 factor (~6% max compression).
+            let floor = m * MIN_LINE_SPACING_FACTOR;
             let new_m = (m * space_factor).max(floor).clamp(0.5, 132.0);
             LineSpacing::Multiple((new_m * 100.0).round() / 100.0)
         }
-        LineSpacing::AtLeast(pts) => LineSpacing::AtLeast(scale_spacing(pts, space_factor)),
-        LineSpacing::Exactly(pts) => LineSpacing::Exactly(scale_spacing(pts, space_factor).max(pts * 0.95)),
+        LineSpacing::AtLeast(pts) => LineSpacing::AtLeast(scale_spacing(pts, space_factor.max(MIN_LINE_SPACING_FACTOR))),
+        LineSpacing::Exactly(pts) => LineSpacing::Exactly(scale_spacing(pts, space_factor.max(MIN_LINE_SPACING_FACTOR))),
     }
 }
 
@@ -110,11 +114,52 @@ pub fn shrink_document_typography(doc: &mut Document, delta_pt: f32, space_facto
         return;
     }
 
-    // 1. Freeze header and footer font sizes and spacing before modifying styles,
-    // so headers and footers never shrink even if they inherit from default or shared styles.
-    let old_styles = doc.styles.clone();
-    for part in doc.parts.values_mut() {
+    // 1. Find all text boxes reachable from Header and Footer parts (including nested text boxes and chains).
+    let mut hf_boxes: BTreeSet<u32> = BTreeSet::new();
+    let mut queue: Vec<u32> = Vec::new();
+
+    for part in doc.parts.values() {
         if matches!(part.kind, PartKind::Header | PartKind::Footer) {
+            for b in &part.blocks {
+                each_para(b, 0, &mut |p| {
+                    for obj in &p.objects {
+                        for box_id in obj.text_boxes() {
+                            if hf_boxes.insert(box_id) {
+                                queue.push(box_id);
+                            }
+                        }
+                    }
+                });
+            }
+        }
+    }
+
+    while let Some(box_id) = queue.pop() {
+        if let Some(part) = doc.parts.get(&box_id) {
+            if let Some(next_id) = part.body.next
+                && hf_boxes.insert(next_id)
+            {
+                queue.push(next_id);
+            }
+            for b in &part.blocks {
+                each_para(b, 0, &mut |p| {
+                    for obj in &p.objects {
+                        for nested_id in obj.text_boxes() {
+                            if hf_boxes.insert(nested_id) {
+                                queue.push(nested_id);
+                            }
+                        }
+                    }
+                });
+            }
+        }
+    }
+
+    // Freeze header and footer font sizes and spacing (and reachable text boxes) before modifying styles,
+    // so headers, footers, and their text boxes never shrink even if they inherit from default or shared styles.
+    let old_styles = doc.styles.clone();
+    for (id, part) in doc.parts.iter_mut() {
+        if matches!(part.kind, PartKind::Header | PartKind::Footer) || hf_boxes.contains(id) {
             for b in &mut part.blocks {
                 each_para_mut(Arc::make_mut(b), 0, &mut |p| {
                     let style = p.props.style.clone();
@@ -207,9 +252,10 @@ pub fn shrink_document_typography(doc: &mut Document, delta_pt: f32, space_facto
         each_para_mut(Arc::make_mut(b), 0, &mut shrink_paragraph);
     }
 
-    // 5. Traverse secondary editable stories (footnotes, text boxes), excluding headers and footers.
-    for part in doc.parts.values_mut() {
-        if matches!(part.kind, PartKind::Header | PartKind::Footer) {
+    // 5. Traverse secondary editable stories (footnotes, body text boxes), excluding headers and footers
+    // and text boxes reachable from headers or footers.
+    for (id, part) in doc.parts.iter_mut() {
+        if matches!(part.kind, PartKind::Header | PartKind::Footer) || hf_boxes.contains(id) {
             continue;
         }
         for b in &mut part.blocks {
@@ -348,8 +394,8 @@ mod tests {
         assert_eq!(p_after.props.space_before, Some(16.0));
         // 12.0 * 0.9 = 10.8 -> round to 0.5 pt = 11.0
         assert_eq!(p_after.props.space_after, Some(11.0));
-        // 1.15 * 0.9 = 1.035 -> round to 2 decimals = 1.04
-        assert_eq!(p_after.props.line_spacing, Some(LineSpacing::Multiple(1.04)));
+        // 1.15 * 0.9 = 1.035 -> clamped to safe line spacing floor (1.15 * 0.94 = 1.081) -> 1.08
+        assert_eq!(p_after.props.line_spacing, Some(LineSpacing::Multiple(1.08)));
     }
 
     #[test]
@@ -359,11 +405,53 @@ mod tests {
         p.props.line_spacing = Some(LineSpacing::Multiple(1.0));
         doc.body = vec![para_block(p)];
 
-        // Even with aggressive space_factor = 0.5, line spacing multiple must not fall below 1.0
+        // Even with aggressive space_factor = 0.5, line spacing multiple must not fall below safe floor (0.94)
         fit_document_typography(&mut doc, 0.5, 0.5);
 
         let p_after = doc.body[0].as_para().unwrap();
-        assert_eq!(p_after.props.line_spacing, Some(LineSpacing::Multiple(1.0)));
+        assert_eq!(p_after.props.line_spacing, Some(LineSpacing::Multiple(0.94)));
+    }
+
+    #[test]
+    fn test_header_text_boxes_are_frozen_and_do_not_shrink() {
+        let mut doc = Document::new();
+        let body_p = Paragraph::with_text("Body text", CharProps { size: Some(12.0), ..Default::default() });
+        doc.body = vec![para_block(body_p)];
+
+        let header_box_id = doc
+            .add_part(PartKind::TextBox, vec![para_block(Paragraph::with_text("Header box", CharProps { size: Some(14.0), ..Default::default() }))]);
+        let mut header_p = Paragraph::with_text("Header prefix ", CharProps { size: Some(10.0), ..Default::default() });
+        let shape = crate::para::InlineObject::Shape {
+            kind: crate::para::ShapeKind::TextBox,
+            w: 144.0,
+            h: 72.0,
+            fill: None,
+            stroke: None,
+            stroke_width: 0.75,
+            float: Default::default(),
+            story: Some(header_box_id),
+            freeform: None,
+            effects: Default::default(),
+            extra: Default::default(),
+        };
+        header_p.objects.push(shape);
+        doc.add_part(PartKind::Header, vec![para_block(header_p)]);
+
+        let body_box_id =
+            doc.add_part(PartKind::TextBox, vec![para_block(Paragraph::with_text("Body box", CharProps { size: Some(16.0), ..Default::default() }))]);
+
+        shrink_document_typography(&mut doc, 2.0, 1.0);
+
+        let b_p = doc.body[0].as_para().unwrap();
+        assert_eq!(b_p.runs[0].props.size, Some(10.0));
+
+        let bb_part = doc.parts.get(&body_box_id).unwrap();
+        let bb_p = bb_part.blocks[0].as_para().unwrap();
+        assert_eq!(bb_p.runs[0].props.size, Some(14.0));
+
+        let hb_part = doc.parts.get(&header_box_id).unwrap();
+        let hb_p = hb_part.blocks[0].as_para().unwrap();
+        assert_eq!(hb_p.runs[0].props.size, Some(14.0));
     }
 
     #[test]

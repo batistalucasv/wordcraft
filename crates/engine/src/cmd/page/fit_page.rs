@@ -16,12 +16,15 @@ use crate::{CmdError, CmdResult, Session, p};
 /// Minimum comfortable body font size before refusing further reduction (Anti-Compound Guard).
 pub const MIN_COMFORTABLE_BODY_FONT_SIZE: f32 = 8.5;
 
+/// Maximum number of fine-grained trial steps allowed when `stepPt` is specified.
+pub const MAX_FINE_STEPS: usize = 20;
+
 /// Pre-calculated candidate steps `(delta_font_pt, space_factor)`.
 ///
 /// Evaluated in ascending order of aesthetic perturbation:
 /// 1. Tries paragraph spacing adjustment first with zero font size perturbation.
 /// 2. Then tests micro font adjustments with minimal spacing changes.
-/// 3. Respects a line-spacing floor (>= 1.0) and paragraph spacing floor (>= 0.85)
+/// 3. Respects a line-spacing floor (>= 0.94) and paragraph spacing floor (>= 0.85)
 ///    to guarantee that lines and paragraphs never crowd or collide.
 const CANDIDATE_STEPS: [(f32, f32); 8] = [
     (0.0, 0.92), // 1. Spacing-only compression (font sizes untouched)
@@ -33,6 +36,24 @@ const CANDIDATE_STEPS: [(f32, f32); 8] = [
     (1.5, 0.90), // 7. Higher font reduction (-1.5 pt)
     (2.0, 0.88), // 8. Maximum safe font reduction (-2.0 pt)
 ];
+
+/// Calls `f` on every paragraph in a block, including paragraphs inside table cells, using a stack.
+fn walk_block_paras<'a>(b: &'a wordcraft_doc::Block, f: &mut dyn FnMut(&'a wordcraft_doc::para::Paragraph)) {
+    let mut stack = vec![b];
+    while let Some(current) = stack.pop() {
+        if let Some(p) = current.as_para() {
+            f(p);
+        } else if let Some(tbl) = current.as_table() {
+            for row in &tbl.rows {
+                for cell in &row.cells {
+                    for cb in &cell.blocks {
+                        stack.push(cb);
+                    }
+                }
+            }
+        }
+    }
+}
 
 /// Returns true if the document contains explicit page or section breaks that
 /// physically force content onto additional pages.
@@ -67,27 +88,50 @@ fn has_explicit_breaks(doc: &Document) -> bool {
     false
 }
 
-/// Checks whether the body text is already at or below the minimum readable font size.
+/// Checks whether effective body font sizes are at or below the minimum readable font size (8.5 pt).
+///
+/// Inspects default styles, named styles, and all body paragraphs (including paragraphs in tables),
+/// resolving effective font sizes against styles while ignoring superscript/subscript characters.
 fn doc_has_unreadable_body_font(doc: &Document) -> bool {
+    let default_size = doc.styles.default_chr.size.unwrap_or(wordcraft_doc::props::DEFAULT_FONT_SIZE);
+    if default_size < MIN_COMFORTABLE_BODY_FONT_SIZE {
+        return true;
+    }
+
     if let Some(normal) = doc.styles.get("Normal")
         && let Some(sz) = normal.chr.size
-        && sz <= MIN_COMFORTABLE_BODY_FONT_SIZE
+        && sz < MIN_COMFORTABLE_BODY_FONT_SIZE
     {
         return true;
     }
-    for b in &doc.body {
-        if let Some(p) = b.as_para() {
-            for r in &p.runs {
-                if let Some(sz) = r.props.size
-                    && !matches!(r.props.vert_align, Some(wordcraft_doc::props::VertAlign::Superscript | wordcraft_doc::props::VertAlign::Subscript))
-                    && sz <= MIN_COMFORTABLE_BODY_FONT_SIZE
-                {
-                    return true;
-                }
+
+    let mut found_unreadable = false;
+    let mut check_para = |p: &wordcraft_doc::para::Paragraph| {
+        if found_unreadable {
+            return;
+        }
+        let style_id = p.props.style.as_deref();
+        let mark_sz = p.mark.size.unwrap_or_else(|| doc.styles.resolve_char(style_id, &p.mark).size);
+        if mark_sz < MIN_COMFORTABLE_BODY_FONT_SIZE {
+            found_unreadable = true;
+            return;
+        }
+        for r in &p.runs {
+            if matches!(r.props.vert_align, Some(wordcraft_doc::props::VertAlign::Superscript | wordcraft_doc::props::VertAlign::Subscript)) {
+                continue;
+            }
+            let eff_sz = r.props.size.unwrap_or_else(|| doc.styles.resolve_char(style_id, &r.props).size);
+            if eff_sz < MIN_COMFORTABLE_BODY_FONT_SIZE {
+                found_unreadable = true;
+                return;
             }
         }
+    };
+
+    for b in &doc.body {
+        walk_block_paras(b, &mut check_para);
     }
-    false
+    found_unreadable
 }
 
 /// Executes the `layout.fitOnePage` command.
@@ -109,17 +153,12 @@ pub fn fit_one_page(s: &mut Session, v: &Value) -> CmdResult {
     }
     let target_pages = p0.saturating_sub(1);
 
-    // 2. Anti-compound guard: refuse if body text is already at the minimum readable size
-    if doc_has_unreadable_body_font(&s.doc) {
-        return Err(CmdError::Params("Unable to fit document to one page: font size is already at the minimum readable size.".into()));
-    }
-
-    // 3. Parse parameters safely
+    // 2. Parse parameters safely
     let max_delta = p::f32(v, "maxDeltaPt").unwrap_or(2.0).clamp(0.0, 10.0);
     let step_pt_opt = p::f32(v, "stepPt");
     let adjust_spacing = p::bool(v, "adjustSpacing").unwrap_or(true);
 
-    // 4. Lightweight transient layout options (proofing disabled for performance)
+    // 3. Lightweight transient layout options (proofing disabled for performance)
     let trial_opts = LayoutOptions {
         view: ViewMode::Print,
         proofing: false,
@@ -127,22 +166,22 @@ pub fn fit_one_page(s: &mut Session, v: &Value) -> CmdResult {
         ..LayoutOptions::default()
     };
 
-    // 5. Generate candidate steps: either fine-grained stepPt or pre-calculated steps
+    // 4. Generate candidate steps: either bounded fine-grained stepPt or pre-calculated steps
     let mut candidates: Vec<(f32, f32)> = Vec::new();
     if let Some(step_pt) = step_pt_opt {
-        if step_pt > 0.0 {
+        if step_pt > 0.0 && step_pt.is_finite() {
             if adjust_spacing {
                 candidates.push((0.0, 0.92));
             }
-            let mut d = step_pt;
-            while d <= max_delta + 1e-4 {
+            let count = (((max_delta + 1e-4) / step_pt).floor()).min(MAX_FINE_STEPS as f32).max(0.0) as usize;
+            for i in 1..=count {
+                let d = i as f32 * step_pt;
                 if adjust_spacing {
                     candidates.push((d, 0.95));
                     candidates.push((d, 0.90));
                 } else {
                     candidates.push((d, 1.0));
                 }
-                d += step_pt;
             }
         }
     } else {
@@ -154,16 +193,36 @@ pub fn fit_one_page(s: &mut Session, v: &Value) -> CmdResult {
                 }
             }
         }
+        // If maxDeltaPt was explicitly configured above 2.0 pt, test higher reductions up to max_delta
+        if max_delta > 2.0 {
+            let mut extra_delta = 2.5;
+            while extra_delta <= max_delta + 1e-4 {
+                let alpha = if adjust_spacing { 0.85 } else { 1.0 };
+                candidates.push((extra_delta, alpha));
+                extra_delta += 0.5;
+            }
+        }
     }
 
-    // 6. Speculative search loop using ephemeral cache
+    // 5. Speculative search loop using ephemeral cache
     let mut successful_doc = None;
     let mut applied_step = None;
     let mut final_pages = target_pages;
 
     for (delta, alpha) in candidates {
+        // Anti-compound guard: refuse font reduction if body font is already at or below the readability floor,
+        // while allowing spacing-only candidates (delta == 0.0) to run.
+        if delta > 0.0 && doc_has_unreadable_body_font(&s.doc) {
+            continue;
+        }
+
         let mut trial_doc = s.doc.clone();
         fit_document_typography(&mut trial_doc, delta, alpha);
+
+        // Validate the trial document's effective body font sizes against 8.5 pt minimum before accepting
+        if delta > 0.0 && doc_has_unreadable_body_font(&trial_doc) {
+            continue;
+        }
 
         let mut trial_cache = LayoutCache::new();
         let trial_layout = wordcraft_layout::layout(&trial_doc, &mut trial_cache, &trial_opts);
@@ -176,7 +235,7 @@ pub fn fit_one_page(s: &mut Session, v: &Value) -> CmdResult {
         }
     }
 
-    // 7. Success commit or clean rollback
+    // 6. Success commit or clean rollback
     match (successful_doc, applied_step) {
         (Some(new_doc), Some((d, a))) => {
             s.doc = new_doc;
@@ -192,6 +251,8 @@ pub fn fit_one_page(s: &mut Session, v: &Value) -> CmdResult {
         _ => {
             if has_explicit_breaks(&s.doc) {
                 Err(CmdError::Params("Unable to fit document to one page: explicit page or section breaks prevent page reduction.".into()))
+            } else if doc_has_unreadable_body_font(&s.doc) {
+                Err(CmdError::Params("Unable to shrink document further without reducing text beyond readability limits.".into()))
             } else {
                 Err(CmdError::Params(
                     "Unable to fit document to one page: content on the final page exceeds limits for aesthetic page reduction.".into(),
