@@ -252,10 +252,11 @@ pub(crate) fn load(bytes: &[u8], acc: &mut Acc) -> Option<Package> {
     let ct_at = entries.iter().position(|e| !e.is_dir && e.name.eq_ignore_ascii_case("[Content_Types].xml"));
     acc.ran("PKG-NO-CONTENT-TYPES");
     let content_types_present = ct_at.is_some();
-    if !content_types_present {
+    // The archive suffix may hold the manifest; a prefix cannot establish its absence.
+    if !content_types_present && !entries_truncated {
         acc.add("PKG-NO-CONTENT-TYPES", None, "the package has no [Content_Types].xml part, so part content types cannot be resolved".to_string());
     }
-    let mut content_types = ContentTypes::default();
+    let mut content_types = ContentTypes { incomplete: !content_types_present && entries_truncated, ..ContentTypes::default() };
     let mut ct_guard = ParseGuard::new(limits.events, limits.depth);
     if let Some(e) = ct_at.and_then(|i| entries.get(i))
         && let Some(text) = &e.decoded
@@ -304,7 +305,7 @@ pub(crate) fn load(bytes: &[u8], acc: &mut Acc) -> Option<Package> {
         // If `_rels/.rels` is present but its content could not be read, its officeDocument
         // relationship is unknown, not absent: no absence conclusion is established.
         let package_rels_unavailable = entries.iter().any(|e| !e.is_dir && e.name.eq_ignore_ascii_case("_rels/.rels") && e.content_unavailable);
-        if !package_rels_unavailable && !package_rels.is_some_and(|rp| rp.incomplete) {
+        if !entries_truncated && !package_rels_unavailable && !package_rels.is_some_and(|rp| rp.incomplete) {
             acc.add("PKG-NO-MAIN", None, no_main_message(package_rels));
         }
     }
@@ -823,7 +824,10 @@ fn is_office_document_relationship(kind: &str) -> bool {
 /// Whether an owner's relationship declarations are unavailable or only partially examined.
 pub(crate) fn relationships_incomplete(pkg: &Package, part: &str) -> bool {
     let name = rels_part_name(part);
-    content_unavailable(pkg, &name) || pkg.rels.iter().any(|rp| rp.name.eq_ignore_ascii_case(&name) && rp.incomplete)
+    // An unexamined archive suffix may hold the missing relationships part.
+    (pkg.entries_truncated && entry_by_name(pkg, &name).is_none())
+        || content_unavailable(pkg, &name)
+        || pkg.rels.iter().any(|rp| rp.name.eq_ignore_ascii_case(&name) && rp.incomplete)
 }
 
 /// The last `/`-separated segment of a relationship type.

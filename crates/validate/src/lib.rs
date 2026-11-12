@@ -853,6 +853,12 @@ struct XmlScan {
     note_incomplete_parts: HashSet<String>,
 }
 
+/// Whether the full XML source was available and completely scanned. Auxiliary parsers can
+/// return a prefix at EOF (for example, an unclosed root), which cannot establish absent IDs.
+fn xml_source_complete(xml: &XmlScan, entry: &package::Entry) -> bool {
+    !entry.content_unavailable && !xml.story_incomplete_parts.contains(&entry.name.to_ascii_lowercase())
+}
+
 /// Whether every incoming definition will fit the pooled allowances. A dropped definition
 /// makes only its source part incomplete; already collected owner scopes remain checkable.
 fn definitions_fit(facts: &scan::StoryFacts, incoming: &scan::StoryFacts, cap: usize) -> bool {
@@ -1002,9 +1008,9 @@ fn check_xml(pkg: &Package, acc: &mut Acc) -> XmlScan {
             ));
             acc.set_incomplete();
         }
-        if scanned.malformed.is_some() {
-            // The contentPart collection is not story-only: any part
-            // whose scan stopped early has a partial collection.
+        if !scanned.facts_complete {
+            // A scan stopped by events/depth cannot establish non-consumption, even when no
+            // contentPart id was reached. Fact caps also conservatively invalidate this source.
             content_part_incomplete_owners.insert(e.name.clone());
         }
         if !scanned.refs.is_empty() && !refs_pooled_capped {
@@ -1383,7 +1389,8 @@ fn check_rels(
     for rp in &pkg.rels {
         for r in &rp.rels {
             let Some(target) = &r.target_abs else { continue };
-            if package::canonical_entry(pkg, target).is_none() {
+            // An unexamined archive suffix may still contain this target.
+            if !pkg.entries_truncated && package::canonical_entry(pkg, target).is_none() {
                 acc.add(
                     "REL-DANGLING",
                     Some(rp.name.clone()),
@@ -1649,8 +1656,8 @@ fn check_typed_content(
     // Relationships-part names whose owner is an XML part that was
     // never scanned at all (oversized, undecodable, or skipped before
     // the scan): its consumption is likewise unestablished. An owner
-    // that is not an XML part cannot contain a `w:contentPart`, so its
-    // collection is complete by construction; the package `.rels` has
+    // with a known non-XML content type cannot contain a `w:contentPart`; an unknown type
+    // may have lost its XML classification with a manifest declaration. The package `.rels` has
     // no containing part at all.
     let unscanned_rels: HashSet<String> = pkg
         .rels
@@ -1663,7 +1670,8 @@ fn check_typed_content(
                 // proven absent): consumption is unestablished either
                 // way. A proven-absent owner (complete enumeration)
                 // cannot consume anything and is judged normally.
-                (package::is_xml_part(pkg, &owner) && !content_part_scanned_owners.contains(&owner))
+                ((package::is_xml_part(pkg, &owner) || (pkg.content_types.of(&owner).is_none() && entry_by_name(pkg, &owner).is_some()))
+                    && !content_part_scanned_owners.contains(&owner))
                     || (pkg.entries_truncated && !pkg.entries.iter().any(|e| e.name.eq_ignore_ascii_case(&owner)))
             })
         })
@@ -1681,6 +1689,7 @@ fn check_typed_content(
         .filter(|owner| !main_rels.as_deref().is_some_and(|m| m.eq_ignore_ascii_case(&rels_part_name(owner))))
         .map(|owner| rels_part_name(owner).to_ascii_lowercase())
         .collect();
+    let mut skipped_consumption = HashSet::new();
     for rp in &pkg.rels {
         let is_non_main_owner = non_main_owner_rels.contains(&rp.name.to_ascii_lowercase());
         let rp_key = rp.name.to_ascii_lowercase();
@@ -1695,12 +1704,20 @@ fn check_typed_content(
             if matches!(kind, "header" | "footer") && !is_non_main_owner {
                 continue;
             }
-            if kind == "customXml"
-                && (incomplete_rels.contains(&rp_key)
-                    || unscanned_rels.contains(&rp_key)
-                    || (first_with_id && consumed.get(&rp_key).is_some_and(|ids| ids.contains(r.id.as_str()))))
-            {
-                continue;
+            if kind == "customXml" {
+                if incomplete_rels.contains(&rp_key) || unscanned_rels.contains(&rp_key) {
+                    // Explain only an actual skipped pairing; unrelated malformed parts have no
+                    // consumption check to lose and must retain their existing coverage behavior.
+                    if skipped_consumption.insert(rp_key.clone()) {
+                        let source = rels_owner_name(&rp.name).unwrap_or_else(|| rp.name.clone());
+                        acc.note(format!("{source} was not fully examined as XML; contentPart pairing absence was not checked"));
+                        acc.set_incomplete();
+                    }
+                    continue;
+                }
+                if first_with_id && consumed.get(&rp_key).is_some_and(|ids| ids.contains(r.id.as_str())) {
+                    continue;
+                }
             }
             let Some(ct) = pkg.content_types.of(target) else { continue };
             if ct == want {
@@ -1808,15 +1825,15 @@ fn check_story(pkg: &Package, xml: &XmlScan, acc: &mut Acc) {
     acc.ran("REF-HEADER");
     check_header_footer_refs(pkg, facts, acc);
     acc.ran("REF-STYLE");
-    check_style_refs(pkg, facts, acc);
+    check_style_refs(pkg, xml, acc);
     check_vocabulary(pkg, acc);
-    check_numbering(pkg, facts, acc);
+    check_numbering(pkg, xml, acc);
     check_commentex(pkg, xml, acc);
     acc.ran("FLD-UNBALANCED");
     acc.ran("STRUCT-TC-NO-P");
     acc.ran("STRUCT-DELTEXT");
     acc.ran("STRUCT-MOVE-UNPAIRED");
-    check_custom_xml(pkg, acc);
+    check_custom_xml(pkg, xml, acc);
 }
 
 /// Duplicate decimal IDs are forbidden within a definition part, not between independent owners.
@@ -1901,7 +1918,7 @@ fn check_header_footer_refs(pkg: &Package, facts: &scan::StoryFacts, acc: &mut A
     let want = rels_part_name(main);
     // The main part's relationships could not be read: its header/footer relationships are unknown,
     // not absent, so a reference must not be reported as having no relationship.
-    if package::content_unavailable(pkg, &want) {
+    if package::relationships_incomplete(pkg, main) {
         return;
     }
     let Some(rp) = pkg.rels.iter().find(|r| r.name.eq_ignore_ascii_case(&want)) else {
@@ -2005,6 +2022,10 @@ fn supporting_part<'a>(pkg: &'a Package, owner: Option<&str>, kind: &str, ct: &s
 /// that source is the owner's `.rels`; in the no-owner fallback scope it is the content-type
 /// manifest that [`find_by_type`] reads.
 fn discovery_unavailable(pkg: &Package, owner: Option<&str>) -> bool {
+    // An unexamined archive suffix may hold the target or its discovery declarations.
+    if pkg.entries_truncated {
+        return true;
+    }
     match owner {
         Some(owner) => package::relationships_incomplete(pkg, owner),
         None => package::content_unavailable(pkg, "[Content_Types].xml") || pkg.content_types.incomplete,
@@ -2077,7 +2098,8 @@ fn part_owners<'a>(owner_map: &'a HashMap<String, Vec<usize>>, part: &str) -> &'
 }
 
 /// Verify that style references in story parts resolve to a defined style in their owner scope.
-fn check_style_refs(pkg: &Package, facts: &scan::StoryFacts, acc: &mut Acc) {
+fn check_style_refs(pkg: &Package, xml: &XmlScan, acc: &mut Acc) {
+    let facts = &xml.facts;
     let cap = acc.limits.facts;
     let owners = owner_scopes(pkg);
     let owner_map = owner_index_map(pkg);
@@ -2091,6 +2113,12 @@ fn check_style_refs(pkg: &Package, facts: &scan::StoryFacts, acc: &mut Acc) {
             continue;
         };
         present = true;
+        if !xml_source_complete(xml, entry) {
+            acc.note(format!("{} was not fully examined; style-reference absence was not checked", entry.name));
+            acc.set_incomplete();
+            per_owner.push(None);
+            continue;
+        }
         let mut guard = scan::ParseGuard::new(acc.limits.events, acc.limits.depth);
         let parsed = entry.decoded.as_deref().map(|text| scan::parse_style_ids(text, cap, &mut guard));
         if guard.exhausted() {
@@ -2103,7 +2131,10 @@ fn check_style_refs(pkg: &Package, facts: &scan::StoryFacts, acc: &mut Acc) {
             Some(Some((ids, c))) => {
                 parsed_any = true;
                 capped |= c;
-                per_owner.push(Some(ids));
+                if c {
+                    acc.note(format!("{} exceeded the {cap}-entry budget; style-reference absence was not checked", entry.name));
+                }
+                per_owner.push((!c).then_some(ids));
             }
             Some(None) => per_owner.push(None),
             None => per_owner.push(None),
@@ -2316,7 +2347,8 @@ fn find_by_type<'a>(pkg: &'a Package, ct: &str) -> Option<&'a package::Entry> {
 }
 
 /// Verify numbering definitions and references in story and styles parts for each owner scope.
-fn check_numbering(pkg: &Package, facts: &scan::StoryFacts, acc: &mut Acc) {
+fn check_numbering(pkg: &Package, xml: &XmlScan, acc: &mut Acc) {
+    let facts = &xml.facts;
     acc.ran("NUM-DANGLING");
     let cap = acc.limits.facts;
     let owners = owner_scopes(pkg);
@@ -2339,7 +2371,7 @@ fn check_numbering(pkg: &Package, facts: &scan::StoryFacts, acc: &mut Acc) {
                 if let Some(cached) = numbering_cache.get(np) {
                     cached.clone()
                 } else {
-                    let parsed = process_numbering_part(pkg, np, cap, acc);
+                    let parsed = process_numbering_part(pkg, xml, np, cap, acc);
                     numbering_cache.insert(np.clone(), parsed.clone());
                     parsed
                 }
@@ -2371,8 +2403,13 @@ fn check_numbering(pkg: &Package, facts: &scan::StoryFacts, acc: &mut Acc) {
 /// Parse a numbering part, reporting duplicate definitions and dangling `w:abstractNumId`
 /// references. `None` when the part could not be read, did not parse, or exceeded a budget (its
 /// references must not be checked).
-fn process_numbering_part(pkg: &Package, name: &str, cap: usize, acc: &mut Acc) -> Option<HashSet<String>> {
+fn process_numbering_part(pkg: &Package, xml: &XmlScan, name: &str, cap: usize, acc: &mut Acc) -> Option<HashSet<String>> {
     let entry = entry_by_name(pkg, name)?;
+    if !xml_source_complete(xml, entry) {
+        acc.note(format!("{name} was not fully examined; list numbering absence was not checked"));
+        acc.set_incomplete();
+        return None;
+    }
     let Some(text) = entry.decoded.as_deref() else {
         acc.note(format!("{name} could not be read; list numbering references were not checked"));
         return None;
@@ -2389,7 +2426,7 @@ fn process_numbering_part(pkg: &Package, name: &str, cap: usize, acc: &mut Acc) 
         return None;
     };
     if defs.capped {
-        acc.note(format!("{name} exceeded the {cap}-entry budget; later numbering definitions were not recorded"));
+        acc.note(format!("{name} exceeded the {cap}-entry budget; numbering definition absence was not checked"));
         acc.set_incomplete();
     }
     report_dups_values(acc, &defs.num_ids, &entry.name, "w:num numId");
@@ -2397,7 +2434,7 @@ fn process_numbering_part(pkg: &Package, name: &str, cap: usize, acc: &mut Acc) 
     let abstract_set: HashSet<&str> = defs.abstract_ids.iter().map(String::as_str).collect();
     for (num, abs) in &defs.num_to_abstract {
         match abs {
-            Some(a) if !abstract_set.contains(a.as_str()) => acc.add(
+            Some(a) if !defs.capped && !abstract_set.contains(a.as_str()) => acc.add(
                 "NUM-DANGLING",
                 Some(entry.name.clone()),
                 format!("w:num numId {num} references w:abstractNumId {a}, which has no w:abstractNum"),
@@ -2406,7 +2443,8 @@ fn process_numbering_part(pkg: &Package, name: &str, cap: usize, acc: &mut Acc) 
             _ => {}
         }
     }
-    Some(defs.num_ids.into_iter().collect())
+    // A retained reference is still checkable, but a truncated definition set cannot prove absence.
+    (!defs.capped).then(|| defs.num_ids.into_iter().collect())
 }
 
 /// `NUM-DANGLING` for `w:numPr/w:numId` references in a styles part, checked against its owner's
@@ -2484,19 +2522,28 @@ fn check_commentex(pkg: &Package, xml: &XmlScan, acc: &mut Acc) {
     let cap = acc.limits.facts;
     let owners = owner_scopes(pkg);
     let owner_map = owner_index_map(pkg);
+    let roles = story_roles(pkg);
     let any_ext = owners.iter().any(|o| supporting_part(pkg, o.as_deref(), "commentsExtended", package::COMMENTS_EXTENDED_CONTENT_TYPE).is_some());
     if !any_ext {
         return;
     }
     acc.ran("COMMENTEX-LINK");
     for (i, owner) in owners.iter().enumerate() {
-        // Missing paragraphs are established only from a known, completely observed comments
-        // source. Unknown ownership must not turn the ownership-filtered set into an empty one.
-        let comments = supporting_part(pkg, owner.as_deref(), "comments", package::COMMENTS_CONTENT_TYPE);
-        let comments_complete = match comments {
-            Some(e) => !e.content_unavailable && !xml.story_incomplete_parts.contains(&e.name.to_ascii_lowercase()),
-            None => !discovery_unavailable(pkg, owner.as_deref()),
-        };
+        // This join pools every comments source in the context, including shared sources after
+        // the first relationship target. Every contributing source must establish completeness.
+        let mut comments_complete = !discovery_unavailable(pkg, owner.as_deref());
+        for entry in pkg.entries.iter().filter(|e| {
+            !e.is_dir && roles.get(&e.name.to_ascii_lowercase()).is_some_and(|r| r.is_comments) && part_owners(&owner_map, &e.name).contains(&i)
+        }) {
+            if !xml_source_complete(xml, entry) {
+                comments_complete = false;
+                acc.note(format!(
+                    "comment-threading paragraphs for {} could not be fully checked: contributing source {} was not fully examined",
+                    owner.as_deref().unwrap_or("the package"),
+                    entry.name
+                ));
+            }
+        }
         if !comments_complete {
             acc.note(format!(
                 "comment-threading paragraphs for {} could not be fully checked (comments ownership or source facts were not fully examined)",
@@ -2504,16 +2551,16 @@ fn check_commentex(pkg: &Package, xml: &XmlScan, acc: &mut Acc) {
             ));
             acc.set_incomplete();
         }
-        if supporting_part(pkg, owner.as_deref(), "commentsExtended", package::COMMENTS_EXTENDED_CONTENT_TYPE).is_some_and(|e| e.content_unavailable)
-        {
-            continue;
-        }
         // Each owner's comment-threading is checked within its own scope: its commentEx entries
-        // against its own comments part, and its commentsIds paraIds against its own commentEx.
+        // against all its contributing comments sources, and its commentsIds against its own commentEx.
         let comment_para: HashSet<&str> =
             facts.comment_para_ids.iter().filter(|(_, p)| part_owners(&owner_map, p).contains(&i)).map(|(p, _)| p.as_str()).collect();
-        let ext = supporting_part(pkg, owner.as_deref(), "commentsExtended", package::COMMENTS_EXTENDED_CONTENT_TYPE)
-            .and_then(|entry| read_comments_ext(entry, cap, acc).map(|e| (entry.name.clone(), e)));
+        let ext_source = supporting_part(pkg, owner.as_deref(), "commentsExtended", package::COMMENTS_EXTENDED_CONTENT_TYPE);
+        let ext = ext_source.and_then(|entry| read_comments_ext(entry, xml, cap, acc).map(|e| (entry.name.clone(), e)));
+        let ext_complete = match &ext {
+            Some((_, e)) => !e.capped,
+            None => ext_source.is_none() && !discovery_unavailable(pkg, owner.as_deref()),
+        };
         let ex_para: HashSet<&str> = match &ext {
             Some((_, e)) => e.entries.iter().map(|(p, _)| p.as_str()).collect(),
             None => HashSet::new(),
@@ -2527,7 +2574,8 @@ fn check_commentex(pkg: &Package, xml: &XmlScan, acc: &mut Acc) {
                         format!("w15:commentEx paraId {para} has no paragraph with that w14:paraId in comments.xml"),
                     );
                 }
-                if let Some(p) = parent
+                if ext_complete
+                    && let Some(p) = parent
                     && !ex_para.contains(p.as_str())
                 {
                     acc.add(
@@ -2541,17 +2589,17 @@ fn check_commentex(pkg: &Package, xml: &XmlScan, acc: &mut Acc) {
         // commentsIds ids keep their own part name, so an unmatched id is reported at the part it
         // came from, never at another owner's (H9).
         let cid = supporting_part(pkg, owner.as_deref(), "commentsIds", package::COMMENTS_IDS_CONTENT_TYPE)
-            .and_then(|entry| read_comments_ids(entry, cap, acc));
-        let Some((cid_name, cid_ids)) = &cid else { continue };
+            .and_then(|entry| read_comments_ids(entry, xml, cap, acc));
+        let Some((cid_name, cid_ids, cid_complete)) = &cid else { continue };
         let cid_set: HashSet<&str> = cid_ids.iter().map(String::as_str).collect();
         for id in cid_ids {
-            if !ex_para.contains(id.as_str()) {
+            if ext_complete && !ex_para.contains(id.as_str()) {
                 acc.add("COMMENTEX-LINK", Some(cid_name.clone()), format!("commentsIds paraId {id} has no commentEx counterpart"));
             }
         }
         if let Some((name, e)) = &ext {
             for (para, _) in &e.entries {
-                if !cid_set.contains(para.as_str()) {
+                if *cid_complete && !cid_set.contains(para.as_str()) {
                     acc.add("COMMENTEX-LINK", Some(name.clone()), format!("commentEx paraId {para} has no commentsIds paraId counterpart"));
                 }
             }
@@ -2561,8 +2609,13 @@ fn check_commentex(pkg: &Package, xml: &XmlScan, acc: &mut Acc) {
 
 /// Parse a commentsExtended part, recording a note (and INCOMPLETE for a budget exhaustion) when it
 /// cannot be checked. `None` when the part's link checks must be skipped.
-fn read_comments_ext(entry: &package::Entry, cap: usize, acc: &mut Acc) -> Option<scan::CommentEx> {
+fn read_comments_ext(entry: &package::Entry, xml: &XmlScan, cap: usize, acc: &mut Acc) -> Option<scan::CommentEx> {
     let name = &entry.name;
+    if !xml_source_complete(xml, entry) {
+        acc.note(format!("{name} was not fully examined; commentEx definition absence was not checked"));
+        acc.set_incomplete();
+        return None;
+    }
     let Some(text) = entry.decoded.as_deref() else {
         acc.note(format!("{name} could not be read; comment-threading links were not checked"));
         return None;
@@ -2579,16 +2632,23 @@ fn read_comments_ext(entry: &package::Entry, cap: usize, acc: &mut Acc) -> Optio
         return None;
     };
     if ext.capped {
-        acc.note(format!("{name} exceeded the {cap}-entry budget; later commentEx entries were not recorded"));
+        acc.note(format!(
+            "{name} exceeded the {cap}-entry budget; later commentEx entries were not recorded and commentEx definition absence was not checked"
+        ));
         acc.set_incomplete();
     }
     Some(ext)
 }
 
 /// Parse a commentsIds part, returning its part name and `w16cid:paraId` values. `None` when the part's link
-/// checks must be skipped.
-fn read_comments_ids(entry: &package::Entry, cap: usize, acc: &mut Acc) -> Option<(String, Vec<String>)> {
+/// checks must be skipped. The returned boolean says whether the definition set is complete.
+fn read_comments_ids(entry: &package::Entry, xml: &XmlScan, cap: usize, acc: &mut Acc) -> Option<(String, Vec<String>, bool)> {
     let name = &entry.name;
+    if !xml_source_complete(xml, entry) {
+        acc.note(format!("{name} was not fully examined; commentsIds definition absence was not checked"));
+        acc.set_incomplete();
+        return None;
+    }
     let text = entry.decoded.as_deref()?;
     let mut guard = scan::ParseGuard::new(acc.limits.events, acc.limits.depth);
     let parsed = scan::parse_comments_ids(text, cap, &mut guard);
@@ -2599,14 +2659,16 @@ fn read_comments_ids(entry: &package::Entry, cap: usize, acc: &mut Acc) -> Optio
     }
     let (ids, capped) = parsed?;
     if capped {
-        acc.note(format!("{name} exceeded the {cap}-entry budget; later paraIds were not recorded"));
+        acc.note(format!(
+            "{name} exceeded the {cap}-entry budget; later paraIds were not recorded and commentsIds definition absence was not checked"
+        ));
         acc.set_incomplete();
     }
-    Some((entry.name.clone(), ids))
+    Some((entry.name.clone(), ids, !capped))
 }
 
 /// Verify that custom XML itemProperties parts only reference schemas declared in settings.xml.
-fn check_custom_xml(pkg: &Package, acc: &mut Acc) {
+fn check_custom_xml(pkg: &Package, xml: &XmlScan, acc: &mut Acc) {
     acc.ran("CUSTOMXML-SCHEMA");
     let cap = acc.limits.facts;
     let owners = owner_scopes(pkg);
@@ -2659,6 +2721,12 @@ fn check_custom_xml(pkg: &Package, acc: &mut Acc) {
             per_owner.push(Some(HashSet::new()));
             continue;
         };
+        if !xml_source_complete(xml, entry) {
+            acc.note(format!("{} was not fully examined; custom XML schema references were not checked", entry.name));
+            acc.set_incomplete();
+            per_owner.push(None);
+            continue;
+        }
         let Some(text) = entry.decoded.as_deref() else {
             acc.note(format!("{} could not be read; custom XML schema references were not checked", entry.name));
             acc.set_incomplete();
@@ -2669,10 +2737,10 @@ fn check_custom_xml(pkg: &Package, acc: &mut Acc) {
         match scan::parse_attached_schemas(text, cap, &mut guard) {
             Some((vals, capped)) if !guard.exhausted() => {
                 if capped {
-                    acc.note(format!("{} exceeded the {cap}-entry budget; later attached schemas were not recorded", entry.name));
+                    acc.note(format!("{} exceeded the {cap}-entry budget; attached-schema absence was not checked", entry.name));
                     acc.set_incomplete();
                 }
-                per_owner.push(Some(vals.into_iter().collect()));
+                per_owner.push((!capped).then(|| vals.into_iter().collect()));
             }
             result => {
                 if guard.exhausted() {
@@ -4148,5 +4216,555 @@ mod round4_comment_para_tests {
             !links.iter().any(|f| f.part.as_deref() == Some("word/gloss-commentsExtended.xml") && f.message.contains("no paragraph")),
             "{report:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod round5_completeness_tests {
+    //! Absence predicates cover every source in their joined definition set.
+    use super::*;
+    use std::io::{Cursor, Write};
+
+    /// Package synthetic parts in their supplied order, including typed nonstandard names.
+    fn package(parts: Vec<(&str, &str, String)>, main_rels: &str) -> Vec<u8> {
+        let relns = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+        let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let mut overrides = format!(r#"<Override PartName="/word/document.xml" ContentType="{}"/>"#, package::MAIN_CONTENT_TYPE);
+        for (name, ct, _) in &parts {
+            if !ct.is_empty() {
+                overrides.push_str(&format!(r#"<Override PartName="/{name}" ContentType="{ct}"/>"#));
+            }
+        }
+        let ct = format!(
+            r#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/>{overrides}</Types>"#
+        );
+        let root = format!(
+            r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rM" Type="{relns}/officeDocument" Target="word/document.xml"/></Relationships>"#
+        );
+        let rels = relationships(main_rels);
+        let doc = format!(r#"<w:document xmlns:w="{NS_W}"><w:body><w:p/></w:body></w:document>"#);
+        for (name, text) in [("[Content_Types].xml", ct), ("_rels/.rels", root), ("word/document.xml", doc), ("word/_rels/document.xml.rels", rels)]
+            .into_iter()
+            .chain(parts.into_iter().map(|(name, _, text)| (name, text)))
+        {
+            zip.start_file(name, zip::write::SimpleFileOptions::default()).unwrap();
+            zip.write_all(text.as_bytes()).unwrap();
+        }
+        zip.finish().unwrap().into_inner()
+    }
+
+    /// Wrap owner-local relationships.
+    fn relationships(children: &str) -> String {
+        format!(r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">{children}</Relationships>"#)
+    }
+
+    /// One internal relationship with a stable unique id per target.
+    fn rel(kind: &str, target: &str) -> String {
+        format!(
+            r#"<Relationship Id="{target}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/{kind}" Target="{target}"/>"#
+        )
+    }
+
+    /// Comment paragraphs use the same ids as the threading records.
+    fn comments(ids: &[u32]) -> String {
+        let paragraphs = ids.iter().map(|id| format!(r#"<w:p w14:paraId="{id:08X}"/>"#)).collect::<String>();
+        format!(r#"<w:comments xmlns:w="{NS_W}" xmlns:w14="{NS_W14}"><w:comment w:id="1">{paragraphs}</w:comment></w:comments>"#)
+    }
+
+    /// The first glossary comments source is complete; the second, shared source loses id 3.
+    fn shared(pooled: bool, loss: bool) -> Vec<u8> {
+        let own_ids: &[u32] = if pooled { &[4] } else { &[] };
+        let shared_ids: &[u32] = if !loss {
+            &[1, 3]
+        } else if pooled {
+            &[1, 2, 3]
+        } else {
+            &[1, 2, 4, 3]
+        };
+        let gloss_rels = rel("comments", "gloss-comments.xml") + &rel("comments", "comments.xml") + &rel("commentsExtended", "gloss-ext.xml");
+        package(
+            vec![
+                (
+                    "word/glossary.xml",
+                    package::GLOSSARY_CONTENT_TYPE,
+                    format!(r#"<w:glossaryDocument xmlns:w="{NS_W}"><w:docParts/></w:glossaryDocument>"#),
+                ),
+                ("word/_rels/glossary.xml.rels", "", relationships(&gloss_rels)),
+                ("word/gloss-comments.xml", package::COMMENTS_CONTENT_TYPE, comments(own_ids)),
+                ("word/comments.xml", package::COMMENTS_CONTENT_TYPE, comments(shared_ids)),
+                (
+                    "word/gloss-ext.xml",
+                    package::COMMENTS_EXTENDED_CONTENT_TYPE,
+                    format!(
+                        r#"<w15:commentsEx xmlns:w15="{NS_W15}"><w15:commentEx w15:paraId="00000003" w15:paraIdParent="00000008"/></w15:commentsEx>"#
+                    ),
+                ),
+                (
+                    "word/main-ext.xml",
+                    package::COMMENTS_EXTENDED_CONTENT_TYPE,
+                    format!(r#"<w15:commentsEx xmlns:w15="{NS_W15}"><w15:commentEx w15:paraId="00000009"/></w15:commentsEx>"#),
+                ),
+            ],
+            &(rel("glossaryDocument", "glossary.xml") + &rel("comments", "comments.xml") + &rel("commentsExtended", "main-ext.xml")),
+        )
+    }
+
+    /// Both loss paths must suppress glossary absence and preserve independent parent checks.
+    fn assert_shared(pooled: bool) {
+        let limits = Limits { facts: 3, ..Limits::default() };
+        let control = validate_bytes_limited(&shared(pooled, false), limits);
+        assert!(control.findings.iter().any(|f| f.part.as_deref() == Some("word/main-ext.xml") && f.message.contains("no paragraph")), "{control:?}");
+        assert!(
+            !control.findings.iter().any(|f| f.part.as_deref() == Some("word/gloss-ext.xml") && f.message.contains("no paragraph")),
+            "{control:?}"
+        );
+        let report = validate_bytes_limited(&shared(pooled, true), limits);
+        eprintln!("shared pooled={pooled}: {report:?}");
+        assert_eq!(report.verdict, Verdict::Incomplete, "{report:?}");
+        assert!(report.findings.iter().any(|f| f.part.as_deref() == Some("word/gloss-ext.xml") && f.message.contains("paraIdParent")), "{report:?}");
+        assert!(!report.findings.iter().any(|f| f.message.contains("no paragraph")), "{report:?}");
+        assert!(
+            report
+                .coverage_notes
+                .iter()
+                .any(|n| n.contains("comment-threading") && n.contains("word/glossary.xml") && n.contains("word/comments.xml")),
+            "{report:?}"
+        );
+        assert_eq!(report.coverage_notes.iter().any(|n| n.contains("pooled comment paragraph IDs")), pooled, "{report:?}");
+    }
+
+    /// Pooled loss in the second contributing comments source.
+    #[test]
+    fn round5_shared_pooled_loss() {
+        assert_shared(true);
+    }
+
+    /// Pure per-part loss in the second contributing comments source, with the first empty.
+    #[test]
+    fn round5_shared_per_part_loss() {
+        assert_shared(false);
+    }
+
+    /// Definition caps cannot manufacture style-reference absence.
+    #[test]
+    fn round5_style_definition_cap() {
+        let bytes = package(
+            vec![
+                (
+                    "word/styles.xml",
+                    package::STYLES_CONTENT_TYPE,
+                    format!(r#"<w:styles xmlns:w="{NS_W}"><w:style w:styleId="A"/><w:style w:styleId="B"/></w:styles>"#),
+                ),
+                (
+                    "word/header.xml",
+                    package::HEADER_CONTENT_TYPE,
+                    format!(r#"<w:hdr xmlns:w="{NS_W}"><w:p><w:pPr><w:pStyle w:val="B"/></w:pPr></w:p></w:hdr>"#),
+                ),
+            ],
+            &(rel("styles", "styles.xml") + &rel("header", "header.xml")),
+        );
+        let report = validate_bytes_limited(&bytes, Limits { facts: 1, ..Limits::default() });
+        eprintln!("style cap: {report:?}");
+        assert!(!report.findings.iter().any(|f| f.rule == "REF-STYLE"), "{report:?}");
+        assert!(!validate_bytes(&bytes).findings.iter().any(|f| f.rule == "REF-STYLE"));
+    }
+
+    /// Numbering caps must guard the abstract set and both story/style joins.
+    #[test]
+    fn round5_numbering_definition_cap() {
+        let bytes = package(
+            vec![
+                (
+                    "word/numbering.xml",
+                    package::NUMBERING_CONTENT_TYPE,
+                    format!(
+                        r#"<w:numbering xmlns:w="{NS_W}"><w:abstractNum w:abstractNumId="1"/><w:abstractNum w:abstractNumId="2"/><w:num w:numId="1"><w:abstractNumId w:val="2"/></w:num><w:num w:numId="2"><w:abstractNumId w:val="2"/></w:num></w:numbering>"#
+                    ),
+                ),
+                (
+                    "word/styles.xml",
+                    package::STYLES_CONTENT_TYPE,
+                    format!(
+                        r#"<w:styles xmlns:w="{NS_W}"><w:style w:styleId="A"><w:pPr><w:numPr><w:numId w:val="2"/></w:numPr></w:pPr></w:style></w:styles>"#
+                    ),
+                ),
+                (
+                    "word/header.xml",
+                    package::HEADER_CONTENT_TYPE,
+                    format!(r#"<w:hdr xmlns:w="{NS_W}"><w:p><w:pPr><w:numPr><w:numId w:val="2"/></w:numPr></w:pPr></w:p></w:hdr>"#),
+                ),
+            ],
+            &(rel("numbering", "numbering.xml") + &rel("styles", "styles.xml") + &rel("header", "header.xml")),
+        );
+        let report = validate_bytes_limited(&bytes, Limits { facts: 1, ..Limits::default() });
+        eprintln!("numbering cap: {report:?}");
+        assert!(!report.findings.iter().any(|f| f.rule == "NUM-DANGLING"), "{report:?}");
+        assert!(!validate_bytes(&bytes).findings.iter().any(|f| f.rule == "NUM-DANGLING"));
+    }
+
+    /// Capped attached-schema definitions cannot establish an unattached reference.
+    #[test]
+    fn round5_attached_schema_cap() {
+        let bytes = package(
+            vec![
+                (
+                    "word/settings.xml",
+                    package::SETTINGS_CONTENT_TYPE,
+                    format!(r#"<w:settings xmlns:w="{NS_W}"><w:attachedSchema w:val="urn:A"/><w:attachedSchema w:val="urn:B"/></w:settings>"#),
+                ),
+                (
+                    "word/props.xml",
+                    package::CUSTOM_XML_PROPS_CONTENT_TYPE,
+                    format!(
+                        r#"<ds:datastoreItem xmlns:ds="{NS_DS}"><ds:schemaRefs><ds:schemaRef ds:uri="urn:B"/></ds:schemaRefs></ds:datastoreItem>"#
+                    ),
+                ),
+            ],
+            &(rel("settings", "settings.xml") + &rel("customXmlProps", "props.xml")),
+        );
+        let report = validate_bytes_limited(&bytes, Limits { facts: 1, ..Limits::default() });
+        eprintln!("schema cap: {report:?}");
+        assert!(!report.findings.iter().any(|f| f.rule == "CUSTOMXML-SCHEMA"), "{report:?}");
+        assert!(!validate_bytes(&bytes).findings.iter().any(|f| f.rule == "CUSTOMXML-SCHEMA"));
+    }
+
+    /// Threading joins use each direction's definition completeness, including missing parse results.
+    fn assert_threading_loss(mode: &str) {
+        let ext = if mode == "ext-malformed" {
+            "<".to_string()
+        } else {
+            let second = if mode == "ext-cap" { r#"<w15:commentEx w15:paraId="00000002"/>"# } else { "" };
+            format!(
+                r#"<w15:commentsEx xmlns:w15="{NS_W15}"><w15:commentEx w15:paraId="00000001" w15:paraIdParent="00000002"/>{second}</w15:commentsEx>"#
+            )
+        };
+        let ids = if mode == "ids-cap" { vec![2, 1] } else { vec![2] };
+        let ids = ids.into_iter().map(|id| format!(r#"<w16cid:commentId w16cid:paraId="{id:08X}"/>"#)).collect::<String>();
+        let bytes = package(
+            vec![
+                ("word/comments.xml", package::COMMENTS_CONTENT_TYPE, comments(&[1])),
+                ("word/ext.xml", package::COMMENTS_EXTENDED_CONTENT_TYPE, ext),
+                (
+                    "word/ids.xml",
+                    package::COMMENTS_IDS_CONTENT_TYPE,
+                    format!(r#"<w16cid:commentsIds xmlns:w16cid="{NS_W16CID}">{ids}</w16cid:commentsIds>"#),
+                ),
+            ],
+            &(rel("comments", "comments.xml") + &rel("commentsExtended", "ext.xml") + &rel("commentsIds", "ids.xml")),
+        );
+        let report = validate_bytes_limited(&bytes, Limits { facts: 1, ..Limits::default() });
+        eprintln!("threading {mode}: {report:?}");
+        if mode != "ids-cap" {
+            assert!(
+                !report
+                    .findings
+                    .iter()
+                    .any(|f| f.rule == "COMMENTEX-LINK" && (f.message.contains("paraIdParent") || f.message.contains("no commentEx counterpart"))),
+                "{mode}: {report:?}"
+            );
+        } else {
+            assert!(!report.findings.iter().any(|f| f.message.contains("no commentsIds paraId counterpart")), "{report:?}");
+            assert!(report.findings.iter().any(|f| f.message.contains("paraIdParent")), "{report:?}");
+        }
+    }
+
+    /// The parent and commentsIds checks cannot draw absence from capped commentEx definitions.
+    #[test]
+    fn round5_threading_ext_cap() {
+        assert_threading_loss("ext-cap");
+    }
+
+    /// Only the check against capped commentsIds is suppressed; the complete parent set still warns.
+    #[test]
+    fn round5_threading_ids_cap() {
+        assert_threading_loss("ids-cap");
+    }
+
+    /// A failed commentEx parse cannot be replaced with an empty definition set.
+    #[test]
+    fn round5_threading_ext_malformed() {
+        assert_threading_loss("ext-malformed");
+    }
+
+    /// An auxiliary parser's EOF result cannot override the XML scan's incomplete source.
+    #[test]
+    fn round5_unclosed_definition_sources() {
+        let mut manufactured = Vec::new();
+        for kind in ["styles", "numbering", "settings", "ext"] {
+            let (ct, text, ref_ct, reference, reference_kind, rule) = match kind {
+                "styles" => (
+                    package::STYLES_CONTENT_TYPE,
+                    format!(r#"<w:styles xmlns:w="{NS_W}"><w:style w:styleId="A"/>"#),
+                    package::HEADER_CONTENT_TYPE,
+                    format!(r#"<w:hdr xmlns:w="{NS_W}"><w:p><w:pPr><w:pStyle w:val="B"/></w:pPr></w:p></w:hdr>"#),
+                    "header",
+                    "REF-STYLE",
+                ),
+                "numbering" => (
+                    package::NUMBERING_CONTENT_TYPE,
+                    format!(r#"<w:numbering xmlns:w="{NS_W}"><w:abstractNum w:abstractNumId="1"/>"#),
+                    package::HEADER_CONTENT_TYPE,
+                    format!(r#"<w:hdr xmlns:w="{NS_W}"><w:p><w:pPr><w:numPr><w:numId w:val="2"/></w:numPr></w:pPr></w:p></w:hdr>"#),
+                    "header",
+                    "NUM-DANGLING",
+                ),
+                "settings" => (
+                    package::SETTINGS_CONTENT_TYPE,
+                    format!(r#"<w:settings xmlns:w="{NS_W}"><w:attachedSchema w:val="urn:A"/>"#),
+                    package::CUSTOM_XML_PROPS_CONTENT_TYPE,
+                    format!(
+                        r#"<ds:datastoreItem xmlns:ds="{NS_DS}"><ds:schemaRefs><ds:schemaRef ds:uri="urn:B"/></ds:schemaRefs></ds:datastoreItem>"#
+                    ),
+                    "customXmlProps",
+                    "CUSTOMXML-SCHEMA",
+                ),
+                _ => (
+                    package::COMMENTS_EXTENDED_CONTENT_TYPE,
+                    format!(r#"<w15:commentsEx xmlns:w15="{NS_W15}"><w15:commentEx w15:paraId="00000001" w15:paraIdParent="00000002"/>"#),
+                    package::COMMENTS_IDS_CONTENT_TYPE,
+                    format!(r#"<w16cid:commentsIds xmlns:w16cid="{NS_W16CID}"><w16cid:commentId w16cid:paraId="00000002"/></w16cid:commentsIds>"#),
+                    "commentsIds",
+                    "COMMENTEX-LINK",
+                ),
+            };
+            let bytes = package(
+                vec![("word/defs.xml", ct, text), ("word/refs.xml", ref_ct, reference)],
+                &(rel(if kind == "ext" { "commentsExtended" } else { kind }, "defs.xml") + &rel(reference_kind, "refs.xml")),
+            );
+            let report = validate_bytes(&bytes);
+            eprintln!("unclosed {kind}: {report:?}");
+            if report.findings.iter().any(|f| f.rule == rule) {
+                manufactured.push(kind);
+            }
+            assert!(report.findings.iter().any(|f| f.rule == "XML-MALFORMED"), "{report:?}");
+        }
+        assert!(manufactured.is_empty(), "false absences from unclosed sources: {manufactured:?}");
+    }
+
+    /// A relationship's target can lie beyond the examined archive prefix.
+    #[test]
+    fn round5_archive_prefix_absence() {
+        let bytes = package(
+            vec![("word/header.xml", package::HEADER_CONTENT_TYPE, format!(r#"<w:hdr xmlns:w="{NS_W}"><w:p/></w:hdr>"#))],
+            &rel("header", "header.xml"),
+        );
+        let report = validate_bytes_limited(&bytes, Limits { entries: 4, ..Limits::default() });
+        eprintln!("archive prefix: {report:?}");
+        assert!(!report.findings.iter().any(|f| f.rule == "REL-DANGLING"), "{report:?}");
+        assert_eq!(report.verdict, Verdict::Incomplete, "{report:?}");
+        assert_eq!(validate_bytes(&bytes).verdict, Verdict::Pass);
+    }
+
+    /// Unexamined declarations and owners cannot establish missing parts or relationship ids.
+    #[test]
+    fn round5_archive_prefix_declarations() {
+        let mut failures = Vec::new();
+        let root = relationships(&rel("officeDocument", "word/document.xml"));
+        let doc = format!(r#"<w:document xmlns:w="{NS_W}"><w:body><w:p/></w:body></w:document>"#);
+        let ct = format!(
+            r#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Override PartName="/word/document.xml" ContentType="{}"/></Types>"#,
+            package::MAIN_CONTENT_TYPE
+        );
+        for (label, parts) in [
+            ("manifest", vec![("_rels/.rels", root.as_str()), ("word/document.xml", doc.as_str()), ("[Content_Types].xml", ct.as_str())]),
+            ("main", vec![("[Content_Types].xml", ct.as_str()), ("_rels/.rels", root.as_str()), ("word/document.xml", doc.as_str())]),
+        ] {
+            let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+            for (name, text) in parts {
+                zip.start_file(name, zip::write::SimpleFileOptions::default()).unwrap();
+                zip.write_all(text.as_bytes()).unwrap();
+            }
+            let report = validate_bytes_limited(&zip.finish().unwrap().into_inner(), Limits { entries: 2, ..Limits::default() });
+            eprintln!("archive prefix {label}: {report:?}");
+            if report.findings.iter().any(|f| matches!(f.rule, "PKG-NO-CONTENT-TYPES" | "PKG-NO-MAIN")) {
+                failures.push(label);
+            }
+        }
+        let bytes = package(
+            vec![
+                (
+                    "word/header.xml",
+                    package::HEADER_CONTENT_TYPE,
+                    format!(r#"<w:hdr xmlns:w="{NS_W}" xmlns:r="{NS_R}"><w:p><w:r><w:object r:id="x"/></w:r></w:p></w:hdr>"#),
+                ),
+                ("word/pad.xml", "", "<pad/>".to_string()),
+                ("word/_rels/header.xml.rels", "", relationships(r#"<Relationship Id="x" Type="urn:test" Target="pad.xml"/>"#)),
+            ],
+            &rel("header", "header.xml"),
+        );
+        let report = validate_bytes_limited(&bytes, Limits { entries: 6, ..Limits::default() });
+        eprintln!("archive prefix relationships: {report:?}");
+        if report.findings.iter().any(|f| f.rule == "REL-REF-MISSING") {
+            failures.push("relationships");
+        }
+        assert!(failures.is_empty(), "false absences from archive prefixes: {failures:?}");
+    }
+
+    /// Repack one synthetic part while preserving archive ordering and all other payloads.
+    fn replace_part(bytes: &[u8], target: &str, text: &str) -> Vec<u8> {
+        use std::io::Read;
+        let mut input = zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
+        let mut output = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        for i in 0..input.len() {
+            let mut entry = input.by_index(i).unwrap();
+            let mut data = Vec::new();
+            entry.read_to_end(&mut data).unwrap();
+            output.start_file(entry.name(), zip::write::SimpleFileOptions::default()).unwrap();
+            output.write_all(if entry.name() == target { text.as_bytes() } else { &data }).unwrap();
+        }
+        output.finish().unwrap().into_inner()
+    }
+
+    /// Unreadable or parser-failed second contributors have the same source-set requirements as caps.
+    #[test]
+    fn round5_shared_unavailable_source() {
+        for text in [r#"<?xml version="1.0" encoding="X-unknown"?><comments/>"#, "<"] {
+            let bytes = replace_part(&shared(true, false), "word/comments.xml", text);
+            let report = validate_bytes(&bytes);
+            eprintln!("shared unavailable {text}: {report:?}");
+            assert!(!report.findings.iter().any(|f| f.rule == "COMMENTEX-LINK" && f.message.contains("no paragraph")), "{report:?}");
+            assert!(report.findings.iter().any(|f| f.message.contains("paraIdParent")), "{report:?}");
+            assert!(report.coverage_notes.iter().any(|n| n.contains("word/glossary.xml") && n.contains("word/comments.xml")), "{report:?}");
+        }
+    }
+
+    /// A truncated consumption scan cannot establish that the customXml relationship is unused.
+    #[test]
+    fn round5_content_part_scan_stop() {
+        let mut failures = Vec::new();
+        for depth in [false, true] {
+            let padding = if depth { "<x>".repeat(8) + &"</x>".repeat(8) } else { "<x/>".repeat(40) };
+            let bytes = package(
+                vec![
+                    (
+                        "word/header.xml",
+                        package::HEADER_CONTENT_TYPE,
+                        format!(
+                            r#"<w:hdr xmlns:w="{NS_W}" xmlns:r="{NS_R}">{padding}<w:p><w:r><w:contentPart r:id="data.xml"/></w:r></w:p></w:hdr>"#
+                        ),
+                    ),
+                    ("word/_rels/header.xml.rels", "", relationships(&rel("customXml", "data.xml"))),
+                    ("word/data.xml", "text/xml", "<data/>".to_string()),
+                ],
+                &rel("header", "header.xml"),
+            );
+            let limits = if depth { Limits { depth: 6, ..Limits::default() } } else { Limits { events: 25, ..Limits::default() } };
+            let report = validate_bytes_limited(&bytes, limits);
+            eprintln!("contentPart depth={depth}: {report:?}");
+            if report.findings.iter().any(|f| f.rule == "CT-MISMATCH") {
+                failures.push(depth);
+            }
+            assert_eq!(validate_bytes(&bytes).verdict, Verdict::Pass);
+        }
+        assert!(failures.is_empty(), "false non-consumption from scan stops: depth={failures:?}");
+    }
+
+    /// The specialized header join needs the same missing-relationships guard as generic r:id joins.
+    #[test]
+    fn round5_header_archive_prefix() {
+        let ct = format!(
+            r#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="{}"/><Override PartName="/word/header.xml" ContentType="{}"/></Types>"#,
+            package::MAIN_CONTENT_TYPE,
+            package::HEADER_CONTENT_TYPE
+        );
+        let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        for (name, text) in [
+            ("[Content_Types].xml", ct),
+            ("_rels/.rels", relationships(&rel("officeDocument", "word/document.xml"))),
+            (
+                "word/document.xml",
+                format!(
+                    r#"<w:document xmlns:w="{NS_W}" xmlns:r="{NS_R}"><w:body><w:p/><w:sectPr><w:headerReference w:type="default" r:id="header.xml"/></w:sectPr></w:body></w:document>"#
+                ),
+            ),
+            ("word/header.xml", format!(r#"<w:hdr xmlns:w="{NS_W}"><w:p/></w:hdr>"#)),
+            ("word/_rels/document.xml.rels", relationships(&rel("header", "header.xml"))),
+        ] {
+            zip.start_file(name, zip::write::SimpleFileOptions::default()).unwrap();
+            zip.write_all(text.as_bytes()).unwrap();
+        }
+        let bytes = zip.finish().unwrap().into_inner();
+        let report = validate_bytes_limited(&bytes, Limits { entries: 4, ..Limits::default() });
+        eprintln!("header archive prefix: {report:?}");
+        assert!(!report.findings.iter().any(|f| f.rule == "REF-HEADER"), "{report:?}");
+        assert_eq!(report.verdict, Verdict::Incomplete, "{report:?}");
+        assert_eq!(validate_bytes(&bytes).verdict, Verdict::Pass);
+    }
+
+    /// Complete definition sources still expose genuine absences in every newly guarded family.
+    #[test]
+    fn round5_complete_definition_absence_controls() {
+        let bytes = package(
+            vec![
+                (
+                    "word/styles.xml",
+                    package::STYLES_CONTENT_TYPE,
+                    format!(
+                        r#"<w:styles xmlns:w="{NS_W}"><w:style w:styleId="A"><w:pPr><w:numPr><w:numId w:val="9"/></w:numPr></w:pPr></w:style></w:styles>"#
+                    ),
+                ),
+                (
+                    "word/numbering.xml",
+                    package::NUMBERING_CONTENT_TYPE,
+                    format!(r#"<w:numbering xmlns:w="{NS_W}"><w:num w:numId="1"><w:abstractNumId w:val="9"/></w:num></w:numbering>"#),
+                ),
+                (
+                    "word/header.xml",
+                    package::HEADER_CONTENT_TYPE,
+                    format!(
+                        r#"<w:hdr xmlns:w="{NS_W}"><w:p><w:pPr><w:pStyle w:val="B"/><w:numPr><w:numId w:val="9"/></w:numPr></w:pPr></w:p></w:hdr>"#
+                    ),
+                ),
+                (
+                    "word/settings.xml",
+                    package::SETTINGS_CONTENT_TYPE,
+                    format!(r#"<w:settings xmlns:w="{NS_W}"><w:attachedSchema w:val="urn:A"/></w:settings>"#),
+                ),
+                (
+                    "word/props.xml",
+                    package::CUSTOM_XML_PROPS_CONTENT_TYPE,
+                    format!(
+                        r#"<ds:datastoreItem xmlns:ds="{NS_DS}"><ds:schemaRefs><ds:schemaRef ds:uri="urn:B"/></ds:schemaRefs></ds:datastoreItem>"#
+                    ),
+                ),
+            ],
+            &(rel("styles", "styles.xml")
+                + &rel("numbering", "numbering.xml")
+                + &rel("header", "header.xml")
+                + &rel("settings", "settings.xml")
+                + &rel("customXmlProps", "props.xml")),
+        );
+        let report = validate_bytes_limited(&bytes, Limits { facts: 1, ..Limits::default() });
+        assert!(report.findings.iter().any(|f| f.rule == "REF-STYLE"), "{report:?}");
+        for part in ["word/header.xml", "word/styles.xml", "word/numbering.xml"] {
+            assert!(report.findings.iter().any(|f| f.rule == "NUM-DANGLING" && f.part.as_deref() == Some(part)), "{report:?}");
+        }
+        assert!(report.findings.iter().any(|f| f.rule == "CUSTOMXML-SCHEMA"), "{report:?}");
+    }
+
+    /// An unexamined content-type declaration cannot establish that an owner is non-XML.
+    #[test]
+    fn round5_content_part_unknown_owner_type() {
+        let bytes = package(
+            vec![
+                (
+                    "word/extra.dat",
+                    "application/xml",
+                    format!(r#"<w:root xmlns:w="{NS_W}" xmlns:r="{NS_R}"><w:contentPart r:id="data.xml"/></w:root>"#),
+                ),
+                ("word/_rels/extra.dat.rels", "", relationships(&rel("customXml", "data.xml"))),
+                ("word/data.xml", "text/xml", "<data/>".to_string()),
+            ],
+            &rel("unknown", "extra.dat"),
+        );
+        let padding = (0..10).map(|i| format!(r#"<Default Extension="unused{i}" ContentType="application/xml"/>"#)).collect::<String>();
+        let ct = format!(
+            r#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Override PartName="/word/document.xml" ContentType="{}"/><Override PartName="/word/data.xml" ContentType="text/xml"/>{padding}<Override PartName="/word/extra.dat" ContentType="application/xml"/></Types>"#,
+            package::MAIN_CONTENT_TYPE
+        );
+        let report = validate_bytes_limited(&replace_part(&bytes, "[Content_Types].xml", &ct), Limits { entries: 10, ..Limits::default() });
+        eprintln!("unknown contentPart owner type: {report:?}");
+        assert!(!report.findings.iter().any(|f| f.rule == "CT-MISMATCH"), "{report:?}");
+        assert_eq!(validate_bytes(&bytes).verdict, Verdict::Pass);
     }
 }
