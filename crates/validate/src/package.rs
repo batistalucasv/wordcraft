@@ -886,16 +886,37 @@ pub(crate) fn relationship_kind(uri: &str) -> Option<&str> {
     (official && !kind.is_empty()).then_some(kind)
 }
 
-/// Whether the package entry-point relationship selects the unsupported Strict OOXML profile.
-/// Keep this separate from supported kind classification: recognizing an entry point does not
-/// establish support for Strict markup or its reference namespaces.
-pub(crate) fn uses_strict_profile(pkg: &Package) -> bool {
-    pkg.rels.iter().find(|rp| rp.name.eq_ignore_ascii_case("_rels/.rels")).is_some_and(|rp| {
-        rp.rels
-            .iter()
-            .find(|r| !r.external && is_office_document_relationship(&r.kind))
-            .is_some_and(|r| r.kind == "http://purl.oclc.org/ooxml/officeDocument/relationships/officeDocument")
-    })
+/// Agreement of the recognized package entry points about the document profile.
+pub(crate) enum EntryPointProfile {
+    /// Every recognized entry point declares Transitional.
+    Transitional,
+    /// Every recognized entry point declares Strict, whose markup is unsupported.
+    Strict,
+    /// Recognized entry points disagree, even if they name the same target part.
+    Mixed,
+}
+
+/// Resolve the profile across all recognized internal entry points, without choosing a target.
+/// Repeated targets cannot excuse profile disagreement: first-match scanning could manufacture
+/// a Transitional verdict for an uncertain package. The relationship loader bounds this walk.
+/// Recognition remains separate from supported kind classification and Strict markup support.
+pub(crate) fn entry_point_profile(pkg: &Package) -> Option<EntryPointProfile> {
+    let rp = pkg.rels.iter().find(|rp| rp.name.eq_ignore_ascii_case("_rels/.rels"))?;
+    let mut transitional = false;
+    let mut strict = false;
+    for r in rp.rels.iter().filter(|r| !r.external && is_office_document_relationship(&r.kind)) {
+        if r.kind == "http://purl.oclc.org/ooxml/officeDocument/relationships/officeDocument" {
+            strict = true;
+        } else {
+            transitional = true;
+        }
+    }
+    match (transitional, strict) {
+        (true, true) => Some(EntryPointProfile::Mixed),
+        (true, false) => Some(EntryPointProfile::Transitional),
+        (false, true) => Some(EntryPointProfile::Strict),
+        (false, false) => None,
+    }
 }
 
 /// Parse `[Content_Types].xml`. Returns `true` when the declaration budget stopped it early.

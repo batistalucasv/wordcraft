@@ -690,12 +690,23 @@ pub(crate) fn validate_bytes_limited(bytes: &[u8], limits: Limits) -> Report {
         return acc.finish();
     };
     if !pkg.roots_ambiguous {
-        if package::uses_strict_profile(&pkg) {
-            // The XML scanner understands Transitional WML only. Running it on Strict markup would
-            // silently skip its elements and could manufacture a PASS without checking that profile.
-            acc.note("the Strict OOXML profile is unsupported; document checks require the Transitional profile".to_string());
-            acc.set_incomplete();
-            return acc.finish();
+        match package::entry_point_profile(&pkg) {
+            Some(package::EntryPointProfile::Mixed) => {
+                acc.note(
+                    "mixed Transitional/Strict officeDocument entry points leave the package profile uncertain; document checks were skipped"
+                        .to_string(),
+                );
+                acc.set_incomplete();
+                return acc.finish();
+            }
+            Some(package::EntryPointProfile::Strict) => {
+                // The XML scanner understands Transitional WML only. Running it on Strict markup would
+                // silently skip its elements and could manufacture a PASS without checking that profile.
+                acc.note("the Strict OOXML profile is unsupported; document checks require the Transitional profile".to_string());
+                acc.set_incomplete();
+                return acc.finish();
+            }
+            Some(package::EntryPointProfile::Transitional) | None => {}
         }
         if !owner_roots_supported(&pkg, &mut acc) {
             return acc.finish();
