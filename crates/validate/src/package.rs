@@ -103,6 +103,15 @@ pub(crate) struct ContentTypes {
 impl ContentTypes {
     /// The effective content type of `part` (a package path, leading `/` ignored).
     pub fn of(&self, part: &str) -> Option<&str> {
+        observation_contract! {
+            rules: "-";
+            collections: "field.defaults*1,field.incomplete*1,field.overrides*1";
+            scope: "source-local bounded extraction; no implicit document owner";
+            loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+            fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+            package_loss: "independent";
+        }
+
         let part = part.trim_start_matches('/').to_ascii_lowercase();
         if let Some(t) = self.overrides.get(&part) {
             return Some(t);
@@ -155,12 +164,59 @@ pub(crate) struct Rel {
 /// Bind lexical relationship IDs consistently: the first declaration in XML order wins.
 /// Duplicate declarations still produce REL-DUP-ID, and every declaration retains its
 /// independent target/type checks. Reordering duplicate declarations changes binding evidence.
-pub(crate) fn relationship_bindings(rp: &RelsPart) -> HashMap<&str, &Rel> {
+pub(crate) fn relationship_bindings(rp: &RelsPart) -> RelationshipBindings<'_> {
+    observation_contract! {
+        rules: "-";
+        collections: "field.incomplete*1,field.rels*1,type.HashMap*1";
+        scope: "per relationships part and lexical ID; first XML declaration binds; duplicates retain independent REL-DUP-ID and per-declaration target checks";
+        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+        fallback: "retained first bindings prove presence even in an incomplete suffix; missing IDs require complete declarations";
+        package_loss: "independent";
+    }
+
     let mut bindings = HashMap::new();
     for rel in &rp.rels {
         bindings.entry(rel.id.as_str()).or_insert(rel);
     }
-    bindings
+    RelationshipBindings { first: bindings, complete: !rp.incomplete }
+}
+
+/// A sealed first-declaration index carrying completeness of the declaring XML source.
+pub(crate) struct RelationshipBindings<'a> {
+    first: HashMap<&'a str, &'a Rel>,
+    complete: bool,
+}
+impl<'a> RelationshipBindings<'a> {
+    /// A missing ID is Absent only after complete declaration discovery; prefix bindings survive.
+    pub(crate) fn resolve(&self, id: &str) -> Resolution<&'a Rel> {
+        observation_contract! {
+            rules: "-";
+            collections: "field.first*1";
+            scope: "source-local bounded extraction; no implicit document owner";
+            loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+            fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+            package_loss: "independent";
+        }
+
+        Resolution::discovered(self.first.get(id).copied(), self.complete)
+    }
+    /// Presence-only traversal of retained bindings, never negative membership evidence.
+    pub(crate) fn values(&self) -> impl Iterator<Item = &'a Rel> + '_ {
+        observation_contract! {
+            rules: "-";
+            collections: "field.first*1";
+            scope: "source-local bounded extraction; no implicit document owner";
+            loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+            fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+            package_loss: "independent";
+        }
+
+        self.first.values().copied()
+    }
+    /// The declaration actually bound for this ID; other duplicates retain their independent checks.
+    pub(crate) fn is_first(&self, rel: &Rel) -> bool {
+        matches!(self.resolve(rel.id.as_str()), Resolution::One(first) if std::ptr::eq(first, rel))
+    }
 }
 
 /// One `.rels` part.
@@ -198,6 +254,15 @@ pub(crate) struct Package {
 /// Load a zip into the package model. Returns `None` only when the input is not a readable zip
 /// (after a `PKG-NOT-ZIP` finding): every other problem becomes a finding or a coverage note.
 pub(crate) fn load(bytes: &[u8], acc: &mut Acc) -> Option<Package> {
+    observation_contract! {
+        rules: "PKG-NO-CONTENT-TYPES,PKG-NO-MAIN,PKG-NOT-ZIP";
+        collections: "field.bytes*1,field.entries*6,field.incomplete*5,field.rels*1,parser.parse_content_types*1,type.Vec*2";
+        scope: "source-local bounded extraction; no implicit document owner";
+        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+        fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+        package_loss: "PKG-NO-CONTENT-TYPES,PKG-NO-MAIN";
+    }
+
     acc.ran("PKG-NOT-ZIP");
     let Ok(mut zip) = zip::ZipArchive::new(Cursor::new(bytes)) else {
         acc.add("PKG-NOT-ZIP", None, "the input is not a readable zip archive".to_string());
@@ -394,6 +459,15 @@ pub(crate) fn load(bytes: &[u8], acc: &mut Acc) -> Option<Package> {
 /// Normalized paths identify parts case-insensitively; repeated edges to one part are harmless.
 /// Missing or unreadable targets still compete, independently of their own package/XML findings.
 fn competing_targets(rp: Option<&RelsPart>, matches: impl Fn(&str) -> bool) -> bool {
+    observation_contract! {
+        rules: "-";
+        collections: "field.rels*1";
+        scope: "source-local bounded extraction; no implicit document owner";
+        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+        fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+        package_loss: "independent";
+    }
+
     let Some(rp) = rp else { return false };
     let mut target: Option<&str> = None;
     for r in &rp.rels {
@@ -413,6 +487,15 @@ fn competing_targets(rp: Option<&RelsPart>, matches: impl Fn(&str) -> bool) -> b
 /// Select the main document's official glossary target, else the unique glossary-content-typed
 /// part. Multiple fallback candidates are unknown selection, never a ZIP-order tie-break.
 fn glossary_part(entries: &[Entry], ct: &ContentTypes, rels: &[RelsPart], main: Option<&str>, entries_complete: bool) -> Resolution<String> {
+    observation_contract! {
+        rules: "-";
+        collections: "field.incomplete*2,field.rels*1";
+        scope: "source-local bounded extraction; no implicit document owner";
+        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+        fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+        package_loss: "independent";
+    }
+
     if let Some(main) = main {
         let want = rels_part_name(main);
         let rp = rels.iter().find(|r| r.name.eq_ignore_ascii_case(&want));
@@ -454,6 +537,15 @@ fn blank_entry(name: String, is_dir: bool) -> Entry {
 /// A file entry whose bytes are held: text parts are decoded once, strictly. A decode failure means
 /// the content is present but unreadable, so its text is unavailable to any consumer.
 fn text_entry(name: String, bytes: Vec<u8>) -> Entry {
+    observation_contract! {
+        rules: "-";
+        collections: "type.Vec*1";
+        scope: "source-local bounded extraction; no implicit document owner";
+        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+        fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+        package_loss: "independent";
+    }
+
     let (decoded, decode_error) = if is_text_part(&name) {
         match crate::scan::decode_strict(&bytes) {
             Ok(t) => (Some(t), None),
@@ -468,6 +560,15 @@ fn text_entry(name: String, bytes: Vec<u8>) -> Entry {
 
 /// Decode a part identified as XML by its effective content type, whichever its file name (H5).
 fn decode_entry(e: &mut Entry) {
+    observation_contract! {
+        rules: "-";
+        collections: "field.bytes*1";
+        scope: "source-local bounded extraction; no implicit document owner";
+        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+        fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+        package_loss: "independent";
+    }
+
     let Some(bytes) = e.bytes.as_deref() else { return };
     let (decoded, decode_error) = match crate::scan::decode_strict(bytes) {
         Ok(t) => (Some(t), None),
@@ -521,6 +622,15 @@ fn is_xml_relationship_kind(kind: &str) -> bool {
 /// relationship part, or a part reached through a recognised XML relationship role. Returns the
 /// lowercased names.
 fn classified_xml_parts(entries: &[Entry], ct: &ContentTypes, rels: &[RelsPart]) -> HashSet<String> {
+    observation_contract! {
+        rules: "-";
+        collections: "field.rels*1,type.HashSet*5";
+        scope: "source-local bounded extraction; no implicit document owner";
+        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+        fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+        package_loss: "independent";
+    }
+
     let mut role_targets: HashSet<String> = HashSet::new();
     for rp in rels {
         for r in &rp.rels {
@@ -547,11 +657,29 @@ fn classified_xml_parts(entries: &[Entry], ct: &ContentTypes, rels: &[RelsPart])
 
 /// Whether `name` is an XML part, by the classification stored on the package (J4).
 pub(crate) fn is_xml_part(pkg: &Package, name: &str) -> bool {
+    observation_contract! {
+        rules: "-";
+        collections: "field.xml_parts*1";
+        scope: "source-local bounded extraction; no implicit document owner";
+        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+        fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+        package_loss: "independent";
+    }
+
     pkg.xml_parts.contains(&name.to_ascii_lowercase())
 }
 
 /// Format an explanatory error message when the package lacks a valid main document part.
 fn no_main_message(package_rels: Option<&RelsPart>) -> String {
+    observation_contract! {
+        rules: "-";
+        collections: "field.rels*1";
+        scope: "source-local bounded extraction; no implicit document owner";
+        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+        fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+        package_loss: "independent";
+    }
+
     let Some(rp) = package_rels else {
         return "the package has no _rels/.rels part, so it has no main document part".to_string();
     };
@@ -571,6 +699,15 @@ fn trim_leading_slash(mut b: &[u8]) -> &[u8] {
 
 /// Inspect the raw zip central directory for duplicate entry names and report `PKG-DUP-ENTRY` findings.
 fn check_duplicate_entries(dir: Option<&CentralDirectory>, acc: &mut Acc) {
+    observation_contract! {
+        rules: "PKG-DUP-ENTRY";
+        collections: "field.entries*1,field.names*1,type.HashMap*2,type.Vec*1";
+        scope: "source-local bounded extraction; no implicit document owner";
+        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+        fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+        package_loss: "independent";
+    }
+
     acc.ran("PKG-DUP-ENTRY");
     // The zip reader collapses duplicate names into one entry, so the central directory itself is
     // read to see every stored name (a package may legally list the same name twice). The parse is
@@ -646,6 +783,15 @@ struct CentralDirectory<'a> {
 /// decoding occurs only when formatting finding messages. Records past the entry budget are
 /// unexamined by design, and the run reports INCOMPLETE instead of claiming coverage.
 fn central_directory<'a>(bytes: &'a [u8], limit: usize) -> Option<CentralDirectory<'a>> {
+    observation_contract! {
+        rules: "-";
+        collections: "type.Vec*1";
+        scope: "source-local bounded extraction; no implicit document owner";
+        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+        fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+        package_loss: "independent";
+    }
+
     let eocd = find_eocd(bytes)?;
     let mut count = u64::from(u16_at(bytes, eocd + 10)?);
     let mut cd_off = u64::from(u32_at(bytes, eocd + 16)?);
@@ -717,6 +863,15 @@ fn find_eocd(bytes: &[u8]) -> Option<usize> {
 /// (whose names the reader decoded) rather than not checking at all; the
 /// run is already INCOMPLETE in that case via the duplicate check.
 fn check_case_collisions(dir: Option<&CentralDirectory>, entries: &[Entry], acc: &mut Acc) {
+    observation_contract! {
+        rules: "PKG-CASE-COLLISION";
+        collections: "field.names*1,type.HashMap*4,type.Vec*5";
+        scope: "source-local bounded extraction; no implicit document owner";
+        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+        fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+        package_loss: "independent";
+    }
+
     acc.ran("PKG-CASE-COLLISION");
     let mut collisions: Vec<Vec<String>> = match dir {
         Some(dir) => {
@@ -760,6 +915,15 @@ fn check_case_collisions(dir: Option<&CentralDirectory>, entries: &[Entry], acc:
 
 /// Parse all `.rels` relationship parts within the package entries up to configured resource limits.
 fn load_rels(entries: &[Entry], acc: &mut Acc) -> Vec<RelsPart> {
+    observation_contract! {
+        rules: "-";
+        collections: "field.entries*1,parser.parse_rels*1,type.Vec*3";
+        scope: "source-local bounded extraction; no implicit document owner";
+        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+        fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+        package_loss: "independent";
+    }
+
     let cap = acc.limits.entries;
     let limits = acc.limits;
     let mut rels = Vec::new();
@@ -824,11 +988,29 @@ fn canonical(entries: &[Entry], name: &str) -> Option<String> {
 
 /// The stored spelling of the part at `name` (case-insensitive, leading `/` ignored), if present.
 pub(crate) fn canonical_entry(pkg: &Package, name: &str) -> Option<String> {
+    observation_contract! {
+        rules: "-";
+        collections: "field.entries*1";
+        scope: "source-local bounded extraction; no implicit document owner";
+        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+        fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+        package_loss: "independent";
+    }
+
     canonical(&pkg.entries, name)
 }
 
 /// The entry at `name` (case-insensitive, leading `/` ignored), if present.
 pub(crate) fn entry_by_name<'a>(pkg: &'a Package, name: &str) -> Option<&'a Entry> {
+    observation_contract! {
+        rules: "-";
+        collections: "field.entries*1";
+        scope: "source-local bounded extraction; no implicit document owner";
+        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+        fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+        package_loss: "independent";
+    }
+
     let n = name.trim_start_matches('/');
     pkg.entries.iter().find(|e| !e.is_dir && e.name.eq_ignore_ascii_case(n))
 }
@@ -843,6 +1025,15 @@ pub(crate) fn content_unavailable(pkg: &Package, name: &str) -> bool {
 
 /// Compute the set of lowercased package part paths reachable from the package relationships root and main document.
 fn reachability(rels: &[RelsPart], main: Option<&str>) -> HashSet<String> {
+    observation_contract! {
+        rules: "-";
+        collections: "field.rels*2,type.HashMap*1,type.HashSet*4,type.Vec*2";
+        scope: "source-local bounded extraction; no implicit document owner";
+        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+        fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+        package_loss: "independent";
+    }
+
     let by_name: HashMap<String, usize> = rels.iter().enumerate().map(|(i, r)| (r.name.to_ascii_lowercase(), i)).collect();
     let mut seen = HashSet::new();
     seen.insert("[content_types].xml".to_string());
@@ -882,6 +1073,15 @@ fn reachability(rels: &[RelsPart], main: Option<&str>) -> HashSet<String> {
 /// package-absolute). Part-name equivalence itself is ASCII case-insensitive (§6.2.2.3) and is
 /// applied by the caller when it looks the result up.
 pub(crate) fn resolve(dir: &str, target: &str) -> String {
+    observation_contract! {
+        rules: "-";
+        collections: "type.Vec*2";
+        scope: "source-local bounded extraction; no implicit document owner";
+        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+        fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+        package_loss: "independent";
+    }
+
     let target = target.split(['?', '#']).next().unwrap_or(target);
     let mut parts: Vec<String> =
         if target.starts_with('/') { Vec::new() } else { dir.split('/').filter(|s| !s.is_empty()).map(percent_decode).collect() };
@@ -900,6 +1100,15 @@ pub(crate) fn resolve(dir: &str, target: &str) -> String {
 
 /// Percent-decode a URI path segment (`%20` → space); invalid escapes are left as written.
 fn percent_decode(s: &str) -> String {
+    observation_contract! {
+        rules: "-";
+        collections: "type.Vec*1";
+        scope: "source-local bounded extraction; no implicit document owner";
+        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+        fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+        package_loss: "independent";
+    }
+
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
@@ -938,6 +1147,15 @@ fn is_office_document_relationship(kind: &str) -> bool {
 
 /// Whether an owner's relationship declarations are unavailable or only partially examined.
 pub(crate) fn relationships_incomplete(pkg: &Package, part: &str) -> bool {
+    observation_contract! {
+        rules: "-";
+        collections: "field.incomplete*1,field.rels*1";
+        scope: "source-local bounded extraction; no implicit document owner";
+        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+        fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+        package_loss: "independent";
+    }
+
     let name = rels_part_name(part);
     // An unexamined archive suffix may hold the missing relationships part.
     ((pkg.entries_truncated || pkg.identity_incomplete) && entry_by_name(pkg, &name).is_none())
@@ -973,6 +1191,15 @@ pub(crate) enum EntryPointProfile {
 /// a Transitional verdict for an uncertain package. The relationship loader bounds this walk.
 /// Recognition remains separate from supported kind classification and Strict markup support.
 pub(crate) fn entry_point_profile(pkg: &Package) -> Resolution<EntryPointProfile> {
+    observation_contract! {
+        rules: "-";
+        collections: "field.incomplete*1,field.rels*3";
+        scope: "source-local bounded extraction; no implicit document owner";
+        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+        fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+        package_loss: "independent";
+    }
+
     let complete = !pkg.entries_truncated
         && !pkg.identity_incomplete
         && !content_unavailable(pkg, "_rels/.rels")
@@ -999,6 +1226,15 @@ pub(crate) fn entry_point_profile(pkg: &Package) -> Resolution<EntryPointProfile
 
 /// Parse `[Content_Types].xml`. Returns `true` when the declaration budget stopped it early.
 fn parse_content_types(text: &str, ct: &mut ContentTypes, cap: usize, guard: &mut ParseGuard) -> bool {
+    observation_contract! {
+        rules: "-";
+        collections: "field.incomplete*1,parser.parse_content_types*1,parser.parse_opc_children*1";
+        scope: "source-local bounded extraction; no implicit document owner";
+        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+        fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+        package_loss: "independent";
+    }
+
     let mut count = 0usize;
     let mut capped = false;
     let complete = parse_opc_children(text, b"Types", b"http://schemas.openxmlformats.org/package/2006/content-types", guard, |e| {
@@ -1019,6 +1255,15 @@ fn parse_content_types(text: &str, ct: &mut ContentTypes, cap: usize, guard: &mu
 /// Visit only namespace-qualified direct children of the expected OPC root container.
 /// All XML events still consume the guard, including ignored foreign or nested elements.
 fn parse_opc_children(text: &str, container: &[u8], namespace: &[u8], guard: &mut ParseGuard, mut visit: impl FnMut(&BytesStart)) -> bool {
+    observation_contract! {
+        rules: "-";
+        collections: "parser.parse_opc_children*1,type.Vec*1";
+        scope: "source-local bounded extraction; no implicit document owner";
+        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+        fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+        package_loss: "independent";
+    }
+
     let mut reader = NsReader::from_reader(text.as_bytes());
     let mut buf = Vec::new();
     let mut depth = 0usize;
@@ -1059,6 +1304,15 @@ fn parse_opc_children(text: &str, container: &[u8], namespace: &[u8], guard: &mu
 
 /// Extract and record an `Override` or `Default` content type declaration from an XML element.
 fn record_content_type(e: &BytesStart, ct: &mut ContentTypes) {
+    observation_contract! {
+        rules: "-";
+        collections: "field.defaults*1,field.dup_defaults*1,field.dup_overrides*1,field.overrides*1";
+        scope: "source-local bounded extraction; no implicit document owner";
+        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+        fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+        package_loss: "independent";
+    }
+
     let local = e.local_name();
     let l = local.as_ref();
     if l != b"Override" && l != b"Default" {
@@ -1079,6 +1333,15 @@ fn record_content_type(e: &BytesStart, ct: &mut ContentTypes) {
 /// parser (J1), so a deeply nested relationships part stops before a later (possibly dangling)
 /// relationship is read.
 fn parse_rels(dir: &str, text: &str, cap: usize, guard: &mut ParseGuard) -> (Vec<Rel>, bool, bool) {
+    observation_contract! {
+        rules: "-";
+        collections: "parser.parse_opc_children*1,parser.parse_rels*1,type.Vec*2";
+        scope: "source-local bounded extraction; no implicit document owner";
+        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+        fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+        package_loss: "independent";
+    }
+
     let mut rels = Vec::new();
     let mut capped = false;
     let complete = parse_opc_children(text, b"Relationships", b"http://schemas.openxmlformats.org/package/2006/relationships", guard, |e| {
@@ -1089,6 +1352,15 @@ fn parse_rels(dir: &str, text: &str, cap: usize, guard: &mut ParseGuard) -> (Vec
 
 /// Record one `<Relationship>` element, ignoring any other element.
 fn push_rel(dir: &str, e: &BytesStart, rels: &mut Vec<Rel>, cap: usize, capped: &mut bool) {
+    observation_contract! {
+        rules: "-";
+        collections: "parser.parse_rel*1,type.Vec*1";
+        scope: "source-local bounded extraction; no implicit document owner";
+        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+        fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+        package_loss: "independent";
+    }
+
     if e.local_name().as_ref() == b"Relationship"
         && let Some(rel) = parse_rel(dir, e)
     {
@@ -1102,6 +1374,15 @@ fn push_rel(dir: &str, e: &BytesStart, rels: &mut Vec<Rel>, cap: usize, capped: 
 
 /// Parse attributes of a `<Relationship>` element into a [`Rel`] struct, resolving internal targets.
 fn parse_rel(dir: &str, e: &BytesStart) -> Option<Rel> {
+    observation_contract! {
+        rules: "-";
+        collections: "parser.parse_rel*1";
+        scope: "source-local bounded extraction; no implicit document owner";
+        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+        fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+        package_loss: "independent";
+    }
+
     let id = attr_plain(e, b"Id")?;
     let kind = attr_plain(e, b"Type").unwrap_or_default();
     let target = attr_plain(e, b"Target").unwrap_or_default();

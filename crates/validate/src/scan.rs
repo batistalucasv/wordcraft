@@ -10,7 +10,7 @@ use quick_xml::events::{BytesStart, Event};
 use quick_xml::name::{Namespace, NamespaceResolver, QName, ResolveResult};
 use quick_xml::reader::NsReader;
 
-use crate::observed::Observed;
+use crate::observed::{CompleteSet, Observed};
 use crate::{Acc, NS_DS, NS_M, NS_MC, NS_R, NS_W, NS_W14, NS_W15, NS_W16CID, NS_WP};
 
 /// Parsed numeric value; invalid spellings remain explicitly separate from valid keys.
@@ -31,6 +31,15 @@ macro_rules! numeric_id {
         impl $name {
             /// Parse without a machine-integer bound or allocation proportional to numeric value.
             fn parse(raw: String) -> Self {
+                observation_contract! {
+                    rules: "-";
+                    collections: "field.bytes*1";
+                    scope: "source-local bounded extraction; no implicit document owner";
+                    loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+                    fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+                    package_loss: "independent";
+                }
+
                 let lexical = raw.trim_matches([' ', '\t', '\r', '\n']);
                 let digits = if $radix == 10 { lexical.strip_prefix(['+', '-']).unwrap_or(lexical) } else { lexical };
                 let valid = !digits.is_empty() && digits.bytes().all(|b| if $radix == 10 { b.is_ascii_digit() } else { b.is_ascii_hexdigit() });
@@ -248,6 +257,7 @@ pub(crate) struct StoryFacts {
 
 /// One `r:id`/`r:embed`/`r:link` value found in a part, with the element identity needed to
 /// verify typed references (an image element must resolve to an image relationship).
+#[derive(Clone)]
 pub(crate) struct RefFact {
     pub attr: String,
     pub value: RelId,
@@ -258,6 +268,15 @@ pub(crate) struct RefFact {
 impl StoryFacts {
     /// A source loss affects only the collections extracted from that source.
     pub(crate) fn invalidate(&mut self, reason: &'static str) {
+        observation_contract! {
+            rules: "-";
+            collections: "access.invalidate*14,field.bookmarks*1,field.comment_defs*1,field.comment_para_ids*1,field.comment_refs*1,field.docpr*1,field.endnote_defs*1,field.endnote_refs*1,field.footer_refs*1,field.footnote_defs*1,field.footnote_refs*1,field.header_refs*1,field.num_ids*1,field.revisions*1,field.style_refs*1";
+            scope: "source-local bounded extraction; no implicit document owner";
+            loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+            fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+            package_loss: "independent";
+        }
+
         self.comment_defs.invalidate(reason);
         self.comment_refs.invalidate(reason);
         self.comment_para_ids.invalidate(reason);
@@ -275,6 +294,15 @@ impl StoryFacts {
     }
     /// Preserve the existing package allocation bound while retaining facts per part.
     pub(crate) fn retain_budget(&mut self, held: &mut [usize; 14], cap: usize) -> bool {
+        observation_contract! {
+            rules: "-";
+            collections: "access.retain_budget*14,field.bookmarks*1,field.comment_defs*1,field.comment_para_ids*1,field.comment_refs*1,field.docpr*1,field.endnote_defs*1,field.endnote_refs*1,field.footer_refs*1,field.footnote_defs*1,field.footnote_refs*1,field.header_refs*1,field.num_ids*1,field.revisions*1,field.style_refs*1";
+            scope: "source-local bounded extraction; no implicit document owner";
+            loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+            fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+            package_loss: "independent";
+        }
+
         let mut dropped = false;
         dropped |= self.comment_defs.retain_budget(&mut held[0], cap);
         dropped |= self.comment_refs.retain_budget(&mut held[1], cap);
@@ -294,6 +322,15 @@ impl StoryFacts {
     }
     /// Package-global reductions are deliberate; owner-local joins never use this as definitions.
     pub(crate) fn append(&mut self, from: &Self) {
+        observation_contract! {
+            rules: "-";
+            collections: "access.append*14,field.bookmark_starts*3,field.bookmarks*2,field.comment_defs*2,field.comment_para_ids*2,field.comment_refs*2,field.docpr*2,field.endnote_defs*2,field.endnote_refs*2,field.footer_refs*2,field.footnote_defs*2,field.footnote_refs*2,field.header_refs*2,field.num_ids*2,field.revisions*2,field.style_refs*2";
+            scope: "source-local bounded extraction; no implicit document owner";
+            loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+            fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+            package_loss: "independent";
+        }
+
         self.comment_defs.append(&from.comment_defs);
         self.comment_refs.append(&from.comment_refs);
         self.comment_para_ids.append(&from.comment_para_ids);
@@ -467,12 +504,30 @@ struct AltSuppress {
 impl AltSuppress {
     /// Create a new alternate content suppression tracker.
     fn new() -> AltSuppress {
+        observation_contract! {
+            rules: "-";
+            collections: "type.Vec*1";
+            scope: "source-local bounded extraction; no implicit document owner";
+            loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+            fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+            package_loss: "independent";
+        }
+
         AltSuppress { depth: 0, frames: Vec::new() }
     }
 
     /// Handle an open tag. Returns `true` while inside a subtree that must be skipped; an
     /// `mc:AlternateContent` open tag itself is skipped.
     fn open(&mut self, id: &ElemId, empty: bool) -> bool {
+        observation_contract! {
+            rules: "-";
+            collections: "field.frames*2";
+            scope: "source-local bounded extraction; no implicit document owner";
+            loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+            fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+            package_loss: "independent";
+        }
+
         let is_alt = is_alternate_content(id);
         if is_alt {
             if !empty {
@@ -491,6 +546,15 @@ impl AltSuppress {
     /// through the per-element frame pushed on open (J5): only an `mc:AlternateContent` frame
     /// decrements the suppression depth.
     fn close(&mut self, _local: &[u8]) {
+        observation_contract! {
+            rules: "-";
+            collections: "field.frames*1";
+            scope: "source-local bounded extraction; no implicit document owner";
+            loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+            fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+            package_loss: "independent";
+        }
+
         if self.frames.pop().unwrap_or(false) {
             self.depth = self.depth.saturating_sub(1);
         }
@@ -710,6 +774,15 @@ fn find_bytes(hay: &[u8], needle: &[u8]) -> Option<usize> {
 /// detection. The declaration is scanned in full within [`DECLARATION_SCAN_BOUND`], not just its
 /// first 512 bytes (H6).
 fn declared_encoding(bytes: &[u8]) -> Declared {
+    observation_contract! {
+        rules: "-";
+        collections: "field.bytes*1";
+        scope: "source-local bounded extraction; no implicit document owner";
+        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+        fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+        package_loss: "independent";
+    }
+
     let scan = &bytes[..bytes.len().min(DECLARATION_SCAN_BOUND)];
     let Some(end) = find_bytes(scan, b"?>") else {
         // No closing marker within the bound. If the input extends past the bound and looks like it
@@ -738,6 +811,15 @@ fn declared_encoding(bytes: &[u8]) -> Declared {
 
 /// Decode strict UTF-16 (little-endian or big-endian) into a String, rejecting truncated units or unpaired surrogates.
 fn decode_utf16_strict(bytes: &[u8], little_endian: bool) -> Result<String, DecodeError> {
+    observation_contract! {
+        rules: "-";
+        collections: "type.Vec*1";
+        scope: "source-local bounded extraction; no implicit document owner";
+        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+        fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+        package_loss: "independent";
+    }
+
     if !bytes.len().is_multiple_of(2) {
         return Err(DecodeError::Malformed("a UTF-16 part ends with a truncated unit".to_string()));
     }
@@ -750,6 +832,15 @@ fn decode_utf16_strict(bytes: &[u8], little_endian: bool) -> Result<String, Deco
 /// `XML-INVALID-CHAR` reference findings are added to `acc`; the collected story facts and every
 /// `r:id`/`r:embed`/`r:link` value come back on the `PartScan`.
 pub(crate) fn scan_part(part: &str, text: &str, role: PartRole, acc: &mut Acc) -> PartScan {
+    observation_contract! {
+        rules: "-";
+        collections: "access.invalidate*1,field.alt_stack*2,field.content_part_exemptions*2,field.content_parts*2,field.declared*4,field.frames*9,field.note_listings*1,field.note_listings_e*1,field.note_listings_f*1,field.refs*2,field.special_notes*2,field.unknown_prefixes*4,type.Vec*9";
+        scope: "source-local bounded extraction; no implicit document owner";
+        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+        fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+        package_loss: "independent";
+    }
+
     let mut reader = NsReader::from_reader(text.as_bytes());
     let mut buf = Vec::new();
     let mut state = State { fact_cap: acc.limits.facts, ..State::default() };
@@ -973,6 +1064,15 @@ pub(crate) fn scan_part(part: &str, text: &str, role: PartRole, acc: &mut Acc) -
 /// Collect an element's attributes, turning an iterator error (a duplicate or malformed attribute)
 /// into a malformed-part message rather than silently dropping it.
 fn open_attributes<'a>(e: &'a BytesStart<'_>, out: &mut PartScan) -> Option<Vec<Attribute<'a>>> {
+    observation_contract! {
+        rules: "-";
+        collections: "type.Vec*2";
+        scope: "source-local bounded extraction; no implicit document owner";
+        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+        fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+        package_loss: "independent";
+    }
+
     let mut attrs = Vec::new();
     for a in e.attributes() {
         match a {
@@ -990,6 +1090,15 @@ fn open_attributes<'a>(e: &'a BytesStart<'_>, out: &mut PartScan) -> Option<Vec<
 /// and stop the immediately enclosing `w:tc` from being reported empty (its block content is in a
 /// branch we deliberately do not read).
 fn enter_alt(state: &mut State, id: &ElemId, part: &str, acc: &mut Acc) -> bool {
+    observation_contract! {
+        rules: "-";
+        collections: "field.alt_stack*1,field.frames*1";
+        scope: "source-local bounded extraction; no implicit document owner";
+        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+        fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+        package_loss: "independent";
+    }
+
     let is_alt = id.ns.as_deref() == Some(NS_MC) && id.local == "AlternateContent";
     if is_alt {
         state.alt_depth += 1;
@@ -1060,6 +1169,15 @@ fn frame_for(id: &ElemId) -> Frame {
 /// cell's last block is known even if later XML is malformed or truncated, so it is
 /// evaluated here; an open cell never is, because later content could repair it.
 fn close_cell(f: &Frame, part: &str, role: PartRole, acc: &mut Acc) {
+    observation_contract! {
+        rules: "STRUCT-END-P,STRUCT-TC-NO-P";
+        collections: "-";
+        scope: "source-local bounded extraction; no implicit document owner";
+        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+        fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+        package_loss: "independent";
+    }
+
     if !f.is_tc || !role.is_main() {
         return;
     }
@@ -1075,6 +1193,15 @@ fn close_cell(f: &Frame, part: &str, role: PartRole, acc: &mut Acc) {
 /// block content is corrupt). Only the immediately enclosing frame is checked, so a run-level
 /// `w:sdt` inside a `w:p` does not satisfy the cell. Also record the terminal block kind.
 fn mark_block_content(state: &mut State, id: &ElemId) {
+    observation_contract! {
+        rules: "-";
+        collections: "field.frames*1";
+        scope: "source-local bounded extraction; no implicit document owner";
+        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+        fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+        package_loss: "independent";
+    }
+
     if !id.w() || !matches!(id.local.as_str(), "p" | "tbl" | "sdt" | "customXml" | "altChunk") {
         return;
     }
@@ -1118,6 +1245,15 @@ fn wrapper_is_block_level(frames: &[Frame], idx: usize) -> bool {
 /// `w:sdtContent` / `w:customXml` sitting at block level. Returns the parent's
 /// local name for the finding message.
 fn prohibited_parent(state: &State) -> Option<&'static str> {
+    observation_contract! {
+        rules: "-";
+        collections: "field.frames*4";
+        scope: "source-local bounded extraction; no implicit document owner";
+        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+        fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+        package_loss: "independent";
+    }
+
     let parent = state.frames.last()?;
     if let Some(name) = parent.block_parent_name {
         return Some(name);
@@ -1139,6 +1275,15 @@ fn prohibited_parent(state: &State) -> Option<&'static str> {
 /// content. A stray math island (math content with no `m:oMath` anywhere above it)
 /// is reported once, at its root element, not once per descendant.
 fn check_math_placement(state: &State, id: &ElemId, role: PartRole, part: &str, acc: &mut Acc) {
+    observation_contract! {
+        rules: "MATH-PLACEMENT";
+        collections: "field.frames*6";
+        scope: "source-local bounded extraction; no implicit document owner";
+        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+        fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+        package_loss: "independent";
+    }
+
     if !role.is_story() || !id.m() {
         return;
     }
@@ -1204,6 +1349,15 @@ fn check_math_placement(state: &State, id: &ElemId, role: PartRole, part: &str, 
 /// same namespace is reported here rather than silently read as present (a
 /// same-prefix duplicate is rejected earlier, as a malformed attribute).
 fn check_protection(id: &ElemId, attrs: &[Attribute], res: &NamespaceResolver, role: PartRole, part: &str, acc: &mut Acc) {
+    observation_contract! {
+        rules: "PROTECTION-PASSWORD";
+        collections: "type.Vec*1";
+        scope: "source-local bounded extraction; no implicit document owner";
+        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+        fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+        package_loss: "independent";
+    }
+
     if !role.is_settings() || !id.w() || !matches!(id.local.as_str(), "documentProtection" | "writeProtection") {
         return;
     }
@@ -1267,6 +1421,15 @@ fn record_compat_flag(state: &mut State, id: &ElemId, attrs: &[Attribute], res: 
 /// the document-wide form, CT_FtnDocProps; the section-wide form,
 /// CT_FtnProps, admits only numbering/positioning children).
 fn record_note_pr(state: &mut State, id: &ElemId, attrs: &[Attribute], res: &NamespaceResolver, role: PartRole) {
+    observation_contract! {
+        rules: "-";
+        collections: "field.frames*1,field.note_listings_e*1,field.note_listings_f*1,field.special_notes*2";
+        scope: "source-local bounded extraction; no implicit document owner";
+        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+        fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+        package_loss: "independent";
+    }
+
     if !id.w() || (id.local != "footnote" && id.local != "endnote") {
         return;
     }
@@ -1303,6 +1466,15 @@ fn record_note_pr(state: &mut State, id: &ElemId, attrs: &[Attribute], res: &Nam
 /// present." The element's only schema location is as a mailMerge
 /// child, so presence is judged there.
 fn check_header_source(state: &State, id: &ElemId, role: PartRole, part: &str, acc: &mut Acc) {
+    observation_contract! {
+        rules: "HEADERSOURCE-PRESENT";
+        collections: "field.frames*1";
+        scope: "source-local bounded extraction; no implicit document owner";
+        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+        fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+        package_loss: "independent";
+    }
+
     if role.is_settings() && id.w() && id.local == "headerSource" && state.frames.last().is_some_and(|f| f.is_mail_merge) {
         acc.add(
             "HEADERSOURCE-PRESENT",
@@ -1357,6 +1529,15 @@ struct ParaOcc {
 impl ParaOcc {
     /// Record one occurrence at the given ancestry path.
     fn record(&mut self, path: ParaPath) {
+        observation_contract! {
+            rules: "-";
+            collections: "field.reps*3";
+            scope: "source-local bounded extraction; no implicit document owner";
+            loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+            fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+            package_loss: "independent";
+        }
+
         if self.conflict {
             return;
         }
@@ -1397,6 +1578,15 @@ struct AltCtx {
 /// ancestry — a repeat is excused exactly when the two occurrences
 /// sit in different branch instances of some block enclosing both.
 fn check_para_ids(state: &mut State, id: &ElemId, attrs: &[Attribute], res: &NamespaceResolver, role: PartRole, part: &str, acc: &mut Acc) {
+    observation_contract! {
+        rules: "PARAID-VALUE";
+        collections: "field.alt_stack*1,field.para_ids*3";
+        scope: "source-local bounded extraction; no implicit document owner";
+        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+        fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+        package_loss: "independent";
+    }
+
     if !role.is_story() {
         return;
     }
@@ -1460,6 +1650,15 @@ fn check_para_ids(state: &mut State, id: &ElemId, attrs: &[Attribute], res: &Nam
 /// branch value, which the caller restores when the branch element
 /// closes (its frame carries it; an empty element restores at once).
 fn assign_alt_branch(state: &mut State, id: &ElemId) -> Option<u32> {
+    observation_contract! {
+        rules: "-";
+        collections: "field.alt_stack*1,field.frames*1";
+        scope: "source-local bounded extraction; no implicit document owner";
+        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+        fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+        package_loss: "independent";
+    }
+
     if id.ns.as_deref() != Some(NS_MC) || (id.local != "Choice" && id.local != "Fallback") {
         return None;
     }
@@ -1476,6 +1675,15 @@ fn assign_alt_branch(state: &mut State, id: &ElemId) -> Option<u32> {
 /// Restore the innermost block's branch value saved by
 /// `assign_alt_branch` when its branch element closes.
 fn restore_branch(state: &mut State, prev: Option<u32>) {
+    observation_contract! {
+        rules: "-";
+        collections: "field.alt_stack*1";
+        scope: "source-local bounded extraction; no implicit document owner";
+        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+        fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+        package_loss: "independent";
+    }
+
     if let Some(prev) = prev
         && let Some(ctx) = state.alt_stack.last_mut()
     {
@@ -1500,6 +1708,15 @@ fn on_open(state: &mut State, id: &ElemId, attrs: &[Attribute], res: &NamespaceR
 
 /// Handle self-closing/empty tags: check structural requirements like non-empty table cells, and record IDs.
 fn on_empty(state: &mut State, id: &ElemId, attrs: &[Attribute], res: &NamespaceResolver, role: PartRole, part: &str, acc: &mut Acc) {
+    observation_contract! {
+        rules: "STRUCT-TC-NO-P";
+        collections: "-";
+        scope: "source-local bounded extraction; no implicit document owner";
+        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+        fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+        package_loss: "independent";
+    }
+
     mark_block_content(state, id);
     check_math_placement(state, id, role, part, acc);
     check_protection(id, attrs, res, role, part, acc);
@@ -1516,6 +1733,15 @@ fn on_empty(state: &mut State, id: &ElemId, attrs: &[Attribute], res: &Namespace
 
 /// Record defined and referenced IDs across story parts (comments, footnotes, endnotes, bookmarks, revisions).
 fn record_ids(state: &mut State, id: &ElemId, attrs: &[Attribute], res: &NamespaceResolver, role: PartRole, part: &str) {
+    observation_contract! {
+        rules: "-";
+        collections: "field.docpr*1";
+        scope: "source-local bounded extraction; no implicit document owner";
+        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+        fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+        package_loss: "independent";
+    }
+
     if !role.is_story() {
         return;
     }
@@ -1539,12 +1765,30 @@ fn record_ids(state: &mut State, id: &ElemId, attrs: &[Attribute], res: &Namespa
 /// note (c) and §17.13.4.3 note (b): Word ignores commentRangeStart and
 /// commentRangeEnd under a header, footer, text box, footnote, or endnote.
 fn range_scope(state: &State, role: PartRole) -> bool {
+    observation_contract! {
+        rules: "-";
+        collections: "field.frames*1";
+        scope: "source-local bounded extraction; no implicit document owner";
+        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+        fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+        package_loss: "independent";
+    }
+
     (role.is_main() || role.is_glossary()) && !state.frames.iter().any(|f| f.is_txbx_content)
 }
 
 /// Collect one comment range id under the fact budget (the bookmark
 /// pairing sets' discipline: at the cap, record the cap and stop).
 fn collect_range_id(set: &mut BTreeSet<DecimalId>, cap: usize, capped: &mut bool, id: Option<DecimalId>) {
+    observation_contract! {
+        rules: "-";
+        collections: "type.BTreeSet*1";
+        scope: "source-local bounded extraction; no implicit document owner";
+        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+        fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+        package_loss: "independent";
+    }
+
     if let Some(x) = id {
         if set.len() >= cap {
             *capped = true;
@@ -1556,6 +1800,15 @@ fn collect_range_id(set: &mut BTreeSet<DecimalId>, cap: usize, capped: &mut bool
 
 /// Collect canonical decimal comment IDs and range endpoints within the scan budget.
 fn record_comment_ids(state: &mut State, id: &ElemId, attrs: &[Attribute], res: &NamespaceResolver, role: PartRole, part: &str) {
+    observation_contract! {
+        rules: "-";
+        collections: "field.comment_defs*1,field.comment_para_ids*1,field.comment_range_end_ids*1,field.comment_range_start_ids*1,field.comment_refs*1";
+        scope: "source-local bounded extraction; no implicit document owner";
+        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+        fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+        package_loss: "independent";
+    }
+
     let cap = state.fact_cap;
     match id.local.as_str() {
         "comment" if id.w() && role.is_comments() => {
@@ -1600,6 +1853,15 @@ fn record_comment_ids(state: &mut State, id: &ElemId, attrs: &[Attribute], res: 
 
 /// Record footnote and endnote definitions and references.
 fn record_note_ids(state: &mut State, id: &ElemId, attrs: &[Attribute], res: &NamespaceResolver, role: PartRole, part: &str) {
+    observation_contract! {
+        rules: "-";
+        collections: "field.endnote_defs*1,field.endnote_refs*1,field.footnote_defs*1,field.footnote_refs*1";
+        scope: "source-local bounded extraction; no implicit document owner";
+        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+        fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+        package_loss: "independent";
+    }
+
     let cap = state.fact_cap;
     match id.local.as_str() {
         "footnoteReference" if id.w() => {
@@ -1620,6 +1882,15 @@ fn record_note_ids(state: &mut State, id: &ElemId, attrs: &[Attribute], res: &Na
 
 /// Record bookmark start and end tags, tracking paired IDs up to the fact budget.
 fn record_bookmark_ids(state: &mut State, id: &ElemId, attrs: &[Attribute], res: &NamespaceResolver, part: &str) {
+    observation_contract! {
+        rules: "-";
+        collections: "field.bookmark_ends*2,field.bookmark_starts*3,field.bookmarks*1";
+        scope: "source-local bounded extraction; no implicit document owner";
+        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+        fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+        package_loss: "independent";
+    }
+
     match id.local.as_str() {
         "bookmarkStart" if id.w() => {
             // Counted before any budget logic: the compat counter must be exact
@@ -1649,6 +1920,15 @@ fn record_bookmark_ids(state: &mut State, id: &ElemId, attrs: &[Attribute], res:
 
 /// Record revision IDs on change-tracking elements (`ins`, `del`, `moveFrom`, `moveTo`, etc.).
 fn record_revision_ids(state: &mut State, id: &ElemId, attrs: &[Attribute], res: &NamespaceResolver, part: &str) {
+    observation_contract! {
+        rules: "-";
+        collections: "field.revisions*1";
+        scope: "source-local bounded extraction; no implicit document owner";
+        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+        fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+        package_loss: "independent";
+    }
+
     let is_revision =
         matches!(id.local.as_str(), "ins" | "del" | "moveFrom" | "moveTo" | "rPrChange" | "pPrChange" | "sectPrChange" | "cellIns" | "cellDel");
     if id.w() && is_revision {
@@ -1658,6 +1938,15 @@ fn record_revision_ids(state: &mut State, id: &ElemId, attrs: &[Attribute], res:
 
 /// Record header, footer, style, and numbering references found in elements.
 fn record_reference_ids(state: &mut State, id: &ElemId, attrs: &[Attribute], res: &NamespaceResolver, role: PartRole, part: &str) {
+    observation_contract! {
+        rules: "-";
+        collections: "field.footer_refs*1,field.header_refs*1,field.num_ids*1,field.style_refs*1";
+        scope: "source-local bounded extraction; no implicit document owner";
+        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+        fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+        package_loss: "independent";
+    }
+
     let cap = state.fact_cap;
     match id.local.as_str() {
         "headerReference" if id.w() && role.is_main() => {
@@ -1678,6 +1967,15 @@ fn record_reference_ids(state: &mut State, id: &ElemId, attrs: &[Attribute], res
 
 /// Insert a collected id/name into a set, honouring the fact budget.
 fn insert_name<T: Ord>(into: &mut BTreeSet<T>, cap: usize, capped: &mut bool, value: Option<T>) {
+    observation_contract! {
+        rules: "-";
+        collections: "type.BTreeSet*1";
+        scope: "source-local bounded extraction; no implicit document owner";
+        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+        fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+        package_loss: "independent";
+    }
+
     if let Some(v) = value {
         if into.len() >= cap {
             *capped = true;
@@ -1689,6 +1987,15 @@ fn insert_name<T: Ord>(into: &mut BTreeSet<T>, cap: usize, capped: &mut bool, va
 
 /// Push a `(value, part)` pair into a vector, bounded by the fact capacity limit.
 fn push_capped<T>(into: &mut Observed<Vec<(T, String)>>, cap: usize, capped: &mut bool, value: Option<T>, part: &str) {
+    observation_contract! {
+        rules: "-";
+        collections: "access.invalidate*1,access.push_bounded*1,type.Observed*1,type.Vec*1";
+        scope: "source-local bounded extraction; no implicit document owner";
+        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+        fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+        package_loss: "independent";
+    }
+
     if into.len() >= cap {
         *capped = true;
         if value.is_some() {
@@ -1703,6 +2010,15 @@ fn push_capped<T>(into: &mut Observed<Vec<(T, String)>>, cap: usize, capped: &mu
 
 /// Examine structural constraints such as fields, moves, deleted text, and custom XML elements.
 fn record_structure(state: &mut State, id: &ElemId, attrs: &[Attribute], res: &NamespaceResolver, part: &str, acc: &mut Acc, empty: bool) {
+    observation_contract! {
+        rules: "CUSTOMXML-SCHEMA,STRUCT-DELTEXT";
+        collections: "field.move_from_end*1,field.move_from_names*1,field.move_from_start*2,field.move_start_ids*4,field.move_to_end*1,field.move_to_names*1,field.move_to_start*2";
+        scope: "source-local bounded extraction; no implicit document owner";
+        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+        fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+        package_loss: "independent";
+    }
+
     if !id.w() {
         return;
     }
@@ -1783,6 +2099,15 @@ const NS_V: &str = "urn:schemas-microsoft-com:vml";
 
 /// Collect the relationship id named by a `w:contentPart` element, if any.
 fn collect_content_part(id: &ElemId, attrs: &[Attribute], res: &NamespaceResolver, out: &mut Vec<RelId>, cap: usize, capped: &mut bool) {
+    observation_contract! {
+        rules: "-";
+        collections: "type.Vec*1";
+        scope: "source-local bounded extraction; no implicit document owner";
+        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+        fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+        package_loss: "independent";
+    }
+
     if id.w()
         && id.local == "contentPart"
         && let Some(v) = attr_ns(attrs, res, NS_R, b"id")
@@ -1797,6 +2122,15 @@ fn collect_content_part(id: &ElemId, attrs: &[Attribute], res: &NamespaceResolve
 
 /// Collect native Word 2010 references in either branch for pairing exemptions, never the w:contentPart type check.
 fn collect_ink_content_part(id: &ElemId, attrs: &[Attribute], res: &NamespaceResolver, out: &mut PartScan, cap: usize) {
+    observation_contract! {
+        rules: "-";
+        collections: "field.ink_content_parts*2";
+        scope: "source-local bounded extraction; no implicit document owner";
+        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+        fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+        package_loss: "independent";
+    }
+
     if id.ns.as_deref() == Some(NS_W14)
         && id.local == "contentPart"
         && let Some(value) = attr_ns(attrs, res, NS_R, b"id")
@@ -1811,6 +2145,15 @@ fn collect_ink_content_part(id: &ElemId, attrs: &[Attribute], res: &NamespaceRes
 
 /// Collect relationship references (`r:id`, `r:embed`, `r:link`) from element attributes up to the fact limit.
 fn collect_refs(id: &ElemId, attrs: &[Attribute], res: &NamespaceResolver, out: &mut Vec<RefFact>, cap: usize, capped: &mut bool) {
+    observation_contract! {
+        rules: "-";
+        collections: "type.Vec*1";
+        scope: "source-local bounded extraction; no implicit document owner";
+        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+        fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+        package_loss: "independent";
+    }
+
     // headerReference/footerReference are checked by REF-HEADER, not REL-REF-MISSING.
     if id.w() && matches!(id.local.as_str(), "headerReference" | "footerReference") {
         return;
@@ -1838,21 +2181,48 @@ fn collect_refs(id: &ElemId, attrs: &[Attribute], res: &NamespaceResolver, out: 
 }
 
 /// Report `STRUCT-MOVE-UNPAIRED` findings for items present in `set` but missing from `counterpart`.
-fn report_unpaired(acc: &mut Acc, part: &str, tag: &str, set: &BTreeSet<DecimalId>, counterpart: &BTreeSet<DecimalId>, want: &str) {
-    for id in set.difference(counterpart) {
+fn report_unpaired(acc: &mut Acc, part: &str, tag: &str, set: &BTreeSet<DecimalId>, counterpart: &CompleteSet<&DecimalId>, want: &str) {
+    observation_contract! {
+        rules: "STRUCT-MOVE-UNPAIRED";
+        collections: "access.missing*1,type.BTreeSet*1,type.CompleteSet*1";
+        scope: "intentional per-part pairing; counterpart CompleteSet constructed only behind completed uncapped scanner barrier";
+        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+        fallback: "suppress completion-dependent absence on scan loss; independent finish_prefix duplicate and extra-field-end findings survive";
+        package_loss: "independent";
+    }
+
+    for id in set.iter().filter(|id| counterpart.missing(id)) {
         acc.add("STRUCT-MOVE-UNPAIRED", Some(part.to_string()), format!("{tag} with w:id {id} in {part} has no matching {want}"));
     }
 }
 
-/// Report `STRUCT-MOVE-UNPAIRED` findings for move names present in `names` without a counterpart.
-fn report_name_pairs(acc: &mut Acc, part: &str, tag: &str, names: &BTreeSet<String>, want: &str, other: &BTreeSet<String>) {
-    for name in names.difference(other) {
+/// Move names are paired only against proof-bearing complete counterpart collections.
+fn report_name_pairs(acc: &mut Acc, part: &str, tag: &str, names: &BTreeSet<String>, want: &str, other: &CompleteSet<&String>) {
+    observation_contract! {
+        rules: "STRUCT-MOVE-UNPAIRED";
+        collections: "access.missing*1,type.BTreeSet*1,type.CompleteSet*1";
+        scope: "intentional per-part pairing; counterpart CompleteSet constructed only behind completed uncapped scanner barrier";
+        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+        fallback: "suppress completion-dependent absence on scan loss; independent finish_prefix duplicate and extra-field-end findings survive";
+        package_loss: "independent";
+    }
+
+    for name in names.iter().filter(|name| other.missing(name)) {
         acc.add("STRUCT-MOVE-UNPAIRED", Some(part.to_string()), format!("{tag} name {name} in {part} has no matching {want} name"));
     }
 }
 
 /// Report `STRUCT-MOVE-UNPAIRED` findings when a move start ID is reused within a single part.
 fn report_duplicate_move_ids(acc: &mut Acc, part: &str, ids: &[DecimalId]) {
+    observation_contract! {
+        rules: "STRUCT-MOVE-UNPAIRED";
+        collections: "type.BTreeSet*2";
+        scope: "source-local bounded extraction; no implicit document owner";
+        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+        fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+        package_loss: "independent";
+    }
+
     let mut seen = BTreeSet::new();
     let mut reported = BTreeSet::new();
     for id in ids {
@@ -1865,31 +2235,69 @@ fn report_duplicate_move_ids(acc: &mut Acc, part: &str, ids: &[DecimalId]) {
 /// Report `COMMENT-RANGE-UNPAIRED` findings for comment ranges that have a
 /// start without an end or vice versa (collected only where Word honours
 /// ranges — see `range_scope`).
-fn report_comment_ranges(acc: &mut Acc, part: &str, starts: &BTreeSet<DecimalId>, ends: &BTreeSet<DecimalId>) {
-    for id in starts.difference(ends) {
-        acc.add(
-            "COMMENT-RANGE-UNPAIRED",
-            Some(part.to_string()),
-            format!("w:commentRangeStart with w:id {id} in {part} has no matching w:commentRangeEnd; Word anchors the comment at its commentReference instead of the range"),
-        );
+fn report_comment_ranges(
+    acc: &mut Acc,
+    part: &str,
+    starts: &BTreeSet<DecimalId>,
+    ends: &BTreeSet<DecimalId>,
+    complete_starts: &CompleteSet<&DecimalId>,
+    complete_ends: &CompleteSet<&DecimalId>,
+) {
+    observation_contract! {
+        rules: "COMMENT-RANGE-UNPAIRED";
+        collections: "access.missing*2,type.BTreeSet*2,type.CompleteSet*2";
+        scope: "intentional per-part pairing; counterpart CompleteSet constructed only behind completed uncapped scanner barrier";
+        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+        fallback: "suppress completion-dependent absence on scan loss; independent finish_prefix duplicate and extra-field-end findings survive";
+        package_loss: "independent";
     }
-    for id in ends.difference(starts) {
-        acc.add(
-            "COMMENT-RANGE-UNPAIRED",
-            Some(part.to_string()),
-            format!("w:commentRangeEnd with w:id {id} in {part} has no matching w:commentRangeStart; Word anchors the comment at its commentReference instead of the range"),
-        );
+
+    for id in starts.iter().filter(|id| complete_ends.missing(id)) {
+        acc.add("COMMENT-RANGE-UNPAIRED", Some(part.to_string()), format!("w:commentRangeStart with w:id {id} in {part} has no matching w:commentRangeEnd; Word anchors the comment at its commentReference instead of the range"));
+    }
+    for id in ends.iter().filter(|id| complete_starts.missing(id)) {
+        acc.add("COMMENT-RANGE-UNPAIRED", Some(part.to_string()), format!("w:commentRangeEnd with w:id {id} in {part} has no matching w:commentRangeStart; Word anchors the comment at its commentReference instead of the range"));
     }
 }
 
-/// Report `BOOKMARK-UNPAIRED` findings for bookmarks that have a start tag without an end or vice versa.
-fn report_bookmarks(acc: &mut Acc, part: &str, starts: &BTreeSet<DecimalId>, ends: &BTreeSet<DecimalId>) {
-    for id in starts.difference(ends) {
+/// Bookmark endpoint absence requires complete counterparts in both directions.
+fn report_bookmarks(
+    acc: &mut Acc,
+    part: &str,
+    starts: &BTreeSet<DecimalId>,
+    ends: &BTreeSet<DecimalId>,
+    complete_starts: &CompleteSet<&DecimalId>,
+    complete_ends: &CompleteSet<&DecimalId>,
+) {
+    observation_contract! {
+        rules: "BOOKMARK-UNPAIRED";
+        collections: "access.missing*2,type.BTreeSet*2,type.CompleteSet*2";
+        scope: "intentional per-part pairing; counterpart CompleteSet constructed only behind completed uncapped scanner barrier";
+        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+        fallback: "suppress completion-dependent absence on scan loss; independent finish_prefix duplicate and extra-field-end findings survive";
+        package_loss: "independent";
+    }
+
+    for id in starts.iter().filter(|id| complete_ends.missing(id)) {
         acc.add("BOOKMARK-UNPAIRED", Some(part.to_string()), format!("w:bookmarkStart with w:id {id} in {part} has no matching w:bookmarkEnd"));
     }
-    for id in ends.difference(starts) {
+    for id in ends.iter().filter(|id| complete_starts.missing(id)) {
         acc.add("BOOKMARK-UNPAIRED", Some(part.to_string()), format!("w:bookmarkEnd with w:id {id} in {part} has no matching w:bookmarkStart"));
     }
+}
+
+/// Materialize scanner-completion evidence for a counterpart set, after finish_completion's barrier.
+fn completed_pairs<K: Eq + std::hash::Hash>(values: &BTreeSet<K>) -> Option<CompleteSet<&K>> {
+    observation_contract! {
+        rules: "-";
+        collections: "access.into_complete_set*1,type.BTreeSet*1,type.CompleteSet*1,type.HashSet*1,type.Observed*1";
+        scope: "intentional per-part pairing; counterpart CompleteSet constructed only behind completed uncapped scanner barrier";
+        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+        fallback: "suppress completion-dependent absence on scan loss; independent finish_prefix duplicate and extra-field-end findings survive";
+        package_loss: "independent";
+    }
+
+    Observed::complete(values.iter().collect::<HashSet<_>>()).into_complete_set()
 }
 
 /// Prefix-established pairing reports: their truth is decided by the scanned prefix alone, so they
@@ -1902,6 +2310,15 @@ fn report_bookmarks(acc: &mut Acc, part: &str, starts: &BTreeSet<DecimalId>, end
 ///   the prefix, the duplicate exists regardless of the rest.
 /// - `PARAID-DUP` for a repeated `w14:paraId` value in the part — same reasoning.
 fn finish_prefix(state: &State, part: &str, acc: &mut Acc) {
+    observation_contract! {
+        rules: "FLD-UNBALANCED,PARAID-DUP";
+        collections: "field.move_start_ids*1,field.para_ids*1";
+        scope: "source-local bounded extraction; no implicit document owner";
+        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+        fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+        package_loss: "independent";
+    }
+
     report_duplicate_move_ids(acc, part, &state.move_start_ids);
     for (key, occ) in &state.para_ids {
         if occ.is_duplicate() {
@@ -1923,14 +2340,34 @@ fn finish_prefix(state: &State, part: &str, acc: &mut Acc) {
 /// complete scan. An unclosed `w:fldChar` begin, an unpaired move range start/end, a mismatched move
 /// name or an unpaired bookmark could still be paired by content the scan has not read.
 fn finish_completion(state: &State, part: &str, acc: &mut Acc) {
-    report_unpaired(acc, part, "w:moveFromRangeStart", &state.move_from_start, &state.move_from_end, "w:moveFromRangeEnd");
-    report_unpaired(acc, part, "w:moveFromRangeEnd", &state.move_from_end, &state.move_from_start, "w:moveFromRangeStart");
-    report_unpaired(acc, part, "w:moveToRangeStart", &state.move_to_start, &state.move_to_end, "w:moveToRangeEnd");
-    report_unpaired(acc, part, "w:moveToRangeEnd", &state.move_to_end, &state.move_to_start, "w:moveToRangeStart");
-    report_name_pairs(acc, part, "w:moveFromRangeStart", &state.move_from_names, "w:moveToRangeStart", &state.move_to_names);
-    report_name_pairs(acc, part, "w:moveToRangeStart", &state.move_to_names, "w:moveFromRangeStart", &state.move_from_names);
-    report_bookmarks(acc, part, &state.bookmark_starts, &state.bookmark_ends);
-    report_comment_ranges(acc, part, &state.comment_range_start_ids, &state.comment_range_end_ids);
+    observation_contract! {
+        rules: "FLD-UNBALANCED";
+        collections: "field.bookmark_ends*2,field.bookmark_starts*2,field.comment_range_end_ids*2,field.comment_range_start_ids*2,field.move_from_end*2,field.move_from_names*2,field.move_from_start*2,field.move_to_end*2,field.move_to_names*2,field.move_to_start*2";
+        scope: "intentional per-part pairing; counterpart CompleteSet constructed only behind completed uncapped scanner barrier";
+        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+        fallback: "suppress completion-dependent absence on scan loss; independent finish_prefix duplicate and extra-field-end findings survive";
+        package_loss: "independent";
+    }
+
+    // Called only after a completed, uncapped source scan. A partial scan uses finish_prefix.
+    let Some(from_start) = completed_pairs(&state.move_from_start) else { return };
+    let Some(from_end) = completed_pairs(&state.move_from_end) else { return };
+    let Some(to_start) = completed_pairs(&state.move_to_start) else { return };
+    let Some(to_end) = completed_pairs(&state.move_to_end) else { return };
+    let Some(from_names) = completed_pairs(&state.move_from_names) else { return };
+    let Some(to_names) = completed_pairs(&state.move_to_names) else { return };
+    let Some(bookmark_starts) = completed_pairs(&state.bookmark_starts) else { return };
+    let Some(bookmark_ends) = completed_pairs(&state.bookmark_ends) else { return };
+    let Some(comment_starts) = completed_pairs(&state.comment_range_start_ids) else { return };
+    let Some(comment_ends) = completed_pairs(&state.comment_range_end_ids) else { return };
+    report_unpaired(acc, part, "w:moveFromRangeStart", &state.move_from_start, &from_end, "w:moveFromRangeEnd");
+    report_unpaired(acc, part, "w:moveFromRangeEnd", &state.move_from_end, &from_start, "w:moveFromRangeStart");
+    report_unpaired(acc, part, "w:moveToRangeStart", &state.move_to_start, &to_end, "w:moveToRangeEnd");
+    report_unpaired(acc, part, "w:moveToRangeEnd", &state.move_to_end, &to_start, "w:moveToRangeStart");
+    report_name_pairs(acc, part, "w:moveFromRangeStart", &state.move_from_names, "w:moveToRangeStart", &to_names);
+    report_name_pairs(acc, part, "w:moveToRangeStart", &state.move_to_names, "w:moveFromRangeStart", &from_names);
+    report_bookmarks(acc, part, &state.bookmark_starts, &state.bookmark_ends, &bookmark_starts, &bookmark_ends);
+    report_comment_ranges(acc, part, &state.comment_range_start_ids, &state.comment_range_end_ids, &comment_starts, &comment_ends);
     if state.fld_depth > 0 {
         acc.add("FLD-UNBALANCED", Some(part.to_string()), format!("{part} has {} unclosed w:fldChar begin(s)", state.fld_depth));
     }
@@ -1940,6 +2377,15 @@ fn finish_completion(state: &State, part: &str, acc: &mut Acc) {
 /// A matched pair before the break emits nothing; an unmatched begin or end does. (A duplicate move
 /// id is prefix-established, so it is not part of this test.)
 fn completion_dependent_pending(state: &State) -> bool {
+    observation_contract! {
+        rules: "-";
+        collections: "field.bookmark_ends*1,field.bookmark_starts*1,field.comment_range_end_ids*1,field.comment_range_start_ids*1,field.move_from_end*1,field.move_from_names*1,field.move_from_start*1,field.move_to_end*1,field.move_to_names*1,field.move_to_start*1";
+        scope: "source-local bounded extraction; no implicit document owner";
+        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+        fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+        package_loss: "independent";
+    }
+
     state.fld_depth > 0
         || state.move_from_start != state.move_from_end
         || state.move_to_start != state.move_to_end
@@ -1950,6 +2396,15 @@ fn completion_dependent_pending(state: &State) -> bool {
 
 /// Detect attribute prefixes that are undeclared or referenced in `mc:Ignorable` without a namespace declaration.
 fn check_prefixes(declared: &[Vec<String>], attrs: &[Attribute], res: &NamespaceResolver, extra: &[String], out: &mut PartScan) {
+    observation_contract! {
+        rules: "-";
+        collections: "field.unknown_prefixes*2,type.Vec*1";
+        scope: "source-local bounded extraction; no implicit document owner";
+        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+        fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+        package_loss: "independent";
+    }
+
     for a in attrs {
         match res.resolve_attribute(a.key).0 {
             ResolveResult::Unknown(p) => out.unknown_prefixes.push(lossy(&p)),
@@ -1969,11 +2424,29 @@ fn check_prefixes(declared: &[Vec<String>], attrs: &[Attribute], res: &Namespace
 
 /// Check if prefix `pfx` exists among declared prefixes in current element stack or extras.
 fn declared_has(declared: &[Vec<String>], extra: &[String], pfx: &str) -> bool {
+    observation_contract! {
+        rules: "-";
+        collections: "type.Vec*1";
+        scope: "source-local bounded extraction; no implicit document owner";
+        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+        fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+        package_loss: "independent";
+    }
+
     declared.iter().flatten().any(|d| d == pfx) || extra.iter().any(|d| d == pfx)
 }
 
 /// Extract XML namespace prefixes declared with `xmlns:prefix` in the given attributes.
 fn declarations(attrs: &[Attribute]) -> Vec<String> {
+    observation_contract! {
+        rules: "-";
+        collections: "type.Vec*2";
+        scope: "source-local bounded extraction; no implicit document owner";
+        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+        fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+        package_loss: "independent";
+    }
+
     let mut v = Vec::new();
     for a in attrs {
         if let Some(p) = a.key.as_ref().strip_prefix(b"xmlns:")
@@ -2033,6 +2506,15 @@ fn is_whitespace(e: &quick_xml::events::BytesText) -> bool {
 /// `XML-INVALID-CHAR` for a general entity reference: a character reference (`&#…;`) to a
 /// character illegal in XML 1.0. Named entities are ignored.
 fn scan_general_ref(part: &str, content: &[u8], acc: &mut Acc) {
+    observation_contract! {
+        rules: "XML-INVALID-CHAR";
+        collections: "field.first*1";
+        scope: "source-local bounded extraction; no implicit document owner";
+        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+        fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+        package_loss: "independent";
+    }
+
     if content.first() != Some(&b'#') {
         return;
     }
@@ -2044,6 +2526,15 @@ fn scan_general_ref(part: &str, content: &[u8], acc: &mut Acc) {
 
 /// `XML-INVALID-CHAR` for an illegal character reference inside any attribute value.
 fn scan_attr_refs(part: &str, attrs: &[Attribute], acc: &mut Acc) {
+    observation_contract! {
+        rules: "XML-INVALID-CHAR";
+        collections: "-";
+        scope: "source-local bounded extraction; no implicit document owner";
+        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+        fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+        package_loss: "independent";
+    }
+
     for a in attrs {
         let value = String::from_utf8_lossy(a.value.as_ref()).into_owned();
         let mut rest: &str = &value;
@@ -2077,6 +2568,15 @@ fn xml_char_ok(u: u32) -> bool {
 
 /// If `s` starts with a `&#…;` character reference to an illegal character, describe it.
 fn bad_char_ref(s: &str) -> Option<String> {
+    observation_contract! {
+        rules: "-";
+        collections: "field.first*1";
+        scope: "source-local bounded extraction; no implicit document owner";
+        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+        fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+        package_loss: "independent";
+    }
+
     let b = s.as_bytes();
     if b.first() != Some(&b'&') || b.get(1) != Some(&b'#') {
         return None;
@@ -2150,6 +2650,15 @@ fn aux_open<'a>(guard: &mut ParseGuard, alt: &mut AltSuppress, res: &NamespaceRe
 /// Parse a numbering part. `None` when it does not parse. `guard.exhausted()` marks the result
 /// partial (H1).
 pub(crate) fn parse_numbering(text: &str, cap: usize, guard: &mut ParseGuard) -> Option<NumberingDefs> {
+    observation_contract! {
+        rules: "NUM-DANGLING";
+        collections: "parser.parse_numbering*1,type.Vec*3";
+        scope: "source-local bounded extraction; no implicit document owner";
+        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+        fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+        package_loss: "independent";
+    }
+
     let mut reader = NsReader::from_reader(text.as_bytes());
     let mut buf = Vec::new();
     let mut defs = NumberingDefs::default();
@@ -2211,6 +2720,15 @@ fn numbering_open(
     empty: bool,
     cap: usize,
 ) -> bool {
+    observation_contract! {
+        rules: "-";
+        collections: "field.abstract_ids*2,field.num_ids*2,field.num_to_abstract*3";
+        scope: "source-local bounded extraction; no implicit document owner";
+        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+        fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+        package_loss: "independent";
+    }
+
     if !id.w() {
         return false;
     }
@@ -2259,6 +2777,15 @@ fn numbering_open(
 /// parse. `w:numId` `0` is handled by the caller (it is a sentinel, not a reference). References
 /// inside a skipped `mc:AlternateContent` branch are not collected (H3).
 pub(crate) fn parse_style_num_ids(text: &str, cap: usize, guard: &mut ParseGuard) -> Option<(Vec<DecimalId>, bool)> {
+    observation_contract! {
+        rules: "NUM-DANGLING";
+        collections: "parser.parse_style_num_ids*1,type.Vec*3";
+        scope: "source-local bounded extraction; no implicit document owner";
+        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+        fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+        package_loss: "independent";
+    }
+
     let mut reader = NsReader::from_reader(text.as_bytes());
     let mut buf = Vec::new();
     let mut out = Vec::new();
@@ -2300,6 +2827,15 @@ pub(crate) fn parse_style_num_ids(text: &str, cap: usize, guard: &mut ParseGuard
 
 /// Extract and append a `w:numId/@w:val` reference to the list, respecting the capacity cap.
 fn push_style_num_id(out: &mut Vec<DecimalId>, capped: &mut bool, id: &ElemId, attrs: &[Attribute], res: &NamespaceResolver, cap: usize) {
+    observation_contract! {
+        rules: "-";
+        collections: "type.Vec*1";
+        scope: "source-local bounded extraction; no implicit document owner";
+        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+        fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+        package_loss: "independent";
+    }
+
     if id.w()
         && id.local == "numId"
         && let Some(v) = attr_ns(attrs, res, NS_W, b"val").map(DecimalId::parse)
@@ -2315,6 +2851,15 @@ fn push_style_num_id(out: &mut Vec<DecimalId>, capped: &mut bool, id: &ElemId, a
 /// The `w:style/@w:styleId` values of a styles part. `None` when it does not parse. Definitions
 /// inside a skipped `mc:AlternateContent` branch are not collected (H3).
 pub(crate) fn parse_style_ids(text: &str, cap: usize, guard: &mut ParseGuard) -> Option<(HashSet<StyleId>, bool)> {
+    observation_contract! {
+        rules: "REF-STYLE";
+        collections: "parser.parse_style_ids*1,type.HashSet*2,type.Vec*1";
+        scope: "source-local bounded extraction; no implicit document owner";
+        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+        fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+        package_loss: "independent";
+    }
+
     let mut reader = NsReader::from_reader(text.as_bytes());
     let mut buf = Vec::new();
     let mut defs = HashSet::new();
@@ -2376,6 +2921,15 @@ pub(crate) struct StyleDef {
 /// part does not parse. Definitions inside a skipped
 /// `mc:AlternateContent` branch are not collected.
 pub(crate) fn parse_style_defs(text: &str, cap: usize, guard: &mut ParseGuard) -> Option<(Vec<StyleDef>, bool, usize)> {
+    observation_contract! {
+        rules: "-";
+        collections: "parser.parse_style_defs*1,type.Vec*4";
+        scope: "source-local bounded extraction; no implicit document owner";
+        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+        fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+        package_loss: "independent";
+    }
+
     let mut reader = NsReader::from_reader(text.as_bytes());
     let mut buf = Vec::new();
     let mut defs: Vec<StyleDef> = Vec::new();
@@ -2491,6 +3045,15 @@ pub(crate) fn parse_style_defs(text: &str, cap: usize, guard: &mut ParseGuard) -
 /// The `w:font/@w:name` values of a fontTable part (capped), or
 /// `None` when the part does not parse.
 pub(crate) fn parse_font_names(text: &str, cap: usize, guard: &mut ParseGuard) -> Option<(Vec<String>, bool)> {
+    observation_contract! {
+        rules: "-";
+        collections: "parser.parse_font_names*1,parser.parse_part_names*1,type.Vec*1";
+        scope: "source-local bounded extraction; no implicit document owner";
+        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+        fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+        package_loss: "independent";
+    }
+
     parse_part_names(text, cap, guard, NS_W, "font", true)
 }
 
@@ -2498,6 +3061,15 @@ pub(crate) fn parse_font_names(text: &str, cap: usize, guard: &mut ParseGuard) -
 /// or `None` when the part does not parse. The elements live in the
 /// custom-properties namespace and the attribute is unprefixed.
 pub(crate) fn parse_custom_prop_names(text: &str, cap: usize, guard: &mut ParseGuard) -> Option<(Vec<String>, bool)> {
+    observation_contract! {
+        rules: "-";
+        collections: "parser.parse_custom_prop_names*1,parser.parse_part_names*1,type.Vec*1";
+        scope: "source-local bounded extraction; no implicit document owner";
+        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+        fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+        package_loss: "independent";
+    }
+
     parse_part_names(text, cap, guard, NS_CUSTOM_PROPS, "property", false)
 }
 
@@ -2509,6 +3081,15 @@ const NS_CUSTOM_PROPS: &str = "http://schemas.openxmlformats.org/officeDocument/
 /// `w:`-style namespaced attribute when `namespaced_attr`, else as
 /// the unprefixed attribute of the same local name.
 fn parse_part_names(text: &str, cap: usize, guard: &mut ParseGuard, ns: &str, elem: &str, namespaced_attr: bool) -> Option<(Vec<String>, bool)> {
+    observation_contract! {
+        rules: "-";
+        collections: "parser.parse_part_names*1,type.Vec*5";
+        scope: "source-local bounded extraction; no implicit document owner";
+        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+        fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+        package_loss: "independent";
+    }
+
     let mut reader = NsReader::from_reader(text.as_bytes());
     let mut buf = Vec::new();
     let mut names: Vec<String> = Vec::new();
@@ -2570,6 +3151,15 @@ fn parse_part_names(text: &str, cap: usize, guard: &mut ParseGuard, ns: &str, el
 
 /// Extract and insert a `w:style/@w:styleId` definition into the set, respecting the capacity cap.
 fn push_style_id(defs: &mut HashSet<StyleId>, capped: &mut bool, id: &ElemId, attrs: &[Attribute], res: &NamespaceResolver, cap: usize) {
+    observation_contract! {
+        rules: "-";
+        collections: "type.HashSet*1";
+        scope: "source-local bounded extraction; no implicit document owner";
+        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+        fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+        package_loss: "independent";
+    }
+
     if id.w()
         && id.local == "style"
         && let Some(v) = attr_ns(attrs, res, NS_W, b"styleId")
@@ -2584,6 +3174,15 @@ fn push_style_id(defs: &mut HashSet<StyleId>, capped: &mut bool, id: &ElemId, at
 
 /// The `w:attachedSchema/@w:val` values of a settings part. `None` when it does not parse.
 pub(crate) fn parse_attached_schemas(text: &str, cap: usize, guard: &mut ParseGuard) -> Option<(Vec<String>, bool)> {
+    observation_contract! {
+        rules: "CUSTOMXML-SCHEMA";
+        collections: "parser.parse_attached_schemas*1,type.Vec*3";
+        scope: "source-local bounded extraction; no implicit document owner";
+        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+        fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+        package_loss: "independent";
+    }
+
     let mut reader = NsReader::from_reader(text.as_bytes());
     let mut buf = Vec::new();
     let mut out = Vec::new();
@@ -2625,6 +3224,15 @@ pub(crate) fn parse_attached_schemas(text: &str, cap: usize, guard: &mut ParseGu
 
 /// Extract and append a `w:attachedSchema/@w:val` target to the list, respecting the capacity cap.
 fn push_attached_schema(out: &mut Vec<String>, capped: &mut bool, id: &ElemId, attrs: &[Attribute], res: &NamespaceResolver, cap: usize) {
+    observation_contract! {
+        rules: "-";
+        collections: "type.Vec*1";
+        scope: "source-local bounded extraction; no implicit document owner";
+        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+        fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+        package_loss: "independent";
+    }
+
     if id.w()
         && id.local == "attachedSchema"
         && let Some(v) = attr_ns(attrs, res, NS_W, b"val")
@@ -2640,6 +3248,15 @@ fn push_attached_schema(out: &mut Vec<String>, capped: &mut bool, id: &ElemId, a
 /// The `ds:schemaRef/@ds:uri` values of a customXml itemProperties part (empty when it does not
 /// parse).
 pub(crate) fn parse_custom_xml_schemas(text: &str, cap: usize, guard: &mut ParseGuard) -> (Vec<String>, bool) {
+    observation_contract! {
+        rules: "CUSTOMXML-SCHEMA";
+        collections: "parser.parse_custom_xml_schemas*1,type.Vec*4";
+        scope: "source-local bounded extraction; no implicit document owner";
+        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+        fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+        package_loss: "independent";
+    }
+
     let mut reader = NsReader::from_reader(text.as_bytes());
     let mut buf = Vec::new();
     let mut out = Vec::new();
@@ -2679,6 +3296,15 @@ pub(crate) fn parse_custom_xml_schemas(text: &str, cap: usize, guard: &mut Parse
 
 /// Extract and append a `ds:schemaRef/@ds:uri` target to the list, respecting the capacity cap.
 fn push_custom_xml_schema(out: &mut Vec<String>, capped: &mut bool, id: &ElemId, attrs: &[Attribute], res: &NamespaceResolver, cap: usize) {
+    observation_contract! {
+        rules: "-";
+        collections: "type.Vec*1";
+        scope: "source-local bounded extraction; no implicit document owner";
+        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+        fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+        package_loss: "independent";
+    }
+
     if id.local_w(NS_DS)
         && id.local == "schemaRef"
         && let Some(v) = attr_ns(attrs, res, NS_DS, b"uri")
@@ -2701,6 +3327,15 @@ pub(crate) struct CommentEx {
 
 /// Parse a commentsExtended part. `None` when it does not parse.
 pub(crate) fn parse_comments_extended(text: &str, cap: usize, guard: &mut ParseGuard) -> Option<CommentEx> {
+    observation_contract! {
+        rules: "COMMENTEX-LINK";
+        collections: "parser.parse_comments_extended*1,type.Vec*1";
+        scope: "source-local bounded extraction; no implicit document owner";
+        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+        fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+        package_loss: "independent";
+    }
+
     let mut reader = NsReader::from_reader(text.as_bytes());
     let mut buf = Vec::new();
     let mut out = CommentEx::default();
@@ -2741,6 +3376,15 @@ pub(crate) fn parse_comments_extended(text: &str, cap: usize, guard: &mut ParseG
 
 /// Extract and append a `w15:commentEx` entry with paragraph and parent IDs, respecting capacity.
 fn push_comment_ex(out: &mut CommentEx, id: &ElemId, attrs: &[Attribute], res: &NamespaceResolver, cap: usize) {
+    observation_contract! {
+        rules: "-";
+        collections: "field.entries*2";
+        scope: "source-local bounded extraction; no implicit document owner";
+        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+        fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+        package_loss: "independent";
+    }
+
     if id.local_w(NS_W15)
         && id.local == "commentEx"
         && let Some(para) = attr_ns(attrs, res, NS_W15, b"paraId")
@@ -2758,6 +3402,15 @@ fn push_comment_ex(out: &mut CommentEx, id: &ElemId, attrs: &[Attribute], res: &
 /// The `w16cid:commentId/@w16cid:paraId` values of a commentsIds part. `None` when it does not
 /// parse.
 pub(crate) fn parse_comments_ids(text: &str, cap: usize, guard: &mut ParseGuard) -> Option<(Vec<HexId>, bool)> {
+    observation_contract! {
+        rules: "COMMENTEX-LINK";
+        collections: "parser.parse_comments_ids*1,type.Vec*3";
+        scope: "source-local bounded extraction; no implicit document owner";
+        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+        fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+        package_loss: "independent";
+    }
+
     let mut reader = NsReader::from_reader(text.as_bytes());
     let mut buf = Vec::new();
     let mut out = Vec::new();
@@ -2799,6 +3452,15 @@ pub(crate) fn parse_comments_ids(text: &str, cap: usize, guard: &mut ParseGuard)
 
 /// Extract and append a `w16cid:commentId/@w16cid:paraId` entry to the list, respecting capacity.
 fn push_comment_id(out: &mut Vec<HexId>, capped: &mut bool, id: &ElemId, attrs: &[Attribute], res: &NamespaceResolver, cap: usize) {
+    observation_contract! {
+        rules: "-";
+        collections: "type.Vec*1";
+        scope: "source-local bounded extraction; no implicit document owner";
+        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+        fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+        package_loss: "independent";
+    }
+
     if id.local_w(NS_W16CID)
         && id.local == "commentId"
         && let Some(v) = attr_ns(attrs, res, NS_W16CID, b"paraId")
@@ -2814,6 +3476,15 @@ fn push_comment_id(out: &mut Vec<HexId>, capped: &mut bool, id: &ElemId, attrs: 
 /// An element's attributes, or `None` when the attribute list is malformed (a duplicate or an
 /// unterminated value).
 fn attrs_of<'a>(e: &'a BytesStart<'_>) -> Option<Vec<Attribute<'a>>> {
+    observation_contract! {
+        rules: "-";
+        collections: "type.Vec*2";
+        scope: "source-local bounded extraction; no implicit document owner";
+        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+        fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+        package_loss: "independent";
+    }
+
     let mut attrs = Vec::new();
     for a in e.attributes() {
         attrs.push(a.ok()?);

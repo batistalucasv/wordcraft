@@ -3,7 +3,7 @@
 use super::*;
 #[allow(dead_code, clippy::duplicate_mod)]
 #[path = "../tests/common/mod.rs"]
-mod common;
+pub(super) mod common;
 use common::{CT_STYLES, Doc, NS};
 
 #[test]

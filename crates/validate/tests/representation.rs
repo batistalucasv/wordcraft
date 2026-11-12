@@ -202,3 +202,35 @@ fn every_relationship_reference_binds_the_first_duplicate_declaration() {
         assert_eq!(serde_json::to_vec(&validate_bytes(&d.build())).unwrap(), serde_json::to_vec(&report).unwrap());
     }
 }
+
+#[test]
+fn glossary_roots_keep_distinct_definitions_across_official_and_custom_edges() {
+    use common::{CT_FOOTNOTES, CT_GLOSSARY, rels_xml};
+    for matching in [false, true] {
+        for edge in ["http://schemas.openxmlformats.org/officeDocument/2006/relationships/glossaryDocument", "urn:custom/glossaryDocument"] {
+            let mut d = Doc::minimal();
+            d.set_doc_rels(&rel("glossaryDocument", "a/document.xml"));
+            for (folder, note, comment) in [("a", 2, 4), ("b", if matching { 2 } else { 3 }, if matching { 4 } else { 5 })] {
+                d.add_with_override(&format!("word/{folder}/document.xml"), CT_GLOSSARY, format!(r#"<w:glossaryDocument {NS}><w:docParts><w:docPart><w:docPartBody><w:p><w:r><w:footnoteReference w:id="{note}"/><w:commentReference w:id="{comment}"/></w:r></w:p></w:docPartBody></w:docPart></w:docParts></w:glossaryDocument>"#));
+                d.add_with_override(
+                    &format!("word/{folder}/footnotes.xml"),
+                    CT_FOOTNOTES,
+                    format!(r#"<w:footnotes {NS}><w:footnote w:id="{note}"><w:p/></w:footnote></w:footnotes>"#),
+                );
+                d.add_with_override(
+                    &format!("word/{folder}/comments.xml"),
+                    CT_COMMENTS,
+                    format!(r#"<w:comments {NS}><w:comment w:id="{comment}"><w:p/></w:comment></w:comments>"#),
+                );
+                let mut links = rel("footnotes", "footnotes.xml") + &rel("comments", "comments.xml");
+                if folder == "a" {
+                    links.push_str(&format!(r#"<Relationship Id="nested" Type="{edge}" Target="../b/document.xml"/>"#));
+                }
+                d.set(&format!("word/{folder}/_rels/document.xml.rels"), rels_xml(&links));
+            }
+            let report = report_in_all_orders(&mut d);
+            assert_eq!(report.verdict, wordcraft_validate::Verdict::Pass, "{edge} matching={matching}: {report:?}");
+            assert!(report.findings.is_empty(), "{report:?}");
+        }
+    }
+}
