@@ -777,6 +777,7 @@ fn fit_one_page_skips_deleted_text_when_markup_hidden() {
 fn fit_one_page_tracks_reduced_complex_script_font_sizes() {
     let mut s = create_multiline_doc(27);
     assert_eq!(s.layout().pages.len(), 2);
+    let styles_before = s.doc.styles.clone();
 
     // Set complex script font size on body run while keeping standard font size default (12 pt)
     if let wordcraft_doc::Block::Para(p) = std::sync::Arc::make_mut(&mut s.doc.body[0]) {
@@ -790,22 +791,15 @@ fn fit_one_page_tracks_reduced_complex_script_font_sizes() {
     assert!(res.is_ok(), "first fit must succeed: {res:?}");
     assert_eq!(s.doc.fit_state.as_ref().map(|f| f.cum_delta), Some(0.5));
 
-    // User restores standard size to 12.0 pt, but leaves size_cs reduced at 13.5 pt
-    if let wordcraft_doc::Block::Para(p) = std::sync::Arc::make_mut(&mut s.doc.body[0]) {
-        p.runs[0].props.size = Some(12.0);
-    }
-    s.touch();
-    s.relayout();
-
-    // Because size_cs is still reduced, cumulative tracking retains the 0.5 pt delta provenance
-    assert_eq!(s.doc.fit_state.as_ref().map(|f| f.cum_delta), Some(0.5));
-
-    // Add spill line pushing to 2 pages again
-    let extra_p = wordcraft_doc::Paragraph::with_text("Extra overflow paragraph.", CharProps::default());
-    s.doc.body.push(wordcraft_doc::para_block(extra_p));
+    // User restores every other size (the styles the fit rescaled), leaving only this run's
+    // explicit complex-script size reduced at 13.5 pt.
+    s.doc.styles = styles_before;
     s.touch();
     s.relayout();
     assert_eq!(s.layout().pages.len(), 2);
+
+    // Because size_cs is still reduced, cumulative tracking retains the 0.5 pt delta provenance
+    assert_eq!(s.doc.fit_state.as_ref().map(|f| f.cum_delta), Some(0.5));
 
     // Second fit within remaining 0.5 pt budget succeeds up to 1.0 pt cap
     let res2 = s.run("layout.fitOnePage", &json!({"maxDeltaPt": 0.5, "adjustSpacing": false}));
@@ -855,21 +849,37 @@ fn fit_one_page_preserves_budget_across_document_serialization() {
 #[test]
 fn fit_one_page_enforces_durable_limit_when_fit_state_missing() {
     // A document with body font already at 8.5 pt readability floor and fit_state == None
-    let mut s = create_multiline_doc(27);
-    for b in &mut s.doc.body {
-        if let wordcraft_doc::Block::Para(p) = std::sync::Arc::make_mut(b) {
-            for r in &mut p.runs {
-                r.props.size = Some(8.5);
+    let set_font = |s: &mut Session| {
+        for b in &mut s.doc.body {
+            if let wordcraft_doc::Block::Para(p) = std::sync::Arc::make_mut(b) {
+                for r in &mut p.runs {
+                    r.props.size = Some(8.5);
+                }
             }
         }
+        s.touch();
+        s.relayout();
+    };
+    let mut lines = 27;
+    let mut s = create_multiline_doc(lines);
+    set_font(&mut s);
+    while s.layout().pages.len() < 2 && lines < 120 {
+        lines += 1;
+        s = create_multiline_doc(lines);
+        set_font(&mut s);
     }
+    assert_eq!(s.layout().pages.len(), 2);
     s.doc.fit_state = None;
     s.touch();
     s.relayout();
+    let before = s.doc.clone();
 
-    // With adjustSpacing = false, font reduction is bounded by durable 8.5 pt floor and refused
+    // With adjustSpacing = false, font reduction is bounded by the durable 8.5 pt floor and refused
     let res = s.run("layout.fitOnePage", &json!({"maxDeltaPt": 0.5, "adjustSpacing": false}));
     assert!(res.is_err(), "fit must be refused when typography is at durable readability floor");
+    let err = res.unwrap_err().to_string();
+    assert!(err.contains("Unable to shrink document further without reducing text beyond readability limits."), "unexpected error: {err}");
+    assert_eq!(s.doc, before, "a refused fit must leave the document unchanged");
 }
 
 #[test]
@@ -1014,4 +1024,89 @@ fn fit_one_page_reports_search_exhaustion_when_candidates_cannot_remove_page() {
         err.contains("no permitted typography adjustment could remove a page"),
         "error message must distinguish search exhaustion from overflow limits: {err}"
     );
+}
+
+#[test]
+fn fit_one_page_excludes_line_number_decorations_from_final_page_limits() {
+    let mut lines = 33;
+    let enable_line_numbers = |s: &mut Session| {
+        s.doc.last_section.line_numbers = Some(wordcraft_doc::section::LineNumbering::default());
+        s.touch();
+        s.relayout();
+    };
+    let mut s = create_multiline_doc(lines);
+    enable_line_numbers(&mut s);
+    while s.layout().pages.len() < 2 && lines < 60 {
+        lines += 1;
+        s = create_multiline_doc(lines);
+        enable_line_numbers(&mut s);
+    }
+    assert_eq!(s.layout().pages.len(), 2);
+
+    // Every body line on the final page also places a line-number decoration. Counting those as
+    // content would double the final-page line count and refuse before any candidate is tried.
+    let decorated = s.layout().pages[1]
+        .items
+        .iter()
+        .filter(|item| matches!(item, wordcraft_layout::Placed::Lines { story, .. } if *story == wordcraft_layout::DECOR_STORY))
+        .count();
+    assert!(decorated > 0, "the final page must carry line-number decorations");
+
+    let res = s.run("layout.fitOnePage", &json!({"maxDeltaPt": 4.0}));
+    assert!(res.is_ok(), "line-number decorations must not count as final-page content: {res:?}");
+    assert_eq!(s.layout().pages.len(), 1);
+}
+
+#[test]
+fn fit_one_page_counts_side_by_side_footnote_cells_once() {
+    let mut s = create_multiline_doc(27);
+    assert_eq!(s.layout().pages.len(), 2);
+
+    // A footnote table whose row's cells sit side by side: their text occupies one vertical
+    // interval, so their heights must not be summed as if stacked.
+    let mut table = wordcraft_doc::Table::new(1, 3, 420.0);
+    let cell_text = "The quick brown fox jumps over the lazy dog again and again.";
+    for cell in &mut table.rows[0].cells {
+        cell.blocks =
+            vec![wordcraft_doc::para_block(wordcraft_doc::Paragraph::with_text(cell_text, CharProps { size: Some(21.0), ..Default::default() }))];
+    }
+    let note_blocks: Vec<std::sync::Arc<wordcraft_doc::Block>> = vec![std::sync::Arc::new(wordcraft_doc::Block::Table(table))];
+    let note_id = s.doc.add_part(wordcraft_doc::PartKind::Footnote, note_blocks);
+
+    let last_para_idx = s.doc.body.len().saturating_sub(1);
+    let noteref = wordcraft_doc::para::InlineObject::NoteRef { kind: wordcraft_doc::para::NoteKind::Footnote, id: note_id, custom: String::new() };
+    s.doc.insert_object(&wordcraft_doc::Pos::body(last_para_idx, 0), noteref, &Default::default()).unwrap();
+    s.touch();
+    s.relayout();
+    assert_eq!(s.layout().pages.len(), 2);
+
+    let note_cells = s.layout().pages[1]
+        .items
+        .iter()
+        .filter(|item| matches!(item, wordcraft_layout::Placed::Cell { story: wordcraft_doc::StoryRef::Part(id), .. } if *id == note_id))
+        .count();
+    assert!(note_cells >= 2, "the footnote table must place its cells side by side on the final page");
+
+    let res = s.run("layout.fitOnePage", &json!({"maxDeltaPt": 4.0}));
+    assert!(res.is_ok(), "side-by-side footnote cells must count once in the fill height: {res:?}");
+    assert_eq!(s.layout().pages.len(), 1);
+}
+
+#[test]
+fn fit_one_page_refuses_when_formatting_changes_cannot_be_tracked() {
+    let mut s = create_multiline_doc(27);
+    assert_eq!(s.layout().pages.len(), 2);
+    s.doc.settings.track_changes = true;
+    s.prefs.markup.track_formatting = true;
+    let before = s.doc.clone();
+
+    // Style reductions cannot be recorded as formatting revisions, so the command must refuse
+    // (through both ids) rather than change typography that rejecting all changes cannot undo.
+    for id in ["layout.fitOnePage", "layout.shrinkOnePage"] {
+        let res = s.run(id, &json!({}));
+        assert!(res.is_err(), "{id} must refuse while formatting is tracked");
+        let err = res.unwrap_err().to_string();
+        assert!(err.contains("tracks formatting changes"), "{id}: unexpected error: {err}");
+        assert_eq!(s.doc, before, "{id} must leave the document unchanged");
+    }
 }

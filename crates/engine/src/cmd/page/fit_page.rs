@@ -10,7 +10,7 @@ use serde_json::Value;
 use wordcraft_doc::Document;
 use wordcraft_doc::fit_page::fit_document_typography;
 use wordcraft_doc::section::SectionStart;
-use wordcraft_layout::{LayoutCache, LayoutOptions, ViewMode};
+use wordcraft_layout::{LayoutCache, LayoutOptions, Placed, ViewMode};
 
 use crate::cmd::sel_result;
 use crate::{CmdError, CmdResult, Session, p};
@@ -164,6 +164,44 @@ fn has_explicit_breaks(doc: &Document) -> bool {
         }
     }
     false
+}
+
+/// True when `item` is a line-number decoration: a `DECOR_STORY` line with no block path.
+///
+/// Note separators and continuation notices also use `DECOR_STORY`, but carry their block path.
+/// Line numbers sit outside the body column and must not count as page content.
+fn is_line_number_decoration(item: &Placed) -> bool {
+    matches!(item, Placed::Lines { story, path, .. } if *story == wordcraft_layout::DECOR_STORY && path.0.is_empty())
+}
+
+/// True when `story` is a footnote part, whose text sits at the bottom of its page.
+fn is_footnote_story(doc: &Document, story: &wordcraft_doc::StoryRef) -> bool {
+    match story {
+        wordcraft_doc::StoryRef::Part(id) => doc.parts.get(id).is_some_and(|p| p.kind == wordcraft_doc::PartKind::Footnote),
+        _ => false,
+    }
+}
+
+/// The height covered by the union of `spans`, so overlapping items (side-by-side table cells)
+/// count once.
+fn union_height(spans: &[(f32, f32)]) -> f32 {
+    let mut spans: Vec<(f32, f32)> = spans.iter().copied().filter(|(a, b)| a.is_finite() && b.is_finite() && *b > *a).collect();
+    spans.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    let mut total = 0.0;
+    let mut iter = spans.into_iter();
+    if let Some((mut start, mut end)) = iter.next() {
+        for (a, b) in iter {
+            if a <= end + 0.01 {
+                end = end.max(b);
+            } else {
+                total += end - start;
+                start = a;
+                end = b;
+            }
+        }
+        total += end - start;
+    }
+    total
 }
 
 /// Calculates the minimum effective body font size in points across the document body and editable text boxes.
@@ -434,7 +472,18 @@ fn generate_candidate_steps(max_delta: f32, step_pt_opt: Option<f32>, adjust_spa
 ///
 /// Condenses the document by one page if feasible, preserving typographical
 /// hierarchies, protecting line spacing, and clamping to readability bounds.
+/// Refuses while Track Changes and Track Formatting are on, because the style
+/// reductions it needs cannot be recorded as formatting revisions.
 pub fn fit_one_page(s: &mut Session, v: &Value) -> CmdResult {
+    // 0. Refuse while formatting changes must be tracked: fitting rescales styles, and the
+    //    formatting-recording path compares direct run/paragraph properties only, so the
+    //    inherited reductions could not be represented as revisions.
+    if s.doc.settings.track_changes && s.prefs.markup.track_formatting {
+        return Err(CmdError::Disabled(
+            "the document tracks formatting changes: Fit One Page cannot record its style changes as formatting revisions".into(),
+        ));
+    }
+
     // 1. Anti-compound guard: refuse if cumulative reduction already reached 1.0 pt or spacing factor <= 0.94
     let (cum_delta, cum_space) = cumulative_shrink_state(&s.doc);
     if cum_delta >= 1.0 - 1e-4 || cum_space <= 0.94 + 1e-4 {
@@ -467,32 +516,51 @@ pub fn fit_one_page(s: &mut Session, v: &Value) -> CmdResult {
     }
 
     // 4. Pre-flight check on final page content volume
+    //
+    // Line-number decorations sit outside the body column, and note separators belong to the
+    // notes at the page's foot: neither is body overflow. Footnotes can be condensed too, so
+    // their occupied height (the union of their items, side-by-side table cells counted once)
+    // reduces the body area available on the page rather than counting as spilled body text.
     let last_page = &initial_layout.pages[p0 - 1];
-    let mut last_page_lines = 0;
+    let mut last_page_lines = 0usize;
     let mut body_min_y = f32::INFINITY;
     let mut body_max_y: f32 = 0.0;
-    let mut footnote_h: f32 = 0.0;
+    let mut note_spans: Vec<(f32, f32)> = Vec::new();
     for item in &last_page.items {
-        if let wordcraft_layout::Placed::Lines { story, l0, l1, y, para, .. } = item {
-            let line_count = l1.saturating_sub(*l0);
-            last_page_lines += line_count;
+        if is_line_number_decoration(item) {
+            continue;
+        }
+        let is_note_separator = matches!(item, Placed::Lines { story, .. } if *story == wordcraft_layout::DECOR_STORY);
+        let is_note = matches!(
+            item,
+            Placed::Lines { story, .. }
+                | Placed::Cell { story, .. }
+                | Placed::Image { story, .. }
+                | Placed::Graphic { story, .. }
+                | Placed::Object { story, .. }
+                if is_footnote_story(&s.doc, story)
+        );
+        if is_note || is_note_separator {
+            note_spans.push(item.vertical_span());
+            continue;
+        }
+        if let Placed::Lines { l0, l1, y, para, .. } = item {
+            last_page_lines = last_page_lines.saturating_add(l1.saturating_sub(*l0));
             let h: f32 = para.lines.get(*l0..*l1).map(|slice| slice.iter().map(|l| l.height).sum()).unwrap_or(0.0);
-            let is_note_content = *story == wordcraft_layout::DECOR_STORY
-                || match story {
-                    wordcraft_doc::StoryRef::Part(id) => s.doc.parts.get(id).is_some_and(|p| p.kind == wordcraft_doc::PartKind::Footnote),
-                    _ => false,
-                };
-            if is_note_content {
-                footnote_h += h;
-            } else {
-                body_min_y = body_min_y.min(*y);
-                body_max_y = body_max_y.max(y + h);
-            }
+            body_min_y = body_min_y.min(*y);
+            body_max_y = body_max_y.max(y + h);
         }
     }
     let body_spill_h = if body_max_y > body_min_y { body_max_y - body_min_y } else { 0.0 };
-    let total_spill_h = body_spill_h + footnote_h;
-    let fill_ratio = if last_page.body.h > 0.0 { total_spill_h / last_page.body.h } else { 0.0 };
+    let note_h = union_height(&note_spans);
+    let body_area_h = (last_page.body.h - note_h).max(0.0);
+    let fill_ratio = if body_area_h > 0.0 {
+        body_spill_h / body_area_h
+    } else if body_spill_h > 0.0 {
+        1.0
+    } else {
+        0.0
+    };
     if last_page_lines > 12 || fill_ratio > 0.30 {
         return Err(CmdError::Failed(
             "Unable to fit document to one page: content on the final page exceeds limits for aesthetic page reduction.".into(),
@@ -570,7 +638,7 @@ pub fn fit_one_page(s: &mut Session, v: &Value) -> CmdResult {
         _ => {
             if has_explicit_breaks(&s.doc) {
                 Err(CmdError::Failed("Unable to fit document to one page: explicit page or section breaks prevent page reduction.".into()))
-            } else if doc_has_unreadable_body_font(&s.doc, hide_deleted, shown_hidden) {
+            } else if min_body_font_size(&s.doc, hide_deleted, shown_hidden) <= MIN_COMFORTABLE_BODY_FONT_SIZE {
                 Err(CmdError::Failed("Unable to shrink document further without reducing text beyond readability limits.".into()))
             } else {
                 Err(CmdError::Failed("Unable to fit document to one page: no permitted typography adjustment could remove a page.".into()))
@@ -595,5 +663,14 @@ mod tests {
         let candidates = generate_candidate_steps(2.0, Some(0.001), false);
         let fine_steps_count = candidates.iter().filter(|(d, _)| *d < 0.5).count();
         assert_eq!(fine_steps_count, MAX_FINE_STEPS);
+    }
+
+    #[test]
+    fn union_height_counts_overlaps_and_stacked_spans_once() {
+        assert_eq!(union_height(&[]), 0.0);
+        // Side-by-side cells overlap; the stacked span below adds its own height.
+        assert_eq!(union_height(&[(0.0, 20.0), (5.0, 20.0), (20.0, 30.0)]), 30.0);
+        // Malformed input (reversed, NaN, infinite) is ignored rather than poisoning the total.
+        assert_eq!(union_height(&[(10.0, 5.0), (f32::NAN, 1.0), (0.0, f32::INFINITY), (2.0, 4.0)]), 2.0);
     }
 }
