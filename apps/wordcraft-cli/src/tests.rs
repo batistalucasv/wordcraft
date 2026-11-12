@@ -598,7 +598,8 @@ fn validate_rejects_missing_or_surplus_operands_without_validating() {
 
 /// Finding 4: `validate` is in `OPENS_FILE`, so a file name that is not valid Unicode reaches the
 /// validator by its preserved path rather than being rejected as a bad argument.
-#[cfg(unix)]
+/// APFS refuses invalid UTF-8 file names, so macOS covers native path handling without creating one.
+#[cfg(all(unix, not(target_os = "macos")))]
 #[test]
 fn validate_accepts_a_file_name_that_is_not_unicode() {
     use std::os::unix::ffi::OsStringExt;
@@ -688,4 +689,19 @@ fn invisible_characters_are_escaped_and_json_lines_still_parse_back() {
     assert!(!line.chars().any(is_unsafe_char), "{line}");
     assert!(line.contains("\\ud800") || line.contains("\\udb40"), "{line}");
     assert_eq!(serde_json::from_str::<Value>(&line).unwrap(), value);
+}
+
+/// Native non-Unicode paths survive argument parsing and reach the validator's I/O error path.
+/// No file is created: APFS refuses invalid UTF-8 names. The original bytes, rather than their
+/// lossy display spelling, must be retained even when options precede the operand.
+#[cfg(unix)]
+#[test]
+fn validate_preserves_a_non_unicode_path_without_creating_a_file() {
+    use std::os::unix::ffi::OsStringExt;
+    let raw_path = OsString::from_vec(b"wordcraft-nonexistent-caf\xe9.docx".to_vec());
+    let raw = vec![OsString::from("validate"), OsString::from("--json"), raw_path.clone()];
+    let (_, parsed) = text_args(&raw).unwrap();
+    assert_eq!(parsed.as_deref(), Some(Path::new(&raw_path)));
+    assert!(parsed.as_deref().unwrap().to_str().is_none());
+    assert_eq!(run(&raw), Err(Failure::Status(3)), "native path reaches I/O handling");
 }

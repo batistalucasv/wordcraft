@@ -4644,7 +4644,7 @@ fn fredapps_1_truncated_content_types() {
     assert!(!has(&report, "CT-MAIN-TYPE"), "{report:?}");
 }
 
-/// Finding 2: relationship types are complete URIs, with both standard families supported.
+/// Finding 2: complete official URIs establish entry points; Strict remains an unsupported profile.
 #[test]
 fn fredapps_2_office_document_uri() {
     for (kind, valid) in [
@@ -4657,7 +4657,9 @@ fn fredapps_2_office_document_uri() {
         let report = validate_bytes(&d.build());
         assert_eq!(has(&report, "PKG-NO-MAIN"), !valid, "{kind}: {report:?}");
         if valid {
-            assert_eq!(report.verdict, Verdict::Pass, "{report:?}");
+            let expected =
+                if kind == "http://purl.oclc.org/ooxml/officeDocument/relationships/officeDocument" { Verdict::Incomplete } else { Verdict::Pass };
+            assert_eq!(report.verdict, expected, "{report:?}");
         }
     }
 }
@@ -5400,4 +5402,126 @@ fn round4_shared_custom_xml() {
     let satisfied = validate_bytes(&d.build());
     assert_eq!(satisfied.verdict, Verdict::Pass, "{satisfied:?}");
     assert!(!has(&satisfied, "CUSTOMXML-SCHEMA"), "{satisfied:?}");
+}
+
+// Round 6: relationship classification and the unsupported Strict profile.
+/// A vendor relationship before the real styles edge must not select the vendor's definitions.
+#[test]
+fn round6_custom_styles_cannot_shadow_real_styles() {
+    let mut d = Doc::minimal();
+    d.set_document(r#"<w:p><w:pPr><w:pStyle w:val="Real"/></w:pPr></w:p>"#);
+    d.add_with_override(
+        "word/vendor.xml",
+        CT_STYLES,
+        format!(r#"<w:styles xmlns:w="{W_NS}"><w:style w:type="paragraph" w:styleId="Vendor"/></w:styles>"#),
+    );
+    d.add_with_override(
+        "word/styles.xml",
+        CT_STYLES,
+        format!(r#"<w:styles xmlns:w="{W_NS}"><w:style w:type="paragraph" w:styleId="Real"/></w:styles>"#),
+    );
+    d.set_doc_rels(r#"<Relationship Id="vendor" Type="https://vendor.example/rels/styles" Target="vendor.xml"/><Relationship Id="real" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>"#);
+    let report = validate(&d);
+    eprintln!("custom styles: {report:?}");
+    assert!(!report.findings.iter().any(|f| f.rule == "REF-STYLE"), "{report:?}");
+    // The actual definitions still resolve, and actual absence still warns.
+    d.set_document(r#"<w:p><w:pPr><w:pStyle w:val="Missing"/></w:pPr></w:p>"#);
+    assert!(validate(&d).findings.iter().any(|f| f.rule == "REF-STYLE"));
+}
+
+/// Custom types with catalogue suffixes prescribe no content type and no XML decoding.
+#[test]
+fn round6_custom_types_do_not_create_false_content_mismatches() {
+    let mut rejected = Vec::new();
+    for kind in [
+        "styles",
+        "numbering",
+        "comments",
+        "footnotes",
+        "endnotes",
+        "header",
+        "footer",
+        "settings",
+        "theme",
+        "chart",
+        "customXml",
+        "glossaryDocument",
+        "commentsExtended",
+        "commentsIds",
+        "people",
+        "customXmlProps",
+        "fontTable",
+        "webSettings",
+        "bibliography",
+        "image",
+    ] {
+        let mut d = Doc::minimal();
+        d.add_with_override("word/vendor.dat", "application/octet-stream", vec![0xff, 0xfe, 0xfd]);
+        d.set_doc_rels(&format!(r#"<Relationship Id="vendor" Type="https://vendor.example/rels/{kind}" Target="vendor.dat"/>"#));
+        let report = validate(&d);
+        eprintln!("custom {kind}: {report:?}");
+        if report.verdict != Verdict::Pass || !report.findings.is_empty() {
+            rejected.push(kind);
+        }
+    }
+    assert!(rejected.is_empty(), "custom types rejected: {rejected:?}");
+}
+
+/// Strict markup and relationship namespaces are unsupported, so their checks cannot silently pass.
+#[test]
+fn round6_strict_profile_is_incomplete() {
+    let mut d = Doc::minimal();
+    let root = String::from_utf8(d.get("_rels/.rels").to_vec()).unwrap().replace(
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument",
+        "http://purl.oclc.org/ooxml/officeDocument/relationships/officeDocument",
+    );
+    d.set("_rels/.rels", root);
+    d.set_document_raw(r#"<w:document xmlns:w="http://purl.oclc.org/ooxml/wordprocessingml/main" xmlns:r="http://purl.oclc.org/ooxml/officeDocument/relationships"><w:body><w:p><w:r><w:t>Strict</w:t></w:r></w:p></w:body></w:document>"#);
+    let report = validate(&d);
+    eprintln!("Strict profile: {report:?}");
+    assert_eq!(report.verdict, Verdict::Incomplete, "{report:?}");
+    assert!(report.coverage_notes.iter().any(|n| n.contains("Strict") && n.contains("profile")), "{report:?}");
+}
+
+/// The supported profile retains the existing PASS verdict.
+#[test]
+fn round6_transitional_profile_still_passes() {
+    let report = validate(&Doc::minimal());
+    assert_eq!(report.verdict, Verdict::Pass, "{report:?}");
+    assert!(!report.coverage_notes.iter().any(|n| n.contains("Strict")));
+}
+
+/// Definition-source loss suppresses absence; a retained reference can still prove a defect.
+#[test]
+fn round6_auxiliary_eof_guards_do_not_manufacture_conclusions() {
+    let mut d = Doc::minimal();
+    d.add_with_override(
+        "word/styles.xml",
+        CT_STYLES,
+        format!(r#"<w:styles xmlns:w="{W_NS}"><w:style w:styleId="A"><w:pPr><w:numPr><w:numId w:val="2"/></w:numPr></w:pPr></w:style>"#),
+    );
+    d.add_with_override("word/numbering.xml", CT_NUMBERING, format!(r#"<w:numbering xmlns:w="{W_NS}"/>"#));
+    d.set_doc_rels(r#"<Relationship Id="s" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/><Relationship Id="n" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/numbering" Target="numbering.xml"/>"#);
+    let report = validate(&d);
+    eprintln!("unclosed style num refs: {report:?}");
+    assert!(report.findings.iter().any(|f| f.rule == "XML-MALFORMED"));
+    // The numbering definition set is complete and empty. The retained numId=2 reference is
+    // positive evidence even though its styles source is unclosed; this is no false absence.
+    assert!(report.findings.iter().any(|f| f.rule == "NUM-DANGLING"));
+    let mut d = Doc::minimal();
+    d.add_with_override(
+        "word/commentsExtended.xml",
+        CT_COMMENTS_EXT,
+        format!(r#"<w15:commentsEx xmlns:w15="{W15_NS}"><w15:commentEx w15:paraId="00000001"/></w15:commentsEx>"#),
+    );
+    d.add_with_override(
+        "word/commentsIds.xml",
+        CT_COMMENTS_IDS,
+        format!(r#"<w16cid:commentsIds xmlns:w16cid="{W16CID_NS}"><w16cid:commentId w16cid:paraId="00000002"/>"#),
+    );
+    d.set_doc_rels(r#"<Relationship Id="e" Type="http://schemas.microsoft.com/office/2011/relationships/commentsExtended" Target="commentsExtended.xml"/><Relationship Id="i" Type="http://schemas.microsoft.com/office/2016/09/relationships/commentsIds" Target="commentsIds.xml"/>"#);
+    let report = validate(&d);
+    eprintln!("unclosed commentsIds: {report:?}");
+    assert!(report.findings.iter().any(|f| f.rule == "XML-MALFORMED"));
+    assert!(!report.findings.iter().any(|f| f.message.contains("counterpart")));
 }

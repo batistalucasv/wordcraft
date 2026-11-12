@@ -33,7 +33,7 @@ use std::path::Path;
 
 use serde::Serialize;
 
-use package::{Package, RelsPart, canonical_entry, entry_by_name, rels_part_name, tail};
+use package::{Package, RelsPart, canonical_entry, entry_by_name, relationship_kind, rels_part_name};
 use scan::{DecodeError, RefFact};
 
 /// The WordprocessingML main namespace.
@@ -108,25 +108,28 @@ pub enum Verdict {
     Incomplete,
 }
 
-/// How serious a finding is.
+/// Consumer-impact grade, calibrated per rule against the named consumers in corpus/EVIDENCE.md.
+/// A specification violation alone does not determine the grade.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum Severity {
-    /// The package cannot be a valid document.
+    /// Structurally unusable as a document (for example, not a ZIP or missing its manifest).
     Corrupt,
-    /// A rule of the specification is violated.
+    /// Consumer refusal, repair, or loss of referenced content, as calibrated for this rule.
     Error,
-    /// Something Word tolerates, but that is still worth reporting.
+    /// A tolerated defect or degradation worth reporting, including some specification violations.
     Warning,
 }
 
-/// How the rule's truth was established.
+/// How the integrity violation was established; consumer impact is attributed separately.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum Evidence {
-    /// The package format forces it: it cannot be otherwise.
+    /// Structurally certain at the XML/package level; does not establish a consumer reaction.
     ByConstruction,
-    /// Stated in the OOXML specification.
+    /// Documented by OOXML or Microsoft's format/implementation specifications.
     MsDocumented,
-    /// Seen in documents produced by Word.
+    /// Consumer reaction observed on a defective fixture in a named Word oracle, with fixture,
+    /// date, and consumer/open-path details recorded in corpus/EVIDENCE.md. One consumer's reaction
+    /// does not establish another's.
     Observed,
     /// Concluded from the package contents.
     Inferred,
@@ -540,7 +543,9 @@ pub(crate) struct Acc {
 /// Rules whose truth depends on something being *absent* from the package (a relationship target, a
 /// content-type declaration, a cross-part reference's definition, or the main-part resolution). When
 /// the package holds an entry of unknown identity, whatever it might have contained is unknown, so
-/// none of these can be concluded: absence is not established. Presence-based rules are unaffected.
+/// failing findings in these families are suppressed: absence is not established. Warning grades
+/// remain advisory; presence/duplicate/count rules are unaffected. Source-local missing attributes
+/// and children do not belong here: an unknown package entry cannot supply them.
 const ABSENCE_RULES: &[&str] = &[
     "PKG-NO-CONTENT-TYPES",
     "PKG-NO-MAIN",
@@ -551,16 +556,10 @@ const ABSENCE_RULES: &[&str] = &[
     "REL-REF-MISSING",
     "ID-COMMENT-REF",
     "REF-NOTE",
+    "NOTE-PR-LISTING",
+    "NOTE-PR-DANGLING",
     "REF-HEADER",
     "REF-STYLE",
-    "STYLE-DUP-ID",
-    "STYLE-DUP-NAME",
-    "STYLE-RESERVED-NAME",
-    "STYLE-RESERVED-ID",
-    "STYLE-COUNT",
-    "STYLE-ID-LENGTH",
-    "FONT-DUP-NAME",
-    "PROP-DUP-NAME",
     "NUM-DANGLING",
     "COMMENTEX-LINK",
     "CUSTOMXML-SCHEMA",
@@ -690,6 +689,13 @@ pub(crate) fn validate_bytes_limited(bytes: &[u8], limits: Limits) -> Report {
     let Some(pkg) = package::load(bytes, &mut acc) else {
         return acc.finish();
     };
+    if package::uses_strict_profile(&pkg) {
+        // The XML scanner understands Transitional WML only. Running it on Strict markup would
+        // silently skip its elements and could manufacture a PASS without checking that profile.
+        acc.note("the Strict OOXML profile is unsupported; document checks require the Transitional profile".to_string());
+        acc.set_incomplete();
+        return acc.finish();
+    }
     check_content_types(&pkg, &mut acc);
     let xml = check_xml(&pkg, &mut acc);
     check_rels(
@@ -1348,21 +1354,9 @@ fn content_type_role(ct: Option<&str>) -> Option<scan::PartRole> {
 
 /// Classify a part role from the relationship type that targets it.
 fn relationship_role(kind: &str) -> Option<scan::PartRole> {
-    // The settings role is matched on the complete relationship type, not the
-    // tail: PROTECTION-PASSWORD emits Error findings from it, and a custom
-    // relationship type that merely ends in "/settings" must not turn an
-    // application-owned part into Word settings.
-    if kind == "http://schemas.openxmlformats.org/officeDocument/2006/relationships/settings" {
-        return Some(scan::PartRole { is_settings: true, ..scan::PartRole::default() });
-    }
-    // The glossary role is matched on the complete relationship type for the
-    // same reason: COMMENT-RANGE-UNPAIRED adds a part to its scope from it,
-    // and a custom relationship type that merely ends in "/glossaryDocument"
-    // must not turn an application-owned part into a Word glossary.
-    if kind == "http://schemas.openxmlformats.org/officeDocument/2006/relationships/glossaryDocument" {
-        return Some(scan::PartRole { is_story: true, is_glossary: true, ..scan::PartRole::default() });
-    }
-    Some(match tail(kind) {
+    Some(match relationship_kind(kind)? {
+        "settings" => scan::PartRole { is_settings: true, ..scan::PartRole::default() },
+        "glossaryDocument" => scan::PartRole { is_story: true, is_glossary: true, ..scan::PartRole::default() },
         "comments" => scan::PartRole { is_story: true, is_comments: true, ..scan::PartRole::default() },
         "footnotes" => scan::PartRole { is_story: true, is_footnotes: true, ..scan::PartRole::default() },
         "endnotes" => scan::PartRole { is_story: true, is_endnotes: true, ..scan::PartRole::default() },
@@ -1459,14 +1453,13 @@ fn check_typed_image_refs(pkg: &Package, refs: &[(String, Vec<RefFact>)], acc: &
                 continue;
             }
             let Some(rel) = by_id.get(r.value.as_str()) else { continue };
-            if tail(&rel.kind) != "image" {
+            if relationship_kind(&rel.kind) != Some("image") {
                 acc.add(
                     "REL-TYPED",
                     Some(part.clone()),
                     format!(
                         "an image element in {part} references relationship {}, which is a {} relationship, not an image relationship",
-                        r.value,
-                        tail(&rel.kind)
+                        r.value, rel.kind
                     ),
                 );
             } else if let Some(target) = &rel.target_abs {
@@ -1534,14 +1527,14 @@ fn check_typed_targets(pkg: &Package, acc: &mut Acc) {
         if ct.is_none() && pkg.content_types.incomplete {
             continue;
         }
-        match tail(&r.kind) {
-            "header" if ct != Some(package::HEADER_CONTENT_TYPE) => {
+        match relationship_kind(&r.kind) {
+            Some("header") if ct != Some(package::HEADER_CONTENT_TYPE) => {
                 acc.add("REL-TYPED", Some(rp.name.clone()), header_footer_message("header", &r.id, target, ct));
             }
-            "footer" if ct != Some(package::FOOTER_CONTENT_TYPE) => {
+            Some("footer") if ct != Some(package::FOOTER_CONTENT_TYPE) => {
                 acc.add("REL-TYPED", Some(rp.name.clone()), header_footer_message("footer", &r.id, target, ct));
             }
-            "image" if !ct.is_some_and(|c| c.starts_with("image/")) => {
+            Some("image") if !ct.is_some_and(|c| c.starts_with("image/")) => {
                 acc.add(
                     "REL-TYPED",
                     Some(rp.name.clone()),
@@ -1559,8 +1552,9 @@ fn header_footer_message(kind: &str, id: &str, target: &str, ct: Option<&str>) -
 }
 
 /// The content type each fixed-type relationship requires of its internal target, keyed by the
-/// relationship type's last path segment. This is the ECMA-376 Part 1 part catalogue (§11.3 and
-/// §15.2, plus the MS-DOCX extension parts), so CT-MISMATCH is a table lookup rather than a
+/// official relationship's namespace-checked local kind (see [`relationship_kind`]). This is the
+/// ECMA-376 Part 1 part catalogue (§11.3 and §15.2, plus the MS-DOCX extension parts), so
+/// CT-MISMATCH is a table lookup rather than a
 /// hand-picked list.
 ///
 /// `officeDocument` is absent: the main part's type is pinned by `CT-MAIN-TYPE`. `header` and
@@ -1699,7 +1693,7 @@ fn check_typed_content(
         for r in &rp.rels {
             let first_with_id = seen_ids.insert(r.id.as_str());
             let Some(target) = &r.target_abs else { continue };
-            let kind = tail(&r.kind);
+            let Some(kind) = relationship_kind(&r.kind) else { continue };
             let Some(want) = fixed_rel_content_type(kind) else { continue };
             if matches!(kind, "header" | "footer") && !is_non_main_owner {
                 continue;
@@ -1941,10 +1935,13 @@ fn check_header_footer_refs(pkg: &Package, facts: &scan::StoryFacts, acc: &mut A
             match by_id.get(id.as_str()) {
                 None if rp.incomplete => {}
                 None => acc.add("REF-HEADER", Some(part.clone()), format!("w:{element} r:id {id} in {part} has no matching relationship")),
-                Some(rel) if tail(&rel.kind) != kind => acc.add(
+                Some(rel) if relationship_kind(&rel.kind) != Some(kind) => acc.add(
                     "REF-HEADER",
                     Some(part.clone()),
-                    format!("w:{element} r:id {id} in {part} resolves to a {} relationship, not a {kind} relationship", tail(&rel.kind)),
+                    format!(
+                        "w:{element} r:id {id} in {part} resolves to a {} relationship, not a {kind} relationship",
+                        relationship_kind(&rel.kind).unwrap_or(&rel.kind)
+                    ),
                 ),
                 Some(rel) if rel.external || rel.target_abs.is_none() => acc.add(
                     "REF-HEADER",
@@ -1992,7 +1989,7 @@ fn owner_rel_part<'a>(pkg: &'a Package, owner: &str, kind: &str) -> Option<&'a p
     let want = rels_part_name(owner);
     let rp = pkg.rels.iter().find(|r| r.name.eq_ignore_ascii_case(&want))?;
     for r in &rp.rels {
-        if tail(&r.kind) != kind {
+        if relationship_kind(&r.kind) != Some(kind) {
             continue;
         }
         if let Some(t) = &r.target_abs
@@ -2062,7 +2059,7 @@ fn owner_index_map(pkg: &Package) -> HashMap<String, Vec<usize>> {
             let want = rels_part_name(&part);
             if let Some(rp) = pkg.rels.iter().find(|r| r.name.eq_ignore_ascii_case(&want)) {
                 for r in &rp.rels {
-                    if tail(&r.kind) == "glossaryDocument" {
+                    if relationship_kind(&r.kind) == Some("glossaryDocument") {
                         continue;
                     }
                     if let Some(t) = &r.target_abs
@@ -2850,7 +2847,7 @@ fn image_rel_targets(pkg: &Package) -> HashSet<String> {
     let mut set = HashSet::new();
     for rp in &pkg.rels {
         for r in &rp.rels {
-            if tail(&r.kind) == "image"
+            if relationship_kind(&r.kind) == Some("image")
                 && let Some(t) = &r.target_abs
             {
                 set.insert(t.to_ascii_lowercase());
@@ -4766,5 +4763,158 @@ mod round5_completeness_tests {
         eprintln!("unknown contentPart owner type: {report:?}");
         assert!(!report.findings.iter().any(|f| f.rule == "CT-MISMATCH"), "{report:?}");
         assert_eq!(validate_bytes(&bytes).verdict, Verdict::Pass);
+    }
+}
+
+/// Round-6 probes for ownership and classification not exposed by the public report.
+#[cfg(test)]
+mod round6_tests {
+    use super::*;
+    use std::io::{Cursor, Write};
+
+    /// A minimal package with one optional typed relationship to a custom binary part.
+    fn fixture(kind: &str, ct: &str, target: &[u8]) -> Vec<u8> {
+        let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let types = format!(
+            r#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="{}"/><Override PartName="/word/vendor.dat" ContentType="{ct}"/></Types>"#,
+            package::MAIN_CONTENT_TYPE
+        );
+        let root = format!(
+            r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="main" Type="{NS_R}/officeDocument" Target="word/document.xml"/></Relationships>"#
+        );
+        let rels = format!(
+            r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="vendor" Type="{kind}" Target="vendor.dat"/></Relationships>"#
+        );
+        let doc = format!(r#"<w:document xmlns:w="{NS_W}"><w:body><w:p/></w:body></w:document>"#);
+        for (name, bytes) in [
+            ("[Content_Types].xml", types.as_bytes()),
+            ("_rels/.rels", root.as_bytes()),
+            ("word/document.xml", doc.as_bytes()),
+            ("word/_rels/document.xml.rels", rels.as_bytes()),
+            ("word/vendor.dat", target),
+        ] {
+            zip.start_file(name, zip::write::SimpleFileOptions::default()).unwrap();
+            zip.write_all(bytes).unwrap();
+        }
+        zip.finish().unwrap().into_inner()
+    }
+
+    /// A custom glossary suffix cannot create a second owner or cut its subtree out of main.
+    #[test]
+    fn round6_custom_glossary_does_not_create_owner_scope() {
+        let bytes = fixture("urn:vendor/glossaryDocument", "application/octet-stream", b"payload");
+        let mut acc = Acc::default();
+        let pkg = package::load(&bytes, &mut acc).unwrap();
+        eprintln!("custom glossary scope: {:?}", owner_scopes(&pkg));
+        assert!(pkg.glossary.is_none());
+        assert_eq!(owner_scopes(&pkg), vec![Some("word/document.xml".into())]);
+        assert_eq!(part_owners(&owner_index_map(&pkg), "word/vendor.dat"), vec![0]);
+    }
+
+    /// Actual glossary types still establish and isolate the glossary's owner context.
+    #[test]
+    fn round6_official_glossary_still_resolves() {
+        let bytes = fixture(
+            &format!("{NS_R}/glossaryDocument"),
+            package::GLOSSARY_CONTENT_TYPE,
+            format!(r#"<w:glossaryDocument xmlns:w="{NS_W}"/>"#).as_bytes(),
+        );
+        let mut acc = Acc::default();
+        let pkg = package::load(&bytes, &mut acc).unwrap();
+        assert_eq!(pkg.glossary.as_deref(), Some("word/vendor.dat"));
+        assert_eq!(part_owners(&owner_index_map(&pkg), "word/vendor.dat"), vec![1]);
+    }
+
+    /// A vendor comments edge grants neither a story role nor XML decoding by suffix.
+    #[test]
+    fn round6_custom_comment_role_and_xml_classification_are_unknown() {
+        assert!(relationship_role("urn:vendor/comments").is_none());
+        let bytes = fixture("urn:vendor/comments", "application/octet-stream", &[0xff]);
+        let mut acc = Acc::default();
+        let pkg = package::load(&bytes, &mut acc).unwrap();
+        assert!(!pkg.xml_parts.contains("word/vendor.dat"));
+        assert!(entry_by_name(&pkg, "word/vendor.dat").unwrap().decode_error.is_none());
+    }
+
+    /// Absence suppression cannot hide an observed count; an unknown entry could supply a listing.
+    #[test]
+    fn round6_absence_table_matches_its_contract() {
+        let mut acc = Acc::default();
+        acc.set_unknown_unreadable();
+        acc.add("STYLE-COUNT", None, "observed 4079 styles".into());
+        acc.add("NOTE-PR-LISTING", None, "unknown settings could supply the listing".into());
+        eprintln!("unknown identity accumulator: {:?}", acc.findings);
+        assert_eq!(acc.findings.len(), 1);
+        assert_eq!(acc.findings[0].rule, "STYLE-COUNT");
+    }
+
+    /// Element-side image and header references require the real relationship type, not a suffix.
+    #[test]
+    fn round6_custom_image_and_header_types_do_not_satisfy_references() {
+        for (kind, ct) in [("image", "image/png"), ("header", package::HEADER_CONTENT_TYPE)] {
+            for (namespace, expected) in [("urn:vendor", 1), (NS_R, 0)] {
+                let bytes = fixture(&format!("{namespace}/{kind}"), ct, b"payload");
+                let mut acc = Acc::default();
+                let pkg = package::load(&bytes, &mut acc).unwrap();
+                if kind == "image" {
+                    check_typed_image_refs(
+                        &pkg,
+                        &[("word/document.xml".into(), vec![RefFact { attr: "embed".into(), value: "vendor".into(), image: true }])],
+                        &mut acc,
+                    );
+                } else {
+                    let facts = scan::StoryFacts { header_refs: vec![("vendor".into(), "word/document.xml".into())], ..scan::StoryFacts::default() };
+                    check_header_footer_refs(&pkg, &facts, &mut acc);
+                }
+                assert_eq!(acc.findings.len(), expected, "{namespace}/{kind}: {:?}", acc.findings);
+            }
+        }
+    }
+
+    /// A custom image suffix must not opt an unrelated binary target into magic-byte checking.
+    #[test]
+    fn round6_custom_image_does_not_classify_media_target() {
+        for (namespace, expected) in [("urn:vendor", false), (NS_R, true)] {
+            let bytes = fixture(&format!("{namespace}/image"), "application/octet-stream", b"payload");
+            let mut acc = Acc::default();
+            let pkg = package::load(&bytes, &mut acc).unwrap();
+            assert_eq!(image_rel_targets(&pkg).contains("word/vendor.dat"), expected);
+        }
+    }
+
+    /// Transitional and the Microsoft extension namespaces retain catalogue pairing behavior.
+    #[test]
+    fn round6_official_content_pairings_still_classify() {
+        for namespace in [
+            NS_R,
+            "http://schemas.microsoft.com/office/2006/relationships",
+            "http://schemas.microsoft.com/office/2007/relationships",
+            "http://schemas.microsoft.com/office/2011/relationships",
+            "http://schemas.microsoft.com/office/2016/09/relationships",
+        ] {
+            for (kind, ct) in FIXED_REL_CONTENT_TYPES.iter().filter(|(k, _)| !matches!(*k, "header" | "footer")) {
+                let bytes = fixture(&format!("{namespace}/{kind}"), ct, b"<root/>");
+                let report = validate_bytes(&bytes);
+                assert_eq!(report.verdict, Verdict::Pass, "{namespace}/{kind}: {report:?}");
+                let bytes = fixture(&format!("{namespace}/{kind}"), "application/xml", b"<root/>");
+                let report = validate_bytes(&bytes);
+                assert_eq!(report.findings.iter().any(|f| f.rule == "CT-MISMATCH"), *ct != "application/xml", "{namespace}/{kind}: {report:?}");
+            }
+        }
+    }
+
+    /// Official-looking prefixes, nested paths, and scheme changes are still custom type URIs.
+    #[test]
+    fn round6_relationship_kind_rejects_namespace_lookalikes() {
+        for uri in [
+            "styles",
+            "urn:vendor/styles",
+            "https://schemas.openxmlformats.org/officeDocument/2006/relationships/styles",
+            "http://schemas.openxmlformats.org/officeDocument/2006/relationships/vendor/styles",
+            "http://schemas.microsoft.com/office/2011/relationships/vendor/commentsExtended",
+            "http://schemas.microsoft.com/office/2011/relationships/",
+        ] {
+            assert_eq!(relationship_kind(uri), None, "{uri}");
+        }
     }
 }

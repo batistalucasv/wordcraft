@@ -322,7 +322,7 @@ fn glossary_part(entries: &[Entry], ct: &ContentTypes, rels: &[RelsPart], main: 
     if let Some(main) = main {
         let want = rels_part_name(main);
         if let Some(rp) = rels.iter().find(|r| r.name.eq_ignore_ascii_case(&want))
-            && let Some(r) = rp.rels.iter().find(|r| !r.external && tail(&r.kind) == "glossaryDocument")
+            && let Some(r) = rp.rels.iter().find(|r| !r.external && relationship_kind(&r.kind) == Some("glossaryDocument"))
             && let Some(t) = &r.target_abs
             && let Some(name) = canonical(entries, t)
         {
@@ -380,25 +380,27 @@ pub(crate) fn is_text_part(name: &str) -> bool {
 
 /// Relationship kinds whose target is an XML part, for the single XML-part classification (J4).
 fn is_xml_relationship_kind(kind: &str) -> bool {
-    matches!(
-        tail(kind),
-        "officeDocument"
-            | "styles"
-            | "numbering"
-            | "settings"
-            | "comments"
-            | "commentsExtended"
-            | "commentsIds"
-            | "footnotes"
-            | "endnotes"
-            | "header"
-            | "footer"
-            | "glossaryDocument"
-            | "theme"
-            | "fontTable"
-            | "customXml"
-            | "customXmlProps"
-    )
+    relationship_kind(kind).is_some_and(|kind| {
+        matches!(
+            kind,
+            "officeDocument"
+                | "styles"
+                | "numbering"
+                | "settings"
+                | "comments"
+                | "commentsExtended"
+                | "commentsIds"
+                | "footnotes"
+                | "endnotes"
+                | "header"
+                | "footer"
+                | "glossaryDocument"
+                | "theme"
+                | "fontTable"
+                | "customXml"
+                | "customXmlProps"
+        )
+    })
 }
 
 /// The single classification of XML parts (J4), used by loading, decoding and `check_xml`: a part
@@ -830,9 +832,31 @@ pub(crate) fn relationships_incomplete(pkg: &Package, part: &str) -> bool {
         || pkg.rels.iter().any(|rp| rp.name.eq_ignore_ascii_case(&name) && rp.incomplete)
 }
 
-/// The last `/`-separated segment of a relationship type.
-pub(crate) fn tail(t: &str) -> &str {
-    t.rsplit('/').next().unwrap_or(t)
+/// The local kind of a relationship in a supported official namespace. A matching suffix alone
+/// cannot grant a custom relationship a Word role, select a supporting part, or prescribe its type.
+pub(crate) fn relationship_kind(uri: &str) -> Option<&str> {
+    let (namespace, kind) = uri.rsplit_once('/')?;
+    let official = matches!(
+        namespace,
+        crate::NS_R
+            | "http://schemas.microsoft.com/office/2006/relationships"
+            | "http://schemas.microsoft.com/office/2007/relationships"
+            | "http://schemas.microsoft.com/office/2011/relationships"
+            | "http://schemas.microsoft.com/office/2016/09/relationships"
+    );
+    (official && !kind.is_empty()).then_some(kind)
+}
+
+/// Whether the package entry-point relationship selects the unsupported Strict OOXML profile.
+/// Keep this separate from supported kind classification: recognizing an entry point does not
+/// establish support for Strict markup or its reference namespaces.
+pub(crate) fn uses_strict_profile(pkg: &Package) -> bool {
+    pkg.rels.iter().find(|rp| rp.name.eq_ignore_ascii_case("_rels/.rels")).is_some_and(|rp| {
+        rp.rels
+            .iter()
+            .find(|r| !r.external && is_office_document_relationship(&r.kind))
+            .is_some_and(|r| r.kind == "http://purl.oclc.org/ooxml/officeDocument/relationships/officeDocument")
+    })
 }
 
 /// Parse `[Content_Types].xml`. Returns `true` when the declaration budget stopped it early.
