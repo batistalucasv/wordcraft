@@ -65,7 +65,9 @@ pub use numbering::{ListKind, Numbering};
 pub use para::{InlineObject, Paragraph, Run};
 pub use props::{Align, CharProps, ParaProps, Rgb, TextColor};
 pub use section::SectionProps;
-pub use shrink::{MAX_SHRINK_FONT_SIZE, MIN_SHRINK_FONT_SIZE, round_half_pt, shrink_document_typography};
+pub use shrink::{
+    MAX_SHRINK_FONT_SIZE, MAX_SHRINK_SPACE_FACTOR, MIN_SHRINK_FONT_SIZE, MIN_SHRINK_SPACE_FACTOR, round_half_pt, shrink_document_typography,
+};
 pub use styles::{Style, StyleKind, StyleSheet};
 pub use table::{Cell, Row, Table};
 
