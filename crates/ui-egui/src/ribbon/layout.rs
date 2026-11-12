@@ -48,6 +48,7 @@ pub(super) fn columns_items(ui: &mut Ui, app: &mut WordApp) {
     mi(ui, app, "More Columns…", "ui.dialog", json!({"name": "columns"}));
 }
 
+/// Render the Layout tab on the ribbon, containing Page Setup, Paragraph, and Arrange controls.
 pub(super) fn layout(app: &mut WordApp, ui: &mut Ui) {
     group(ui, "Page Setup", Some("layout.pageSetup"), app, |ui, app| {
         // Text Direction works on what the caret is in: table cells, a text box, else the section.
@@ -119,6 +120,7 @@ pub(super) fn layout(app: &mut WordApp, ui: &mut Ui) {
                 },
             );
         });
+        big(ui, app, "shrinkOnePage", "Shrink\nOne Page", "layout.shrinkOnePage", json!({}), false);
     });
     group(ui, "Paragraph", Some("para.dialog"), app, |ui, app| {
         let rp = app.session.doc.para_at(&app.session.sel.focus).map(|_| wordcraft_engine::cmd::para::selection_para(&app.session));
