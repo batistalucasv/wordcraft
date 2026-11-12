@@ -25,7 +25,11 @@ mod model;
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod model_tests;
+mod observed;
+mod ownership;
 mod package;
+use observed::{CompleteSet, Completeness, Observed};
+use ownership::{OwnerContext, OwnerId, PartGraph, PartId, owner_scopes};
 mod reserved;
 mod resolution;
 #[cfg(test)]
@@ -917,7 +921,7 @@ enum Compat {
 }
 
 struct XmlScan {
-    facts: scan::StoryFacts,
+    parts: std::collections::BTreeMap<PartId, PartFacts>,
     refs: Vec<(String, Vec<RefFact>)>,
     /// `w:contentPart` relationship ids per owning part (for `CONTENTPART-TYPE`).
     content_parts: Vec<(String, Vec<RelId>)>,
@@ -937,31 +941,50 @@ struct XmlScan {
     content_part_scanned_owners: HashSet<String>,
     compat: Compat,
     /// Parts whose story facts were only partially examined.
-    story_incomplete_parts: HashSet<String>,
-    /// (ID, source part) listed by `w:footnotePr` / `w:endnotePr` in settings parts.
-    note_listings: (Vec<(DecimalId, String)>, Vec<(DecimalId, String)>),
-    /// Special note definitions: (owning part, id, is_endnote, w:type).
-    special_notes: Vec<(String, DecimalId, bool, String)>,
-    /// Note definition or listing parts with an incomplete scan or pooled collection.
-    note_incomplete_parts: HashSet<String>,
+    syntax_incomplete_parts: HashSet<String>,
 }
 
-/// Whether the full XML source was available and completely scanned. Auxiliary parsers can
-/// return a prefix at EOF (for example, an unclosed root), which cannot establish absent IDs.
+/// Per-part facts retain completeness beside each collection, rather than in a global pool.
+struct PartFacts {
+    facts: scan::StoryFacts,
+    listings: (Observed<Vec<(DecimalId, String)>>, Observed<Vec<(DecimalId, String)>>),
+    special_notes: Observed<Vec<(String, DecimalId, bool, String)>>,
+}
+impl XmlScan {
+    /// Explicit package-global scope for counts and legacy document-wide duplicate rules.
+    fn package_facts(&self) -> scan::StoryFacts {
+        let mut result = scan::StoryFacts::default();
+        for part in self.parts.values() {
+            result.append(&part.facts);
+        }
+        result
+    }
+    /// Assemble the settings-listing rule's explicit source-scoped view.
+    fn note_listings(&self) -> (Vec<(DecimalId, String)>, Vec<(DecimalId, String)>) {
+        let mut result = (Vec::new(), Vec::new());
+        for part in self.parts.values() {
+            result.0.extend_from_slice(part.listings.0.prefix());
+            result.1.extend_from_slice(part.listings.1.prefix());
+        }
+        result
+    }
+    /// Special-note presence remains usable even when another collection is incomplete.
+    fn special_notes(&self) -> Vec<(String, DecimalId, bool, String)> {
+        self.parts.values().flat_map(|p| p.special_notes.prefix().iter().cloned()).collect()
+    }
+    /// Completeness of the selected settings/listing category, independent of unrelated collections.
+    fn notes_complete(&self, part: &str) -> bool {
+        self.parts.get(&PartId::new(part)).is_some_and(|p| p.listings.0.is_complete() && p.listings.1.is_complete() && p.special_notes.is_complete())
+    }
+    /// A fact family carries the completeness of its exact source, including pooled-budget loss.
+    fn category_complete<K>(&self, part: &str, category: fn(&scan::StoryFacts) -> &Observed<Vec<(K, String)>>) -> bool {
+        self.parts.get(&PartId::new(part)).is_some_and(|p| category(&p.facts).is_complete())
+    }
+}
+
+/// Auxiliary collectors check their own category budgets after completed XML syntax observation.
 fn xml_source_complete(xml: &XmlScan, entry: &package::Entry) -> bool {
-    !entry.content_unavailable && !xml.story_incomplete_parts.contains(&entry.name.to_ascii_lowercase())
-}
-
-/// Whether every incoming definition will fit the pooled allowances. A dropped definition
-/// makes only its source part incomplete; already collected owner scopes remain checkable.
-fn definitions_fit(facts: &scan::StoryFacts, incoming: &scan::StoryFacts, cap: usize) -> bool {
-    [
-        (facts.comment_defs.len(), incoming.comment_defs.len()),
-        (facts.footnote_defs.len(), incoming.footnote_defs.len()),
-        (facts.endnote_defs.len(), incoming.endnote_defs.len()),
-    ]
-    .into_iter()
-    .all(|(held, added)| held.saturating_add(added) <= cap)
+    !entry.content_unavailable && !xml.syntax_incomplete_parts.contains(&entry.name.to_ascii_lowercase())
 }
 
 /// Scan all XML parts for well-formedness, undeclared prefixes, illegal characters, and extract story facts.
@@ -974,8 +997,9 @@ fn check_xml(pkg: &Package, acc: &mut Acc) -> XmlScan {
     acc.ran("PROTECTION-PASSWORD");
     acc.ran("HEADERSOURCE-PRESENT");
     let roles = story_roles(pkg);
-    let mut facts = scan::StoryFacts::default();
-    let mut story_incomplete_parts = HashSet::new();
+    let mut parts = std::collections::BTreeMap::new();
+    let mut fact_budget = [0usize; 14];
+    let mut syntax_incomplete_parts = HashSet::new();
     let mut refs: Vec<(String, Vec<RefFact>)> = Vec::new();
     let mut content_parts: Vec<(String, Vec<RelId>)> = Vec::new();
     let mut content_part_total = 0usize;
@@ -1000,11 +1024,11 @@ fn check_xml(pkg: &Package, acc: &mut Acc) -> XmlScan {
         }
         let l = e.name.to_ascii_lowercase();
         let role = roles.get(&l).copied().unwrap_or_default();
-        if role.is_settings && e.decode_error.is_some() {
+        if role.is_settings() && e.decode_error.is_some() {
             compat_unknown = true;
             note_incomplete_parts.insert(l.clone());
         }
-        if (role.is_footnotes || role.is_endnotes) && e.decode_error.is_some() {
+        if (role.is_footnotes() || role.is_endnotes()) && e.decode_error.is_some() {
             note_incomplete_parts.insert(l.clone());
         }
         if let Some(err) = &e.decode_error {
@@ -1025,13 +1049,13 @@ fn check_xml(pkg: &Package, acc: &mut Acc) -> XmlScan {
         }
         let Some(text) = &e.decoded else { continue };
         let mut scanned = scan::scan_part(&e.name, text, role, acc);
-        story_incomplete_parts.extend((!scanned.facts_complete).then(|| e.name.to_ascii_lowercase()));
+        syntax_incomplete_parts.extend((!scanned.syntax_complete).then(|| e.name.to_ascii_lowercase()));
         content_part_scanned_owners.insert(e.name.to_ascii_lowercase());
         note_incomplete_parts.extend(scanned.note_capped.then(|| l.clone()));
         if append_note_items(&mut note_listings, &mut special_notes, &e.name, scanned.note_listings, scanned.special_notes, acc.limits.facts) {
             note_incomplete_parts.insert(l.clone());
         }
-        if role.is_settings {
+        if role.is_settings() {
             if scanned.malformed.is_some() {
                 compat_unknown = true;
                 note_incomplete_parts.insert(l.clone());
@@ -1048,24 +1072,19 @@ fn check_xml(pkg: &Package, acc: &mut Acc) -> XmlScan {
         for prefix in &scanned.unknown_prefixes {
             acc.add("XML-UNDECLARED-PREFIX", Some(e.name.clone()), format!("the namespace prefix `{prefix}` used in {} is not declared", e.name));
         }
-        story_incomplete_parts.extend((!definitions_fit(&facts, &scanned.facts, acc.limits.facts)).then(|| l.clone()));
-        // Pooled reference drops invalidate "never referenced" conclusions at their source.
-        story_incomplete_parts
-            .extend((facts.comment_refs.len().saturating_add(scanned.facts.comment_refs.len()) > acc.limits.facts).then(|| l.clone()));
-        // A pooled paragraph drop cannot establish absence in this source's comment-threading join.
-        if role.is_story && facts.comment_para_ids.len().saturating_add(scanned.facts.comment_para_ids.len()) > acc.limits.facts {
-            story_incomplete_parts.insert(l.clone());
-            acc.note(format!(
-                "{} lost pooled comment paragraph IDs at the {}-entry fact budget; comment-threading paragraph absence was not checked for its owners",
-                e.name, acc.limits.facts
-            ));
+        if role.is_story() && fact_budget[2].saturating_add(scanned.facts.comment_para_ids.prefix().len()) > acc.limits.facts {
+            acc.note(format!("{} lost pooled comment paragraph IDs at the {}-entry fact budget; comment-threading paragraph absence was not checked for its owners", e.name, acc.limits.facts));
         }
-        if role.is_story && scan::merge_facts(&mut facts, scanned.facts, acc.limits.facts) {
+        if role.is_story() && scanned.facts.retain_budget(&mut fact_budget, acc.limits.facts) {
             pooled_capped = true;
             if facts_pooled_part.is_none() {
                 facts_pooled_part = Some(e.name.clone());
             }
         }
+        parts.insert(
+            PartId::new(&e.name),
+            PartFacts { facts: scanned.facts, listings: (Observed::default(), Observed::default()), special_notes: Observed::default() },
+        );
         if scanned.content_part_capped {
             content_part_capped_any = true;
             content_part_incomplete_owners.insert(e.name.clone());
@@ -1142,8 +1161,9 @@ fn check_xml(pkg: &Package, acc: &mut Acc) -> XmlScan {
     // across parts as well as per part; the allowances were enforced
     // while appending in the loop above, so the accumulated collections
     // never exceeded the fact budget at any point.
+    store_note_observations(&mut parts, note_listings, special_notes, note_incomplete_parts, acc.limits.facts);
     XmlScan {
-        facts,
+        parts,
         refs,
         content_parts,
         content_part_exemptions,
@@ -1151,10 +1171,39 @@ fn check_xml(pkg: &Package, acc: &mut Acc) -> XmlScan {
         content_part_incomplete_owners,
         content_part_scanned_owners,
         compat,
-        story_incomplete_parts,
-        note_listings,
-        special_notes,
-        note_incomplete_parts,
+        syntax_incomplete_parts,
+    }
+}
+
+/// Distribute the budgeted note categories back to their contributing part, retaining source loss.
+fn store_note_observations(
+    parts: &mut std::collections::BTreeMap<PartId, PartFacts>,
+    note_listings: (Vec<(DecimalId, String)>, Vec<(DecimalId, String)>),
+    special_notes: Vec<(String, DecimalId, bool, String)>,
+    note_incomplete_parts: HashSet<String>,
+    cap: usize,
+) {
+    for (id, part) in note_listings.0 {
+        if let Some(facts) = parts.get_mut(&PartId::new(&part)) {
+            facts.listings.0.push_bounded((id, part), cap);
+        }
+    }
+    for (id, part) in note_listings.1 {
+        if let Some(facts) = parts.get_mut(&PartId::new(&part)) {
+            facts.listings.1.push_bounded((id, part), cap);
+        }
+    }
+    for (part, id, end, kind) in special_notes {
+        if let Some(facts) = parts.get_mut(&PartId::new(&part)) {
+            facts.special_notes.push_bounded((part, id, end, kind), cap);
+        }
+    }
+    for name in note_incomplete_parts {
+        if let Some(part) = parts.get_mut(&PartId::new(&name)) {
+            part.listings.0.invalidate("note collection budget or source");
+            part.listings.1.invalidate("note collection budget or source");
+            part.special_notes.invalidate("note collection budget or source");
+        }
     }
 }
 
@@ -1260,21 +1309,24 @@ fn retain_native_ink_refs(pkg: &Package, owner: &str, ids: &mut Vec<RelId>, capp
 /// Unlisted special notes remain Errors under the existing union-of-consumers calibration:
 /// Word for the web loads them, but Word for Mac wedged on the same shape (batch Mac-2).
 fn check_note_pr(pkg: &Package, xml: &XmlScan, acc: &mut Acc) {
+    let note_listings = xml.note_listings();
+    let special_notes = xml.special_notes();
+
     acc.ran("NOTE-PR-LISTING");
     acc.ran("NOTE-PR-DANGLING");
     let owner_map = owner_index_map(pkg);
     let roles = story_roles(pkg);
     for (index, owner) in owner_scopes(pkg).iter().enumerate() {
+        let index = OwnerId(index);
         let selected = [
-            supporting_part(pkg, owner.as_deref(), "settings", package::SETTINGS_CONTENT_TYPE, acc),
-            supporting_part(pkg, owner.as_deref(), "footnotes", package::FOOTNOTES_CONTENT_TYPE, acc),
-            supporting_part(pkg, owner.as_deref(), "endnotes", package::ENDNOTES_CONTENT_TYPE, acc),
+            supporting_part(pkg, owner.root(), "settings", package::SETTINGS_CONTENT_TYPE, acc),
+            supporting_part(pkg, owner.root(), "footnotes", package::FOOTNOTES_CONTENT_TYPE, acc),
+            supporting_part(pkg, owner.root(), "endnotes", package::ENDNOTES_CONTENT_TYPE, acc),
         ];
-        let discovered = !discovery_unavailable(pkg, owner.as_deref());
-        let complete = |source: Option<&package::Entry>| {
-            source.is_none_or(|entry| xml_source_complete(xml, entry) && !xml.note_incomplete_parts.contains(&entry.name.to_ascii_lowercase()))
-        };
-        let (forward_ok, reverse_ok) = if owner.is_some() {
+        let discovered = !discovery_unavailable(pkg, owner.root());
+        let complete =
+            |source: Option<&package::Entry>| source.is_none_or(|entry| xml_source_complete(xml, entry) && xml.notes_complete(&entry.name));
+        let (forward_ok, reverse_ok) = if owner.root().is_some() {
             let forward = discovered
                 && matches!(selected[0], Resolution::One(_) | Resolution::Absent)
                 && match selected[0] {
@@ -1288,14 +1340,14 @@ fn check_note_pr(pkg: &Package, xml: &XmlScan, acc: &mut Acc) {
                     forward
                         && matches!(selected[1], Resolution::One(_) | Resolution::Absent)
                         && match selected[1] {
-                            Resolution::One(entry) => complete(Some(entry)),
+                            Resolution::One(entry) => complete(Some(entry)) && xml.category_complete(&entry.name, |f| &f.footnote_defs),
                             Resolution::Absent => true,
                             Resolution::Ambiguous(_) | Resolution::Unknown(_) => false,
                         },
                     forward
                         && matches!(selected[2], Resolution::One(_) | Resolution::Absent)
                         && match selected[2] {
-                            Resolution::One(entry) => complete(Some(entry)),
+                            Resolution::One(entry) => complete(Some(entry)) && xml.category_complete(&entry.name, |f| &f.endnote_defs),
                             Resolution::Absent => true,
                             Resolution::Ambiguous(_) | Resolution::Unknown(_) => false,
                         },
@@ -1303,24 +1355,24 @@ fn check_note_pr(pkg: &Package, xml: &XmlScan, acc: &mut Acc) {
             )
         } else {
             let discovered = discovered && !descendant_discovery_incomplete(pkg, &owner_map, index);
-            let forward = discovered && note_sources_complete(pkg, xml, &owner_map, &roles, index, |r| r.is_settings);
+            let forward = discovered && note_sources_complete(pkg, xml, &owner_map, &roles, index, |r| r.is_settings());
             (
                 forward,
                 [
-                    forward && note_sources_complete(pkg, xml, &owner_map, &roles, index, |r| r.is_footnotes),
-                    forward && note_sources_complete(pkg, xml, &owner_map, &roles, index, |r| r.is_endnotes),
+                    forward && note_sources_complete(pkg, xml, &owner_map, &roles, index, |r| r.is_footnotes()),
+                    forward && note_sources_complete(pkg, xml, &owner_map, &roles, index, |r| r.is_endnotes()),
                 ],
             )
         };
         if !forward_ok || reverse_ok.contains(&false) {
-            acc.note(format!("the footnotePr/endnotePr listings for {} could not be fully joined (ownership, declarations, or source facts were not fully examined)", owner.as_deref().unwrap_or("the package")));
+            acc.note(format!("the footnotePr/endnotePr listings for {} could not be fully joined (ownership, declarations, or source facts were not fully examined)", owner.root().unwrap_or("the package")));
             acc.set_incomplete();
         }
         check_owner_note_pr(
             xml,
             &owner_map,
             index,
-            owner.is_some().then_some(selected.map(|source| match source {
+            owner.root().is_some().then_some(selected.map(|source| match source {
                 Resolution::One(entry) => Some(entry),
                 Resolution::Absent => None,
                 Resolution::Ambiguous(_) | Resolution::Unknown(_) => None,
@@ -1333,9 +1385,9 @@ fn check_note_pr(pkg: &Package, xml: &XmlScan, acc: &mut Acc) {
             acc,
         );
     }
-    if owner_scopes(pkg) == [None]
-        && (xml.special_notes.iter().any(|(part, ..)| part_owners(&owner_map, part).is_empty())
-            || xml.note_listings.0.iter().chain(&xml.note_listings.1).any(|(_, part)| part_owners(&owner_map, part).is_empty()))
+    if owner_scopes(pkg) == [OwnerContext::Fallback]
+        && (special_notes.iter().any(|(part, ..)| part_owners(&owner_map, part).is_empty())
+            || note_listings.0.iter().chain(&note_listings.1).any(|(_, part)| part_owners(&owner_map, part).is_empty()))
     {
         acc.note("the footnotePr/endnotePr join skipped facts whose document ownership could not be established".to_string());
         acc.set_incomplete();
@@ -1347,40 +1399,54 @@ fn check_note_pr(pkg: &Package, xml: &XmlScan, acc: &mut Acc) {
 fn note_sources_complete(
     pkg: &Package,
     xml: &XmlScan,
-    owner_map: &HashMap<String, Vec<usize>>,
+    owner_map: &PartGraph,
     roles: &HashMap<String, scan::PartRole>,
-    owner: usize,
+    owner: OwnerId,
     relevant: fn(&scan::PartRole) -> bool,
 ) -> bool {
     pkg.entries.iter().filter(|e| !e.is_dir).all(|e| {
         let key = e.name.to_ascii_lowercase();
         !roles.get(&key).is_some_and(relevant)
             || (!unresolved_fallback_contributor(owner_map, owner, &e.name)
-                && (!part_owners(owner_map, &e.name).contains(&owner) || (xml_source_complete(xml, e) && !xml.note_incomplete_parts.contains(&key))))
+                && (!part_owners(owner_map, &e.name).contains(&owner)
+                    || (xml_source_complete(xml, e)
+                        && xml.notes_complete(&e.name)
+                        && (!roles.get(&key).is_some_and(|r| r.is_footnotes()) || xml.category_complete(&e.name, |f| &f.footnote_defs))
+                        && (!roles.get(&key).is_some_and(|r| r.is_endnotes()) || xml.category_complete(&e.name, |f| &f.endnote_defs)))))
     })
 }
 
 /// Apply both special-note join directions to retained facts from one established owner.
 fn check_owner_note_pr(
     xml: &XmlScan,
-    owner_map: &HashMap<String, Vec<usize>>,
-    owner: usize,
+    owner_map: &PartGraph,
+    owner: OwnerId,
     selected: Option<[Option<&package::Entry>; 3]>,
     forward_ok: [bool; 2],
     reverse_ok: [bool; 2],
     acc: &mut Acc,
 ) {
+    let note_listings = xml.note_listings();
+    let special_notes = xml.special_notes();
+    let note_facts = xml.package_facts();
+
     let owned = |part: &str, role: usize| match selected {
         Some(sources) => sources[role].is_some_and(|entry| entry.name.eq_ignore_ascii_case(part)),
         None => part_owners(owner_map, part).contains(&owner),
     };
-    let listed_f: HashSet<&DecimalId> = xml.note_listings.0.iter().filter(|(_, part)| owned(part, 0)).map(|(id, _)| id).collect();
-    let listed_e: HashSet<&DecimalId> = xml.note_listings.1.iter().filter(|(_, part)| owned(part, 0)).map(|(id, _)| id).collect();
+    let listed_f: HashSet<DecimalId> = note_listings.0.iter().filter(|(_, part)| owned(part, 0)).map(|(id, _)| id.clone()).collect();
+    let listed_e: HashSet<DecimalId> = note_listings.1.iter().filter(|(_, part)| owned(part, 0)).map(|(id, _)| id.clone()).collect();
+    let listing_set = |items, complete| {
+        Observed::with_status(items, if complete { Completeness::Complete } else { Completeness::Incomplete("selected note listings unavailable") })
+            .into_complete_set()
+    };
+    let listed_f = listing_set(listed_f, forward_ok[0]);
+    let listed_e = listing_set(listed_e, forward_ok[1]);
     for (part, id, is_end, t) in
-        xml.special_notes.iter().filter(|(part, _, end, _)| forward_ok[usize::from(*end)] && owned(part, if *end { 2 } else { 1 }))
+        special_notes.iter().filter(|(part, _, end, _)| forward_ok[usize::from(*end)] && owned(part, if *end { 2 } else { 1 }))
     {
         let listed = if *is_end { &listed_e } else { &listed_f };
-        if !listed.contains(id) {
+        if listed.as_ref().is_some_and(|set| set.missing(id)) {
             let (note, pr) = if *is_end { ("endnote", "endnotePr") } else { ("footnote", "footnotePr") };
             acc.add_graded(
                 "NOTE-PR-LISTING", Severity::Error, Evidence::Observed, Some(part.clone()),
@@ -1390,13 +1456,14 @@ fn check_owner_note_pr(
     }
     for (role, (complete, (note, listings, defs))) in reverse_ok
         .into_iter()
-        .zip([("footnote", &xml.note_listings.0, &xml.facts.footnote_defs), ("endnote", &xml.note_listings.1, &xml.facts.endnote_defs)])
+        .zip([("footnote", &note_listings.0, &note_facts.footnote_defs.prefix()), ("endnote", &note_listings.1, &note_facts.endnote_defs.prefix())])
         .enumerate()
     {
         if complete {
-            let defined: HashSet<&DecimalId> = defs.iter().filter(|(_, part)| owned(part, role + 1)).map(|(id, _)| id).collect();
+            let defined = Observed::complete(defs.iter().filter(|(_, part)| owned(part, role + 1)).map(|(id, _)| id.clone()).collect::<HashSet<_>>())
+                .into_complete_set();
             for (id, _) in listings.iter().filter(|(_, part)| owned(part, 0)) {
-                if !defined.contains(id) {
+                if defined.as_ref().is_some_and(|set| set.missing(id)) {
                     acc.add(
                         "NOTE-PR-DANGLING",
                         None,
@@ -1479,11 +1546,11 @@ fn report_malformed(pkg: &Package, name: &str, err: &str, acc: &mut Acc) {
 fn story_roles(pkg: &Package) -> HashMap<String, scan::PartRole> {
     let mut roles = HashMap::new();
     if let Resolution::One(main) = &pkg.main {
-        roles.insert(main.to_ascii_lowercase(), scan::PartRole { is_main: true, is_story: true, ..scan::PartRole::default() });
+        roles.insert(main.to_ascii_lowercase(), scan::PartRole::Main);
     }
     for e in pkg.entries.iter().filter(|e| !e.is_dir) {
         if let Some(role) = content_type_role(pkg.content_types.of(&e.name)) {
-            roles.entry(e.name.to_ascii_lowercase()).or_insert(role);
+            roles.entry(e.name.to_ascii_lowercase()).and_modify(|existing| *existing = existing.merge(role)).or_insert(role);
         }
     }
     for rp in &pkg.rels {
@@ -1491,7 +1558,7 @@ fn story_roles(pkg: &Package) -> HashMap<String, scan::PartRole> {
             let Some(role) = relationship_role(&r.kind) else { continue };
             let Some(target) = &r.target_abs else { continue };
             if let Some(name) = package::canonical_entry(pkg, target) {
-                roles.entry(name.to_ascii_lowercase()).or_insert(role);
+                roles.entry(name.to_ascii_lowercase()).and_modify(|existing| *existing = existing.merge(role)).or_insert(role);
             }
         }
     }
@@ -1501,12 +1568,12 @@ fn story_roles(pkg: &Package) -> HashMap<String, scan::PartRole> {
 /// Classify a part role from its declared content type.
 fn content_type_role(ct: Option<&str>) -> Option<scan::PartRole> {
     let role = match ct? {
-        package::COMMENTS_CONTENT_TYPE => scan::PartRole { is_story: true, is_comments: true, ..scan::PartRole::default() },
-        package::FOOTNOTES_CONTENT_TYPE => scan::PartRole { is_story: true, is_footnotes: true, ..scan::PartRole::default() },
-        package::ENDNOTES_CONTENT_TYPE => scan::PartRole { is_story: true, is_endnotes: true, ..scan::PartRole::default() },
-        package::HEADER_CONTENT_TYPE | package::FOOTER_CONTENT_TYPE => scan::PartRole { is_story: true, ..scan::PartRole::default() },
-        package::GLOSSARY_CONTENT_TYPE => scan::PartRole { is_story: true, is_glossary: true, ..scan::PartRole::default() },
-        package::SETTINGS_CONTENT_TYPE => scan::PartRole { is_settings: true, ..scan::PartRole::default() },
+        package::COMMENTS_CONTENT_TYPE => scan::PartRole::Comments,
+        package::FOOTNOTES_CONTENT_TYPE => scan::PartRole::Footnotes,
+        package::ENDNOTES_CONTENT_TYPE => scan::PartRole::Endnotes,
+        package::HEADER_CONTENT_TYPE | package::FOOTER_CONTENT_TYPE => scan::PartRole::Story,
+        package::GLOSSARY_CONTENT_TYPE => scan::PartRole::Glossary,
+        package::SETTINGS_CONTENT_TYPE => scan::PartRole::Settings,
         _ => return None,
     };
     Some(role)
@@ -1515,12 +1582,12 @@ fn content_type_role(ct: Option<&str>) -> Option<scan::PartRole> {
 /// Classify a part role from the relationship type that targets it.
 fn relationship_role(kind: &str) -> Option<scan::PartRole> {
     Some(match relationship_kind(kind)? {
-        "settings" => scan::PartRole { is_settings: true, ..scan::PartRole::default() },
-        "glossaryDocument" => scan::PartRole { is_story: true, is_glossary: true, ..scan::PartRole::default() },
-        "comments" => scan::PartRole { is_story: true, is_comments: true, ..scan::PartRole::default() },
-        "footnotes" => scan::PartRole { is_story: true, is_footnotes: true, ..scan::PartRole::default() },
-        "endnotes" => scan::PartRole { is_story: true, is_endnotes: true, ..scan::PartRole::default() },
-        "header" | "footer" => scan::PartRole { is_story: true, ..scan::PartRole::default() },
+        "settings" => scan::PartRole::Settings,
+        "glossaryDocument" => scan::PartRole::Glossary,
+        "comments" => scan::PartRole::Comments,
+        "footnotes" => scan::PartRole::Footnotes,
+        "endnotes" => scan::PartRole::Endnotes,
+        "header" | "footer" => scan::PartRole::Story,
         _ => return None,
     })
 }
@@ -1613,7 +1680,7 @@ fn check_typed_image_refs(pkg: &Package, refs: &[(String, Vec<RefFact>)], acc: &
                 continue;
             }
             let Some(rel) = by_id.get(r.value.as_str()) else { continue };
-            if relationship_kind(&rel.kind) != Some("image") {
+            if rel.role.kind() != Some("image") {
                 acc.add(
                     "REL-TYPED",
                     Some(part.clone()),
@@ -1687,7 +1754,7 @@ fn check_typed_targets(pkg: &Package, acc: &mut Acc) {
         if ct.is_none() && pkg.content_types.incomplete {
             continue;
         }
-        match relationship_kind(&r.kind) {
+        match r.role.kind() {
             Some("header") if ct != Some(package::HEADER_CONTENT_TYPE) => {
                 acc.add("REL-TYPED", Some(rp.name.clone()), header_footer_message("header", &r.id, target, ct));
             }
@@ -1843,7 +1910,7 @@ fn check_typed_content(
     .map(rels_part_name);
     let non_main_owner_rels: HashSet<String> = owner_scopes(pkg)
         .iter()
-        .filter_map(|owner| owner.as_deref())
+        .filter_map(|owner| owner.root())
         .filter(|owner| !main_rels.as_deref().is_some_and(|m| m.eq_ignore_ascii_case(&rels_part_name(owner))))
         .map(|owner| rels_part_name(owner).to_ascii_lowercase())
         .collect();
@@ -1857,7 +1924,7 @@ fn check_typed_content(
         for r in &rp.rels {
             let first_with_id = seen_ids.insert(r.id.as_str());
             let Some(target) = &r.target_abs else { continue };
-            let Some(kind) = relationship_kind(&r.kind) else { continue };
+            let Some(kind) = r.role.kind() else { continue };
             let Some(want) = fixed_rel_content_type(kind) else { continue };
             if matches!(kind, "header" | "footer") && !is_non_main_owner {
                 continue;
@@ -1904,7 +1971,7 @@ fn check_typed_content(
 
 /// Check cross-document story identifier families (comments, docPr, bookmarks, revisions, notes, styles, headers).
 fn check_story(pkg: &Package, xml: &XmlScan, acc: &mut Acc) {
-    let facts = &xml.facts;
+    let facts = &xml.package_facts();
     let compat = xml.compat;
     acc.ran("COMMENT-RANGE-COUNT");
     if facts.comment_range_starts > 32_767 {
@@ -1957,14 +2024,14 @@ fn check_story(pkg: &Package, xml: &XmlScan, acc: &mut Acc) {
         Compat::Off => {}
     }
     acc.ran("ID-COMMENT-DUP");
-    report_definition_dups(acc, "ID-COMMENT-DUP", &facts.comment_defs, "w:comment id");
+    report_definition_dups(acc, "ID-COMMENT-DUP", facts.comment_defs.prefix(), "w:comment id");
     acc.ran("ID-COMMENT-REF");
-    check_owned_ids(pkg, xml, "comments", package::COMMENTS_CONTENT_TYPE, &facts.comment_defs, &facts.comment_refs, acc);
+    check_owned_ids(pkg, xml, "comments", package::COMMENTS_CONTENT_TYPE, |f| &f.comment_defs, |f| &f.comment_refs, acc);
     report_unreferenced_comments(pkg, xml, acc);
     acc.ran("ID-DOCPR-DUP");
-    report_dups(acc, "ID-DOCPR-DUP", &facts.docpr, "wp:docPr id");
+    report_dups(acc, "ID-DOCPR-DUP", facts.docpr.prefix(), "wp:docPr id");
     acc.ran("ID-BOOKMARK-DUP");
-    report_dups(acc, "ID-BOOKMARK-DUP", &facts.bookmarks, "w:bookmarkStart id");
+    report_dups(acc, "ID-BOOKMARK-DUP", facts.bookmarks.prefix(), "w:bookmarkStart id");
     // BOOKMARK-UNPAIRED findings are produced by the streaming scan; the rule is registered here.
     acc.ran("BOOKMARK-UNPAIRED");
     // COMMENT-RANGE-UNPAIRED likewise.
@@ -1973,13 +2040,13 @@ fn check_story(pkg: &Package, xml: &XmlScan, acc: &mut Acc) {
     acc.ran("PARAID-DUP");
     acc.ran("PARAID-VALUE");
     acc.ran("ID-REVISION-DUP");
-    report_dups(acc, "ID-REVISION-DUP", &facts.revisions, "revision id");
+    report_dups(acc, "ID-REVISION-DUP", facts.revisions.prefix(), "revision id");
     acc.ran("NOTE-DUP");
-    report_definition_dups(acc, "NOTE-DUP", &facts.footnote_defs, "w:footnote id");
-    report_definition_dups(acc, "NOTE-DUP", &facts.endnote_defs, "w:endnote id");
+    report_definition_dups(acc, "NOTE-DUP", facts.footnote_defs.prefix(), "w:footnote id");
+    report_definition_dups(acc, "NOTE-DUP", facts.endnote_defs.prefix(), "w:endnote id");
     acc.ran("REF-NOTE");
-    check_owned_ids(pkg, xml, "footnotes", package::FOOTNOTES_CONTENT_TYPE, &facts.footnote_defs, &facts.footnote_refs, acc);
-    check_owned_ids(pkg, xml, "endnotes", package::ENDNOTES_CONTENT_TYPE, &facts.endnote_defs, &facts.endnote_refs, acc);
+    check_owned_ids(pkg, xml, "footnotes", package::FOOTNOTES_CONTENT_TYPE, |f| &f.footnote_defs, |f| &f.footnote_refs, acc);
+    check_owned_ids(pkg, xml, "endnotes", package::ENDNOTES_CONTENT_TYPE, |f| &f.endnote_defs, |f| &f.endnote_refs, acc);
     acc.ran("REF-HEADER");
     check_header_footer_refs(pkg, facts, acc);
     acc.ran("REF-STYLE");
@@ -2012,31 +2079,33 @@ fn check_owned_ids(
     xml: &XmlScan,
     kind: &str,
     ct: &str,
-    definitions: &[(DecimalId, String)],
-    references: &[(DecimalId, String)],
+    definitions: fn(&scan::StoryFacts) -> &Observed<Vec<(DecimalId, String)>>,
+    references: fn(&scan::StoryFacts) -> &Observed<Vec<(DecimalId, String)>>,
     acc: &mut Acc,
 ) {
     let owners = owner_scopes(pkg);
     let owner_map = owner_index_map(pkg);
     for (index, owner) in owners.iter().enumerate() {
-        let source = supporting_part(pkg, owner.as_deref(), kind, ct, acc);
-        if matches!(source, Resolution::Ambiguous(_) | Resolution::Unknown(_)) {
-            continue;
-        }
-        let source = match source {
-            Resolution::One(entry) => Some(entry),
-            Resolution::Absent => None,
+        let index = OwnerId(index);
+        let source = supporting_part(pkg, owner.root(), kind, ct, acc);
+        let observed = match source {
+            Resolution::One(entry) => {
+                if discovery_unavailable(pkg, owner.root()) {
+                    continue;
+                }
+                let Some(part) = xml.parts.get(&PartId::new(&entry.name)) else { continue };
+                definitions(&part.facts).project(|items| items.iter().map(|(id, _)| id.clone()).collect::<HashSet<_>>())
+            }
+            Resolution::Absent => Observed::complete(HashSet::new()),
             Resolution::Ambiguous(_) | Resolution::Unknown(_) => continue,
         };
-        if source.is_none() && discovery_unavailable(pkg, owner.as_deref()) {
-            continue;
-        }
-        if source.is_some_and(|e| e.content_unavailable || xml.story_incomplete_parts.contains(&e.name.to_ascii_lowercase())) {
-            continue;
-        }
-        let defs: HashSet<DecimalId> =
-            definitions.iter().filter(|(_, part)| source.is_some_and(|e| e.name.eq_ignore_ascii_case(part))).map(|(id, _)| id.clone()).collect();
-        let refs: Vec<_> = references.iter().filter(|(_, part)| part_owners(&owner_map, part).contains(&index)).cloned().collect();
+        let Some(defs) = observed.into_complete_set() else { continue };
+        let refs: Vec<_> = xml
+            .parts
+            .iter()
+            .filter(|(part, _)| owner_map.owners(part.as_str()).contains(&index))
+            .flat_map(|(_, part)| references(&part.facts).prefix().iter().cloned())
+            .collect();
         match kind {
             "comments" => report_missing(acc, "ID-COMMENT-REF", &refs, &defs, "w:commentReference id"),
             "footnotes" => report_missing_note(acc, &refs, &defs, "footnote"),
@@ -2048,22 +2117,25 @@ fn check_owned_ids(
 
 /// Record unreferenced comments only when the owner's entire reference set was observed.
 fn report_unreferenced_comments(pkg: &Package, xml: &XmlScan, acc: &mut Acc) {
+    let facts = xml.package_facts();
     let owner_map = owner_index_map(pkg);
+    let package_registry = ownership::PackageRegistryContext::new(&owner_map);
     let roles = story_roles(pkg);
     let mut incomplete_owners = HashSet::new();
     let mut unknown = !ownership_discovery_complete(pkg);
     for e in pkg.entries.iter().filter(|e| !e.is_dir) {
-        if roles.get(&e.name.to_ascii_lowercase()).is_some_and(|r| r.is_story) {
-            let contexts = part_owners(&owner_map, &e.name);
-            unknown |= contexts.is_empty();
-            if e.content_unavailable || xml.story_incomplete_parts.contains(&e.name.to_ascii_lowercase()) {
+        if roles.get(&e.name.to_ascii_lowercase()).is_some_and(|r| r.is_story()) {
+            let contexts = package_registry.contexts(&e.name);
+            unknown |= owner_map.unknown(&e.name);
+            if !xml.category_complete(&e.name, |f| &f.comment_refs) {
                 incomplete_owners.extend(contexts.iter().copied());
             }
         }
     }
     for (index, owner) in owner_scopes(pkg).iter().enumerate() {
+        let index = OwnerId(index);
         if matches!(
-            supporting_part(pkg, owner.as_deref(), "comments", package::COMMENTS_CONTENT_TYPE, acc),
+            supporting_part(pkg, owner.root(), "comments", package::COMMENTS_CONTENT_TYPE, acc),
             Resolution::Ambiguous(_) | Resolution::Unknown(_)
         ) {
             // Neither candidate's use as the owner's comments source is established.
@@ -2071,10 +2143,10 @@ fn report_unreferenced_comments(pkg: &Package, xml: &XmlScan, acc: &mut Acc) {
         }
     }
     let refs: HashSet<_> =
-        xml.facts.comment_refs.iter().flat_map(|(id, part)| part_owners(&owner_map, part).iter().map(move |owner| (owner, id))).collect();
+        facts.comment_refs.prefix().iter().flat_map(|(id, part)| package_registry.contexts(part).iter().map(move |owner| (owner, id))).collect();
     let mut seen = HashSet::new();
-    for (id, part) in &xml.facts.comment_defs {
-        let contexts = part_owners(&owner_map, part);
+    for (id, part) in facts.comment_defs.prefix() {
+        let contexts = package_registry.contexts(part);
         if !unknown
             && !contexts.is_empty()
             && contexts.iter().all(|owner| !incomplete_owners.contains(owner) && !refs.contains(&(owner, id)))
@@ -2097,15 +2169,15 @@ fn check_header_footer_refs(pkg: &Package, facts: &scan::StoryFacts, acc: &mut A
         return;
     }
     let Some(rp) = pkg.rels.iter().find(|r| r.name.eq_ignore_ascii_case(&want)) else {
-        for (id, part) in facts.header_refs.iter().chain(facts.footer_refs.iter()) {
+        for (id, part) in facts.header_refs.prefix().iter().chain(facts.footer_refs.prefix().iter()) {
             acc.add("REF-HEADER", Some(part.clone()), format!("the main part {main} has a header/footer reference {id} but no relationships part"));
         }
         return;
     };
     let by_id: HashMap<&str, &package::Rel> = rp.rels.iter().map(|r| (r.id.as_str(), r)).collect();
     let groups: [(&str, &str, &str, &[(RelId, String)]); 2] = [
-        ("header", package::HEADER_CONTENT_TYPE, "headerReference", &facts.header_refs),
-        ("footer", package::FOOTER_CONTENT_TYPE, "footerReference", &facts.footer_refs),
+        ("header", package::HEADER_CONTENT_TYPE, "headerReference", facts.header_refs.prefix()),
+        ("footer", package::FOOTER_CONTENT_TYPE, "footerReference", facts.footer_refs.prefix()),
     ];
     for (kind, want_ct, element, refs) in groups {
         let mut reported: HashSet<&str> = HashSet::new();
@@ -2116,12 +2188,12 @@ fn check_header_footer_refs(pkg: &Package, facts: &scan::StoryFacts, acc: &mut A
             match by_id.get(id.as_str()) {
                 None if rp.incomplete => {}
                 None => acc.add("REF-HEADER", Some(part.clone()), format!("w:{element} r:id {id} in {part} has no matching relationship")),
-                Some(rel) if relationship_kind(&rel.kind) != Some(kind) => acc.add(
+                Some(rel) if rel.role.kind() != Some(kind) => acc.add(
                     "REF-HEADER",
                     Some(part.clone()),
                     format!(
                         "w:{element} r:id {id} in {part} resolves to a {} relationship, not a {kind} relationship",
-                        relationship_kind(&rel.kind).unwrap_or(&rel.kind)
+                        rel.role.kind().unwrap_or(&rel.kind)
                     ),
                 ),
                 Some(rel) if rel.external || rel.target_abs.is_none() => acc.add(
@@ -2146,24 +2218,6 @@ fn check_header_footer_refs(pkg: &Package, facts: &scan::StoryFacts, acc: &mut A
     }
 }
 
-/// The document-level story parts whose relationships own the supporting parts: the main document
-/// and, when present, the glossary document.
-fn owner_scopes(pkg: &Package) -> Vec<Option<String>> {
-    let mut v: Vec<Option<String>> = Vec::new();
-    if let Resolution::One(m) = &pkg.main {
-        v.push(Some(m.clone()));
-    }
-    if let Resolution::One(g) = &pkg.glossary
-        && !v.iter().flatten().any(|o| o.eq_ignore_ascii_case(g))
-    {
-        v.push(Some(g.clone()));
-    }
-    if v.is_empty() {
-        v.push(None);
-    }
-    v
-}
-
 /// Select an owner's official role target, deduplicating canonical part identities. Even an
 /// unreadable candidate competes: its bytes cannot justify choosing a different source for Word.
 fn owner_rel_part<'a>(pkg: &'a Package, owner: &str, kind: &str) -> Resolution<&'a package::Entry> {
@@ -2173,7 +2227,7 @@ fn owner_rel_part<'a>(pkg: &'a Package, owner: &str, kind: &str) -> Resolution<&
     };
     let mut target: Option<&str> = None;
     for r in &rp.rels {
-        if r.external || relationship_kind(&r.kind) != Some(kind) {
+        if r.external || r.role.kind() != Some(kind) {
             continue;
         }
         if let Some(t) = r.target_abs.as_deref() {
@@ -2232,154 +2286,51 @@ fn discovery_unavailable(pkg: &Package, owner: Option<&str>) -> bool {
     }
 }
 
-/// Glossary-typed parts and their transitive descendants cannot enter a fallback pool: reaching
-/// them through a glossary does not establish main ownership. Walk every internal edge, including
-/// official glossary edges, and visit each loaded part once so cycles terminate.
-fn glossary_subtree_parts(pkg: &Package) -> HashSet<String> {
-    let mut queue: Vec<String> = pkg
-        .entries
-        .iter()
-        .filter(|e| !e.is_dir && pkg.content_types.of(&e.name) == Some(package::GLOSSARY_CONTENT_TYPE))
-        .map(|e| e.name.clone())
-        .collect();
-    let mut parts = HashSet::new();
-    while let Some(part) = queue.pop() {
-        if !parts.insert(part.to_ascii_lowercase()) {
-            continue;
-        }
-        let want = rels_part_name(&part);
-        if let Some(rp) = pkg.rels.iter().find(|r| r.name.eq_ignore_ascii_case(&want)) {
-            for r in &rp.rels {
-                if let Some(t) = &r.target_abs
-                    && let Some(name) = canonical_entry(pkg, t)
-                {
-                    queue.push(name);
-                }
-            }
-        }
-    }
-    parts
-}
-
-/// Map each part (lowercased) to every owner context that reaches it, indexed in
-/// [`owner_scopes`]. Main traversal stops at glossary boundaries; the selected glossary traverses
-/// further glossaries in its own scope. Direct main reachability still establishes main membership
-/// even for a part also reached across a boundary. Neither fallback pool admits glossary subtrees.
-/// A shared story is checked in each established context, never silently assigned to the first.
-fn owner_index_map(pkg: &Package) -> HashMap<String, Vec<usize>> {
-    let owners = owner_scopes(pkg);
-    let mut map: HashMap<String, Vec<usize>> = HashMap::new();
-    let fallback_excluded = glossary_subtree_parts(pkg);
-    if owners.len() == 1 && owners[0].is_none() {
-        if !ownership_discovery_complete(pkg) {
-            return map;
-        }
-        for e in pkg.entries.iter().filter(|e| !e.is_dir && !fallback_excluded.contains(&e.name.to_ascii_lowercase())) {
-            map.insert(e.name.to_ascii_lowercase(), vec![0]);
-        }
-        return map;
-    }
-    for (i, owner) in owners.iter().enumerate() {
-        let Some(owner) = owner else { continue };
-        // With no main, the selected glossary is context zero and must still traverse its subtree.
-        let is_main = (match &pkg.main {
-            Resolution::One(name) => Some(name.as_str()),
-            Resolution::Absent | Resolution::Ambiguous(_) | Resolution::Unknown(_) => None,
-        })
-        .is_some_and(|main| main.eq_ignore_ascii_case(owner));
-        let mut queue = vec![owner.clone()];
-        let mut visited: HashSet<String> = HashSet::new();
-        while let Some(part) = queue.pop() {
-            let key = part.to_ascii_lowercase();
-            if !visited.insert(key.clone()) {
-                continue;
-            }
-            map.entry(key).or_default().push(i);
-            let want = rels_part_name(&part);
-            if let Some(rp) = pkg.rels.iter().find(|r| r.name.eq_ignore_ascii_case(&want)) {
-                for r in &rp.rels {
-                    if is_main && relationship_kind(&r.kind) == Some("glossaryDocument") {
-                        continue;
-                    }
-                    if let Some(t) = &r.target_abs
-                        && let Some(name) = canonical_entry(pkg, t)
-                    {
-                        // Main cannot cross a glossary boundary. The selected glossary must cross
-                        // it to retain established ownership of further glossaries and descendants.
-                        if !is_main
-                            || (pkg.content_types.of(&name) != Some(package::GLOSSARY_CONTENT_TYPE)
-                                && !(match &pkg.glossary {
-                                    Resolution::One(name) => Some(name.as_str()),
-                                    Resolution::Absent | Resolution::Ambiguous(_) | Resolution::Unknown(_) => None,
-                                })
-                                .is_some_and(|g| g.eq_ignore_ascii_case(&name)))
-                        {
-                            queue.push(name);
-                        }
-                    }
-                }
-            }
-        }
-    }
-    // Only complete discovery can assign an unreached supporting part to the primary scope.
-    // Otherwise an omitted glossary edge could own it; a missing map entry represents unknown.
-    // Known glossary descendants stay unknown unless an owner's traversal already reached them.
-    if ownership_discovery_complete(pkg) {
-        for e in pkg.entries.iter().filter(|e| !e.is_dir && !fallback_excluded.contains(&e.name.to_ascii_lowercase())) {
-            map.entry(e.name.to_ascii_lowercase()).or_insert_with(|| vec![0]);
-        }
-    }
-    map
+/// Build explicit memberships; no traversal may absorb a different glossary root.
+fn owner_index_map(pkg: &Package) -> PartGraph {
+    PartGraph::new(pkg)
 }
 
 /// Whether all sources that can discover owner subtrees have been examined.
 fn ownership_discovery_complete(pkg: &Package) -> bool {
     !pkg.entries_truncated
+        && !pkg.identity_incomplete
         && !pkg.content_types.incomplete
         && !package::content_unavailable(pkg, "[Content_Types].xml")
         && !pkg.rels.iter().any(|rp| rp.incomplete)
 }
 
-/// Every established owner context of a part; an empty slice represents uncertain ownership.
-fn part_owners<'a>(owner_map: &'a HashMap<String, Vec<usize>>, part: &str) -> &'a [usize] {
-    owner_map.get(&part.to_ascii_lowercase()).map(Vec::as_slice).unwrap_or_default()
+/// Established contexts only. Unowned and unknown are retained separately in the graph.
+fn part_owners<'a>(graph: &'a PartGraph, part: &str) -> &'a [OwnerId] {
+    graph.owners(part)
 }
 
-/// Whether a source could enter this owner's pool through the primary fallback assignment.
-/// `owner_index_map` assigns unreached entries outside glossary subtrees to context zero after
-/// complete discovery; an empty membership means discovery is incomplete or the source belongs
-/// to an unreached glossary subtree, never that the source is absent.
-/// Only the primary pool accepts fallback sources, so independent owners must remain checkable.
-fn unresolved_fallback_contributor(owner_map: &HashMap<String, Vec<usize>>, owner: usize, part: &str) -> bool {
-    owner == 0 && part_owners(owner_map, part).is_empty()
+/// Only the explicit fallback context can have undiscovered contributors.
+fn unresolved_fallback_contributor(graph: &PartGraph, _owner: OwnerId, part: &str) -> bool {
+    graph.unknown(part)
 }
 
-/// Whether an established traversal branch has unresolved outgoing relationships. A failed
-/// descendant can hide further contributing sources from both an owner's pooled join and its
-/// source-completeness loop. Check every reached part, including a shared part in each context;
-/// another owner's disjoint branch must not invalidate this owner's absence conclusions.
-fn descendant_discovery_incomplete(pkg: &Package, owner_map: &HashMap<String, Vec<usize>>, owner: usize) -> bool {
-    if !matches!(pkg.main, Resolution::One(_)) && !matches!(pkg.glossary, Resolution::One(_)) {
-        // The fallback map includes every part only after complete package discovery. An empty
-        // map after discovery loss is unknown membership, not a complete empty contributing set.
+/// Discovery loss affects the contexts whose reached descendants have unread relationships.
+fn descendant_discovery_incomplete(pkg: &Package, graph: &PartGraph, owner: OwnerId) -> bool {
+    if owner_scopes(pkg) == [OwnerContext::Fallback] {
         return !ownership_discovery_complete(pkg);
     }
-    owner_map.iter().any(|(part, contexts)| contexts.contains(&owner) && package::relationships_incomplete(pkg, part))
+    graph.parts(owner).any(|part| package::relationships_incomplete(pkg, part))
 }
 
 /// Verify that style references in story parts resolve to a defined style in their owner scope.
 fn check_style_refs(pkg: &Package, xml: &XmlScan, acc: &mut Acc) {
-    let facts = &xml.facts;
+    let facts = &xml.package_facts();
     let cap = acc.limits.facts;
     let owners = owner_scopes(pkg);
     let owner_map = owner_index_map(pkg);
-    let mut per_owner: Vec<Option<HashSet<StyleId>>> = Vec::with_capacity(owners.len());
+    let mut per_owner: Vec<Option<CompleteSet<StyleId>>> = Vec::with_capacity(owners.len());
     let mut present = false;
     let mut capped = false;
     let mut parsed_any = false;
     let mut selection_ambiguous = false;
     for owner in &owners {
-        let selection = supporting_part(pkg, owner.as_deref(), "styles", package::STYLES_CONTENT_TYPE, acc);
+        let selection = supporting_part(pkg, owner.root(), "styles", package::STYLES_CONTENT_TYPE, acc);
         selection_ambiguous |= matches!(selection, Resolution::Ambiguous(_) | Resolution::Unknown(_));
         let entry = match selection {
             Resolution::One(entry) => entry,
@@ -2410,7 +2361,10 @@ fn check_style_refs(pkg: &Package, xml: &XmlScan, acc: &mut Acc) {
                 if c {
                     acc.note(format!("{} exceeded the {cap}-entry budget; style-reference absence was not checked", entry.name));
                 }
-                per_owner.push((!c).then_some(ids));
+                per_owner.push(
+                    Observed::with_status(ids, if c { Completeness::Incomplete("style definition budget") } else { Completeness::Complete })
+                        .into_complete_set(),
+                );
             }
             Some(None) => per_owner.push(None),
             None => per_owner.push(None),
@@ -2421,23 +2375,23 @@ fn check_style_refs(pkg: &Package, xml: &XmlScan, acc: &mut Acc) {
         acc.set_incomplete();
     }
     if !present {
-        if !selection_ambiguous && !facts.style_refs.is_empty() {
+        if !selection_ambiguous && !facts.style_refs.prefix().is_empty() {
             acc.note("no styles part is reachable; w:pStyle/w:rStyle references were not checked".to_string());
         }
         return;
     }
     if !parsed_any {
-        if !selection_ambiguous && !facts.style_refs.is_empty() {
+        if !selection_ambiguous && !facts.style_refs.prefix().is_empty() {
             acc.note("a styles part is present but does not parse; w:pStyle/w:rStyle references were not checked".to_string());
         }
         return;
     }
     // Check each reference against its owner's own definitions only (H2).
     let mut reported: HashSet<(&str, &str)> = HashSet::new();
-    for (id, part) in &facts.style_refs {
+    for (id, part) in facts.style_refs.prefix() {
         for &owner in part_owners(&owner_map, part) {
-            let Some(Some(defs)) = per_owner.get(owner) else { continue };
-            if !defs.contains(id) && reported.insert((id.as_str(), part.as_str())) {
+            let Some(Some(defs)) = per_owner.get(owner.0) else { continue };
+            if defs.missing(id) && reported.insert((id.as_str(), part.as_str())) {
                 acc.add("REF-STYLE", Some(part.clone()), format!("style id {id} in {part} has no definition in the package"));
             }
         }
@@ -2453,10 +2407,10 @@ fn check_vocabulary(pkg: &Package, acc: &mut Acc) {
     let cap = acc.limits.facts;
     let owners = owner_scopes(pkg);
     for owner in &owners {
-        if let Resolution::One(entry) = supporting_part(pkg, owner.as_deref(), "styles", package::STYLES_CONTENT_TYPE, acc) {
+        if let Resolution::One(entry) = supporting_part(pkg, owner.root(), "styles", package::STYLES_CONTENT_TYPE, acc) {
             check_styles_vocabulary(entry, cap, acc);
         }
-        if let Resolution::One(entry) = supporting_part(pkg, owner.as_deref(), "fontTable", package::FONT_TABLE_CONTENT_TYPE, acc) {
+        if let Resolution::One(entry) = supporting_part(pkg, owner.root(), "fontTable", package::FONT_TABLE_CONTENT_TYPE, acc) {
             check_name_dups(entry, cap, acc, true);
         }
     }
@@ -2629,12 +2583,12 @@ fn find_by_type<'a>(pkg: &'a Package, ct: &str) -> Resolution<&'a package::Entry
 
 /// Verify numbering definitions and references in story and styles parts for each owner scope.
 fn check_numbering(pkg: &Package, xml: &XmlScan, acc: &mut Acc) {
-    let facts = &xml.facts;
+    let facts = &xml.package_facts();
     acc.ran("NUM-DANGLING");
     let cap = acc.limits.facts;
     let owners = owner_scopes(pkg);
     let owner_map = owner_index_map(pkg);
-    let mut numbering_cache: HashMap<String, Option<HashSet<DecimalId>>> = HashMap::new();
+    let mut numbering_cache: HashMap<String, Option<CompleteSet<DecimalId>>> = HashMap::new();
     // Each owner's numbering set, in owner order. `Some(set)` = the owner's numbering part was
     // examined, so `set` is the definitions it declares (empty when the owner has no numbering part
     // — established absent, so its references are genuinely dangling). `None` = the owner's
@@ -2642,15 +2596,15 @@ fn check_numbering(pkg: &Package, xml: &XmlScan, acc: &mut Acc) {
     // discovery source (its `.rels`, or the manifest in the no-owner scope) could not be read, so
     // that owner's references are not established as dangling and its dependent checks are skipped
     // (H8).
-    let mut num_sets: Vec<Option<HashSet<DecimalId>>> = Vec::with_capacity(owners.len());
-    let mut style_checks: Vec<(String, HashSet<DecimalId>)> = Vec::new();
+    let mut num_sets: Vec<Option<CompleteSet<DecimalId>>> = Vec::with_capacity(owners.len());
+    let mut style_checks: Vec<(String, CompleteSet<DecimalId>)> = Vec::new();
     for owner in &owners {
-        let selection = supporting_part(pkg, owner.as_deref(), "numbering", package::NUMBERING_CONTENT_TYPE, acc);
+        let selection = supporting_part(pkg, owner.root(), "numbering", package::NUMBERING_CONTENT_TYPE, acc);
         let num_part = match selection {
             Resolution::One(e) => Some(e.name.clone()),
             Resolution::Absent | Resolution::Ambiguous(_) | Resolution::Unknown(_) => None,
         };
-        let num_set: Option<HashSet<DecimalId>> = match &num_part {
+        let num_set: Option<CompleteSet<DecimalId>> = match &num_part {
             Some(np) => {
                 if let Some(cached) = numbering_cache.get(np) {
                     cached.clone()
@@ -2665,16 +2619,16 @@ fn check_numbering(pkg: &Package, xml: &XmlScan, acc: &mut Acc) {
                 // owner has none (an empty set, exactly as before). When the discovery source
                 // itself could not be read, the owner's numbering is unknown, not absent: its
                 // references must not be reported against an empty set (H8).
-                if matches!(selection, Resolution::Ambiguous(_) | Resolution::Unknown(_)) || discovery_unavailable(pkg, owner.as_deref()) {
+                if matches!(selection, Resolution::Ambiguous(_) | Resolution::Unknown(_)) || discovery_unavailable(pkg, owner.root()) {
                     None
                 } else {
-                    Some(HashSet::new())
+                    Observed::complete(HashSet::new()).into_complete_set()
                 }
             }
         };
         // Each owner's styles are checked against that owner's own numbering set, and only when it
         // could actually be examined.
-        if let Resolution::One(entry) = supporting_part(pkg, owner.as_deref(), "styles", package::STYLES_CONTENT_TYPE, acc)
+        if let Resolution::One(entry) = supporting_part(pkg, owner.root(), "styles", package::STYLES_CONTENT_TYPE, acc)
             && let Some(set) = &num_set
         {
             style_checks.push((entry.name.clone(), set.clone()));
@@ -2693,7 +2647,7 @@ fn check_numbering(pkg: &Package, xml: &XmlScan, acc: &mut Acc) {
 /// Parse a numbering part, reporting duplicate definitions and dangling `w:abstractNumId`
 /// references. `None` when the part could not be read, did not parse, or exceeded a budget (its
 /// references must not be checked).
-fn process_numbering_part(pkg: &Package, xml: &XmlScan, name: &str, cap: usize, acc: &mut Acc) -> Option<HashSet<DecimalId>> {
+fn process_numbering_part(pkg: &Package, xml: &XmlScan, name: &str, cap: usize, acc: &mut Acc) -> Option<CompleteSet<DecimalId>> {
     let entry = entry_by_name(pkg, name)?;
     if !xml_source_complete(xml, entry) {
         acc.note(format!("{name} was not fully examined; list numbering absence was not checked"));
@@ -2721,10 +2675,14 @@ fn process_numbering_part(pkg: &Package, xml: &XmlScan, name: &str, cap: usize, 
     }
     report_dups_values(acc, &defs.num_ids, &entry.name, "w:num numId");
     report_dups_values(acc, &defs.abstract_ids, &entry.name, "w:abstractNum abstractNumId");
-    let abstract_set: HashSet<&DecimalId> = defs.abstract_ids.iter().collect();
+    let abstract_set = Observed::with_status(
+        defs.abstract_ids.iter().cloned().collect::<HashSet<_>>(),
+        if defs.capped { Completeness::Incomplete("abstract numbering budget") } else { Completeness::Complete },
+    )
+    .into_complete_set();
     for (num, abs) in &defs.num_to_abstract {
         match abs {
-            Some(a) if !defs.capped && !abstract_set.contains(a) => acc.add(
+            Some(a) if abstract_set.as_ref().is_some_and(|set| set.missing(a)) => acc.add(
                 "NUM-DANGLING",
                 Some(entry.name.clone()),
                 format!("w:num numId {num} references w:abstractNumId {a}, which has no w:abstractNum"),
@@ -2734,7 +2692,11 @@ fn process_numbering_part(pkg: &Package, xml: &XmlScan, name: &str, cap: usize, 
         }
     }
     // A retained reference is still checkable, but a truncated definition set cannot prove absence.
-    (!defs.capped).then(|| defs.num_ids.into_iter().collect())
+    Observed::with_status(
+        defs.num_ids.into_iter().collect::<HashSet<_>>(),
+        if defs.capped { Completeness::Incomplete("numbering definition budget") } else { Completeness::Complete },
+    )
+    .into_complete_set()
 }
 
 /// `NUM-DANGLING` for `w:numPr/w:numId` references in a styles part, checked against its owner's
@@ -2742,7 +2704,7 @@ fn process_numbering_part(pkg: &Package, xml: &XmlScan, name: &str, cap: usize, 
 fn report_style_num_refs(
     pkg: &Package,
     styles_name: &str,
-    num_set: &HashSet<DecimalId>,
+    num_set: &CompleteSet<DecimalId>,
     cap: usize,
     reported: &mut HashSet<(String, DecimalId)>,
     acc: &mut Acc,
@@ -2771,7 +2733,7 @@ fn report_style_num_refs(
         if val.is_zero() {
             continue;
         }
-        if !num_set.contains(val) && reported.insert((entry.name.to_ascii_lowercase(), val.clone())) {
+        if num_set.missing(val) && reported.insert((entry.name.to_ascii_lowercase(), val.clone())) {
             acc.add(
                 "NUM-DANGLING",
                 Some(entry.name.clone()),
@@ -2784,15 +2746,15 @@ fn report_style_num_refs(
 /// `NUM-DANGLING` for `w:numPr/w:numId` references in story parts, each checked against its owner's
 /// own numbering set. A reference whose owner's numbering could not be examined is skipped, so an
 /// unavailable numbering part never manufactures a dangling finding (H2/H8).
-fn report_num_refs(acc: &mut Acc, facts: &scan::StoryFacts, num_sets: &[Option<HashSet<DecimalId>>], owner_map: &HashMap<String, Vec<usize>>) {
+fn report_num_refs(acc: &mut Acc, facts: &scan::StoryFacts, num_sets: &[Option<CompleteSet<DecimalId>>], owner_map: &PartGraph) {
     let mut reported: HashSet<(&DecimalId, &str)> = HashSet::new();
-    for (val, part) in &facts.num_ids {
+    for (val, part) in facts.num_ids.prefix() {
         if val.is_zero() {
             continue;
         }
         for &owner in part_owners(owner_map, part) {
-            let Some(Some(set)) = num_sets.get(owner) else { continue };
-            if !set.contains(val) && reported.insert((val, part.as_str())) {
+            let Some(Some(set)) = num_sets.get(owner.0) else { continue };
+            if set.missing(val) && reported.insert((val, part.as_str())) {
                 acc.add("NUM-DANGLING", Some(part.clone()), format!("w:numPr references numId {val}, which has no w:num definition"));
             }
         }
@@ -2814,21 +2776,22 @@ fn report_dups_values(acc: &mut Acc, values: &[DecimalId], part: &str, what: &st
 
 /// Verify comment-threading relationships between comments, commentsExtended, and commentsIds parts.
 fn check_commentex(pkg: &Package, xml: &XmlScan, acc: &mut Acc) {
-    let facts = &xml.facts;
+    let facts = &xml.package_facts();
     let cap = acc.limits.facts;
     let owners = owner_scopes(pkg);
     let owner_map = owner_index_map(pkg);
     let roles = story_roles(pkg);
     let any_ext = owners
         .iter()
-        .any(|o| !matches!(owner_rel_selection(pkg, o.as_deref(), "commentsExtended", package::COMMENTS_EXTENDED_CONTENT_TYPE), Resolution::Absent));
+        .any(|o| !matches!(owner_rel_selection(pkg, o.root(), "commentsExtended", package::COMMENTS_EXTENDED_CONTENT_TYPE), Resolution::Absent));
     if !any_ext {
         return;
     }
     acc.ran("COMMENTEX-LINK");
     for (i, owner) in owners.iter().enumerate() {
-        let comments_source = supporting_part(pkg, owner.as_deref(), "comments", package::COMMENTS_CONTENT_TYPE, acc);
-        let selected = owner.is_some();
+        let i = OwnerId(i);
+        let comments_source = supporting_part(pkg, owner.root(), "comments", package::COMMENTS_CONTENT_TYPE, acc);
+        let selected = owner.root().is_some();
         let contributes = |part: &str| {
             if selected {
                 match comments_source {
@@ -2840,43 +2803,45 @@ fn check_commentex(pkg: &Package, xml: &XmlScan, acc: &mut Acc) {
             }
         };
         let mut comments_complete = matches!(comments_source, Resolution::One(_) | Resolution::Absent)
-            && !discovery_unavailable(pkg, owner.as_deref())
+            && !discovery_unavailable(pkg, owner.root())
             && (selected || !descendant_discovery_incomplete(pkg, &owner_map, i));
         for entry in pkg.entries.iter().filter(|e| {
             !e.is_dir
                 && if selected {
                     contributes(&e.name)
                 } else {
-                    roles.get(&e.name.to_ascii_lowercase()).is_some_and(|r| r.is_comments)
+                    roles.get(&e.name.to_ascii_lowercase()).is_some_and(|r| r.is_comments())
                         && (contributes(&e.name) || unresolved_fallback_contributor(&owner_map, i, &e.name))
                 }
         }) {
-            if (!selected && unresolved_fallback_contributor(&owner_map, i, &entry.name)) || !xml_source_complete(xml, entry) {
+            if (!selected && unresolved_fallback_contributor(&owner_map, i, &entry.name))
+                || !xml.category_complete(&entry.name, |f| &f.comment_para_ids)
+            {
                 comments_complete = false;
                 acc.note(format!(
                     "comment-threading paragraphs for {} could not be fully checked: contributing source {} had unresolved ownership or was not fully examined",
-                    owner.as_deref().unwrap_or("the package"), entry.name
+                    owner.root().unwrap_or("the package"), entry.name
                 ));
             }
         }
         if !comments_complete {
             acc.note(format!(
                 "comment-threading paragraphs for {} could not be fully checked (comments ownership or source facts were not fully examined)",
-                owner.as_deref().unwrap_or("the package")
+                owner.root().unwrap_or("the package")
             ));
             acc.set_incomplete();
         }
         // Paragraphs come from the owner's selected comments target. A shared target is checked
         // independently in every owner that selects it; unrelated discovery cannot add sources.
-        let comment_para: HashSet<&HexId> = facts.comment_para_ids.iter().filter(|(_, p)| contributes(p)).map(|(p, _)| p).collect();
-        let ext_source = supporting_part(pkg, owner.as_deref(), "commentsExtended", package::COMMENTS_EXTENDED_CONTENT_TYPE, acc);
+        let comment_para: HashSet<&HexId> = facts.comment_para_ids.prefix().iter().filter(|(_, p)| contributes(p)).map(|(p, _)| p).collect();
+        let ext_source = supporting_part(pkg, owner.root(), "commentsExtended", package::COMMENTS_EXTENDED_CONTENT_TYPE, acc);
         let ext = match ext_source {
             Resolution::One(entry) => read_comments_ext(entry, xml, cap, acc).map(|e| (entry.name.clone(), e)),
             Resolution::Absent | Resolution::Ambiguous(_) | Resolution::Unknown(_) => None,
         };
         let ext_complete = match &ext {
             Some((_, e)) => !e.capped,
-            None => matches!(ext_source, Resolution::Absent) && !discovery_unavailable(pkg, owner.as_deref()),
+            None => matches!(ext_source, Resolution::Absent) && !discovery_unavailable(pkg, owner.root()),
         };
         let ex_para: HashSet<&HexId> = match &ext {
             Some((_, e)) => e.entries.iter().map(|(p, _)| p).collect(),
@@ -2905,7 +2870,7 @@ fn check_commentex(pkg: &Package, xml: &XmlScan, acc: &mut Acc) {
         }
         // commentsIds ids keep their own part name, so an unmatched id is reported at the part it
         // came from, never at another owner's (H9).
-        let cid = match supporting_part(pkg, owner.as_deref(), "commentsIds", package::COMMENTS_IDS_CONTENT_TYPE, acc) {
+        let cid = match supporting_part(pkg, owner.root(), "commentsIds", package::COMMENTS_IDS_CONTENT_TYPE, acc) {
             Resolution::One(entry) => read_comments_ids(entry, xml, cap, acc),
             Resolution::Absent | Resolution::Ambiguous(_) | Resolution::Unknown(_) => None,
         };
@@ -2992,29 +2957,33 @@ fn check_custom_xml(pkg: &Package, xml: &XmlScan, acc: &mut Acc) {
     let cap = acc.limits.facts;
     let owners = owner_scopes(pkg);
     let owner_map = owner_index_map(pkg);
+    let package_registry = ownership::PackageRegistryContext::new(&owner_map);
     // Schema availability and definitions are tracked per owner (J3): a glossary-only attached
     // schema cannot satisfy a main-owned reference, and an unreadable settings part disables the
     // checks for its owner alone. `None` = that owner's settings could not be established, so its
     // customXml parts are skipped.
-    let mut per_owner: Vec<Option<HashSet<String>>> = Vec::with_capacity(owners.len());
+    let mut per_owner: Vec<Option<CompleteSet<String>>> = Vec::with_capacity(owners.len());
     // The owners whose customXml item-properties parts exist, so whose schema references would have
     // been checked. A note about a skipped check is only worth recording for such an owner; an owner
     // with no customXml parts loses nothing when the check is skipped (Opus N5). When the manifest
     // that types the parts could not be read the attribution itself is unavailable, so the note is
     // kept.
-    let custom_xml_owners: HashSet<usize> = pkg
+    let custom_xml_owners: HashSet<OwnerId> = pkg
         .entries
         .iter()
         .filter(|e| !e.is_dir && pkg.content_types.of(&e.name) == Some(package::CUSTOM_XML_PROPS_CONTENT_TYPE))
-        .flat_map(|e| part_owners(&owner_map, &e.name).iter().copied())
+        .flat_map(|e| package_registry.contexts(&e.name).iter().copied())
         .collect();
-    if pkg.entries.iter().any(|e| {
-        !e.is_dir && pkg.content_types.of(&e.name) == Some(package::CUSTOM_XML_PROPS_CONTENT_TYPE) && part_owners(&owner_map, &e.name).is_empty()
-    }) {
+    if pkg
+        .entries
+        .iter()
+        .any(|e| !e.is_dir && pkg.content_types.of(&e.name) == Some(package::CUSTOM_XML_PROPS_CONTENT_TYPE) && owner_map.unknown(&e.name))
+    {
         acc.note("custom XML ownership could not be established; custom XML schema references were not checked".to_string());
         acc.set_incomplete();
     }
     for (i, owner) in owners.iter().enumerate() {
+        let i = OwnerId(i);
         // The settings part is discovered through the owner's own `.rels`, or in the no-owner
         // fallback scope through the manifest (`find_by_type`). When that source could not be read,
         // which settings part (and so which schemas) the owner reaches is UNKNOWN, not absent: skip
@@ -3022,9 +2991,9 @@ fn check_custom_xml(pkg: &Package, xml: &XmlScan, acc: &mut Acc) {
         // reference as unattached. Applying the same predicate in both scopes keeps established
         // absence (a readable source that reaches no settings) a genuine empty set. (The run is
         // already INCOMPLETE from loading the unreadable source.)
-        if discovery_unavailable(pkg, owner.as_deref()) {
+        if discovery_unavailable(pkg, owner.root()) {
             if custom_xml_owners.contains(&i) || package::content_unavailable(pkg, "[Content_Types].xml") {
-                let source = match owner.as_deref() {
+                let source = match owner.root() {
                     Some(o) => rels_part_name(o),
                     None => "[Content_Types].xml".to_string(),
                 };
@@ -3034,7 +3003,7 @@ fn check_custom_xml(pkg: &Package, xml: &XmlScan, acc: &mut Acc) {
             per_owner.push(None);
             continue;
         }
-        let selection = supporting_part(pkg, owner.as_deref(), "settings", package::SETTINGS_CONTENT_TYPE, acc);
+        let selection = supporting_part(pkg, owner.root(), "settings", package::SETTINGS_CONTENT_TYPE, acc);
         if matches!(selection, Resolution::Ambiguous(_) | Resolution::Unknown(_)) {
             per_owner.push(None);
             continue;
@@ -3048,7 +3017,7 @@ fn check_custom_xml(pkg: &Package, xml: &XmlScan, acc: &mut Acc) {
             Resolution::Absent => {
                 // The owner's `.rels` was readable and holds no settings relationship: there is
                 // genuinely no settings part for this owner, so the attached-schema set is empty.
-                per_owner.push(Some(HashSet::new()));
+                per_owner.push(Observed::complete(HashSet::new()).into_complete_set());
                 continue;
             }
         };
@@ -3071,7 +3040,13 @@ fn check_custom_xml(pkg: &Package, xml: &XmlScan, acc: &mut Acc) {
                     acc.note(format!("{} exceeded the {cap}-entry budget; attached-schema absence was not checked", entry.name));
                     acc.set_incomplete();
                 }
-                per_owner.push((!capped).then(|| vals.into_iter().collect()));
+                per_owner.push(
+                    Observed::with_status(
+                        vals.into_iter().collect::<HashSet<_>>(),
+                        if capped { Completeness::Incomplete("schema budget") } else { Completeness::Complete },
+                    )
+                    .into_complete_set(),
+                );
             }
             result => {
                 if guard.exhausted() {
@@ -3089,7 +3064,8 @@ fn check_custom_xml(pkg: &Package, xml: &XmlScan, acc: &mut Acc) {
         if pkg.content_types.of(&e.name) != Some(package::CUSTOM_XML_PROPS_CONTENT_TYPE) {
             continue;
         }
-        let schemas: Vec<_> = part_owners(&owner_map, &e.name).iter().filter_map(|&owner| per_owner.get(owner).and_then(Option::as_ref)).collect();
+        let schemas: Vec<_> =
+            package_registry.contexts(&e.name).iter().filter_map(|&owner| per_owner.get(owner.0).and_then(Option::as_ref)).collect();
         if schemas.is_empty() {
             continue;
         }
@@ -3106,7 +3082,7 @@ fn check_custom_xml(pkg: &Package, xml: &XmlScan, acc: &mut Acc) {
             acc.set_incomplete();
         }
         for uri in uris {
-            if schemas.iter().any(|set| !set.contains(&uri)) {
+            if schemas.iter().any(|set| set.missing(&uri)) {
                 acc.add(
                     "CUSTOMXML-SCHEMA",
                     Some(e.name.clone()),
@@ -3136,20 +3112,20 @@ fn report_dups<K: Eq + std::hash::Hash + std::fmt::Display>(acc: &mut Acc, rule:
 }
 
 /// Report missing definitions for references collected from story elements.
-fn report_missing(acc: &mut Acc, rule: &'static str, refs: &[(DecimalId, String)], defs: &HashSet<DecimalId>, what: &str) {
+fn report_missing(acc: &mut Acc, rule: &'static str, refs: &[(DecimalId, String)], defs: &CompleteSet<DecimalId>, what: &str) {
     let mut reported: HashSet<&DecimalId> = HashSet::new();
     for (id, part) in refs {
-        if !defs.contains(id) && reported.insert(id) {
+        if defs.missing(id) && reported.insert(id) {
             acc.add(rule, Some(part.clone()), format!("{what} {id} in {part} has no definition in the package"));
         }
     }
 }
 
 /// Report missing footnote or endnote definitions.
-fn report_missing_note(acc: &mut Acc, refs: &[(DecimalId, String)], defs: &HashSet<DecimalId>, kind: &str) {
+fn report_missing_note(acc: &mut Acc, refs: &[(DecimalId, String)], defs: &CompleteSet<DecimalId>, kind: &str) {
     let mut reported: HashSet<&DecimalId> = HashSet::new();
     for (id, part) in refs {
-        if !defs.contains(id) && reported.insert(id) {
+        if defs.missing(id) && reported.insert(id) {
             acc.add(
                 "REF-NOTE",
                 Some(part.clone()),
@@ -3181,7 +3157,7 @@ fn image_rel_targets(pkg: &Package) -> HashSet<String> {
     let mut set = HashSet::new();
     for rp in &pkg.rels {
         for r in &rp.rels {
-            if relationship_kind(&r.kind) == Some("image")
+            if r.role.kind() == Some("image")
                 && let Some(t) = &r.target_abs
             {
                 set.insert(t.to_ascii_lowercase());
@@ -3336,7 +3312,7 @@ mod budget_tests {
         xml.push_str(&"</w:p>".repeat(2000));
         xml.push_str("</w:document>");
         let mut acc = Acc::with_limits(Limits { depth: 512, ..Limits::default() });
-        let role = scan::PartRole { is_main: true, is_story: true, ..scan::PartRole::default() };
+        let role = scan::PartRole::Main;
         let _ = scan::scan_part("word/document.xml", &xml, role, &mut acc);
         let report = acc.finish();
         assert_eq!(report.verdict, Verdict::Incomplete, "findings: {:?}", report.findings);
@@ -3348,7 +3324,7 @@ mod budget_tests {
     fn extreme_element_count_stops_within_budget() {
         let xml = format!(r#"<w:document xmlns:w="{}">{}</w:document>"#, NS_W, "<w:p/>".repeat(10_000));
         let mut acc = Acc::with_limits(Limits { events: 1000, ..Limits::default() });
-        let role = scan::PartRole { is_main: true, is_story: true, ..scan::PartRole::default() };
+        let role = scan::PartRole::Main;
         let _ = scan::scan_part("word/document.xml", &xml, role, &mut acc);
         let report = acc.finish();
         assert_eq!(report.verdict, Verdict::Incomplete, "findings: {:?}", report.findings);
@@ -5143,8 +5119,8 @@ mod round6_tests {
         let pkg = package::load(&bytes, &mut acc).unwrap();
         eprintln!("custom glossary scope: {:?}", owner_scopes(&pkg));
         assert!(!matches!(pkg.glossary, Resolution::One(_)));
-        assert_eq!(owner_scopes(&pkg), vec![Some("word/document.xml".into())]);
-        assert_eq!(part_owners(&owner_index_map(&pkg), "word/vendor.dat"), vec![0]);
+        assert_eq!(owner_scopes(&pkg), vec![OwnerContext::Main("word/document.xml".into())]);
+        assert_eq!(part_owners(&owner_index_map(&pkg), "word/vendor.dat"), vec![OwnerId(0)]);
     }
 
     /// Actual glossary types still establish and isolate the glossary's owner context.
@@ -5164,7 +5140,7 @@ mod round6_tests {
             }),
             Some("word/vendor.dat")
         );
-        assert_eq!(part_owners(&owner_index_map(&pkg), "word/vendor.dat"), vec![1]);
+        assert_eq!(part_owners(&owner_index_map(&pkg), "word/vendor.dat"), vec![OwnerId(1)]);
     }
 
     /// A vendor comments edge grants neither a story role nor XML decoding by suffix.
@@ -5205,7 +5181,10 @@ mod round6_tests {
                         &mut acc,
                     );
                 } else {
-                    let facts = scan::StoryFacts { header_refs: vec![("vendor".into(), "word/document.xml".into())], ..scan::StoryFacts::default() };
+                    let facts = scan::StoryFacts {
+                        header_refs: Observed::complete(vec![("vendor".into(), "word/document.xml".into())]),
+                        ..scan::StoryFacts::default()
+                    };
                     check_header_footer_refs(&pkg, &facts, &mut acc);
                 }
                 assert_eq!(acc.findings.len(), expected, "{namespace}/{kind}: {:?}", acc.findings);
@@ -5638,7 +5617,7 @@ mod round7_owner_discovery_tests {
         let bytes = zip.finish().unwrap().into_inner();
         let mut acc = Acc::default();
         let pkg = package::load(&bytes, &mut acc).unwrap();
-        assert_eq!(owner_scopes(&pkg), vec![None]);
+        assert_eq!(owner_scopes(&pkg), vec![OwnerContext::Fallback]);
         validate_bytes(&bytes)
     }
 

@@ -137,3 +137,22 @@ fn relationship_ids_remain_lexical() {
     let report = report_in_all_orders(&mut d);
     assert!(report.findings.iter().any(|f| f.rule == "REL-REF-MISSING"), "{report:?}");
 }
+
+#[test]
+fn unreached_story_references_never_borrow_main_definitions() {
+    use common::{CT_HEADER, CT_SETTINGS};
+    let mut d = Doc::minimal();
+    d.add_with_override("word/orphan.xml", CT_HEADER, format!(r#"<w:hdr {NS}><w:p><w:pPr><w:pStyle w:val="missing"/><w:numPr><w:numId w:val="9"/></w:numPr></w:pPr><w:r><w:footnoteReference w:id="9"/><w:endnoteReference w:id="9"/><w:commentReference w:id="9"/></w:r></w:p></w:hdr>"#));
+    d.add_with_override("word/styles.xml", CT_STYLES, format!(r#"<w:styles {NS}/>"#));
+    d.add_with_override("word/settings.xml", CT_SETTINGS, format!(r#"<w:settings {NS}/>"#));
+    let sources = rel("styles", "styles.xml") + &rel("settings", "settings.xml");
+    d.set_doc_rels(&sources);
+    let orphan = report_in_all_orders(&mut d);
+    without(&orphan, &["REF-NOTE", "ID-COMMENT-REF", "REF-STYLE", "NUM-DANGLING"]);
+    // The same references really reached from main must still be diagnosed.
+    d.set_doc_rels(&(sources + &rel("header", "orphan.xml")));
+    let reached = report_in_all_orders(&mut d);
+    for rule in ["REF-NOTE", "ID-COMMENT-REF", "REF-STYLE", "NUM-DANGLING"] {
+        assert!(reached.findings.iter().any(|f| f.rule == rule && f.part.as_deref() == Some("word/orphan.xml")), "{reached:?}");
+    }
+}

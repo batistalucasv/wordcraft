@@ -119,12 +119,12 @@ fn glossary_typed_parts_are_excluded_from_main_traversal_and_fallback() {
             for incomplete in [false, true] {
                 pkg.entries_truncated = incomplete;
                 let map = owner_index_map(&pkg);
-                assert_eq!(part_owners(&map, "word/glossary/document.xml"), &[1]);
-                assert!(part_owners(&map, "word/g2/document.xml").is_empty(), "{map:?}");
+                assert_eq!(part_owners(&map, "word/glossary/document.xml"), &[OwnerId(1)]);
+                assert_eq!(part_owners(&map, "word/g2/document.xml"), &[OwnerId(2)], "{map:?}");
                 if incomplete {
                     // With fallback disabled, these memberships expose traversal through B itself.
-                    assert!(part_owners(&map, "word/g2/footnotes.xml").is_empty(), "{map:?}");
-                    assert!(part_owners(&map, "word/g2/comments.xml").is_empty(), "{map:?}");
+                    assert_eq!(part_owners(&map, "word/g2/footnotes.xml"), &[OwnerId(2)], "{map:?}");
+                    assert_eq!(part_owners(&map, "word/g2/comments.xml"), &[OwnerId(2)], "{map:?}");
                 }
             }
         }
@@ -146,7 +146,7 @@ fn single_glossary_fallback_and_official_selection_preserve_m1_m2() {
                 }),
                 Some("word/glossary/document.xml")
             );
-            assert_eq!(part_owners(&owner_index_map(&pkg), "word/glossary/document.xml"), &[1]);
+            assert_eq!(part_owners(&owner_index_map(&pkg), "word/glossary/document.xml"), &[OwnerId(1)]);
         }
     }
 }
@@ -174,8 +174,8 @@ fn no_main_single_glossary_fallback_remains_the_primary_glossary_owner() {
             Some("word/glossary/document.xml")
         );
         let map = owner_index_map(&pkg);
-        assert_eq!(part_owners(&map, "word/glossary/document.xml"), &[0]);
-        assert_eq!(part_owners(&map, "word/glossary/footnotes.xml"), &[0]);
+        assert_eq!(part_owners(&map, "word/glossary/document.xml"), &[OwnerId(0)]);
+        assert_eq!(part_owners(&map, "word/glossary/footnotes.xml"), &[OwnerId(0)]);
         let report = validate_bytes(&d.build());
         no_false_joins(&report);
         assert!(report.findings.iter().any(|f| f.rule == "PKG-NO-MAIN"), "{report:?}");
@@ -199,7 +199,8 @@ fn no_main_multiple_fallback_glossaries_have_no_owner_anchor() {
         assert!(pkg.roots_ambiguous);
         let map = owner_index_map(&pkg);
         for part in ["word/glossary/document.xml", "word/g2/document.xml"] {
-            assert!(part_owners(&map, part).is_empty(), "{map:?}");
+            let index = owner_scopes(&pkg).iter().position(|o| o.root() == Some(part)).unwrap();
+            assert_eq!(part_owners(&map, part), &[OwnerId(index)], "{map:?}");
         }
         let report = validate_bytes(&d.build());
         no_false_joins(&report);

@@ -116,10 +116,37 @@ impl ContentTypes {
     }
 }
 
+/// Recognized relationship classification, parsed once when loading the declaration.
+pub(crate) enum RelationKind {
+    Supported(String),
+    StrictEntry,
+    Other,
+}
+impl RelationKind {
+    /// Custom suffix lookalikes never acquire official roles.
+    fn parse(uri: &str) -> Self {
+        if uri == "http://purl.oclc.org/ooxml/officeDocument/relationships/officeDocument" {
+            Self::StrictEntry
+        } else if let Some(kind) = relationship_kind(uri) {
+            Self::Supported(kind.to_string())
+        } else {
+            Self::Other
+        }
+    }
+    /// Only the supported official vocabulary supplies document roles.
+    pub(crate) fn kind(&self) -> Option<&str> {
+        match self {
+            Self::Supported(kind) => Some(kind),
+            Self::StrictEntry | Self::Other => None,
+        }
+    }
+}
+
 /// One relationship.
 pub(crate) struct Rel {
     pub id: crate::scan::RelId,
     pub kind: String,
+    pub role: RelationKind,
     /// Resolved package path for internal targets; `None` for external ones.
     pub target_abs: Option<String>,
     pub external: bool,
@@ -382,7 +409,7 @@ fn glossary_part(entries: &[Entry], ct: &ContentTypes, rels: &[RelsPart], main: 
             return Resolution::Ambiguous("distinct official targets compete");
         }
         if let Some(rp) = rp
-            && let Some(r) = rp.rels.iter().find(|r| !r.external && relationship_kind(&r.kind) == Some("glossaryDocument"))
+            && let Some(r) = rp.rels.iter().find(|r| !r.external && r.role.kind() == Some("glossaryDocument"))
             && let Some(t) = &r.target_abs
             && let Some(name) = canonical(entries, t)
         {
@@ -1069,7 +1096,7 @@ fn parse_rel(dir: &str, e: &BytesStart) -> Option<Rel> {
     let target = attr_plain(e, b"Target").unwrap_or_default();
     let external = attr_plain(e, b"TargetMode").is_some_and(|m| m.eq_ignore_ascii_case("External"));
     let target_abs = (!external).then(|| resolve(dir, &target));
-    Some(Rel { id: id.into(), kind, target_abs, external })
+    Some(Rel { id: id.into(), role: RelationKind::parse(&kind), kind, target_abs, external })
 }
 
 /// An unqualified OPC attribute; foreign qualified lookalikes never declare OPC metadata.

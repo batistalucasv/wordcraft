@@ -10,6 +10,7 @@ use quick_xml::events::{BytesStart, Event};
 use quick_xml::name::{Namespace, NamespaceResolver, QName, ResolveResult};
 use quick_xml::reader::NsReader;
 
+use crate::observed::Observed;
 use crate::{Acc, NS_DS, NS_M, NS_MC, NS_R, NS_W, NS_W14, NS_W15, NS_W16CID, NS_WP};
 
 /// Parsed numeric value; invalid spellings remain explicitly separate from valid keys.
@@ -148,26 +149,77 @@ macro_rules! lexical_id {
 lexical_id!(RelId);
 lexical_id!(StyleId);
 
-/// What a part is, for the checks that apply to it.
-#[derive(Clone, Copy, Default)]
-pub(crate) struct PartRole {
-    pub is_main: bool,
-    pub is_story: bool,
-    pub is_comments: bool,
-    pub is_footnotes: bool,
-    pub is_endnotes: bool,
-    /// A glossary document part: comment ranges are honoured there, as in
-    /// the main story (COMMENT-RANGE-UNPAIRED's scope).
-    pub is_glossary: bool,
-    /// A settings part (by effective content type or a `settings` relationship).
-    pub is_settings: bool,
+/// A role is either established or explicitly conflicting; relationship order never chooses it.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub(crate) enum PartRole {
+    #[default]
+    Unknown,
+    Main,
+    Glossary,
+    Story,
+    Comments,
+    Footnotes,
+    Endnotes,
+    Settings,
+    Conflicting(u8),
+}
+impl PartRole {
+    /// Classification evidence retained for monotone checks even when roles conflict.
+    fn bits(self) -> u8 {
+        match self {
+            Self::Unknown => 0,
+            Self::Main => 1,
+            Self::Glossary => 2,
+            Self::Story => 4,
+            Self::Comments => 8,
+            Self::Footnotes => 16,
+            Self::Endnotes => 32,
+            Self::Settings => 64,
+            Self::Conflicting(bits) => bits,
+        }
+    }
+    /// Merge all declarations, retaining a conflict instead of whichever was visited first.
+    pub(crate) fn merge(self, other: Self) -> Self {
+        if self == Self::Unknown {
+            other
+        } else if other == Self::Unknown || self == other {
+            self
+        } else {
+            Self::Conflicting(self.bits() | other.bits())
+        }
+    }
+    /// Conflicting evidence cannot establish complete definition absence.
+    pub(crate) fn conflicting(self) -> bool {
+        matches!(self, Self::Conflicting(_))
+    }
+    pub(crate) fn is_main(self) -> bool {
+        self.bits() & 1 != 0
+    }
+    pub(crate) fn is_glossary(self) -> bool {
+        self.bits() & 2 != 0
+    }
+    pub(crate) fn is_story(self) -> bool {
+        self.bits() & 63 != 0
+    }
+    pub(crate) fn is_comments(self) -> bool {
+        self.bits() & 8 != 0
+    }
+    pub(crate) fn is_footnotes(self) -> bool {
+        self.bits() & 16 != 0
+    }
+    pub(crate) fn is_endnotes(self) -> bool {
+        self.bits() & 32 != 0
+    }
+    pub(crate) fn is_settings(self) -> bool {
+        self.bits() & 64 != 0
+    }
 }
 
 /// Ids collected from the story parts, pooled document-wide.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct StoryFacts {
-    pub comment_defs: Vec<(DecimalId, String)>,
-    pub comment_refs: Vec<(DecimalId, String)>,
+    pub comment_defs: Observed<Vec<(DecimalId, String)>>,
+    pub comment_refs: Observed<Vec<(DecimalId, String)>>,
     /// `w:commentRangeStart` occurrences across this part. A plain counter, not
     /// a pooled fact: 32k ranges must not consume the pooled fact budget.
     pub comment_range_starts: usize,
@@ -179,19 +231,19 @@ pub(crate) struct StoryFacts {
     /// (compat-count counter).
     pub move_range_starts: usize,
     /// `w14:paraId` values on paragraphs in comments.xml (for `COMMENTEX-LINK`).
-    pub comment_para_ids: Vec<(HexId, String)>,
-    pub docpr: Vec<(DecimalId, String)>,
-    pub bookmarks: Vec<(DecimalId, String)>,
-    pub revisions: Vec<(DecimalId, String)>,
-    pub footnote_refs: Vec<(DecimalId, String)>,
-    pub endnote_refs: Vec<(DecimalId, String)>,
-    pub footnote_defs: Vec<(DecimalId, String)>,
-    pub endnote_defs: Vec<(DecimalId, String)>,
-    pub header_refs: Vec<(RelId, String)>,
-    pub footer_refs: Vec<(RelId, String)>,
-    pub style_refs: Vec<(StyleId, String)>,
+    pub comment_para_ids: Observed<Vec<(HexId, String)>>,
+    pub docpr: Observed<Vec<(DecimalId, String)>>,
+    pub bookmarks: Observed<Vec<(DecimalId, String)>>,
+    pub revisions: Observed<Vec<(DecimalId, String)>>,
+    pub footnote_refs: Observed<Vec<(DecimalId, String)>>,
+    pub endnote_refs: Observed<Vec<(DecimalId, String)>>,
+    pub footnote_defs: Observed<Vec<(DecimalId, String)>>,
+    pub endnote_defs: Observed<Vec<(DecimalId, String)>>,
+    pub header_refs: Observed<Vec<(RelId, String)>>,
+    pub footer_refs: Observed<Vec<(RelId, String)>>,
+    pub style_refs: Observed<Vec<(StyleId, String)>>,
     /// `w:numId/@w:val` values used by `w:numPr` in story parts (for `NUM-DANGLING`).
-    pub num_ids: Vec<(DecimalId, String)>,
+    pub num_ids: Observed<Vec<(DecimalId, String)>>,
 }
 
 /// One `r:id`/`r:embed`/`r:link` value found in a part, with the element identity needed to
@@ -203,42 +255,64 @@ pub(crate) struct RefFact {
     pub image: bool,
 }
 
-/// Pool another part's story facts into the document-wide collection, honouring the per-category
-/// budget. Returns `true` when the budget stopped a category from taking more.
-pub(crate) fn merge_facts(into: &mut StoryFacts, from: StoryFacts, cap: usize) -> bool {
-    // The counters are summed unconditionally: they are not pooled facts and
-    // must stay exact even when a fact set caps out.
-    into.comment_range_starts += from.comment_range_starts;
-    into.bookmark_starts += from.bookmark_starts;
-    into.perm_starts += from.perm_starts;
-    into.move_range_starts += from.move_range_starts;
-    let mut capped = false;
-    macro_rules! pool {
-        ($field:ident) => {{
-            for item in from.$field {
-                if into.$field.len() >= cap {
-                    capped = true;
-                    break;
-                }
-                into.$field.push(item);
-            }
-        }};
+impl StoryFacts {
+    /// A source loss affects only the collections extracted from that source.
+    pub(crate) fn invalidate(&mut self, reason: &'static str) {
+        self.comment_defs.invalidate(reason);
+        self.comment_refs.invalidate(reason);
+        self.comment_para_ids.invalidate(reason);
+        self.docpr.invalidate(reason);
+        self.bookmarks.invalidate(reason);
+        self.revisions.invalidate(reason);
+        self.footnote_refs.invalidate(reason);
+        self.endnote_refs.invalidate(reason);
+        self.footnote_defs.invalidate(reason);
+        self.endnote_defs.invalidate(reason);
+        self.header_refs.invalidate(reason);
+        self.footer_refs.invalidate(reason);
+        self.style_refs.invalidate(reason);
+        self.num_ids.invalidate(reason);
     }
-    pool!(comment_defs);
-    pool!(comment_refs);
-    pool!(comment_para_ids);
-    pool!(docpr);
-    pool!(bookmarks);
-    pool!(revisions);
-    pool!(footnote_refs);
-    pool!(endnote_refs);
-    pool!(footnote_defs);
-    pool!(endnote_defs);
-    pool!(header_refs);
-    pool!(footer_refs);
-    pool!(style_refs);
-    pool!(num_ids);
-    capped
+    /// Preserve the existing package allocation bound while retaining facts per part.
+    pub(crate) fn retain_budget(&mut self, held: &mut [usize; 14], cap: usize) -> bool {
+        let mut dropped = false;
+        dropped |= self.comment_defs.retain_budget(&mut held[0], cap);
+        dropped |= self.comment_refs.retain_budget(&mut held[1], cap);
+        dropped |= self.comment_para_ids.retain_budget(&mut held[2], cap);
+        dropped |= self.docpr.retain_budget(&mut held[3], cap);
+        dropped |= self.bookmarks.retain_budget(&mut held[4], cap);
+        dropped |= self.revisions.retain_budget(&mut held[5], cap);
+        dropped |= self.footnote_refs.retain_budget(&mut held[6], cap);
+        dropped |= self.endnote_refs.retain_budget(&mut held[7], cap);
+        dropped |= self.footnote_defs.retain_budget(&mut held[8], cap);
+        dropped |= self.endnote_defs.retain_budget(&mut held[9], cap);
+        dropped |= self.header_refs.retain_budget(&mut held[10], cap);
+        dropped |= self.footer_refs.retain_budget(&mut held[11], cap);
+        dropped |= self.style_refs.retain_budget(&mut held[12], cap);
+        dropped |= self.num_ids.retain_budget(&mut held[13], cap);
+        dropped
+    }
+    /// Package-global reductions are deliberate; owner-local joins never use this as definitions.
+    pub(crate) fn append(&mut self, from: &Self) {
+        self.comment_defs.append(&from.comment_defs);
+        self.comment_refs.append(&from.comment_refs);
+        self.comment_para_ids.append(&from.comment_para_ids);
+        self.docpr.append(&from.docpr);
+        self.bookmarks.append(&from.bookmarks);
+        self.revisions.append(&from.revisions);
+        self.footnote_refs.append(&from.footnote_refs);
+        self.endnote_refs.append(&from.endnote_refs);
+        self.footnote_defs.append(&from.footnote_defs);
+        self.endnote_defs.append(&from.endnote_defs);
+        self.header_refs.append(&from.header_refs);
+        self.footer_refs.append(&from.footer_refs);
+        self.style_refs.append(&from.style_refs);
+        self.num_ids.append(&from.num_ids);
+        self.comment_range_starts = self.comment_range_starts.saturating_add(from.comment_range_starts);
+        self.bookmark_starts = self.bookmark_starts.saturating_add(from.bookmark_starts);
+        self.perm_starts = self.perm_starts.saturating_add(from.perm_starts);
+        self.move_range_starts = self.move_range_starts.saturating_add(from.move_range_starts);
+    }
 }
 
 /// The result of scanning one XML or `.rels` part.
@@ -272,6 +346,8 @@ pub(crate) struct PartScan {
     pub fact_capped: bool,
     /// All XML events and story facts were examined; absence joins may use this part.
     pub facts_complete: bool,
+    /// XML events completed independently of individual fact/reference allocation caps.
+    pub syntax_complete: bool,
 }
 
 struct ElemId {
@@ -694,6 +770,7 @@ pub(crate) fn scan_part(part: &str, text: &str, role: PartRole, acc: &mut Acc) -
         note_capped: false,
         fact_capped: false,
         facts_complete: false,
+        syntax_complete: false,
     };
     let mut root_count = 0usize;
     let mut events = 0usize;
@@ -864,6 +941,10 @@ pub(crate) fn scan_part(part: &str, text: &str, role: PartRole, acc: &mut Acc) -
     // is Warning-only by calibration).
     let scan_complete = out.malformed.is_none() && !budget_stopped && !state.fact_capped && !state.refs_capped;
     out.facts_complete = scan_complete;
+    out.syntax_complete = out.malformed.is_none() && !budget_stopped;
+    if !out.syntax_complete || role.conflicting() {
+        state.facts.invalidate("XML source or role incomplete");
+    }
     finish_prefix(&state, part, acc);
     if scan_complete {
         finish_completion(&state, part, acc);
@@ -979,7 +1060,7 @@ fn frame_for(id: &ElemId) -> Frame {
 /// cell's last block is known even if later XML is malformed or truncated, so it is
 /// evaluated here; an open cell never is, because later content could repair it.
 fn close_cell(f: &Frame, part: &str, role: PartRole, acc: &mut Acc) {
-    if !f.is_tc || !role.is_main {
+    if !f.is_tc || !role.is_main() {
         return;
     }
     if f.tc_has_block && f.tc_last_block == Some(TcEnd::Other) {
@@ -1058,7 +1139,7 @@ fn prohibited_parent(state: &State) -> Option<&'static str> {
 /// content. A stray math island (math content with no `m:oMath` anywhere above it)
 /// is reported once, at its root element, not once per descendant.
 fn check_math_placement(state: &State, id: &ElemId, role: PartRole, part: &str, acc: &mut Acc) {
-    if !role.is_story || !id.m() {
+    if !role.is_story() || !id.m() {
         return;
     }
     let in_omath = state.frames.iter().any(|f| f.is_omath);
@@ -1123,7 +1204,7 @@ fn check_math_placement(state: &State, id: &ElemId, role: PartRole, part: &str, 
 /// same namespace is reported here rather than silently read as present (a
 /// same-prefix duplicate is rejected earlier, as a malformed attribute).
 fn check_protection(id: &ElemId, attrs: &[Attribute], res: &NamespaceResolver, role: PartRole, part: &str, acc: &mut Acc) {
-    if !role.is_settings || !id.w() || !matches!(id.local.as_str(), "documentProtection" | "writeProtection") {
+    if !role.is_settings() || !id.w() || !matches!(id.local.as_str(), "documentProtection" | "writeProtection") {
         return;
     }
     let count = |name: &str| -> usize {
@@ -1170,7 +1251,7 @@ fn check_protection(id: &ElemId, attrs: &[Attribute], res: &NamespaceResolver, r
 /// with no `w:val`, or a val of true/1/on, sets it; an explicit false/0/off
 /// leaves it unset.
 fn record_compat_flag(state: &mut State, id: &ElemId, attrs: &[Attribute], res: &NamespaceResolver, role: PartRole) {
-    if role.is_settings && id.w() && id.local == "uiCompat97to2003" {
+    if role.is_settings() && id.w() && id.local == "uiCompat97to2003" {
         let off = matches!(attr_ns(attrs, res, NS_W, b"val").as_deref(), Some(v) if v.eq_ignore_ascii_case("false") || v == "0" || v.eq_ignore_ascii_case("off"));
         if !off {
             state.compat_97 = true;
@@ -1190,7 +1271,7 @@ fn record_note_pr(state: &mut State, id: &ElemId, attrs: &[Attribute], res: &Nam
         return;
     }
     let is_end = id.local == "endnote";
-    if ((is_end && role.is_endnotes) || (!is_end && role.is_footnotes))
+    if ((is_end && role.is_endnotes()) || (!is_end && role.is_footnotes()))
         && let Some(t) = attr_ns(attrs, res, NS_W, b"type")
         && matches!(t.as_str(), "separator" | "continuationSeparator" | "continuationNotice")
         && let Some(x) = attr_ns(attrs, res, NS_W, b"id").map(DecimalId::parse)
@@ -1201,7 +1282,7 @@ fn record_note_pr(state: &mut State, id: &ElemId, attrs: &[Attribute], res: &Nam
             state.special_notes.push((x, is_end, t));
         }
     }
-    if role.is_settings
+    if role.is_settings()
         && let Some(parent) = state.frames.last()
     {
         let listed = if is_end { parent.is_endnote_pr } else { parent.is_footnote_pr };
@@ -1222,7 +1303,7 @@ fn record_note_pr(state: &mut State, id: &ElemId, attrs: &[Attribute], res: &Nam
 /// present." The element's only schema location is as a mailMerge
 /// child, so presence is judged there.
 fn check_header_source(state: &State, id: &ElemId, role: PartRole, part: &str, acc: &mut Acc) {
-    if role.is_settings && id.w() && id.local == "headerSource" && state.frames.last().is_some_and(|f| f.is_mail_merge) {
+    if role.is_settings() && id.w() && id.local == "headerSource" && state.frames.last().is_some_and(|f| f.is_mail_merge) {
         acc.add(
             "HEADERSOURCE-PRESENT",
             Some(part.to_string()),
@@ -1316,7 +1397,7 @@ struct AltCtx {
 /// ancestry — a repeat is excused exactly when the two occurrences
 /// sit in different branch instances of some block enclosing both.
 fn check_para_ids(state: &mut State, id: &ElemId, attrs: &[Attribute], res: &NamespaceResolver, role: PartRole, part: &str, acc: &mut Acc) {
-    if !role.is_story {
+    if !role.is_story() {
         return;
     }
     let para = attr_ns(attrs, res, NS_W14, b"paraId").map(HexId::parse);
@@ -1426,7 +1507,7 @@ fn on_empty(state: &mut State, id: &ElemId, attrs: &[Attribute], res: &Namespace
     check_para_ids(state, id, attrs, res, role, part, acc);
     record_compat_flag(state, id, attrs, res, role);
     record_note_pr(state, id, attrs, res, role);
-    if id.w() && id.local == "tc" && role.is_main {
+    if id.w() && id.local == "tc" && role.is_main() {
         acc.add("STRUCT-TC-NO-P", Some(part.to_string()), format!("w:tc in {part} has no block-level content"));
     }
     record_ids(state, id, attrs, res, role, part);
@@ -1435,7 +1516,7 @@ fn on_empty(state: &mut State, id: &ElemId, attrs: &[Attribute], res: &Namespace
 
 /// Record defined and referenced IDs across story parts (comments, footnotes, endnotes, bookmarks, revisions).
 fn record_ids(state: &mut State, id: &ElemId, attrs: &[Attribute], res: &NamespaceResolver, role: PartRole, part: &str) {
-    if !role.is_story {
+    if !role.is_story() {
         return;
     }
     record_comment_ids(state, id, attrs, res, role, part);
@@ -1458,7 +1539,7 @@ fn record_ids(state: &mut State, id: &ElemId, attrs: &[Attribute], res: &Namespa
 /// note (c) and §17.13.4.3 note (b): Word ignores commentRangeStart and
 /// commentRangeEnd under a header, footer, text box, footnote, or endnote.
 fn range_scope(state: &State, role: PartRole) -> bool {
-    (role.is_main || role.is_glossary) && !state.frames.iter().any(|f| f.is_txbx_content)
+    (role.is_main() || role.is_glossary()) && !state.frames.iter().any(|f| f.is_txbx_content)
 }
 
 /// Collect one comment range id under the fact budget (the bookmark
@@ -1477,7 +1558,7 @@ fn collect_range_id(set: &mut BTreeSet<DecimalId>, cap: usize, capped: &mut bool
 fn record_comment_ids(state: &mut State, id: &ElemId, attrs: &[Attribute], res: &NamespaceResolver, role: PartRole, part: &str) {
     let cap = state.fact_cap;
     match id.local.as_str() {
-        "comment" if id.w() && role.is_comments => {
+        "comment" if id.w() && role.is_comments() => {
             push_capped(&mut state.facts.comment_defs, cap, &mut state.fact_capped, attr_ns(attrs, res, NS_W, b"id").map(DecimalId::parse), part);
         }
         "commentReference" if id.w() => {
@@ -1504,7 +1585,7 @@ fn record_comment_ids(state: &mut State, id: &ElemId, attrs: &[Attribute], res: 
                 );
             }
         }
-        "p" if id.w() && role.is_comments => {
+        "p" if id.w() && role.is_comments() => {
             push_capped(
                 &mut state.facts.comment_para_ids,
                 cap,
@@ -1527,10 +1608,10 @@ fn record_note_ids(state: &mut State, id: &ElemId, attrs: &[Attribute], res: &Na
         "endnoteReference" if id.w() => {
             push_capped(&mut state.facts.endnote_refs, cap, &mut state.fact_capped, attr_ns(attrs, res, NS_W, b"id").map(DecimalId::parse), part);
         }
-        "footnote" if id.w() && role.is_footnotes => {
+        "footnote" if id.w() && role.is_footnotes() => {
             push_capped(&mut state.facts.footnote_defs, cap, &mut state.fact_capped, attr_ns(attrs, res, NS_W, b"id").map(DecimalId::parse), part);
         }
-        "endnote" if id.w() && role.is_endnotes => {
+        "endnote" if id.w() && role.is_endnotes() => {
             push_capped(&mut state.facts.endnote_defs, cap, &mut state.fact_capped, attr_ns(attrs, res, NS_W, b"id").map(DecimalId::parse), part);
         }
         _ => {}
@@ -1579,10 +1660,10 @@ fn record_revision_ids(state: &mut State, id: &ElemId, attrs: &[Attribute], res:
 fn record_reference_ids(state: &mut State, id: &ElemId, attrs: &[Attribute], res: &NamespaceResolver, role: PartRole, part: &str) {
     let cap = state.fact_cap;
     match id.local.as_str() {
-        "headerReference" if id.w() && role.is_main => {
+        "headerReference" if id.w() && role.is_main() => {
             push_capped(&mut state.facts.header_refs, cap, &mut state.fact_capped, attr_ns(attrs, res, NS_R, b"id").map(RelId::from), part);
         }
-        "footerReference" if id.w() && role.is_main => {
+        "footerReference" if id.w() && role.is_main() => {
             push_capped(&mut state.facts.footer_refs, cap, &mut state.fact_capped, attr_ns(attrs, res, NS_R, b"id").map(RelId::from), part);
         }
         "pStyle" | "rStyle" if id.w() => {
@@ -1607,13 +1688,16 @@ fn insert_name<T: Ord>(into: &mut BTreeSet<T>, cap: usize, capped: &mut bool, va
 }
 
 /// Push a `(value, part)` pair into a vector, bounded by the fact capacity limit.
-fn push_capped<T>(into: &mut Vec<(T, String)>, cap: usize, capped: &mut bool, value: Option<T>, part: &str) {
+fn push_capped<T>(into: &mut Observed<Vec<(T, String)>>, cap: usize, capped: &mut bool, value: Option<T>, part: &str) {
     if into.len() >= cap {
         *capped = true;
+        if value.is_some() {
+            into.invalidate("collection fact budget");
+        }
         return;
     }
-    if let Some(v) = value {
-        into.push((v, part.to_string()));
+    if let Some(value) = value {
+        *capped |= into.push_bounded((value, part.to_string()), cap);
     }
 }
 

@@ -86,8 +86,8 @@ fn selected_glossary_keeps_nested_glossary_header_in_both_zip_orders() {
             for incomplete in [false, true] {
                 pkg.entries_truncated = incomplete;
                 let map = owner_index_map(&pkg);
-                assert_eq!(part_owners(&map, "word/g2/document.xml"), &[1]);
-                assert_eq!(part_owners(&map, HEADER), &[1]);
+                assert_eq!(part_owners(&map, "word/g2/document.xml"), &[OwnerId(2)]);
+                assert_eq!(part_owners(&map, HEADER), if direct_header { &[OwnerId(1), OwnerId(2)][..] } else { &[OwnerId(2)][..] });
             }
         }
     }
@@ -109,7 +109,7 @@ fn selected_glossary_traverses_a_second_official_glossary_edge() {
             }),
             Some("word/glossary/document.xml")
         );
-        assert_eq!(part_owners(&owner_index_map(&pkg), HEADER), &[1]);
+        assert_eq!(part_owners(&owner_index_map(&pkg), HEADER), &[OwnerId(2)]);
     }
 }
 
@@ -134,10 +134,11 @@ fn boundary_only_descendants_never_fallback_to_main_or_no_owner() {
                     pkg.glossary = Resolution::Absent;
                 }
                 let map = owner_index_map(&pkg);
+                let b = owner_scopes(&pkg).iter().position(|o| o.root() == Some("word/g2/document.xml")).unwrap();
                 for part in ["word/g2/document.xml", "word/g2/footnotes.xml", "word/g2/comments.xml", HEADER, "word/g2/tail.xml"] {
-                    assert!(part_owners(&map, part).is_empty(), "{part}: {map:?}");
+                    assert_eq!(part_owners(&map, part), &[OwnerId(b)], "{part}: {map:?}");
                 }
-                assert_eq!(part_owners(&map, "word/orphan.xml"), &[0]);
+                assert!(part_owners(&map, "word/orphan.xml").is_empty());
             }
         }
     }
@@ -155,7 +156,7 @@ fn direct_main_reachability_survives_a_boundary_crossed_path() {
             }
             let pkg = loaded(&d);
             let map = owner_index_map(&pkg);
-            assert_eq!(part_owners(&map, HEADER), if selected_reaches_b { &[0, 1][..] } else { &[0][..] });
+            assert_eq!(part_owners(&map, HEADER), &[OwnerId(0), OwnerId(2)]);
             // These IDs really are absent from main: its direct header membership must be checked.
             let report = validate_bytes(&d.build());
             for rule in ["REF-NOTE", "ID-COMMENT-REF"] {
@@ -169,7 +170,7 @@ fn direct_main_reachability_survives_a_boundary_crossed_path() {
 fn nested_glossary_header_uses_selected_glossary_definitions() {
     for reverse in [false, true] {
         let mut d = fixture(Some(CUSTOM), false, false);
-        // B still defines 2/4. Only A's selected sources establish definitions in this scope.
+        // B still defines 2/4 and its header uses B's own selected sources.
         // Keep the references only in the header: findings deduplicate the same missing ID.
         for folder in ["glossary", "g2"] {
             let name = format!("word/{folder}/document.xml");
@@ -181,10 +182,10 @@ fn nested_glossary_header_uses_selected_glossary_definitions() {
         if reverse {
             d.entries.reverse();
         }
-        assert_eq!(part_owners(&owner_index_map(&loaded(&d)), HEADER), &[1]);
+        assert_eq!(part_owners(&owner_index_map(&loaded(&d)), HEADER), &[OwnerId(2)]);
         let report = validate_bytes(&d.build());
         for rule in ["REF-NOTE", "ID-COMMENT-REF"] {
-            assert!(report.findings.iter().any(|f| f.rule == rule && f.part.as_deref() == Some(HEADER)), "{report:?}");
+            assert!(!report.findings.iter().any(|f| f.rule == rule && f.part.as_deref() == Some(HEADER)), "{report:?}");
         }
     }
 }
@@ -204,7 +205,7 @@ fn no_main_selected_glossary_still_traverses_nested_glossaries_as_owner_zero() {
         pkg.glossary = Resolution::One("word/glossary/document.xml".to_string());
         assert!(!matches!(pkg.main, Resolution::One(_)));
         let map = owner_index_map(&pkg);
-        assert_eq!(part_owners(&map, "word/g2/document.xml"), &[0]);
-        assert_eq!(part_owners(&map, HEADER), &[0]);
+        assert_eq!(part_owners(&map, "word/g2/document.xml"), &[OwnerId(1)]);
+        assert_eq!(part_owners(&map, HEADER), &[OwnerId(1)]);
     }
 }
