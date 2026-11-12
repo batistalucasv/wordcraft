@@ -5242,3 +5242,162 @@ fn round3_unknown_numbering_ownership() {
         r#"<w:p><w:pPr><w:numPr><w:numId w:val="9"/></w:numPr></w:pPr></w:p>"#,
     );
 }
+
+/// Shared special-note definitions must join against both owners' settings, for both families.
+#[test]
+fn round4_shared_special_note_joins() {
+    for (kind, ct) in [("footnote", CT_FOOTNOTES), ("endnote", CT_ENDNOTES)] {
+        let mut d = round2_note_pr_doc(kind, ct, true, false);
+        d.set(&format!("word/gloss-{kind}s.xml"), format!(r#"<w:{kind}s xmlns:w="{W_NS}"/>"#));
+        let single = validate_bytes(&d.build());
+        assert_eq!(single.verdict, Verdict::Pass, "{single:?}");
+        assert!(!has(&single, "NOTE-PR-LISTING"), "{single:?}");
+        round3_add_rel(&mut d, "glossary", "rShared", &format!("{kind}s"), &format!("{kind}s.xml"));
+        let shared = validate_bytes(&d.build());
+        assert_eq!(shared.verdict, Verdict::Fail, "{kind}: {shared:?}");
+        assert_eq!(shared.findings.iter().filter(|f| f.rule == "NOTE-PR-LISTING").count(), 1, "{shared:?}");
+        assert_finding(&shared, "NOTE-PR-LISTING", Some(&format!("word/{kind}s.xml")));
+        d.set("word/gloss-settings.xml", format!(r#"<w:settings xmlns:w="{W_NS}"><w:{kind}Pr><w:{kind} w:id="-1"/></w:{kind}Pr></w:settings>"#));
+        let satisfied = validate_bytes(&d.build());
+        assert_eq!(satisfied.verdict, Verdict::Pass, "{satisfied:?}");
+        assert!(!has(&satisfied, "NOTE-PR-LISTING") && !has(&satisfied, "NOTE-PR-DANGLING"), "{satisfied:?}");
+    }
+}
+
+/// A shared comments story referenced only in glossary must not be called unreferenced in main.
+#[test]
+fn round4_shared_unreferenced_comments() {
+    let mut d = fredapps_owner_doc("comment", CT_COMMENTS, "1", "1");
+    d.set_document("<w:p/>");
+    let single = validate_bytes(&d.build());
+    assert_eq!(single.verdict, Verdict::Pass, "{single:?}");
+    assert!(single.coverage_notes.iter().any(|n| n.contains("id 1 in word/comments.xml is never referenced")), "{single:?}");
+    round3_add_rel(&mut d, "glossary", "rShared", "comments", "comments.xml");
+    let shared = validate_bytes(&d.build());
+    assert_eq!(shared.verdict, Verdict::Pass, "{shared:?}");
+    assert!(!shared.coverage_notes.iter().any(|n| n.contains("never referenced")), "{shared:?}");
+    // Without that second context's reference, the shared definition really is unreferenced.
+    d.set("word/glossary.xml", format!(r#"<w:glossaryDocument xmlns:w="{W_NS}"><w:docParts/></w:glossaryDocument>"#));
+    let absent = validate_bytes(&d.build());
+    assert!(absent.coverage_notes.iter().any(|n| n.contains("id 1 in word/comments.xml is never referenced")), "{absent:?}");
+}
+
+/// Reach one header first through the satisfied owner, then through the owner missing its vocabulary.
+fn round4_shared_vocabulary(kind: &str, ct: &str, rule: &str, defs: &str, reference: &str) {
+    for reverse in [false, true] {
+        let mut d = fredapps_owner_doc("comment", CT_COMMENTS, "1", "1");
+        let good_owner = if reverse { "glossary" } else { "document" };
+        let bad_owner = if reverse { "document" } else { "glossary" };
+        for (owner, prefix) in [(good_owner, "good-"), (bad_owner, "bad-")] {
+            let empty = if kind == "styles" { format!(r#"<w:styles xmlns:w="{W_NS}"/>"#) } else { format!(r#"<w:numbering xmlns:w="{W_NS}"/>"#) };
+            d.add_with_override(&format!("word/{prefix}{kind}.xml"), ct, if owner == good_owner { defs.to_string() } else { empty });
+            round3_add_rel(&mut d, owner, "rV", kind, &format!("{prefix}{kind}.xml"));
+        }
+        d.add_with_override("word/shared-header.xml", CT_HEADER, format!(r#"<w:hdr xmlns:w="{W_NS}">{reference}</w:hdr>"#));
+        round3_add_rel(&mut d, good_owner, "rH", "header", "shared-header.xml");
+        let single = validate_bytes(&d.build());
+        assert_eq!(single.verdict, Verdict::Pass, "{single:?}");
+        assert!(!has(&single, rule), "{single:?}");
+        round3_add_rel(&mut d, bad_owner, "rH", "header", "shared-header.xml");
+        let shared = validate_bytes(&d.build());
+        assert_eq!(shared.verdict, Verdict::Pass, "the vocabulary rule is a warning: {shared:?}");
+        assert_eq!(shared.findings.iter().filter(|f| f.rule == rule).count(), 1, "{kind}, reverse {reverse}: {shared:?}");
+        assert_finding(&shared, rule, Some("word/shared-header.xml"));
+        d.set(&format!("word/bad-{kind}.xml"), defs.to_string());
+        let satisfied = validate_bytes(&d.build());
+        assert_eq!(satisfied.verdict, Verdict::Pass, "{satisfied:?}");
+        assert!(!has(&satisfied, rule), "{satisfied:?}");
+    }
+}
+
+/// A shared header's style is valid in main and absent in glossary, then the owner roles reverse.
+#[test]
+fn round4_shared_style_references() {
+    round4_shared_vocabulary(
+        "styles",
+        CT_STYLES,
+        "REF-STYLE",
+        &format!(r#"<w:styles xmlns:w="{W_NS}"><w:style w:type="paragraph" w:styleId="Known"/></w:styles>"#),
+        r#"<w:p><w:pPr><w:pStyle w:val="Known"/></w:pPr></w:p>"#,
+    );
+}
+
+/// A shared header's numId must be defined in both contexts, in both owner directions.
+#[test]
+fn round4_shared_numbering_references() {
+    round4_shared_vocabulary(
+        "numbering",
+        CT_NUMBERING,
+        "NUM-DANGLING",
+        &format!(
+            r#"<w:numbering xmlns:w="{W_NS}"><w:abstractNum w:abstractNumId="0"/><w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num></w:numbering>"#
+        ),
+        r#"<w:p><w:pPr><w:numPr><w:numId w:val="1"/></w:numPr></w:pPr></w:p>"#,
+    );
+}
+
+/// Reaching the comments story through glossary supplies its threading paragraph in that context.
+#[test]
+fn round4_shared_comment_threading() {
+    let mut d = fredapps_owner_doc("comment", CT_COMMENTS, "1", "1");
+    for (prefix, id) in [("", "00000001"), ("gloss-", "00000002")] {
+        d.set(
+            &format!("word/{prefix}comments.xml"),
+            format!(r#"<w:comments xmlns:w="{W_NS}" xmlns:w14="{W14_NS}"><w:comment w:id="1"><w:p w14:paraId="{id}"/></w:comment></w:comments>"#),
+        );
+        d.add_with_override(
+            &format!("word/{prefix}commentsExtended.xml"),
+            CT_COMMENTS_EXT,
+            format!(r#"<w15:commentsEx xmlns:w15="{W15_NS}"><w15:commentEx w15:paraId="00000001"/></w15:commentsEx>"#),
+        );
+        round3_add_rel(
+            &mut d,
+            if prefix.is_empty() { "document" } else { "glossary" },
+            "rE",
+            "commentsExtended",
+            &format!("{prefix}commentsExtended.xml"),
+        );
+    }
+    let single = validate_bytes(&d.build());
+    assert_eq!(single.findings.iter().filter(|f| f.rule == "COMMENTEX-LINK").count(), 1, "{single:?}");
+    assert_finding(&single, "COMMENTEX-LINK", Some("word/gloss-commentsExtended.xml"));
+    round3_add_rel(&mut d, "glossary", "rShared", "comments", "comments.xml");
+    let shared = validate_bytes(&d.build());
+    assert_eq!(shared.verdict, Verdict::Pass, "{shared:?}");
+    assert!(!has(&shared, "COMMENTEX-LINK"), "{shared:?}");
+    d.set(
+        "word/gloss-commentsExtended.xml",
+        format!(r#"<w15:commentsEx xmlns:w15="{W15_NS}"><w15:commentEx w15:paraId="00000003"/></w15:commentsEx>"#),
+    );
+    let absent = validate_bytes(&d.build());
+    assert_eq!(absent.findings.iter().filter(|f| f.rule == "COMMENTEX-LINK").count(), 1, "{absent:?}");
+    assert_finding(&absent, "COMMENTEX-LINK", Some("word/gloss-commentsExtended.xml"));
+}
+
+/// Custom XML reached through a shared header must use both owners' attached-schema contexts.
+#[test]
+fn round4_shared_custom_xml() {
+    let mut d = fredapps_owner_doc("comment", CT_COMMENTS, "1", "1");
+    for (owner, prefix, schema) in [("document", "", r#"<w:attachedSchema w:val="urn:shared"/>"#), ("glossary", "gloss-", "")] {
+        d.add_with_override(&format!("word/{prefix}settings.xml"), CT_SETTINGS, format!(r#"<w:settings xmlns:w="{W_NS}">{schema}</w:settings>"#));
+        round3_add_rel(&mut d, owner, "rS", "settings", &format!("{prefix}settings.xml"));
+    }
+    d.add_with_override("word/shared-header.xml", CT_HEADER, format!(r#"<w:hdr xmlns:w="{W_NS}"><w:p/></w:hdr>"#));
+    d.add_with_override("customXml/itemProps.xml", CT_CUSTOMXML_PROPS, format!(r#"<ds:datastoreItem xmlns:ds="{DS_NS}" ds:itemID="{{S}}"><ds:schemaRefs><ds:schemaRef ds:uri="urn:shared"/></ds:schemaRefs></ds:datastoreItem>"#));
+    d.set("customXml/item.xml", "<item/>");
+    d.set("customXml/_rels/item.xml.rels", rels_xml(r#"<Relationship Id="rP" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/customXmlProps" Target="itemProps.xml"/>"#));
+    d.set("word/_rels/shared-header.xml.rels", rels_xml(r#"<Relationship Id="rX" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/customXml" Target="../customXml/item.xml"/>"#));
+    round3_add_rel(&mut d, "document", "rH", "header", "shared-header.xml");
+    let single = validate_bytes(&d.build());
+    assert_eq!(single.verdict, Verdict::Pass, "{single:?}");
+    assert!(!has(&single, "CUSTOMXML-SCHEMA"), "{single:?}");
+    round3_add_rel(&mut d, "glossary", "rH", "header", "shared-header.xml");
+    let shared = validate_bytes(&d.build());
+    assert_eq!(shared.verdict, Verdict::Fail, "{shared:?}");
+    assert_eq!(shared.findings.iter().filter(|f| f.rule == "CUSTOMXML-SCHEMA").count(), 1, "{shared:?}");
+    assert_finding(&shared, "CUSTOMXML-SCHEMA", Some("customXml/itemProps.xml"));
+    d.set("word/gloss-settings.xml", format!(r#"<w:settings xmlns:w="{W_NS}"><w:attachedSchema w:val="urn:shared"/></w:settings>"#));
+    let satisfied = validate_bytes(&d.build());
+    assert_eq!(satisfied.verdict, Verdict::Pass, "{satisfied:?}");
+    assert!(!has(&satisfied, "CUSTOMXML-SCHEMA"), "{satisfied:?}");
+}

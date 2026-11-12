@@ -953,6 +953,14 @@ fn check_xml(pkg: &Package, acc: &mut Acc) -> XmlScan {
         // Pooled reference drops invalidate "never referenced" conclusions at their source.
         story_incomplete_parts
             .extend((facts.comment_refs.len().saturating_add(scanned.facts.comment_refs.len()) > acc.limits.facts).then(|| l.clone()));
+        // A pooled paragraph drop cannot establish absence in this source's comment-threading join.
+        if role.is_story && facts.comment_para_ids.len().saturating_add(scanned.facts.comment_para_ids.len()) > acc.limits.facts {
+            story_incomplete_parts.insert(l.clone());
+            acc.note(format!(
+                "{} lost pooled comment paragraph IDs at the {}-entry fact budget; comment-threading paragraph absence was not checked for its owners",
+                e.name, acc.limits.facts
+            ));
+        }
         if role.is_story && scan::merge_facts(&mut facts, scanned.facts, acc.limits.facts) {
             pooled_capped = true;
             if facts_pooled_part.is_none() {
@@ -4043,5 +4051,102 @@ mod round3_note_cap_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod round4_comment_para_tests {
+    //! Pooled paragraph loss must not manufacture owner-local comment-threading absence.
+    use super::*;
+    use std::io::{Cursor, Write};
+
+    /// Build the reviewer's shape with three paragraph slots and one paragraph in the other owner.
+    fn package(main_count: usize, missing_main: bool, missing_parent: bool) -> Vec<u8> {
+        let relns = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+        let mut parts = vec![
+            (
+                "_rels/.rels".to_string(),
+                format!(
+                    r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rM" Type="{relns}/officeDocument" Target="word/document.xml"/></Relationships>"#
+                ),
+            ),
+            ("word/document.xml".to_string(), format!(r#"<w:document xmlns:w="{NS_W}"><w:body><w:p/></w:body></w:document>"#)),
+            ("word/glossary.xml".to_string(), format!(r#"<w:glossaryDocument xmlns:w="{NS_W}"><w:docParts/></w:glossaryDocument>"#)),
+        ];
+        let mut overrides = format!(
+            r#"<Override PartName="/word/document.xml" ContentType="{}"/><Override PartName="/word/glossary.xml" ContentType="{}"/>"#,
+            package::MAIN_CONTENT_TYPE,
+            package::GLOSSARY_CONTENT_TYPE
+        );
+        for gloss in [false, true] {
+            let prefix = if gloss { "gloss-" } else { "" };
+            let owner = if gloss { "glossary" } else { "document" };
+            let extra =
+                if gloss { String::new() } else { format!(r#"<Relationship Id="rG" Type="{relns}/glossaryDocument" Target="glossary.xml"/>"#) };
+            parts.push((format!("word/_rels/{owner}.xml.rels"), format!(r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">{extra}<Relationship Id="rC" Type="{relns}/comments" Target="{prefix}comments.xml"/><Relationship Id="rE" Type="{relns}/commentsExtended" Target="{prefix}commentsExtended.xml"/></Relationships>"#)));
+            let paragraphs = if gloss {
+                r#"<w:p w14:paraId="00030D41"/>"#.to_string()
+            } else {
+                (1..=main_count).map(|id| format!(r#"<w:p w14:paraId="{id:08X}"/>"#)).collect()
+            };
+            parts.push((
+                format!("word/{prefix}comments.xml"),
+                format!(r#"<w:comments xmlns:w="{NS_W}" xmlns:w14="{NS_W14}"><w:comment w:id="1">{paragraphs}</w:comment></w:comments>"#),
+            ));
+            let id = if gloss {
+                "00030D41"
+            } else if missing_main {
+                "00000009"
+            } else {
+                "00000001"
+            };
+            let parent = if gloss && missing_parent { r#" w15:paraIdParent="00000008""# } else { "" };
+            parts.push((
+                format!("word/{prefix}commentsExtended.xml"),
+                format!(r#"<w15:commentsEx xmlns:w15="{NS_W15}"><w15:commentEx w15:paraId="{id}"{parent}/></w15:commentsEx>"#),
+            ));
+            overrides.push_str(&format!(r#"<Override PartName="/word/{prefix}comments.xml" ContentType="{}"/><Override PartName="/word/{prefix}commentsExtended.xml" ContentType="{}"/>"#, package::COMMENTS_CONTENT_TYPE, package::COMMENTS_EXTENDED_CONTENT_TYPE));
+        }
+        parts.push(("[Content_Types].xml".to_string(), format!(r#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/>{overrides}</Types>"#)));
+        let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        for (name, text) in parts {
+            zip.start_file(name, zip::write::SimpleFileOptions::default()).unwrap();
+            zip.write_all(text.as_bytes()).unwrap();
+        }
+        zip.finish().unwrap().into_inner()
+    }
+
+    /// The exact pooled-loss reproduction; reducing main's paragraph count restores PASS.
+    #[test]
+    fn round4_pooled_comment_paragraph_loss() {
+        let limits = Limits { facts: 3, ..Limits::default() };
+        let control = validate_bytes_limited(&package(2, false, false), limits);
+        assert_eq!(control.verdict, Verdict::Pass, "{control:?}");
+        assert!(!control.findings.iter().any(|f| f.rule == "COMMENTEX-LINK"), "{control:?}");
+        let report = validate_bytes_limited(&package(3, false, false), limits);
+        assert_eq!(report.verdict, Verdict::Incomplete, "{report:?}");
+        assert!(!report.findings.iter().any(|f| f.rule == "COMMENTEX-LINK"), "{report:?}");
+        assert!(
+            report.coverage_notes.iter().any(|n| n.contains("word/gloss-comments.xml") && n.contains("pooled comment paragraph IDs")),
+            "{report:?}"
+        );
+        assert!(report.coverage_notes.iter().any(|n| n.contains("comment-threading") && n.contains("word/glossary.xml")), "{report:?}");
+    }
+
+    /// A complete owner's real absence and the incomplete owner's independent parent check survive.
+    #[test]
+    fn round4_pooled_comment_loss_preserves_independent_links() {
+        let report = validate_bytes_limited(&package(3, true, true), Limits { facts: 3, ..Limits::default() });
+        let links: Vec<_> = report.findings.iter().filter(|f| f.rule == "COMMENTEX-LINK").collect();
+        assert_eq!(links.len(), 2, "{report:?}");
+        assert!(links.iter().any(|f| f.part.as_deref() == Some("word/commentsExtended.xml") && f.message.contains("no paragraph")), "{report:?}");
+        assert!(
+            links.iter().any(|f| f.part.as_deref() == Some("word/gloss-commentsExtended.xml") && f.message.contains("paraIdParent")),
+            "{report:?}"
+        );
+        assert!(
+            !links.iter().any(|f| f.part.as_deref() == Some("word/gloss-commentsExtended.xml") && f.message.contains("no paragraph")),
+            "{report:?}"
+        );
     }
 }
