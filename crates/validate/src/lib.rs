@@ -17,6 +17,8 @@
 // Step 0 of the grammar work: the tables land before any check reads them. This allow is
 // removed when the first grammar rule uses the module.
 #[cfg(test)]
+mod glossary_descendant_tests;
+#[cfg(test)]
 mod glossary_tests;
 #[allow(dead_code)]
 mod model;
@@ -2186,25 +2188,57 @@ fn discovery_unavailable(pkg: &Package, owner: Option<&str>) -> bool {
     }
 }
 
+/// Glossary-typed parts and their transitive descendants cannot enter a fallback pool: reaching
+/// them through a glossary does not establish main ownership. Walk every internal edge, including
+/// official glossary edges, and visit each loaded part once so cycles terminate.
+fn glossary_subtree_parts(pkg: &Package) -> HashSet<String> {
+    let mut queue: Vec<String> = pkg
+        .entries
+        .iter()
+        .filter(|e| !e.is_dir && pkg.content_types.of(&e.name) == Some(package::GLOSSARY_CONTENT_TYPE))
+        .map(|e| e.name.clone())
+        .collect();
+    let mut parts = HashSet::new();
+    while let Some(part) = queue.pop() {
+        if !parts.insert(part.to_ascii_lowercase()) {
+            continue;
+        }
+        let want = rels_part_name(&part);
+        if let Some(rp) = pkg.rels.iter().find(|r| r.name.eq_ignore_ascii_case(&want)) {
+            for r in &rp.rels {
+                if let Some(t) = &r.target_abs
+                    && let Some(name) = canonical_entry(pkg, t)
+                {
+                    queue.push(name);
+                }
+            }
+        }
+    }
+    parts
+}
+
 /// Map each part (lowercased) to every owner context that reaches it, indexed in
-/// [`owner_scopes`]. Glossary-typed parts are never traversed into or fallback-assigned to main;
-/// only the selected glossary seeds its own subtree, so its references cannot use main definitions.
+/// [`owner_scopes`]. Main traversal stops at glossary boundaries; the selected glossary traverses
+/// further glossaries in its own scope. Direct main reachability still establishes main membership
+/// even for a part also reached across a boundary. Neither fallback pool admits glossary subtrees.
 /// A shared story is checked in each established context, never silently assigned to the first.
-/// With no owner scope, the single `None` pool still excludes glossary-typed parts.
 fn owner_index_map(pkg: &Package) -> HashMap<String, Vec<usize>> {
     let owners = owner_scopes(pkg);
     let mut map: HashMap<String, Vec<usize>> = HashMap::new();
+    let fallback_excluded = glossary_subtree_parts(pkg);
     if owners.len() == 1 && owners[0].is_none() {
         if !ownership_discovery_complete(pkg) {
             return map;
         }
-        for e in pkg.entries.iter().filter(|e| !e.is_dir && pkg.content_types.of(&e.name) != Some(package::GLOSSARY_CONTENT_TYPE)) {
+        for e in pkg.entries.iter().filter(|e| !e.is_dir && !fallback_excluded.contains(&e.name.to_ascii_lowercase())) {
             map.insert(e.name.to_ascii_lowercase(), vec![0]);
         }
         return map;
     }
     for (i, owner) in owners.iter().enumerate() {
         let Some(owner) = owner else { continue };
+        // With no main, the selected glossary is context zero and must still traverse its subtree.
+        let is_main = pkg.main.as_deref().is_some_and(|main| main.eq_ignore_ascii_case(owner));
         let mut queue = vec![owner.clone()];
         let mut visited: HashSet<String> = HashSet::new();
         while let Some(part) = queue.pop() {
@@ -2216,16 +2250,17 @@ fn owner_index_map(pkg: &Package) -> HashMap<String, Vec<usize>> {
             let want = rels_part_name(&part);
             if let Some(rp) = pkg.rels.iter().find(|r| r.name.eq_ignore_ascii_case(&want)) {
                 for r in &rp.rels {
-                    if relationship_kind(&r.kind) == Some("glossaryDocument") {
+                    if is_main && relationship_kind(&r.kind) == Some("glossaryDocument") {
                         continue;
                     }
                     if let Some(t) = &r.target_abs
                         && let Some(name) = canonical_entry(pkg, t)
                     {
-                        // Every glossary-typed target is a boundary, including an unselected one
-                        // reached through a custom or Strict edge; pooling it would invent main joins.
-                        if pkg.content_types.of(&name) != Some(package::GLOSSARY_CONTENT_TYPE)
-                            && !pkg.glossary.as_deref().is_some_and(|g| g.eq_ignore_ascii_case(&name))
+                        // Main cannot cross a glossary boundary. The selected glossary must cross
+                        // it to retain established ownership of further glossaries and descendants.
+                        if !is_main
+                            || (pkg.content_types.of(&name) != Some(package::GLOSSARY_CONTENT_TYPE)
+                                && !pkg.glossary.as_deref().is_some_and(|g| g.eq_ignore_ascii_case(&name)))
                         {
                             queue.push(name);
                         }
@@ -2236,8 +2271,9 @@ fn owner_index_map(pkg: &Package) -> HashMap<String, Vec<usize>> {
     }
     // Only complete discovery can assign an unreached supporting part to the primary scope.
     // Otherwise an omitted glossary edge could own it; a missing map entry represents unknown.
+    // Known glossary descendants stay unknown unless an owner's traversal already reached them.
     if ownership_discovery_complete(pkg) {
-        for e in pkg.entries.iter().filter(|e| !e.is_dir && pkg.content_types.of(&e.name) != Some(package::GLOSSARY_CONTENT_TYPE)) {
+        for e in pkg.entries.iter().filter(|e| !e.is_dir && !fallback_excluded.contains(&e.name.to_ascii_lowercase())) {
             map.entry(e.name.to_ascii_lowercase()).or_insert_with(|| vec![0]);
         }
     }
@@ -2258,9 +2294,9 @@ fn part_owners<'a>(owner_map: &'a HashMap<String, Vec<usize>>, part: &str) -> &'
 }
 
 /// Whether a source could enter this owner's pool through the primary fallback assignment.
-/// `owner_index_map` assigns unreached non-glossary entries to context zero after complete discovery;
-/// an empty membership means discovery is incomplete or the source is an unselected glossary,
-/// never that the source is absent.
+/// `owner_index_map` assigns unreached entries outside glossary subtrees to context zero after
+/// complete discovery; an empty membership means discovery is incomplete or the source belongs
+/// to an unreached glossary subtree, never that the source is absent.
 /// Only the primary pool accepts fallback sources, so independent owners must remain checkable.
 fn unresolved_fallback_contributor(owner_map: &HashMap<String, Vec<usize>>, owner: usize, part: &str) -> bool {
     owner == 0 && part_owners(owner_map, part).is_empty()
