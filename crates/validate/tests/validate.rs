@@ -2267,6 +2267,7 @@ fn note_pr_listing_satisfied() {
     let mut d = special_footnotes_doc();
     let inner = settings_with_footnote_pr(&["0", "1"]);
     d.add_with_override("word/settings.xml", CT_SETTINGS, format!("<?xml version=\"1.0\"?><w:settings xmlns:w=\"{W_NS}\">{inner}</w:settings>"));
+    d.set_doc_rels(r#"<Relationship Id="rfootnotes" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/footnotes" Target="footnotes.xml"/><Relationship Id="rsettings" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/settings" Target="settings.xml"/>"#);
     let report = validate(&d);
     assert!(!has(&report, "NOTE-PR-LISTING"), "{:?}", report.findings);
     assert!(!has(&report, "NOTE-PR-DANGLING"), "{:?}", report.findings);
@@ -2276,7 +2277,8 @@ fn note_pr_listing_satisfied() {
 /// not be loaded.
 #[test]
 fn note_pr_listing_missing() {
-    let d = special_footnotes_doc();
+    let mut d = special_footnotes_doc();
+    d.set_doc_rels(r#"<Relationship Id="rfootnotes" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/footnotes" Target="footnotes.xml"/>"#);
     let report = validate(&d);
     assert_eq!(report.findings.iter().filter(|f| f.rule == "NOTE-PR-LISTING").count(), 2, "{:?}", report.findings);
     assert_finding(&report, "NOTE-PR-LISTING", Some("word/footnotes.xml"));
@@ -2290,6 +2292,7 @@ fn note_pr_listing_missing() {
 fn note_pr_listing_in_sectpr_does_not_satisfy() {
     let mut d = special_footnotes_doc();
     d.set_document(&format!("<w:p><w:r><w:t>x</w:t></w:r></w:p><w:sectPr>{}</w:sectPr>", settings_with_footnote_pr(&["0", "1"])));
+    d.set_doc_rels(r#"<Relationship Id="rfootnotes" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/footnotes" Target="footnotes.xml"/>"#);
     let report = validate(&d);
     assert_eq!(report.findings.iter().filter(|f| f.rule == "NOTE-PR-LISTING").count(), 2, "{:?}", report.findings);
 }
@@ -2306,6 +2309,7 @@ fn note_pr_listing_in_sectpr_does_not_satisfy() {
 fn note_pr_listing_error_even_when_required() {
     let mut d = special_footnotes_doc();
     d.set_document(r#"<w:p><w:r><w:footnoteReference w:id="2"/></w:r></w:p>"#);
+    d.set_doc_rels(r#"<Relationship Id="rfootnotes" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/footnotes" Target="footnotes.xml"/>"#);
     let report = validate(&d);
     let sep = report.findings.iter().find(|f| f.rule == "NOTE-PR-LISTING" && f.message.contains("type separator")).expect("separator finding");
     assert_eq!(sep.severity, Severity::Error, "{:?}", report.findings);
@@ -2318,7 +2322,8 @@ fn note_pr_listing_error_even_when_required() {
 /// separator required either: unreferenced content renders nothing.
 #[test]
 fn note_pr_listing_error_when_ordinary_unreferenced() {
-    let d = special_footnotes_doc();
+    let mut d = special_footnotes_doc();
+    d.set_doc_rels(r#"<Relationship Id="rfootnotes" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/footnotes" Target="footnotes.xml"/>"#);
     let report = validate(&d);
     let f = assert_finding(&report, "NOTE-PR-LISTING", Some("word/footnotes.xml"));
     assert_eq!(f.severity, Severity::Error, "{:?}", report.findings);
@@ -2336,6 +2341,7 @@ fn note_pr_listing_error_when_unused() {
             r#"<?xml version="1.0"?><w:footnotes xmlns:w="{W_NS}"><w:footnote w:type="continuationNotice" w:id="3"><w:p/></w:footnote></w:footnotes>"#
         ),
     );
+    d.set_doc_rels(r#"<Relationship Id="rfootnotes" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/footnotes" Target="footnotes.xml"/>"#);
     let report = validate(&d);
     let f = assert_finding(&report, "NOTE-PR-LISTING", Some("word/footnotes.xml"));
     assert_eq!(f.severity, Severity::Error);
@@ -2355,6 +2361,7 @@ fn note_pr_dangling_suppressed_when_notes_unreadable() {
     );
     let inner = settings_with_footnote_pr(&["0"]);
     d.add_with_override("word/settings.xml", CT_SETTINGS, format!("<?xml version=\"1.0\"?><w:settings xmlns:w=\"{W_NS}\">{inner}</w:settings>"));
+    d.set_doc_rels(r#"<Relationship Id="rfootnotes" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/footnotes" Target="footnotes.xml"/><Relationship Id="rsettings" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/settings" Target="settings.xml"/>"#);
     let report = validate(&d);
     assert!(!has(&report, "NOTE-PR-DANGLING"), "{:?}", report.findings);
     assert!(report.coverage_notes.iter().any(|n| n.contains("footnotePr")), "{:?}", report.coverage_notes);
@@ -2366,6 +2373,9 @@ fn note_pr_dangling_suppressed_when_notes_unreadable() {
 fn note_pr_incomplete_when_settings_unreadable_and_no_notes() {
     let mut d = Doc::minimal();
     d.add_with_override("word/settings.xml", CT_SETTINGS, format!("<w:settings xmlns:w=\"{W_NS}\"><w:footnotePr>"));
+    d.set_doc_rels(
+        r#"<Relationship Id="rsettings" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/settings" Target="settings.xml"/>"#,
+    );
     let report = validate(&d);
     assert!(report.coverage_notes.iter().any(|n| n.contains("footnotePr")), "{:?}", report.coverage_notes);
     assert!(!has(&report, "NOTE-PR-LISTING"), "{:?}", report.findings);
@@ -2383,6 +2393,9 @@ fn note_pr_listing_endnote() {
             r#"<?xml version="1.0"?><w:endnotes xmlns:w="{W_NS}"><w:endnote w:type="continuationNotice" w:id="3"><w:p/></w:endnote></w:endnotes>"#
         ),
     );
+    d.set_doc_rels(
+        r#"<Relationship Id="rendnotes" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/endnotes" Target="endnotes.xml"/>"#,
+    );
     let report = validate(&d);
     assert_finding(&report, "NOTE-PR-LISTING", Some("word/endnotes.xml"));
 }
@@ -2394,6 +2407,7 @@ fn note_pr_dangling_listing() {
     let mut d = special_footnotes_doc();
     let inner = settings_with_footnote_pr(&["0", "1", "7"]);
     d.add_with_override("word/settings.xml", CT_SETTINGS, format!("<?xml version=\"1.0\"?><w:settings xmlns:w=\"{W_NS}\">{inner}</w:settings>"));
+    d.set_doc_rels(r#"<Relationship Id="rfootnotes" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/footnotes" Target="footnotes.xml"/><Relationship Id="rsettings" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/settings" Target="settings.xml"/>"#);
     let report = validate(&d);
     let f = assert_finding(&report, "NOTE-PR-DANGLING", None);
     assert_eq!(f.severity, Severity::Warning);
@@ -2401,13 +2415,17 @@ fn note_pr_dangling_listing() {
 }
 
 /// An unreadable settings part leaves the join incomplete: no listing
-/// findings, and the run is INCOMPLETE with a coverage note.
+/// findings, and a coverage note; malformed reachable XML independently fails.
 #[test]
 fn note_pr_unknown_when_settings_unreadable() {
     let mut d = special_footnotes_doc();
     d.add_with_override("word/settings.xml", CT_SETTINGS, format!("<w:settings xmlns:w=\"{W_NS}\"><w:footnotePr>"));
+    d.set_doc_rels(r#"<Relationship Id="rfootnotes" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/footnotes" Target="footnotes.xml"/><Relationship Id="rsettings" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/settings" Target="settings.xml"/>"#);
     let report = validate(&d);
-    assert_eq!(report.verdict, Verdict::Incomplete, "findings: {:?}", report.findings);
+    // Reachable unclosed XML independently gets the pre-existing XML-MALFORMED Error:
+    // Word must load settings and refuses or repairs it, so FAIL is correct. INCOMPLETE
+    // was an orphan-fixture artifact; the join assertions below remain unchanged.
+    assert_eq!(report.verdict, Verdict::Fail, "findings: {:?}", report.findings);
     assert!(!has(&report, "NOTE-PR-LISTING"), "{:?}", report.findings);
     assert!(report.coverage_notes.iter().any(|n| n.contains("footnotePr")), "{:?}", report.coverage_notes);
 }
@@ -5254,7 +5272,11 @@ fn round4_shared_special_note_joins() {
         let single = validate_bytes(&d.build());
         assert_eq!(single.verdict, Verdict::Pass, "{single:?}");
         assert!(!has(&single, "NOTE-PR-LISTING"), "{single:?}");
-        round3_add_rel(&mut d, "glossary", "rShared", &format!("{kind}s"), &format!("{kind}s.xml"));
+        let rels = d.entries.iter().find(|(n, _)| n == "word/_rels/glossary.xml.rels").unwrap().1.clone();
+        let rels = String::from_utf8(rels).unwrap().replace(&format!("gloss-{kind}s.xml"), "shared-placeholder.xml");
+        // Replace the existing role target, keeping the shared part its only selected source.
+        let rels = rels.replace("shared-placeholder.xml", &format!("{kind}s.xml"));
+        d.set("word/_rels/glossary.xml.rels", rels);
         let shared = validate_bytes(&d.build());
         assert_eq!(shared.verdict, Verdict::Fail, "{kind}: {shared:?}");
         assert_eq!(shared.findings.iter().filter(|f| f.rule == "NOTE-PR-LISTING").count(), 1, "{shared:?}");
@@ -5363,7 +5385,11 @@ fn round4_shared_comment_threading() {
     let single = validate_bytes(&d.build());
     assert_eq!(single.findings.iter().filter(|f| f.rule == "COMMENTEX-LINK").count(), 1, "{single:?}");
     assert_finding(&single, "COMMENTEX-LINK", Some("word/gloss-commentsExtended.xml"));
-    round3_add_rel(&mut d, "glossary", "rShared", "comments", "comments.xml");
+    let rels = d.entries.iter().find(|(n, _)| n == "word/_rels/glossary.xml.rels").unwrap().1.clone();
+    let rels = String::from_utf8(rels).unwrap().replace("gloss-comments.xml", "shared-placeholder.xml");
+    // Replace the existing role target, keeping the shared part its only selected source.
+    let rels = rels.replace("shared-placeholder.xml", "comments.xml");
+    d.set("word/_rels/glossary.xml.rels", rels);
     let shared = validate_bytes(&d.build());
     assert_eq!(shared.verdict, Verdict::Pass, "{shared:?}");
     assert!(!has(&shared, "COMMENTEX-LINK"), "{shared:?}");
