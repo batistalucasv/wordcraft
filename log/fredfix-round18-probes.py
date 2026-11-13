@@ -10,7 +10,8 @@ RESULTS=[]
 TMP=Path(tempfile.mkdtemp(prefix='wordcraft-r18-'))
 COPY=TMP/'crates/validate'
 shutil.copytree(ROOT/'crates/validate',COPY,ignore=shutil.ignore_patterns('__pycache__','target'))
-(TMP/'target').symlink_to(ROOT/'target',target_is_directory=True)
+(ROOT/'target/r18-probe-tool').mkdir(exist_ok=True)
+(TMP/'target').symlink_to(ROOT/'target/r18-probe-tool',target_is_directory=True)
 # A complete isolated validator crate, retaining all original sources/tests and locked versions.
 manifest=(ROOT/'Cargo.toml').read_text()
 lock=tomllib.loads((ROOT/'Cargo.lock').read_text())
@@ -64,7 +65,7 @@ def probe(number,label,name,mutation,accept=False,compile=False,test=None,diagno
  finally:path.write_text(before)
  RESULTS.append(record)
  print(number,label,'PASS' if record['pass'] else 'FAIL',record['exit'],record['output'].splitlines()[0] if record['output'] else '',flush=True)
- (ROOT/'log/fredfix-round18-probe-results'+Path('.json') if False else ROOT/'log/fredfix-round18-probe-results.json').write_text(json.dumps(RESULTS,indent=2)+'\n')
+ (ROOT/'log/fredfix-round18-probe-results.json').write_text(json.dumps(RESULTS,indent=2)+'\n')
 def condition(s,new):
  result,n=re.subn(r'if match package::canonical_entry\(pkg, target\) \{.*?\n            \} \{',new,s,count=1,flags=re.S)
  assert n==1
@@ -105,6 +106,24 @@ try:
   ('!pkg.entries_truncated\n        && !pkg.identity_incomplete','!pkg.identity_incomplete','2777 delete'),
   ('!pkg.entries_truncated\n        && !pkg.identity_incomplete','pkg.entries_truncated\n        && !pkg.identity_incomplete','2777 negate')]:
   probe(32,label,'lib.rs',lambda s,o=old,n=new:s.replace(o,n,1),diagnostic='entry-loss')
+ for callable in ['Self::prefix','HiddenDefinitions::prefix']:
+  a='\ntype HiddenDefinitions = Observed<HashSet<String>>; impl Observed<HashSet<String>> { fn unregistered_absence(&self, key: &String) -> bool { let prefix = '+callable+'; !prefix(self).contains(key) } }'
+  probe(33,callable,'lib.rs',lambda s,a=a:s+a,diagnostic='CompleteSet')
+ old='self.parts.values().flat_map(|p| p.special_notes.prefix().iter().cloned()).collect()'
+ for negative in [True,False]:
+  body='self.parts.values().flat_map(|p| { let retained = p.special_notes.prefix(); retained.iter().filter(|candidate| '+('!' if negative else '')+'retained.contains(candidate)).cloned() }).collect()'
+  probe(34,'exact prefix-only contract, negative='+str(negative),'lib.rs',lambda s,b=body:s.replace(old,b,1),accept=not negative,compile=not negative,diagnostic='CompleteSet' if negative else None)
+ for expression in ['Self::prefix(self).contains(key) == false','match Self::prefix(self).contains(key) { false => true, true => false }','matches!(Self::prefix(self).contains(key), false)']:
+  a='\nimpl Observed<HashSet<String>> { fn unregistered_absence(&self, key: &String) -> bool { '+expression+' } }'
+  probe(35,expression,'lib.rs',lambda s,a=a:s+a,diagnostic='CompleteSet')
+ for ty,expression in [('HashSet<String>','!Self::prefix(self).iter().any(|candidate| candidate == key)'),('HashMap<String, String>','Self::prefix(self).get(key).is_none()')]:
+  a='\nimpl Observed<'+ty+'> { fn unregistered_absence(&self, key: &String) -> bool { '+expression+' } }'
+  probe(36,expression,'lib.rs',lambda s,a=a:s+a,diagnostic='CompleteSet')
+ for prefix in ['<Self>::prefix(self)','<Observed<HashSet<String>>>::prefix(self)']:
+  a='\nimpl Observed<HashSet<String>> { fn unregistered_absence(&self, key: &String) -> bool { !'+prefix+'.contains(key) } }'
+  probe(37,'negative/'+prefix,'lib.rs',lambda s,a=a:s+a,diagnostic='CompleteSet')
+ for expression in ['Observed::is_complete(&self)','Self::is_complete(&self)','HiddenObservation::is_complete(&self)','<Self>::is_complete(&self)','<Observed<HashSet<K>>>::is_complete(&self)','{ let test = Self::is_complete; test(&self) }']:
+  probe(37,'CompleteSet provider/'+expression,'observed.rs',lambda s,e=expression:s.replace('if self.is_complete() {','if '+e+' {',1)+'\ntype HiddenObservation<T> = Observed<T>;\n',accept=True,test='observed::tests')
  # Later stage probes are installed below this marker.
 finally:
  shutil.rmtree(TMP)

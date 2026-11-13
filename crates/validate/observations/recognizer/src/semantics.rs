@@ -3,6 +3,8 @@
 use crate::{ident, tokens};
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use syn::parse::Parser;
+use syn::punctuated::Punctuated;
 use syn::{
     visit::{self, Visit},
     *,
@@ -81,6 +83,12 @@ fn last(text: &str) -> &str {
 fn lookup(name: &str) -> bool {
     matches!(name, "canonical_entry" | "entry_by_name" | "content_unavailable")
 }
+fn accessor(name: &str) -> bool {
+    matches!(
+        name,
+        "prefix" | "is_complete" | "project" | "into_complete_set" | "missing" | "append" | "retain_budget" | "push_bounded" | "invalidate"
+    )
+}
 fn raw_type(text: &str) -> bool {
     text.split(|c: char| !c.is_alphanumeric() && c != '_')
         .any(|w| matches!(w, "Package" | "Entry" | "ContentTypes" | "HashMap" | "BTreeMap" | "HashSet" | "BTreeSet"))
@@ -90,6 +98,8 @@ struct Origin {
     callable: Option<String>,
     outcome: bool,
     raw: bool,
+    prefix: bool,
+    membership: bool,
 }
 
 pub(crate) fn analyze(sig: &Signature, block: &Block, names: &Names, file: &str, self_type: &str) -> Value {
@@ -103,23 +113,23 @@ pub(crate) fn analyze(sig: &Signature, block: &Block, names: &Names, file: &str,
         function: ident(&sig.ident),
         self_type: self_type.into(),
         negative: false,
+        accessors: vec![],
+        scrub_paths: vec![],
+        positive_membership: vec![],
+        callable_context: 0,
         state_depth: 0,
         state_predicates: vec![],
     };
     for input in &sig.inputs {
         match input {
-            FnArg::Typed(p) => {
-                if let Pat::Ident(n) = p.pat.as_ref() {
-                    audit.bindings.insert(ident(&n.ident), Origin { raw: raw_type(&names.resolve(&tokens(&p.ty))), ..Origin::default() });
-                }
-            }
+            FnArg::Typed(p) => audit.bind(&p.pat, Origin { raw: raw_type(&names.resolve(&tokens(&p.ty))), ..Origin::default() }),
             FnArg::Receiver(_) => {
                 audit.bindings.insert("self".into(), Origin { raw: raw_type(self_type), ..Origin::default() });
             }
         }
     }
     audit.visit_block(block);
-    json!({"issues":audit.issues,"lookups":audit.calls,"state_predicates":audit.state_predicates})
+    json!({"issues":audit.issues,"lookups":audit.calls,"state_predicates":audit.state_predicates,"accessors":audit.accessors,"scrub_paths":audit.scrub_paths,"positive_membership":audit.positive_membership})
 }
 struct Flow {
     names: Names,
@@ -131,6 +141,10 @@ struct Flow {
     returns_absence: bool,
     self_type: String,
     negative: bool,
+    accessors: Vec<String>,
+    scrub_paths: Vec<String>,
+    positive_membership: Vec<String>,
+    callable_context: usize,
     state_depth: usize,
     state_predicates: Vec<String>,
 }
@@ -141,6 +155,30 @@ impl Flow {
     fn path(&self, p: &ExprPath) -> String {
         self.names.resolve(&tokens(p).replace("Self", &self.self_type))
     }
+    fn merge_origins(&self, values: impl IntoIterator<Item = Origin>) -> Origin {
+        let mut result = Origin::default();
+        for v in values {
+            result.prefix |= v.prefix;
+            result.raw |= v.raw;
+            result.outcome |= v.outcome;
+            result.membership |= v.membership;
+        }
+        result
+    }
+    fn bind(&mut self, pat: &Pat, origin: Origin) {
+        struct Bindings(Vec<String>);
+        impl<'ast> Visit<'ast> for Bindings {
+            fn visit_pat_ident(&mut self, p: &'ast PatIdent) {
+                self.0.push(ident(&p.ident));
+                visit::visit_pat_ident(self, p);
+            }
+        }
+        let mut bindings = Bindings(vec![]);
+        bindings.visit_pat(pat);
+        for name in bindings.0 {
+            self.bindings.insert(name, origin.clone());
+        }
+    }
     fn origin(&self, expr: &Expr) -> Origin {
         match expr {
             Expr::Path(p) => {
@@ -149,14 +187,36 @@ impl Flow {
                     return value.clone();
                 }
                 let name = last(&path);
-                Origin { callable: (lookup(name) || name == "canonical").then(|| name.into()), ..Origin::default() }
+                Origin {
+                    callable: (lookup(name) || (accessor(name) && (path.contains("::") || p.qself.is_some())) || name == "canonical")
+                        .then(|| name.into()),
+                    ..Origin::default()
+                }
             }
-            Expr::Call(c) => Origin { outcome: self.origin(&c.func).callable.is_some_and(|n| lookup(&n)), ..Origin::default() },
+            Expr::Call(c) => {
+                let name = self.origin(&c.func).callable;
+                match name.as_deref() {
+                    Some("prefix") => Origin { prefix: true, ..Origin::default() },
+                    Some(n) if lookup(n) => Origin { outcome: true, ..Origin::default() },
+                    _ => self.merge_origins(c.args.iter().map(|arg| self.origin(arg))),
+                }
+            }
+            Expr::Tuple(t) => self.merge_origins(t.elems.iter().map(|e| self.origin(e))),
             Expr::Reference(r) => self.origin(&r.expr),
             Expr::Paren(p) => self.origin(&p.expr),
             Expr::Group(g) => self.origin(&g.expr),
             Expr::Field(f) => Origin { raw: self.origin(&f.base).raw, ..Origin::default() },
-            Expr::MethodCall(m) => self.origin(&m.receiver),
+            Expr::MethodCall(m) => {
+                let origin = self.origin(&m.receiver);
+                match ident(&m.method).as_str() {
+                    "prefix" => Origin { prefix: true, ..Origin::default() },
+                    "into_complete_set" | "is_complete" | "missing" => Origin::default(),
+                    "contains" | "contains_key" | "any" | "is_none" | "is_some" | "is_some_and" => {
+                        Origin { membership: origin.prefix || origin.raw, ..origin }
+                    }
+                    _ => origin,
+                }
+            }
             _ => Origin::default(),
         }
     }
@@ -200,20 +260,35 @@ impl Flow {
     }
 }
 impl<'ast> Visit<'ast> for Flow {
+    fn visit_item_use(&mut self, item: &'ast ItemUse) {
+        let file = File { shebang: None, attrs: vec![], items: vec![Item::Use(item.clone())] };
+        self.names.aliases.extend(Names::from_file(&file).aliases);
+    }
+    fn visit_item_type(&mut self, item: &'ast ItemType) {
+        self.names.aliases.insert(ident(&item.ident), tokens(&item.ty));
+    }
+
     fn visit_block(&mut self, block: &'ast Block) {
         let saved = self.bindings.clone();
+        let names = self.names.clone();
         visit::visit_block(self, block);
         self.bindings = saved;
+        self.names = names;
     }
     fn visit_local(&mut self, local: &'ast Local) {
         if let Some(init) = &local.init {
             if matches!(&local.pat, Pat::Ident(p) if matches!(ident(&p.ident).as_str(), "entries_truncated" | "unknown_unreadable")) {
                 self.state_predicates.push(format!("producer {} = {}", tokens(&local.pat), tokens(&init.expr)));
             }
-            self.visit_expr(&init.expr);
-            if let Pat::Ident(p) = &local.pat {
-                self.bindings.insert(ident(&p.ident), self.origin(&init.expr));
+            let callable = self.origin(&init.expr).callable.is_some();
+            if callable {
+                self.callable_context += 1;
             }
+            self.visit_expr(&init.expr);
+            if callable {
+                self.callable_context -= 1;
+            }
+            self.bind(&local.pat, self.origin(&init.expr));
             if let Some((_, diverge)) = &init.diverge {
                 if self.origin(&init.expr).outcome {
                     self.pattern(&local.pat, false, true);
@@ -232,7 +307,19 @@ impl<'ast> Visit<'ast> for Flow {
             self.state_predicates.push(tokens(expr));
             self.state_depth += 1;
         }
+        let origin_here = self.origin(expr);
+        if origin_here.callable.is_some() && self.callable_context == 0 {
+            self.issue("tracked callable may only be invoked directly or bound to a local function value; escaping callable flow is unsupported");
+        }
+        if self.negative && origin_here.membership && origin_here.prefix {
+            self.issue("negative retained-prefix membership requires CompleteSet, regardless of contract or local binding");
+        }
         match expr {
+            Expr::Path(p) if accessor(last(&self.path(p))) => {
+                if p.qself.is_some() || p.path.segments.len() > 1 {
+                    self.scrub_paths.push(tokens(p));
+                }
+            }
             Expr::Path(p) if last(&self.path(p)) == "Absent" && self.file != "resolution.rs" => {
                 self.issue("unauthorized literal Resolution::Absent construction; use discovered with package loss evidence");
             }
@@ -240,6 +327,8 @@ impl<'ast> Visit<'ast> for Flow {
                 if let Some(name) = self.origin(&c.func).callable {
                     if lookup(&name) {
                         self.calls.push(name);
+                    } else if accessor(&name) {
+                        self.accessors.push(name);
                     } else if name == "canonical"
                         && !(self.file == "package.rs" && matches!(self.function.as_str(), "load" | "glossary_part" | "canonical_entry"))
                     {
@@ -261,11 +350,28 @@ impl<'ast> Visit<'ast> for Flow {
                         }
                     }
                 }
-                visit::visit_expr(self, expr);
+                self.callable_context += 1;
+                self.visit_expr(&c.func);
+                self.callable_context -= 1;
+                for arg in &c.args {
+                    self.visit_expr(arg);
+                }
             }
             Expr::MethodCall(m) => {
                 let origin = self.origin(&m.receiver);
                 let method = ident(&m.method);
+                if accessor(&method) {
+                    self.accessors.push(method.clone());
+                }
+                if origin.prefix
+                    && ((self.negative && matches!(method.as_str(), "contains" | "contains_key" | "any" | "is_some" | "is_some_and"))
+                        || method == "is_none")
+                {
+                    self.issue("negative retained-prefix membership requires CompleteSet, regardless of contract or local binding");
+                }
+                if !self.negative && method != "is_none" && (origin.prefix || origin.raw) && matches!(method.as_str(), "contains" | "contains_key") {
+                    self.positive_membership.push(tokens(&m.receiver).replace(' ', ""));
+                }
                 if origin.outcome {
                     self.issue("unsupported package Resolution operation; match One/Absent/Unknown/Ambiguous explicitly");
                 }
@@ -295,6 +401,11 @@ impl<'ast> Visit<'ast> for Flow {
                         self.pattern(&arm.pat, arm.guard.is_some(), false);
                     }
                 }
+                // A match on a retained membership bool is an absence-polarity spelling.
+                // Require CompleteSet instead of guessing how arbitrary arm bodies use false.
+                if self.origin(&m.expr).prefix && self.origin(&m.expr).membership {
+                    self.issue("boolean membership match on retained prefix requires CompleteSet");
+                }
                 visit::visit_expr(self, expr);
             }
             Expr::Let(l) => {
@@ -307,37 +418,70 @@ impl<'ast> Visit<'ast> for Flow {
             Expr::Binary(b) if matches!(b.op, BinOp::Eq(_)) && matches!(b.right.as_ref(), Expr::Lit(ExprLit {lit: Lit::Bool(v),..}) if !v.value) => {
                 self.negative_expr(&b.left, true);
             }
-            Expr::Macro(m) if last(&tokens(&m.mac.path)) == "matches" => {
-                struct MatchInput {
-                    expr: Expr,
-                    pat: Pat,
-                    guard: bool,
-                }
-                impl syn::parse::Parse for MatchInput {
-                    fn parse(input: syn::parse::ParseStream<'_>) -> syn::Result<Self> {
-                        let expr = input.parse()?;
-                        input.parse::<Token![,]>()?;
-                        let pat = Pat::parse_multi_with_leading_vert(input)?;
-                        let guard = input.peek(Token![if]);
-                        if guard {
-                            input.parse::<Token![if]>()?;
-                            let _: Expr = input.parse()?;
+            Expr::Macro(m) => {
+                let name = tokens(&m.mac.path);
+                match last(&name) {
+                    "matches" => {
+                        struct MatchInput {
+                            expr: Expr,
+                            pat: Pat,
+                            guard: Option<Expr>,
                         }
-                        if input.peek(Token![,]) {
-                            input.parse::<Token![,]>()?;
+                        impl syn::parse::Parse for MatchInput {
+                            fn parse(input: syn::parse::ParseStream<'_>) -> syn::Result<Self> {
+                                let expr = input.parse()?;
+                                input.parse::<Token![,]>()?;
+                                let pat = Pat::parse_multi_with_leading_vert(input)?;
+                                let guard = if input.peek(Token![if]) {
+                                    input.parse::<Token![if]>()?;
+                                    Some(input.parse()?)
+                                } else {
+                                    None
+                                };
+                                if input.peek(Token![,]) {
+                                    input.parse::<Token![,]>()?;
+                                }
+                                Ok(Self { expr, pat, guard })
+                            }
                         }
-                        Ok(Self { expr, pat, guard })
+                        if let Ok(m) = syn::parse2::<MatchInput>(m.mac.tokens.clone()) {
+                            if self.origin(&m.expr).outcome {
+                                self.pattern(&m.pat, m.guard.is_some(), false);
+                            }
+                            let negative = tokens(&m.pat) != "true" && self.origin(&m.expr).membership;
+                            self.negative_expr(&m.expr, self.negative || negative);
+                            if let Some(g) = m.guard {
+                                self.visit_expr(&g);
+                            }
+                        }
                     }
-                }
-                if let Ok(m) = syn::parse2::<MatchInput>(m.mac.tokens.clone()) {
-                    if self.origin(&m.expr).outcome {
-                        self.pattern(&m.pat, m.guard, false);
+                    "format" | "debug_assert" => {
+                        if let Ok(args) = Punctuated::<Expr, Token![,]>::parse_terminated.parse2(m.mac.tokens.clone()) {
+                            for arg in args {
+                                self.visit_expr(&arg);
+                            }
+                        }
                     }
-                    self.visit_expr(&m.expr);
+                    "vec" => {
+                        let ts = &m.mac.tokens;
+                        if let Ok(repeat) = syn::parse2::<ExprRepeat>(quote::quote!([#ts])) {
+                            self.visit_expr(&repeat.expr);
+                            self.visit_expr(&repeat.len);
+                        } else if let Ok(args) = Punctuated::<Expr, Token![,]>::parse_terminated.parse2(ts.clone()) {
+                            for arg in args {
+                                self.visit_expr(&arg);
+                            }
+                        }
+                    }
+                    _ => {} // Syntax recognition rejects all other expression macros.
                 }
             }
             Expr::Assign(a) => {
                 if let Expr::Path(p) = a.left.as_ref() {
+                    let old = self.origin(&a.left);
+                    if old.prefix || old.outcome || old.callable.is_some() {
+                        self.issue("reassignment of tracked observation/callable provenance is unsupported");
+                    }
                     self.bindings.insert(tokens(p), self.origin(&a.right));
                 }
                 visit::visit_expr(self, expr);

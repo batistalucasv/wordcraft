@@ -104,7 +104,10 @@ def recognize(sources):
     return response['ok']
 
 
-def consumption(code, enum_variants=()):
+def consumption(code, enum_variants=(), semantic=None):
+    if semantic:
+        for path in sorted(set(semantic.get('scrub_paths', [])), key=len, reverse=True):
+            code = code.replace(path, '__audited_accessor')
     # Qualified enum values are expressions, not collection types. Infer these
     # identities from recognized enum definitions instead of naming source exceptions.
     type_code = code
@@ -115,15 +118,17 @@ def consumption(code, enum_variants=()):
         type_code = re.sub(IDENT_START + path + IDENT_END, '', type_code)
     fields = ['field.'+m.group(1) for m in re.finditer(r'\.\s*(' + IDENT + r')',code) if m.group(1) in FIELDS]
     methods = ['access.'+m.group(1) for m in re.finditer(r'\.\s*(' + IDENT + r')\s*(?:\(|::)',code) if m.group(1) in ACCESSORS]
+    if semantic is not None and 'accessors' in semantic:
+        methods = ['access.'+name for name in semantic['accessors']]
     parsers = ['parser.'+m.group(1) for m in re.finditer(IDENT_START + r'(parse_' + IDENT + r')\s*\(',code)]
     types = ['type.'+m.group() for m in re.finditer(IDENT_START + r'(?:Observed|CompleteSet|Vec|HashSet|HashMap|BTreeSet|BTreeMap)' + IDENT_END, type_code)]
     return [f'{name}*{count}' for name,count in sorted(Counter(fields + methods + parsers + types).items())]
 
 
-def representation_footprint(header, code):
+def representation_footprint(header, code, semantic=None):
     private = Counter(re.findall(r'\bobserved_(?:value|status)\b', code))
     membership = Counter(re.sub(r'\s+', '', m.group(1)) for m in re.finditer(MEMBERSHIP, code))
-    return sorted(consumption(header+code) + [f'repr.{k}*{v}' for k,v in sorted(private.items())]
+    return sorted(consumption(header+code, semantic=semantic) + [f'repr.{k}*{v}' for k,v in sorted(private.items())]
                   + [f'membership.{k}*{v}' for k,v in sorted(membership.items())])
 
 
@@ -177,8 +182,8 @@ def declarations(sources):
             if state_predicates != entry_loss.get(state_key, []):
                 errors.append(f'{state_key}: entry-loss predicate differs from its named conservative/lookup contract')
             lookup_uses = [f'lookup.{k}*{v}' for k,v in sorted(Counter(semantic.get('lookups', [])).items())]
-            uses = sorted(consumption(header+code) + lookup_uses)
-            bounded_uses = consumption(header+code, enum_variants) + lookup_uses
+            uses = sorted(consumption(header+code, semantic=semantic) + lookup_uses)
+            bounded_uses = consumption(header+code, enum_variants, semantic) + lookup_uses
             decl = re.search(r'observation_contract\s*!\s*\{', code)
             declaration = body[decl.end():close_brace(code, decl.end()-1)] if decl else ''
             if name != 'observed.rs' and re.search(r'\.\s*(?:observed_value|observed_status)\b',code):
@@ -191,7 +196,7 @@ def declarations(sources):
             if name == 'observed.rs':
                 # The private implementation has explicit build-time contracts too.
                 # No function, initializer or consuming body can escape by file name.
-                footprint = representation_footprint(header, code)
+                footprint = representation_footprint(header, code, semantic)
                 if providers.get(func) != dict(header=header, collections=footprint) or func in seen_providers:
                     errors.append(f'{name}::{func}: representation contract differs or is missing')
                 seen_providers.add(func)
@@ -224,7 +229,7 @@ def declarations(sources):
             }
             for access in re.finditer(MEMBERSHIP, code):
                 receiver=re.sub(r'\s+', '', access.group(1))
-                if (name,func,receiver) not in structural_membership:
+                if (name,func,receiver) not in structural_membership and not (decl and receiver in semantic.get('positive_membership', [])):
                     errors.append(f'{name}::{func}: raw membership {receiver} bypasses CompleteSet or undeclared structural scope')
             if not bounded_uses and not decl and not re.search(r'\bacc\s*\.\s*(?:add|add_graded|ran)\s*\(', code):
                 continue
@@ -397,6 +402,15 @@ fn unregistered_read(pkg: &Package) -> usize { (|package_pattern!(items): &Packa
     for helper in ['canonical_entry', 'entry_by_name', 'content_unavailable']:
         for binding in ['hidden_lookup', 'package::'+helper]:
             mutations['R18 helper alias/value '+helper+'/'+binding] = ('lib.rs', lambda s, h=helper, b=binding: s+f'\nuse package::{h} as hidden_lookup; fn unregistered_absence(pkg: &Package, name: &str) -> bool {{ let lookup = {b}; let _ = lookup(pkg, name); false }}')
+    for source in ['Self::prefix(self)', '<Self>::prefix(self)', '<Observed<HashSet<String>>>::prefix(self)']:
+        for operation in ['!ACCESS.contains(key)', 'ACCESS.contains(key) == false', '!ACCESS.iter().any(|candidate| candidate == key)', 'matches!(ACCESS.contains(key), false)', 'match ACCESS.contains(key) { false => true, true => false }']:
+            expression = operation.replace('ACCESS', source)
+            mutations['R18 retained prefix '+expression] = ('lib.rs', lambda s, e=expression: s+'\nimpl Observed<HashSet<String>> { fn unregistered_absence(&self, key: &String) -> bool { '+e+' } }')
+    for callable in ['Self::prefix', 'HiddenDefinitions::prefix']:
+        mutations['R18 accessor function binding '+callable] = ('lib.rs', lambda s, c=callable: s+'\ntype HiddenDefinitions = Observed<HashSet<String>>; impl Observed<HashSet<String>> { fn unregistered_absence(&self, key: &String) -> bool { let prefix = '+c+'; !prefix(self).contains(key) } }')
+    mutations['R18 aliased UFCS'] = ('lib.rs', lambda s: s+'\ntype HiddenDefinitions = Observed<HashSet<String>>; fn unregistered_absence(value: &HiddenDefinitions, key: &String) -> bool { !HiddenDefinitions::prefix(value).contains(key) }')
+    mutations['R18 local prefix with exact original contract'] = ('lib.rs', lambda s: s.replace('self.parts.values().flat_map(|p| p.special_notes.prefix().iter().cloned()).collect()', 'self.parts.values().flat_map(|p| { let retained = p.special_notes.prefix(); retained.iter().filter(|candidate| !retained.contains(candidate)).cloned() }).collect()', 1))
+    mutations['R18 retained map get absence'] = ('lib.rs', lambda s: s+'\nimpl Observed<HashMap<String, String>> { fn unregistered_absence(&self, key: &String) -> bool { Self::prefix(self).get(key).is_none() } }')
     # The new-accessor mutation must introduce a different access kind to test exact declaration matching.
     mutations['new undeclared accessor']=('lib.rs', lambda s:s.replace('acc.ran("CUSTOMXML-SCHEMA");','acc.ran("CUSTOMXML-SCHEMA"); let _ = new_collection.retain_budget(n, cap);',1))
     for label,(name,mutation) in mutations.items():
@@ -424,6 +438,16 @@ fn unregistered_read(pkg: &Package) -> usize { (|package_pattern!(items): &Packa
     ]:
         changed = dict(sources); changed['lib.rs'] += '\n' + control
         assert declarations(changed) == rows
+    # CompleteSet's production provider must keep the exact representation footprint
+    # under all callable spellings, including a local function binding.
+    for expression in ['Observed::is_complete(&self)', 'Self::is_complete(&self)', 'HiddenObservation::is_complete(&self)', '<Self>::is_complete(&self)', '<Observed<HashSet<K>>>::is_complete(&self)', '{ let test = Self::is_complete; test(&self) }']:
+        changed = dict(sources)
+        changed['observed.rs'] += '\ntype HiddenObservation<T> = Observed<T>;\n'
+        changed['observed.rs'] = changed['observed.rs'].replace('if self.is_complete() {', 'if '+expression+' {', 1)
+        assert declarations(changed) == rows, expression
+    changed = dict(sources)
+    changed['lib.rs'] = changed['lib.rs'].replace('self.parts.values().flat_map(|p| p.special_notes.prefix().iter().cloned()).collect()', 'self.parts.values().flat_map(|p| { let retained = p.special_notes.prefix(); retained.iter().filter(|candidate| retained.contains(candidate)).cloned() }).collect()', 1)
+    assert declarations(changed) == rows, 'positive retained-prefix presence must remain accepted'
     print('accepted: current production corpus and non-consuming body controls')
     original=outputs(rows)
     try: verify_output('in-memory register', original[0]+'drift', original[0])

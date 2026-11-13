@@ -167,7 +167,10 @@ impl Audit {
         self.in_unit -= 1;
     }
     fn initializer(&mut self, name: &proc_macro2::Ident, ty: &Type, expr: &Expr) {
-        self.unit(format!("<initializer {}>", ident(name)), tokens(ty), tokens(expr));
+        let sig: Signature = syn::parse_quote!(fn initializer());
+        let block: Block = syn::parse_quote!({ #expr });
+        let semantic = semantics::analyze(&sig, &block, &self.names, &self.file, &self.self_type);
+        self.units.push(json!({"name":format!("<initializer {}>", ident(name)),"header":tokens(ty),"body":tokens(expr),"semantic":semantic}));
         self.in_unit += 1;
         self.visit_type(ty);
         self.visit_expr(expr);
