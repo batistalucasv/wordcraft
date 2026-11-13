@@ -804,7 +804,7 @@ pub(crate) fn validate_bytes_limited(bytes: &[u8], limits: Limits) -> Report {
 fn owner_roots_supported(pkg: &Package, acc: &mut Acc) -> bool {
     observation_contract! {
         rules: "-";
-        collections: "type.Vec*1";
+        collections: "lookup.entry_by_name*1,type.Vec*1";
         scope: "every independently established main/glossary owner root; Transitional namespace and expected root element";
         loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
         fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
@@ -819,7 +819,7 @@ fn owner_roots_supported(pkg: &Package, acc: &mut Acc) -> bool {
             OwnerContext::Glossary(name) => (name, "glossaryDocument"),
             OwnerContext::Fallback => continue,
         };
-        let Some(entry) = entry_by_name(pkg, name) else { continue };
+        let Resolution::One(entry) = entry_by_name(pkg, name) else { continue };
         let Some(text) = entry.decoded.as_deref() else { continue };
         let mut reader = NsReader::from_str(text);
         let mut buf = Vec::new();
@@ -890,7 +890,7 @@ pub fn validate_path(path: &Path) -> std::io::Result<Report> {
 fn check_content_types(pkg: &Package, acc: &mut Acc) {
     observation_contract! {
         rules: "CT-DUP-DEFAULT,CT-DUP-MAIN,CT-DUP-OVERRIDE,CT-MAIN-TYPE,CT-UNDECLARED";
-        collections: "field.content_types*7,field.dup_defaults*1,field.dup_overrides*1,field.entries*1,field.incomplete*2";
+        collections: "field.content_types*7,field.dup_defaults*1,field.dup_overrides*1,field.entries*1,field.incomplete*2,lookup.content_unavailable*1";
         scope: "source-local bounded extraction; no implicit document owner";
         loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
         fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
@@ -902,7 +902,12 @@ fn check_content_types(pkg: &Package, acc: &mut Acc) {
     }
     // The manifest is present but its content could not be read: no declaration is known, so no
     // part is established as undeclared (or mistyped). Absence is not established.
-    if package::content_unavailable(pkg, "[Content_Types].xml") {
+    if match package::content_unavailable(pkg, "[Content_Types].xml") {
+        Resolution::One(unavailable) => unavailable,
+        Resolution::Absent => false,
+        Resolution::Unknown(_) => true,
+        Resolution::Ambiguous(_) => true,
+    } {
         return;
     }
     acc.ran("CT-UNDECLARED");
@@ -1845,7 +1850,7 @@ fn report_malformed(pkg: &Package, name: &str, err: &str, acc: &mut Acc) {
 fn story_roles(pkg: &Package) -> HashMap<String, scan::PartRole> {
     observation_contract! {
         rules: "-";
-        collections: "field.content_types*1,field.entries*1,field.rels*2,type.HashMap*2";
+        collections: "field.content_types*1,field.entries*1,field.rels*2,lookup.canonical_entry*1,type.HashMap*2";
         scope: "source-local bounded extraction; no implicit document owner";
         loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
         fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
@@ -1865,7 +1870,7 @@ fn story_roles(pkg: &Package) -> HashMap<String, scan::PartRole> {
         for r in &rp.rels {
             let Some(role) = relationship_role(r.role.kind()) else { continue };
             let Some(target) = &r.target_abs else { continue };
-            if let Some(name) = package::canonical_entry(pkg, target) {
+            if let Resolution::One(name) = package::canonical_entry(pkg, target) {
                 roles.entry(name.to_ascii_lowercase()).and_modify(|existing| *existing = existing.merge(role)).or_insert(role);
             }
         }
@@ -1904,7 +1909,7 @@ fn relationship_role(kind: Option<&str>) -> Option<scan::PartRole> {
 fn check_rels(pkg: &Package, xml: &XmlScan, acc: &mut Acc) {
     observation_contract! {
         rules: "REL-DANGLING,REL-DUP-ID,REL-TYPED";
-        collections: "field.references*1,field.rels*3";
+        collections: "field.references*1,field.rels*3,lookup.canonical_entry*1";
         scope: "source-local bounded extraction; no implicit document owner";
         loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
         fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
@@ -1921,7 +1926,12 @@ fn check_rels(pkg: &Package, xml: &XmlScan, acc: &mut Acc) {
         for r in &rp.rels {
             let Some(target) = &r.target_abs else { continue };
             // An unexamined archive suffix may still contain this target.
-            if !pkg.entries_truncated && package::canonical_entry(pkg, target).is_none() {
+            if match package::canonical_entry(pkg, target) {
+                Resolution::One(_) => false,
+                Resolution::Absent => true,
+                Resolution::Unknown(_) => false,
+                Resolution::Ambiguous(_) => false,
+            } {
                 acc.add(
                     "REL-DANGLING",
                     Some(rp.name.clone()),
@@ -2001,7 +2011,7 @@ fn check_part_refs(pkg: &Package, refs: &[(String, Vec<RefFact>)], acc: &mut Acc
 fn check_typed_image_refs(pkg: &Package, refs: &[(String, Vec<RefFact>)], acc: &mut Acc) {
     observation_contract! {
         rules: "REL-TYPED";
-        collections: "field.content_types*2,field.incomplete*1,field.rels*1,type.HashSet*2,type.Vec*1";
+        collections: "field.content_types*2,field.incomplete*1,field.rels*1,lookup.content_unavailable*1,type.HashSet*2,type.Vec*1";
         scope: "source-local bounded extraction; no implicit document owner";
         loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
         fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
@@ -2031,7 +2041,12 @@ fn check_typed_image_refs(pkg: &Package, refs: &[(String, Vec<RefFact>)], acc: &
                 // depends on the manifest: when its content could not be read the target's declared
                 // type is unknown, not absent, so it is skipped. (The non-image-relationship and
                 // external-relationship conclusions above and below do not depend on the manifest.)
-                if !package::content_unavailable(pkg, "[Content_Types].xml") {
+                if !(match package::content_unavailable(pkg, "[Content_Types].xml") {
+                    Resolution::One(unavailable) => unavailable,
+                    Resolution::Absent => false,
+                    Resolution::Unknown(_) => true,
+                    Resolution::Ambiguous(_) => true,
+                }) {
                     let ct = pkg.content_types.of(target);
                     if (!pkg.content_types.incomplete || ct.is_some()) && !ct.is_some_and(|c| c.starts_with("image/")) {
                         acc.add(
@@ -2084,7 +2099,7 @@ fn part_rel_ids(pkg: &Package, part: &str) -> HashSet<RelId> {
 fn check_typed_targets(pkg: &Package, acc: &mut Acc) {
     observation_contract! {
         rules: "REL-TYPED";
-        collections: "field.content_types*2,field.incomplete*1,field.rels*2";
+        collections: "field.content_types*2,field.incomplete*1,field.rels*2,lookup.content_unavailable*1";
         scope: "source-local bounded extraction; no implicit document owner";
         loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
         fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
@@ -2094,7 +2109,12 @@ fn check_typed_targets(pkg: &Package, acc: &mut Acc) {
     // Every conclusion here compares a target's declared content type; when the manifest's content
     // could not be read, a target's type is UNKNOWN, not absent, so no type conclusion is
     // established. (The run is already INCOMPLETE from loading the manifest.)
-    if package::content_unavailable(pkg, "[Content_Types].xml") {
+    if match package::content_unavailable(pkg, "[Content_Types].xml") {
+        Resolution::One(unavailable) => unavailable,
+        Resolution::Absent => false,
+        Resolution::Unknown(_) => true,
+        Resolution::Ambiguous(_) => true,
+    } {
         return;
     }
     let Resolution::One(main) = &pkg.main else { return };
@@ -2196,7 +2216,7 @@ fn rels_owner_name(rels_name: &str) -> Option<String> {
 fn content_consumption(pkg: &Package, xml: &XmlScan, rp: &RelsPart) -> Observed<HashSet<RelId>> {
     observation_contract! {
         rules: "-";
-        collections: "access.invalidate*1,access.is_complete*1,access.prefix*1,access.project*1,field.content*1,field.content_types*1,field.exemptions*2,field.parts*1,type.HashSet*3,type.Observed*3";
+        collections: "access.invalidate*1,access.is_complete*1,access.prefix*1,access.project*1,field.content*1,field.content_types*1,field.exemptions*2,field.parts*1,lookup.entry_by_name*1,type.HashSet*3,type.Observed*3";
         scope: "source-local bounded extraction; no implicit document owner";
         loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
         fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
@@ -2211,9 +2231,12 @@ fn content_consumption(pkg: &Package, xml: &XmlScan, rp: &RelsPart) -> Observed<
         }
         return observed;
     }
-    let entry_present = entry_by_name(pkg, &owner).is_some();
-    let unknown =
-        (package::is_xml_part(pkg, &owner) || (pkg.content_types.of(&owner).is_none() && entry_present)) || (pkg.entries_truncated && !entry_present);
+    let unknown = match entry_by_name(pkg, &owner) {
+        Resolution::One(_) => package::is_xml_part(pkg, &owner) || pkg.content_types.of(&owner).is_none(),
+        Resolution::Absent => package::is_xml_part(pkg, &owner),
+        Resolution::Unknown(_) => true,
+        Resolution::Ambiguous(_) => true,
+    };
     Observed::with_status(
         HashSet::new(),
         if unknown { Completeness::Incomplete("XML consumption source unavailable") } else { Completeness::Complete },
@@ -2240,7 +2263,7 @@ fn content_consumption(pkg: &Package, xml: &XmlScan, rp: &RelsPart) -> Observed<
 fn check_typed_content(pkg: &Package, xml: &XmlScan, acc: &mut Acc) {
     observation_contract! {
         rules: "CT-MISMATCH";
-        collections: "access.into_complete_set*1,access.missing*1,field.content_types*1,field.rels*2,type.HashSet*2,type.Observed*1";
+        collections: "access.into_complete_set*1,access.missing*1,field.content_types*1,field.rels*2,lookup.canonical_entry*1,type.HashSet*2,type.Observed*1";
         scope: "per owning XML part consumption; first-bound contentPart relationship only; skipped text/xml and native InkML exemptions separate";
         loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
         fallback: "suppress customXml pairing when consumption unavailable; keep other relationships and independent contentPart presence/type findings";
@@ -2301,7 +2324,12 @@ fn check_typed_content(pkg: &Package, xml: &XmlScan, acc: &mut Acc) {
             } else {
                 Evidence::MsDocumented
             };
-            let part = canonical_entry(pkg, target).unwrap_or_else(|| target.clone());
+            let part = match canonical_entry(pkg, target) {
+                Resolution::One(name) => name,
+                Resolution::Absent => target.clone(),
+                Resolution::Unknown(_) => target.clone(),
+                Resolution::Ambiguous(_) => target.clone(),
+            };
             acc.add_graded(
                 "CT-MISMATCH",
                 Severity::Error,
@@ -2667,7 +2695,7 @@ fn check_header_footer_refs(pkg: &Package, facts: &scan::StoryFacts, acc: &mut A
 fn owner_rel_part<'a>(pkg: &'a Package, owner: &str, kind: &str) -> Resolution<&'a package::Entry> {
     observation_contract! {
         rules: "-";
-        collections: "field.rels*2";
+        collections: "field.rels*2,lookup.entry_by_name*1";
         scope: "source-local bounded extraction; no implicit document owner";
         loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
         fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
@@ -2690,7 +2718,15 @@ fn owner_rel_part<'a>(pkg: &'a Package, owner: &str, kind: &str) -> Resolution<&
             target = Some(t);
         }
     }
-    Resolution::discovered(target.and_then(|name| entry_by_name(pkg, name)), !discovery_unavailable(pkg, Some(owner)))
+    match target {
+        Some(name) => match entry_by_name(pkg, name) {
+            Resolution::One(entry) => Resolution::One(entry),
+            Resolution::Absent => Resolution::discovered(None, !discovery_unavailable(pkg, Some(owner))),
+            Resolution::Unknown(reason) => Resolution::Unknown(reason),
+            Resolution::Ambiguous(reason) => Resolution::Ambiguous(reason),
+        },
+        None => Resolution::discovered(None, !discovery_unavailable(pkg, Some(owner))),
+    }
 }
 
 /// Resolve a role without recording coverage, including the explicit no-owner fallback.
@@ -2740,7 +2776,7 @@ fn supporting_part<'a>(pkg: &'a Package, owner: Option<&str>, kind: &str, ct: &s
 fn discovery_unavailable(pkg: &Package, owner: Option<&str>) -> bool {
     observation_contract! {
         rules: "-";
-        collections: "field.content_types*1,field.incomplete*1";
+        collections: "field.content_types*1,field.incomplete*1,lookup.content_unavailable*1";
         scope: "source-local bounded extraction; no implicit document owner";
         loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
         fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
@@ -2753,7 +2789,14 @@ fn discovery_unavailable(pkg: &Package, owner: Option<&str>) -> bool {
     }
     match owner {
         Some(owner) => package::relationships_incomplete(pkg, owner),
-        None => package::content_unavailable(pkg, "[Content_Types].xml") || pkg.content_types.incomplete,
+        None => {
+            (match package::content_unavailable(pkg, "[Content_Types].xml") {
+                Resolution::One(unavailable) => unavailable,
+                Resolution::Absent => false,
+                Resolution::Unknown(_) => true,
+                Resolution::Ambiguous(_) => true,
+            }) || pkg.content_types.incomplete
+        }
     }
 }
 
@@ -2767,7 +2810,7 @@ fn owner_index_map(pkg: &Package) -> PartGraph {
 fn ownership_discovery_complete(pkg: &Package) -> bool {
     observation_contract! {
         rules: "-";
-        collections: "field.content_types*1,field.incomplete*2,field.rels*1";
+        collections: "field.content_types*1,field.incomplete*2,field.rels*1,lookup.content_unavailable*1";
         scope: "source-local bounded extraction; no implicit document owner";
         loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
         fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
@@ -2777,7 +2820,12 @@ fn ownership_discovery_complete(pkg: &Package) -> bool {
     !pkg.entries_truncated
         && !pkg.identity_incomplete
         && !pkg.content_types.incomplete
-        && !package::content_unavailable(pkg, "[Content_Types].xml")
+        && !(match package::content_unavailable(pkg, "[Content_Types].xml") {
+            Resolution::One(unavailable) => unavailable,
+            Resolution::Absent => false,
+            Resolution::Unknown(_) => true,
+            Resolution::Ambiguous(_) => true,
+        })
         && !pkg.rels.iter().any(|rp| rp.incomplete)
 }
 
@@ -3218,14 +3266,14 @@ fn check_numbering(pkg: &Package, xml: &XmlScan, acc: &mut Acc) {
 fn process_numbering_part(pkg: &Package, xml: &XmlScan, name: &str, cap: usize, acc: &mut Acc) -> Option<CompleteSet<DecimalId>> {
     observation_contract! {
         rules: "NUM-DANGLING";
-        collections: "access.into_complete_set*2,access.missing*1,field.abstract_ids*2,field.num_ids*2,field.num_to_abstract*1,parser.parse_numbering*1,type.CompleteSet*1,type.HashSet*2,type.Observed*2";
+        collections: "access.into_complete_set*2,access.missing*1,field.abstract_ids*2,field.num_ids*2,field.num_to_abstract*1,lookup.entry_by_name*1,parser.parse_numbering*1,type.CompleteSet*1,type.HashSet*2,type.Observed*2";
         scope: "source-local bounded extraction; no implicit document owner";
         loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
         fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
         package_loss: "NUM-DANGLING";
     }
 
-    let entry = entry_by_name(pkg, name)?;
+    let Resolution::One(entry) = entry_by_name(pkg, name) else { return None };
     if !xml_source_complete(xml, entry) {
         acc.note(format!("{name} was not fully examined; list numbering absence was not checked"));
         acc.set_incomplete();
@@ -3288,14 +3336,14 @@ fn report_style_num_refs(
 ) {
     observation_contract! {
         rules: "NUM-DANGLING";
-        collections: "access.missing*1,parser.parse_style_num_ids*1,type.CompleteSet*1,type.HashSet*1";
+        collections: "access.missing*1,lookup.entry_by_name*1,parser.parse_style_num_ids*1,type.CompleteSet*1,type.HashSet*1";
         scope: "each established owner and its selected supporting sources; shared parts in every owner; unowned references excluded; explicit no-root fallback only";
         loss: "source unavailable or malformed; XML event/depth budget; category allocation cap; unknown or ambiguous source discovery; source-local pooled-budget loss";
         fallback: "suppress only dependent absence directions and report Incomplete; independent owner and prefix findings survive";
         package_loss: "NUM-DANGLING";
     }
 
-    let Some(entry) = entry_by_name(pkg, styles_name) else { return };
+    let Resolution::One(entry) = entry_by_name(pkg, styles_name) else { return };
     let Some(text) = entry.decoded.as_deref() else {
         acc.note(format!("{styles_name} could not be read; style numbering references were not checked"));
         return;
@@ -3601,7 +3649,7 @@ fn read_comments_ids(entry: &package::Entry, xml: &XmlScan, cap: usize, acc: &mu
 fn check_custom_xml(pkg: &Package, xml: &XmlScan, acc: &mut Acc) {
     observation_contract! {
         rules: "CUSTOMXML-SCHEMA";
-        collections: "access.into_complete_set*2,access.missing*1,field.content_types*3,field.contexts*2,field.entries*3,parser.parse_attached_schemas*1,parser.parse_custom_xml_schemas*1,type.CompleteSet*1,type.HashSet*3,type.Observed*2,type.Vec*3";
+        collections: "access.into_complete_set*2,access.missing*1,field.content_types*3,field.contexts*2,field.entries*3,lookup.content_unavailable*1,parser.parse_attached_schemas*1,parser.parse_custom_xml_schemas*1,type.CompleteSet*1,type.HashSet*3,type.Observed*2,type.Vec*3";
         scope: "DECLARED EXCEPTION: PackageRegistryContext for established-unowned own declarations; reached declarations keep their selected registry; never grants story ownership";
         loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
         fallback: "unknown membership or registry source suppresses dependent absence; custom-XML Errors and informational unused-comment coverage retain the shipped package-registry policy";
@@ -3647,7 +3695,14 @@ fn check_custom_xml(pkg: &Package, xml: &XmlScan, acc: &mut Acc) {
         // absence (a readable source that reaches no settings) a genuine empty set. (The run is
         // already INCOMPLETE from loading the unreadable source.)
         if discovery_unavailable(pkg, owner.root()) {
-            if custom_xml_owners.contains(&i) || package::content_unavailable(pkg, "[Content_Types].xml") {
+            if custom_xml_owners.contains(&i)
+                || (match package::content_unavailable(pkg, "[Content_Types].xml") {
+                    Resolution::One(unavailable) => unavailable,
+                    Resolution::Absent => false,
+                    Resolution::Unknown(_) => false,
+                    Resolution::Ambiguous(_) => false,
+                })
+            {
                 let source = match owner.root() {
                     Some(o) => rels_part_name(o),
                     None => "[Content_Types].xml".to_string(),
@@ -5851,7 +5906,7 @@ mod round6_tests {
         let mut acc = Acc::default();
         let pkg = package::load(&bytes, &mut acc).unwrap();
         assert!(!pkg.xml_parts.contains("word/vendor.dat"));
-        assert!(entry_by_name(&pkg, "word/vendor.dat").unwrap().decode_error.is_none());
+        assert!(matches!(entry_by_name(&pkg, "word/vendor.dat"), Resolution::One(entry) if entry.decode_error.is_none()));
     }
 
     /// Absence suppression cannot hide an observed count; an unknown entry could supply a listing.

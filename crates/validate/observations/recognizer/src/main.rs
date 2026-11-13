@@ -2,6 +2,8 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+mod semantics;
+
 use proc_macro2::{Delimiter, Group, TokenStream, TokenTree};
 use quote::{ToTokens, quote};
 use serde_json::{Value, json};
@@ -133,6 +135,9 @@ fn substitute(stream: TokenStream, captures: &HashMap<String, TokenTree>) -> Che
 }
 
 struct Audit {
+    file: String,
+    names: semantics::Names,
+    self_type: String,
     error: Option<String>,
     units: Vec<Value>,
     surface: Vec<String>,
@@ -154,7 +159,8 @@ impl Audit {
         self.units.push(json!({"name":name,"header":header,"body":body}));
     }
     fn function(&mut self, sig: &Signature, block: &Block) {
-        self.unit(ident(&sig.ident), tokens(sig), tokens(block));
+        let semantic = semantics::analyze(sig, block, &self.names, &self.file, &self.self_type);
+        self.units.push(json!({"name":ident(&sig.ident),"header":tokens(sig),"body":tokens(block),"semantic":semantic}));
         self.in_unit += 1;
         self.visit_signature(sig);
         self.visit_block(block);
@@ -294,7 +300,9 @@ impl<'ast> Visit<'ast> for Audit {
                 if self_type != "PackageRegistryContext" || i.trait_.is_some() {
                     self.surface.push(self_type);
                 }
+                let old = std::mem::replace(&mut self.self_type, tokens(&i.self_ty));
                 visit::visit_item_impl(self, i);
+                self.self_type = old;
             }
             Item::Struct(s) => {
                 self.surface.push(tokens(&s.fields));
@@ -549,9 +557,12 @@ impl<'ast> Visit<'ast> for Audit {
     }
 }
 
-fn audit(source: &str, templates: HashMap<String, Template>) -> Check<(Value, HashMap<String, Template>)> {
+fn audit(name: &str, source: &str, templates: HashMap<String, Template>) -> Check<(Value, HashMap<String, Template>)> {
     let file = syn::parse_file(source).map_err(|e| format!("Rust parse failed: {e}"))?;
     let mut audit = Audit {
+        file: name.into(),
+        names: semantics::Names::from_file(&file),
+        self_type: String::new(),
         error: None,
         units: vec![],
         surface: vec![],
@@ -579,7 +590,7 @@ fn request(value: Value) -> Check<Value> {
     // lib.rs defines the no-code declaration macro for its child modules.
     for name in ["lib.rs"].into_iter().chain(sources.keys().map(String::as_str).filter(|n| *n != "lib.rs")) {
         if let Some(source) = sources.get(name) {
-            let (data, next) = audit(source.as_str().ok_or("expected source text")?, templates.clone()).map_err(|e| format!("{name}: {e}"))?;
+            let (data, next) = audit(name, source.as_str().ok_or("expected source text")?, templates.clone()).map_err(|e| format!("{name}: {e}"))?;
             result.insert(name.into(), data);
             if name == "lib.rs" {
                 templates = next;

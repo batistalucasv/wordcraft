@@ -143,6 +143,8 @@ def declarations(sources):
     rows=[];errors=[]
     providers = json.loads((Path(__file__).parent / 'representation-contracts.json').read_text())
     seen_providers = set()
+    entry_loss = json.loads((Path(__file__).parent / 'entry-loss-contracts.json').read_text())
+    seen_entry_loss = {}
     FIELDS.clear(); FIELDS.update(BASE_FIELDS)
     discover_fields(sources)
     known_rules=rule_registry(sources)
@@ -166,8 +168,17 @@ def declarations(sources):
         for unit in recognized[name]['units']:
             func, header, body = unit['name'], unit['header'], unit['body']
             header = normalized(mask(header)); code = normalized(mask(body))
-            uses = consumption(header+code)
-            bounded_uses = consumption(header+code, enum_variants)
+            semantic = unit.get('semantic', {})
+            errors.extend(f'{name}::{func}: {issue}' for issue in semantic.get('issues', []))
+            state_predicates = semantic.get('state_predicates', [])
+            state_key = f'{name}::{func}'
+            if state_predicates:
+                seen_entry_loss[state_key] = state_predicates
+            if state_predicates != entry_loss.get(state_key, []):
+                errors.append(f'{state_key}: entry-loss predicate differs from its named conservative/lookup contract')
+            lookup_uses = [f'lookup.{k}*{v}' for k,v in sorted(Counter(semantic.get('lookups', [])).items())]
+            uses = sorted(consumption(header+code) + lookup_uses)
+            bounded_uses = consumption(header+code, enum_variants) + lookup_uses
             decl = re.search(r'observation_contract\s*!\s*\{', code)
             declaration = body[decl.end():close_brace(code, decl.end()-1)] if decl else ''
             if name != 'observed.rs' and re.search(r'\.\s*(?:observed_value|observed_status)\b',code):
@@ -240,6 +251,7 @@ def declarations(sources):
             if key not in seen:
                 rows.append(dict(helper=f'{name}::{func}', **data))
                 seen.add(key)
+    if seen_entry_loss != entry_loss: errors.append('entry-loss producer/conservative-reader contracts missing')
     if seen_providers != set(providers): errors.append('representation contracts missing providers')
     covered={rule for row in rows for rule in row['rules'].split(',')}
     if known_rules-covered: errors.append(f'rule registry lacks observation contracts: {sorted(known_rules-covered)}')
@@ -255,7 +267,7 @@ def outputs(rows):
         'The gate enforces fail-closed syntax recognition over the production Rust in `src/lib.rs`, `src/observed.rs`, `src/ownership.rs`, `src/package.rs`, `src/resolution.rs`, and `src/scan.rs`. Inline `#[cfg(test)]` modules, separate test files, generated policy, and the non-consuming `model.rs`/`reserved.rs` tables are outside this boundary.\n'
         'Every item, expression body and pattern in those files must match the closed grammar in `observations/recognizer/src/main.rs`; unsupported syntax fails. External module declarations must resolve to a supplied source file or an explicit table/test/policy exclusion. Functions and impl methods, nested closures, const/static initializers, discriminants and type-level expressions are audited. Named-field patterns in binding, parameter, closure, match and assignment positions, pattern macros, traits and unaudited item/body kinds are rejected. Raw identifiers are normalized before footprint and registry checks.\n'
         'Single-arm item macro templates with ident/literal fragments and no repetition are instantiated and audited, both at definition and invocation; all other definitions and item macros fail. `observation_contract!` must expand to no code. The recognized `format!`, `vec!`, `matches!` and `debug_assert!` argument grammars are parsed and traversed, including their patterns and nested bodies; other expression macros and local definitions/imports shadowing these standard macros and glob imports fail. Named collection fields are discovered from recognized expansions too. Footprint identifiers retain complete Unicode identifiers, including combining marks; Python word boundaries are not Rust identifier boundaries.\n'
-        'Exact declared lexical footprints cover structural adapters and collection-typed locals; enum values alone do not trigger a collection declaration. Private representation providers have explicit signature/footprint contracts in `observations/representation-contracts.json`, with no file-wide function exemption. Macro instances with identical normalized bodies/headers/contracts share a register row. Fixtures check semantic truth; this is not Rust name resolution or an alias/dataflow proof.\n'
+        'Exact declared lexical footprints cover structural adapters and collection-typed locals; enum values alone do not trigger a collection declaration. Private representation providers have explicit signature/footprint contracts in `observations/representation-contracts.json`, with no file-wide function exemption. Macro instances with identical normalized bodies/headers/contracts share a register row. Package helper imports, module aliases and local function bindings are resolved in the closed grammar. Entry lookups carry Resolution; absence requires an explicit Absent arm, with Unknown separate. Literal Absent construction is sealed to resolution.rs, discovered lookups must consult both entry-loss states, and producer/conservative state predicates are pinned in observations/entry-loss-contracts.json. Raw iterator/map absence cannot be laundered by a contract. Fixtures check semantic truth; this is not general Rust name resolution or a whole-program dataflow proof.\n'
         'Build scripts, compiler expansion and procedural-macro implementations are outside the audit: recognized built-in derives and the existing serde `Serialize` derive are accepted by attribute name, without auditing their generated code. Other attribute macros and `cfg_attr` fail. Rust privacy seals the observation representation. The standalone locked recognizer is build-time tooling and does not enter validator/WASM dependencies.\n'
         'Only `check_custom_xml` (CUSTOMXML-SCHEMA) and `report_unreferenced_comments` (informational coverage) may consult PackageRegistryContext.\n'
         'That context admits established-unowned declarations to the primary package registry; it never grants story ownership.\n'
@@ -364,6 +376,27 @@ fn unregistered_read(pkg: &Package) -> usize { (|package_pattern!(items): &Packa
       'undeclared representation consumer': ('observed.rs', lambda s:s+'\nfn read(pkg: &Package) -> usize { pkg.entries.len() }'),
       'representation membership bypass': ('observed.rs', lambda s:s.replace('!self.0.contains(key)', '!self.0.contains(key) || raw.contains(key)', 1)),
     })
+    mutations.update({
+      'R18 obsolete Option absence': ('lib.rs', lambda s: re.sub(r'if match package::canonical_entry\(pkg, target\) \{.*?\n            \} \{', 'if package::canonical_entry(pkg, target).is_none() {', s, count=1, flags=re.S)),
+      'R18 raw iterator absence': ('package.rs', lambda s: s+'\nfn unregistered_absence(entries: &[Entry], name: &str) -> bool { !entries.iter().any(|entry| entry.name == name) }'),
+      'R18 contracted raw iterator absence': ('package.rs', lambda s: s+\
+          '\nfn unregistered_absence(entries: &[Entry], name: &str) -> bool { observation_contract! { rules: "-"; collections: "field.entries*1"; scope: "x"; loss: "x"; fallback: "x"; package_loss: "independent"; } !entries.iter().any(|entry| entry.name == name) }'),
+      'R18 helper-mediated absence': ('lib.rs', lambda s: s+'\nfn unregistered_absence(pkg: &Package, name: &str) -> bool { entry_by_name(pkg, name).is_none() }'),
+      'R18 raw slice alias': ('package.rs', lambda s: s+'\ntype HiddenEntries = [Entry]; fn unregistered_absence(entries: &HiddenEntries, name: &str) -> bool { !entries.iter().any(|entry| entry.name == name) }'),
+      'R18 fabricated absence': ('package.rs', lambda s: s+'\nfn invented() -> Resolution<()> { Resolution::Absent }'),
+      'R18 fabricated completeness': ('package.rs', lambda s: s.replace('Resolution::discovered(canonical(&pkg.entries, name), !pkg.entries_truncated && !pkg.identity_incomplete)', 'Resolution::discovered(canonical(&pkg.entries, name), true)', 1)),
+      'R18 Unknown-or-Absent': ('lib.rs', lambda s: s.replace('Resolution::Absent => true,\n                Resolution::Unknown(_) => false,', 'Resolution::Absent | Resolution::Unknown(_) => true,', 1)),
+      'R18 missing Unknown': ('lib.rs', lambda s: s.replace('                Resolution::Unknown(_) => false,\n', '', 1)),
+      'R18 direct state deletion': ('lib.rs', lambda s: s.replace('pkg.entries_truncated || pkg.identity_incomplete', 'pkg.identity_incomplete', 1)),
+      'R18 direct state negation': ('lib.rs', lambda s: s.replace('pkg.entries_truncated || pkg.identity_incomplete', '!pkg.entries_truncated || pkg.identity_incomplete', 1)),
+      'R18 discovery complete deletion': ('lib.rs', lambda s: s.replace('!pkg.entries_truncated\n        && !pkg.identity_incomplete', '!pkg.identity_incomplete', 1)),
+      'R18 discovery complete negation': ('lib.rs', lambda s: s.replace('!pkg.entries_truncated\n        && !pkg.identity_incomplete', 'pkg.entries_truncated\n        && !pkg.identity_incomplete', 1)),
+      'R18 reader assembly limit inversion': ('package.rs', lambda s: s.replace('zip.len() > limits.entries', 'zip.len() < limits.entries', 1)),
+      'R18 canonical external call': ('package.rs', lambda s: s+'\nfn invented(entries: &[Entry], name: &str) -> bool { canonical(entries, name).is_none() }'),
+    })
+    for helper in ['canonical_entry', 'entry_by_name', 'content_unavailable']:
+        for binding in ['hidden_lookup', 'package::'+helper]:
+            mutations['R18 helper alias/value '+helper+'/'+binding] = ('lib.rs', lambda s, h=helper, b=binding: s+f'\nuse package::{h} as hidden_lookup; fn unregistered_absence(pkg: &Package, name: &str) -> bool {{ let lookup = {b}; let _ = lookup(pkg, name); false }}')
     # The new-accessor mutation must introduce a different access kind to test exact declaration matching.
     mutations['new undeclared accessor']=('lib.rs', lambda s:s.replace('acc.ran("CUSTOMXML-SCHEMA");','acc.ran("CUSTOMXML-SCHEMA"); let _ = new_collection.retain_budget(n, cap);',1))
     for label,(name,mutation) in mutations.items():

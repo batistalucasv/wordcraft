@@ -982,12 +982,21 @@ pub(crate) fn rels_part_name(part: &str) -> String {
 
 /// Find the stored case-preserving entry name matching `name` (case-insensitive, leading slash stripped).
 fn canonical(entries: &[Entry], name: &str) -> Option<String> {
+    observation_contract! {
+        rules: "-";
+        collections: "-";
+        scope: "internal presence-only entry-name extraction; only package lookup and reader assembly may call canonical";
+        loss: "raw entries may be an examined prefix";
+        fallback: "None is no observed candidate, never established package absence";
+        package_loss: "independent";
+    }
+
     let n = name.trim_start_matches('/');
     entries.iter().find(|e| !e.is_dir && e.name.eq_ignore_ascii_case(n)).map(|e| e.name.clone())
 }
 
 /// The stored spelling of the part at `name` (case-insensitive, leading `/` ignored), if present.
-pub(crate) fn canonical_entry(pkg: &Package, name: &str) -> Option<String> {
+pub(crate) fn canonical_entry(pkg: &Package, name: &str) -> Resolution<String> {
     observation_contract! {
         rules: "-";
         collections: "field.entries*1";
@@ -997,11 +1006,11 @@ pub(crate) fn canonical_entry(pkg: &Package, name: &str) -> Option<String> {
         package_loss: "independent";
     }
 
-    canonical(&pkg.entries, name)
+    Resolution::discovered(canonical(&pkg.entries, name), !pkg.entries_truncated && !pkg.identity_incomplete)
 }
 
 /// The entry at `name` (case-insensitive, leading `/` ignored), if present.
-pub(crate) fn entry_by_name<'a>(pkg: &'a Package, name: &str) -> Option<&'a Entry> {
+pub(crate) fn entry_by_name<'a>(pkg: &'a Package, name: &str) -> Resolution<&'a Entry> {
     observation_contract! {
         rules: "-";
         collections: "field.entries*1";
@@ -1012,15 +1021,32 @@ pub(crate) fn entry_by_name<'a>(pkg: &'a Package, name: &str) -> Option<&'a Entr
     }
 
     let n = name.trim_start_matches('/');
-    pkg.entries.iter().find(|e| !e.is_dir && e.name.eq_ignore_ascii_case(n))
+    Resolution::discovered(
+        pkg.entries.iter().find(|e| !e.is_dir && e.name.eq_ignore_ascii_case(n)),
+        !pkg.entries_truncated && !pkg.identity_incomplete,
+    )
 }
 
 /// Whether the part at `name` is present in the package but its content could not be read. A
 /// cross-part check that would conclude *absence* from this part's content must skip instead:
 /// absence is not established from unavailable content. Part identity is matched exactly as part
 /// lookup does (OPC names are case-insensitive), so `_RELS/.RELS` is recognised the same way.
-pub(crate) fn content_unavailable(pkg: &Package, name: &str) -> bool {
-    entry_by_name(pkg, name).is_some_and(|e| e.content_unavailable)
+pub(crate) fn content_unavailable(pkg: &Package, name: &str) -> Resolution<bool> {
+    observation_contract! {
+        rules: "-";
+        collections: "lookup.entry_by_name*1";
+        scope: "entry content availability; missing entries retain package completeness";
+        loss: "archive entry cap; unknown entry identity; unreadable or undecodable bytes";
+        fallback: "Unknown supplies neither availability nor unavailability";
+        package_loss: "independent";
+    }
+
+    match entry_by_name(pkg, name) {
+        Resolution::One(entry) => Resolution::One(entry.content_unavailable),
+        Resolution::Absent => Resolution::discovered(None, !pkg.entries_truncated && !pkg.identity_incomplete),
+        Resolution::Unknown(reason) => Resolution::Unknown(reason),
+        Resolution::Ambiguous(reason) => Resolution::Ambiguous(reason),
+    }
 }
 
 /// Compute the set of lowercased package part paths reachable from the package relationships root and main document.
@@ -1149,7 +1175,7 @@ fn is_office_document_relationship(kind: &str) -> bool {
 pub(crate) fn relationships_incomplete(pkg: &Package, part: &str) -> bool {
     observation_contract! {
         rules: "-";
-        collections: "field.incomplete*1,field.rels*1";
+        collections: "field.incomplete*1,field.rels*1,lookup.content_unavailable*1";
         scope: "source-local bounded extraction; no implicit document owner";
         loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
         fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
@@ -1158,9 +1184,12 @@ pub(crate) fn relationships_incomplete(pkg: &Package, part: &str) -> bool {
 
     let name = rels_part_name(part);
     // An unexamined archive suffix may hold the missing relationships part.
-    ((pkg.entries_truncated || pkg.identity_incomplete) && entry_by_name(pkg, &name).is_none())
-        || content_unavailable(pkg, &name)
-        || pkg.rels.iter().any(|rp| rp.name.eq_ignore_ascii_case(&name) && rp.incomplete)
+    (match content_unavailable(pkg, &name) {
+        Resolution::One(unavailable) => unavailable,
+        Resolution::Absent => false,
+        Resolution::Unknown(_) => true,
+        Resolution::Ambiguous(_) => true,
+    }) || pkg.rels.iter().any(|rp| rp.name.eq_ignore_ascii_case(&name) && rp.incomplete)
 }
 
 /// The local kind of a relationship in a supported official namespace. A matching suffix alone
@@ -1193,7 +1222,7 @@ pub(crate) enum EntryPointProfile {
 pub(crate) fn entry_point_profile(pkg: &Package) -> Resolution<EntryPointProfile> {
     observation_contract! {
         rules: "-";
-        collections: "field.incomplete*1,field.rels*3";
+        collections: "field.incomplete*1,field.rels*3,lookup.content_unavailable*1";
         scope: "source-local bounded extraction; no implicit document owner";
         loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
         fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
@@ -1202,7 +1231,12 @@ pub(crate) fn entry_point_profile(pkg: &Package) -> Resolution<EntryPointProfile
 
     let complete = !pkg.entries_truncated
         && !pkg.identity_incomplete
-        && !content_unavailable(pkg, "_rels/.rels")
+        && (match content_unavailable(pkg, "_rels/.rels") {
+            Resolution::One(unavailable) => !unavailable,
+            Resolution::Absent => true,
+            Resolution::Unknown(_) => false,
+            Resolution::Ambiguous(_) => false,
+        })
         && !pkg.rels.iter().any(|rp| rp.name.eq_ignore_ascii_case("_rels/.rels") && rp.incomplete);
     let Some(rp) = pkg.rels.iter().find(|rp| rp.name.eq_ignore_ascii_case("_rels/.rels")) else {
         return Resolution::discovered(None, complete);
