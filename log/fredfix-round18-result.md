@@ -2,7 +2,7 @@
 
 Base `8dc309afe132bb09e90e7b19faf99cbfaf82db81`; branch `fix/5875-fredapps`.
 The amendment governs. No GitHub comments or pushes. No dependencies or licence changes.
-This file is the staged result; execution evidence is appended only after commands run.
+This file records the census-first commits, mechanisms, executed acceptance evidence and final gate.
 
 ## Stage 0 — census (before mechanism changes)
 
@@ -88,3 +88,67 @@ Runtime probes 45–47 ran through the full validator suite: round18_entry_looku
 Full gate on unchanged implementation inputs passed its stated criteria: validator ordinary **508/0/0**, corpus **508/0/0**, generator **135** rejected source mutations and **197** byte-current rows, both fmt/clippy checks, model, CLI 37 tests/build, private rustdoc coverage, assets, layers, WASM, i18n/language and doctests. Workspace tests retain the exact **19** baseline failures (6221 passed, 19 failed, 10 ignored); CI retains the exact two strict-export failures. Neither is described as globally green. Commands, tool versions, exit codes and input hashes are in fredfix-round18-final-gate-commands.json, final-tool-versions.json, final-gate-summary.json, final-source-hashes.json (all with the fredfix-round18- prefix). No source input changed during that gate.
 
 Register delta is **195 → 197**, with only two added rows: package.rs::canonical and package.rs::content_unavailable. Sixteen existing callers gain named lookup footprints: lib.rs::{owner_roots_supported, check_content_types, story_roles, check_rels, check_typed_image_refs, check_typed_targets, content_consumption, check_typed_content, owner_rel_part, discovery_unavailable, ownership_discovery_complete, process_numbering_part, report_style_num_refs, check_custom_xml}; package.rs::{relationships_incomplete, entry_point_profile}. package.rs::{canonical_entry, entry_by_name} also receive accurate identity-loss/scope/fallback wording. All 18 modified row identities and before/after columns are in fredfix-round18-register-delta.json. The generated Rust absence policy is byte-unchanged. R4 adds reader permissions in the separate exact-shape manifest/header, not extra consumer rows.
+
+## Stage 4 — close the Resolution interface and return-type aliases
+
+The final interface audit found three in-memory declaration-audit misses beyond the adopted battery: a Resolution parameter, a Resolution self receiver, and a raw absence function returning a bool alias. The first two had no bounded lexical footprint; the third could satisfy an exact empty lexical contract while its return alias hid the bool classification. These were accepted by declarations before this follow-up; this is not a claim that every one passed generated-register byte comparison.
+
+Incoming Resolution views, including type aliases and Self, now carry the same outcome provenance as lookup calls. Return-type aliases and parenthesized bool are normalized before the raw-absence rule. A package lookup result may be matched or locally bound; unmodeled callable/argument forwarding rejects rather than erasing its provenance. Extracting One, Unknown or Ambiguous payloads removes the wrapper tag so an Entry or Reason is not mistaken for another Resolution. No state-predicate, reader permission, PackageRegistryContext exception or probe expectation was relaxed.
+
+Five added source controls pass: plain Resolution parameter collapse, aliased Resolution parameter collapse, Resolution Self collapse, opaque-function argument collapse (all under probe 26), and a parenthesized bool alias with an exact raw contract (probe 30). The final source replay therefore has **141 variants**, all passing (22 accepted/compiled controls and 119 gate negatives), covering every source probe 1–44 plus the verbatim trait-impl companion. Its full diagnostics, fixture hashes and isolated compile/test results are recorded in fredfix-round18-probe-results.json and the compact fredfix-round18-probe-evidence.json. The earlier stage-3 counts describe that completed stage; this expanded replay supersedes them for the final tree. No additional register row or reader permission is needed.
+
+## Final per-finding acceptance map
+
+| Finding / request | Mechanism and scope | Executed acceptance evidence |
+|---|---|---|
+| F1 / R1–R2 | Four-state package lookups; named helper footprints; raw-negative-operation barrier; explicit Unknown polarity; pinned producer/completeness predicates | Source probes 1–4, 26–32 and interface companions; semantic probes 45–47, five added runtime tests; original false-absence and state-predicate mutations are red when the gate is bypassed |
+| F2 / R3 | Accessor identity normalization, local provenance and membership polarity; CompleteSet required for retained negative results | Probes 5–6, 33–37; all six equivalent CompleteSet spellings accept/compile with unchanged footprints; actual positive retained-prefix consumer accepts |
+| F3 / R4 | Canonical reader derive identities; exact type/scope/derive/generic/field-shape manifest, 30 existing permissions | Probes 7, 38–41; every existing reader pair accepts; unauthorized registry readers, added fields and transferred type permissions reject; 13 function representation contracts unchanged |
+| F4 / R5, partial as amended | Closed standard macro paths with argument traversal; four inert attribute spellings; typed Limits scalar control | Probes 8–11, 24, 42–44; consuming std::format remains negative, std::env is negative, macro impostors reject; named-field bindings and trait bodies still reject and are documented |
+| Historical/seam preservation | Original negative fixtures retained; non-consuming controls have no new row | Probes 12–25; only the advance rulings for 4 and 24 apply; no other expectation changed |
+| Full final gates | Byte-current register plus source self-test; behavior, lint, format and exact workspace baseline | Probes 48–49; final command-by-command evidence and input hashes below |
+
+The implementation of the absence-polarity rule is exercised over the migrated production match shapes. Unknown cannot be an Absent or catch-all case, and the actual caller matches pass. The stop condition was therefore not triggered. The named conservative exceptions remain `lib.rs::discovery_unavailable` (truncation suppresses checks) and `lib.rs::ownership_discovery_complete` (truncation prevents completeness), with independent deletion and negation sensitivity tests. No generic bool-guard exception was introduced.
+
+## Final tree — executed gate after the last implementation edit
+
+All 20 commands completed on unchanged implementation inputs. The final source replay is **141/141 passing variants** (22 accepted/compiled controls, 119 negatives), covering source probes 1–44; the semantic tests and final commands cover probes 45–49. No probe expectation was weakened. The generator's final self-test is **140 rejected mutations**, including all 77 historical mutations; the register is **197 byte-current declared consumers**. Earlier stage counts above are historical, not final assertions.
+
+| Final command group | Exit | Executed result |
+|---|---|---|
+| `recognizer-fmt` | 0 | completed |
+| `recognizer-clippy` | 0 | completed |
+| `fmt` | 0 | completed |
+| `clippy` | 0 | completed |
+| `tests` | 0 | 508 passed / 0 failed / 0 ignored |
+| `corpus` | 0 | 508 passed / 0 failed / 0 ignored |
+| `cli` | 0 | 37 passed / 0 failed / 0 ignored |
+| `doc-coverage` | 0 | completed |
+| `contracts` | 0 | 140 source mutations rejected; 197 byte-current rows |
+| `model` | 0 | completed |
+| `cli-build` | 0 | completed |
+| `workspace-ci` | 1 | 134 passed / 2 failed / 1 ignored; exact recorded baseline, no new or missing failures |
+| `workspace-tests` | 101 | 6221 passed / 19 failed / 10 ignored; exact recorded baseline, no new or missing failures |
+| `i18n-report` | 0 | 1 passed / 0 failed / 0 ignored |
+| `language` | 0 | 1 passed / 0 failed / 0 ignored |
+| `doctest` | 0 | 0 passed / 0 failed / 0 ignored |
+| `assets` | 0 | completed |
+| `layers` | 0 | completed |
+| `wasm` | 0 | completed |
+| `diff-check` | 0 | completed |
+
+`cargo xtask ci` is **not globally green**: it exits 1 with the exact two prior strict-export failures. `cargo test --workspace --no-fail-fast` exits 101 with the exact 19 prior failures (6,221 passed, 10 ignored). Both exact name sets and empty new/missing failure lists are recorded in the final summary, alongside the original baseline JSON. No new ignored test was added. Validator ordinary and corpus runs each pass all 508 tests, including the five new semantic regressions; all 503 prior tests and their expectations remain intact.
+
+Commands and environment: [final-gate-commands.json](fredfix-round18-final-gate-commands.json). Versions: cargo 1.99.1 (5f94df478, 2026-08-27), rustc 1.99.1 (58cf8f9c3, 2026-10-13), Python 3.15.2, recorded in [final-tool-versions.json](fredfix-round18-final-tool-versions.json). Every exit is captured directly, without a success-masking pipeline. [Final gate summary](fredfix-round18-final-gate-summary.json) records all 20 exits; [source hashes](fredfix-round18-final-source-hashes.json) record `unchanged_after_gates: true`. Only log evidence was finalized afterward.
+
+Evidence index:
+
+- [Census](fredfix-round18-census.json): complete producer, caller, accessor, derive/field and historical expectation inventories; Stage 0 above contains all nine caller truth tables.
+- [Probe evidence](fredfix-round18-probe-evidence.json): every probe variant, exact fixture hash, expected/observed gate result, diagnostics and isolated compile/test evidence. Full raw outputs remain in local `fredfix-round18-probe-results.json` and the round-18 command logs.
+- [Register row delta](fredfix-round18-register-delta.json): two named new rows and all 18 named modified rows with before/after columns. No representation-provider identity changed and `contracts_generated.rs` is byte-unchanged.
+- [Reviewed diff metadata](fredfix-round18-reviewed-diff.json) and the local [reviewed implementation diff](fredfix-round18-reviewed.diff) (recreated by the evidence finalizer): base `8dc309afe132bb09e90e7b19faf99cbfaf82db81`, implementation and progress documents only (log evidence excluded).
+- [Gate runner](fredfix-round18-final-gates.py), [probe runner](fredfix-round18-probes.py), and [evidence finalizer](fredfix-round18-finalize-evidence.py) reproduce the recorded checks from a stable tree; stage summaries preserve the census and mechanism gates.
+
+Reviewed implementation diff SHA-256: `6605b95a565dfd79867c4ab81e4df9fc046580d18b4fabd66cf61d4d24668e01`.
+
+No dependency, licence-allowlist, CI workflow, asset, font or contributor-credit changes were made. No GitHub comments or pushes were performed. The three pre-existing untracked scripts were left untouched; only the probe-created build directories and Python cache were removed. Work remains on `fix/5875-fredapps`.

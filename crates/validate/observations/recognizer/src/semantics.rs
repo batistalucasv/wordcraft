@@ -104,6 +104,19 @@ struct Origin {
     membership: bool,
 }
 
+fn resolution_type(text: &str) -> bool {
+    text.split(|c: char| !c.is_alphanumeric() && c != '_').any(|word| word == "Resolution")
+}
+fn absence_return(output: &ReturnType, names: &Names, self_type: &str) -> bool {
+    let ReturnType::Type(_, ty) = output else {
+        return false;
+    };
+    let resolved = names.resolve(&tokens(ty).replace("Self", self_type));
+    let resolved = resolved.trim().trim_start_matches('(').trim_end_matches(')').trim();
+    let head = resolved.split('<').next().unwrap_or_default();
+    matches!(head.rsplit("::").next().unwrap_or_default().trim(), "bool" | "Option" | "Resolution")
+}
+
 pub(crate) fn analyze(sig: &Signature, block: &Block, names: &Names, file: &str, self_type: &str) -> Value {
     let mut audit = Flow {
         names: names.clone(),
@@ -111,7 +124,7 @@ pub(crate) fn analyze(sig: &Signature, block: &Block, names: &Names, file: &str,
         issues: vec![],
         calls: vec![],
         file: file.into(),
-        returns_absence: matches!(&sig.output, ReturnType::Type(_, ty) if { let t = tokens(ty); t == "bool" || t.starts_with("Option <") || t.starts_with("Resolution <") }),
+        returns_absence: absence_return(&sig.output, names, self_type),
         function: ident(&sig.ident),
         self_type: self_type.into(),
         negative: false,
@@ -129,12 +142,16 @@ pub(crate) fn analyze(sig: &Signature, block: &Block, names: &Names, file: &str,
                 &p.pat,
                 Origin {
                     raw: raw_type(&names.resolve(&tokens(&p.ty))),
+                    outcome: resolution_type(&names.resolve(&tokens(&p.ty))),
                     limits: names.resolve(&tokens(&p.ty)).split_whitespace().last() == Some("Limits"),
                     ..Origin::default()
                 },
             ),
             FnArg::Receiver(_) => {
-                audit.bindings.insert("self".into(), Origin { raw: raw_type(self_type), ..Origin::default() });
+                audit.bindings.insert(
+                    "self".into(),
+                    Origin { raw: raw_type(self_type), outcome: resolution_type(&names.resolve(self_type)), ..Origin::default() },
+                );
             }
         }
     }
@@ -197,7 +214,7 @@ impl Flow {
             }
             Pat::TupleStruct(p) => {
                 let mut payload = origin;
-                if matches!(last(&self.names.resolve(&tokens(&p.path))), "One" | "Some") {
+                if matches!(last(&self.names.resolve(&tokens(&p.path))), "One" | "Some" | "Unknown" | "Ambiguous") {
                     // Extracting a proven payload removes the Option/Resolution query tag.
                     payload.outcome = false;
                     payload.membership = false;
@@ -414,6 +431,11 @@ impl<'ast> Visit<'ast> for Flow {
                 self.issue("unauthorized literal Resolution::Absent construction; use discovered with package loss evidence");
             }
             Expr::Call(c) => {
+                if self.origin(&c.func).outcome || c.args.iter().any(|arg| self.origin(arg).outcome) {
+                    self.issue(
+                        "absence polarity: package Resolution must be matched or locally bound; unmodeled callable/argument flow is forbidden",
+                    );
+                }
                 if self.negative && c.args.iter().any(|arg| self.origin(arg).prefix) {
                     self.issue("unmodeled negative retained-prefix call requires CompleteSet");
                 }

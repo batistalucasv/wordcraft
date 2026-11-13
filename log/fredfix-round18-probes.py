@@ -196,6 +196,12 @@ try:
   ('!entries_truncated && !unknown_unreadable','!unknown_unreadable','loader main discovery delete'),
   ('!entries_truncated && !unknown_unreadable','entries_truncated && !unknown_unreadable','loader main discovery negate')]:
   probe(32,label,'package.rs',lambda s,o=old,n=new:s.replace(o,n,1),diagnostic='entry-loss')
+ for ty in ['Resolution<String>','HiddenResolution']:
+  a='\ntype HiddenResolution = Resolution<String>; fn unregistered_resolution_absence(value: '+ty+') -> bool { match value { Resolution::One(_) => false, Resolution::Absent | Resolution::Unknown(_) => true, Resolution::Ambiguous(_) => false } }'
+  probe(26,'parameter collapse/'+ty,'lib.rs',lambda s,a=a:s+a,diagnostic='absence polarity')
+ probe(26,'Resolution Self receiver collapse','resolution.rs',lambda s:s+'\nimpl<T> Resolution<T> { fn unregistered_resolution_absence(&self) -> bool { match self { Self::One(_) => false, Self::Absent | Self::Unknown(_) => true, Self::Ambiguous(_) => false } } }',diagnostic='absence polarity')
+ probe(26,'opaque result argument collapse','lib.rs',lambda s:condition(s,'if opaque_verdict(package::canonical_entry(pkg, target)) {')+'\nfn opaque_verdict<T>(_value: T) -> bool { true }',diagnostic='absence polarity')
+ probe(30,'aliased bool return with exact raw contract','package.rs',lambda s:s+'\ntype HiddenVerdict = (bool); fn unregistered_return_alias(entries: &[Entry], name: &str) -> HiddenVerdict { observation_contract! { rules: "-"; collections: "-"; scope: "raw absence control"; loss: "entry prefix"; fallback: "skip unknown"; package_loss: "independent"; } !entries.iter().any(|entry| entry.name == name) }',diagnostic='raw absence')
  # Later stage probes are installed below this marker.
 finally:
  shutil.rmtree(TMP)
