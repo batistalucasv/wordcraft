@@ -702,7 +702,7 @@ pub(crate) fn validate_bytes_limited(bytes: &[u8], limits: Limits) -> Report {
         &mut acc,
     );
     check_content_part_types(&pkg, &xml.content_parts, xml.content_part_capped_any, &mut acc);
-    check_story(&pkg, &xml.facts, xml.compat, &mut acc);
+    check_story(&pkg, &xml, &mut acc);
     check_note_pr(&xml.facts, &xml, &mut acc);
     check_media(&pkg, &mut acc);
     acc.finish()
@@ -744,22 +744,28 @@ fn check_content_types(pkg: &Package, acc: &mut Acc) {
     if package::content_unavailable(pkg, "[Content_Types].xml") {
         return;
     }
-    acc.ran("CT-UNDECLARED");
-    for e in pkg.entries.iter().filter(|e| !e.is_dir) {
-        let l = e.name.to_ascii_lowercase();
-        if l == "[content_types].xml" || l.ends_with(".rels") {
-            continue;
+    // The declarations were truncated: a part not found in the recorded ones may still be
+    // declared later, so the two absence conclusions are skipped. A duplicate that was actually
+    // read is still a duplicate and is reported below.
+    let manifest_truncated = pkg.content_types.truncated;
+    if !manifest_truncated {
+        acc.ran("CT-UNDECLARED");
+        for e in pkg.entries.iter().filter(|e| !e.is_dir) {
+            let l = e.name.to_ascii_lowercase();
+            if l == "[content_types].xml" || l.ends_with(".rels") {
+                continue;
+            }
+            if pkg.content_types.of(&e.name).is_none() {
+                acc.add("CT-UNDECLARED", Some(e.name.clone()), format!("part {} has no effective content type", e.name));
+            }
         }
-        if pkg.content_types.of(&e.name).is_none() {
-            acc.add("CT-UNDECLARED", Some(e.name.clone()), format!("part {} has no effective content type", e.name));
+        acc.ran("CT-MAIN-TYPE");
+        if let Some(main) = &pkg.main
+            && !is_main_typed(pkg, main)
+        {
+            let got = pkg.content_types.of(main).unwrap_or("(none)");
+            acc.add("CT-MAIN-TYPE", Some(main.clone()), format!("main part {main} has content type {got}, not a main-document content type"));
         }
-    }
-    acc.ran("CT-MAIN-TYPE");
-    if let Some(main) = &pkg.main
-        && !is_main_typed(pkg, main)
-    {
-        let got = pkg.content_types.of(main).unwrap_or("(none)");
-        acc.add("CT-MAIN-TYPE", Some(main.clone()), format!("main part {main} has content type {got}, not a main-document content type"));
     }
     acc.ran("CT-DUP-MAIN");
     check_dup_main(pkg, acc);
@@ -855,6 +861,9 @@ struct XmlScan {
     /// The definition side of the note join is complete: no notes part
     /// unreadable or fact-capped, and pooled definitions did not cap.
     defs_complete: bool,
+    /// The pooled story facts are complete: no category hit the fact budget, so a definition or
+    /// reference not in the pool may still exist in the package.
+    facts_complete: bool,
 }
 
 /// Scan all XML parts for well-formedness, undeclared prefixes, illegal characters, and extract story facts.
@@ -1049,6 +1058,7 @@ fn check_xml(pkg: &Package, acc: &mut Acc) -> XmlScan {
         note_capped_any,
         notes_unreadable,
         defs_complete,
+        facts_complete: !pooled_capped,
     }
 }
 
@@ -1399,9 +1409,10 @@ fn report_duplicate_rel_ids(rp: &RelsPart, acc: &mut Acc) {
 fn check_part_refs(pkg: &Package, refs: &[(String, Vec<RefFact>)], acc: &mut Acc) {
     acc.ran("REL-REF-MISSING");
     for (part, values) in refs {
-        // The part's own `.rels` could not be read: which relationships it declares is unknown, so
-        // its `r:id`/`r:embed`/`r:link` values are not established as unresolved.
-        if package::content_unavailable(pkg, &rels_part_name(part)) {
+        // The part's own `.rels` could not be read, or its declarations were truncated: which
+        // relationships it declares is unknown, so its `r:id`/`r:embed`/`r:link` values are not
+        // established as unresolved.
+        if package::rels_incomplete(pkg, part) {
             continue;
         }
         let ids = part_rel_ids(pkg, part);
@@ -1444,10 +1455,11 @@ fn check_typed_image_refs(pkg: &Package, refs: &[(String, Vec<RefFact>)], acc: &
                 );
             } else if let Some(target) = &rel.target_abs {
                 // The relationship resolves and targets an internal part. Only the next conclusion
-                // depends on the manifest: when its content could not be read the target's declared
-                // type is unknown, not absent, so it is skipped. (The non-image-relationship and
-                // external-relationship conclusions above and below do not depend on the manifest.)
-                if !package::content_unavailable(pkg, "[Content_Types].xml") {
+                // depends on the manifest: when its content could not be read, or its declarations
+                // were truncated, the target's declared type is unknown, not absent, so it is
+                // skipped. (The non-image-relationship and external-relationship conclusions above
+                // and below do not depend on the manifest.)
+                if !package::manifest_incomplete(pkg) {
                     let ct = pkg.content_types.of(target);
                     if !ct.is_some_and(|c| c.starts_with("image/")) {
                         acc.add(
@@ -1490,9 +1502,10 @@ fn part_rel_ids(pkg: &Package, part: &str) -> HashSet<String> {
 /// Verify that typed relationships in the main document part target parts with matching content types.
 fn check_typed_targets(pkg: &Package, acc: &mut Acc) {
     // Every conclusion here compares a target's declared content type; when the manifest's content
-    // could not be read, a target's type is UNKNOWN, not absent, so no type conclusion is
-    // established. (The run is already INCOMPLETE from loading the manifest.)
-    if package::content_unavailable(pkg, "[Content_Types].xml") {
+    // could not be read, or its declarations were truncated, a target's type is UNKNOWN, not
+    // absent, so no type conclusion is established. (The run is already INCOMPLETE from loading
+    // the manifest.)
+    if package::manifest_incomplete(pkg) {
         return;
     }
     let Some(main) = &pkg.main else { return };
@@ -1612,8 +1625,12 @@ fn check_typed_content(
     acc: &mut Acc,
 ) {
     acc.ran("CT-MISMATCH");
-    // Relationship ids consumed by a `w:contentPart`, keyed by the
-    // owning part's relationships-part name (compared case-insensitively).
+    // A pairing compares a target's effective content type with the type its relationship
+    // requires. When declarations were truncated, a target may fall back to a Default entry
+    // because its Override was not read: the type is unknown, not mistyped.
+    if package::manifest_incomplete(pkg) {
+        return;
+    }
     let mut consumed: HashMap<String, HashSet<&str>> = HashMap::new();
     for (owner, ids) in content_parts.iter().chain(content_part_exemptions) {
         consumed.entry(rels_part_name(owner).to_ascii_lowercase()).or_default().extend(ids.iter().map(String::as_str));
@@ -1705,7 +1722,9 @@ fn check_typed_content(
 }
 
 /// Check cross-document story identifier families (comments, docPr, bookmarks, revisions, notes, styles, headers).
-fn check_story(pkg: &Package, facts: &scan::StoryFacts, compat: Compat, acc: &mut Acc) {
+fn check_story(pkg: &Package, xml: &XmlScan, acc: &mut Acc) {
+    let facts = &xml.facts;
+    let compat = xml.compat;
     acc.ran("COMMENT-RANGE-COUNT");
     if facts.comment_range_starts > 32_767 {
         acc.add(
@@ -1757,15 +1776,26 @@ fn check_story(pkg: &Package, facts: &scan::StoryFacts, compat: Compat, acc: &mu
         Compat::Off => {}
     }
     acc.ran("ID-COMMENT-DUP");
-    report_dups(acc, "ID-COMMENT-DUP", &facts.comment_defs, "w:comment id");
+    // Duplicates are judged within each definition part: definitions from different parts (the
+    // main document's comments and the glossary document's, say) are different owners' id spaces.
+    // IDs are decimal values, so `1` and `01` are the same id.
+    let owners = owner_scopes(pkg);
+    let owner_map = owner_index_map(pkg);
+    let n = owners.len();
+    let comment_defs = facts_by_owner(&facts.comment_defs, &owner_map, n);
+    let comment_refs = facts_by_owner(&facts.comment_refs, &owner_map, n);
+    let comment_defs_all: Vec<&(String, String)> = facts.comment_defs.iter().collect();
+    report_dups_decimal(acc, "ID-COMMENT-DUP", &comment_defs_all, "w:comment id");
     acc.ran("ID-COMMENT-REF");
-    let comment_defs = id_set(&facts.comment_defs);
-    // A comments part that could not be read leaves the pooled definitions incomplete, so a
-    // reference must not be reported as dangling: absence is not established.
-    if !kind_source_unavailable(pkg, "comments", package::COMMENTS_CONTENT_TYPE) {
-        report_missing(acc, "ID-COMMENT-REF", &facts.comment_refs, &comment_defs, "w:commentReference id");
+    for ((defs, refs), owner) in comment_defs.iter().zip(&comment_refs).zip(&owners) {
+        // A comments part that could not be read, or a pooled fact set that stopped at its budget,
+        // leaves the owner's definitions incomplete, so a reference is not established as dangling.
+        if xml.facts_complete && !owner_kind_unavailable(pkg, owner.as_deref(), "comments", package::COMMENTS_CONTENT_TYPE) {
+            let defs = id_set_decimal(defs);
+            report_missing_decimal(acc, "ID-COMMENT-REF", refs, &defs, "w:commentReference id");
+        }
     }
-    report_unreferenced_comments(facts, acc);
+    report_unreferenced_comments(&comment_defs, &comment_refs, acc);
     acc.ran("ID-DOCPR-DUP");
     report_dups(acc, "ID-DOCPR-DUP", &facts.docpr, "wp:docPr id");
     acc.ran("ID-BOOKMARK-DUP");
@@ -1780,18 +1810,28 @@ fn check_story(pkg: &Package, facts: &scan::StoryFacts, compat: Compat, acc: &mu
     acc.ran("ID-REVISION-DUP");
     report_dups(acc, "ID-REVISION-DUP", &facts.revisions, "revision id");
     acc.ran("NOTE-DUP");
-    report_dups(acc, "NOTE-DUP", &facts.footnote_defs, "w:footnote id");
-    report_dups(acc, "NOTE-DUP", &facts.endnote_defs, "w:endnote id");
+    let footnote_defs = facts_by_owner(&facts.footnote_defs, &owner_map, n);
+    let footnote_refs = facts_by_owner(&facts.footnote_refs, &owner_map, n);
+    let endnote_defs = facts_by_owner(&facts.endnote_defs, &owner_map, n);
+    let endnote_refs = facts_by_owner(&facts.endnote_refs, &owner_map, n);
+    let footnote_defs_all: Vec<&(String, String)> = facts.footnote_defs.iter().collect();
+    let endnote_defs_all: Vec<&(String, String)> = facts.endnote_defs.iter().collect();
+    report_dups_decimal(acc, "NOTE-DUP", &footnote_defs_all, "w:footnote id");
+    report_dups_decimal(acc, "NOTE-DUP", &endnote_defs_all, "w:endnote id");
     acc.ran("REF-NOTE");
-    let footnote_defs = id_set(&facts.footnote_defs);
-    let endnote_defs = id_set(&facts.endnote_defs);
-    // An unreadable footnotes/endnotes part leaves the definitions incomplete, so a reference is
-    // not established as dangling.
-    if !kind_source_unavailable(pkg, "footnotes", package::FOOTNOTES_CONTENT_TYPE) {
-        report_missing_note(acc, &facts.footnote_refs, &footnote_defs, "footnote");
-    }
-    if !kind_source_unavailable(pkg, "endnotes", package::ENDNOTES_CONTENT_TYPE) {
-        report_missing_note(acc, &facts.endnote_refs, &endnote_defs, "endnote");
+    for (((foot_defs, foot_refs), (end_defs, end_refs)), owner) in
+        footnote_defs.iter().zip(&footnote_refs).zip(endnote_defs.iter().zip(&endnote_refs)).zip(&owners)
+    {
+        // An unreadable footnotes/endnotes part, or a definition set that stopped at the fact
+        // budget, leaves the definitions incomplete, so a reference is not established as dangling.
+        if xml.defs_complete && !owner_kind_unavailable(pkg, owner.as_deref(), "footnotes", package::FOOTNOTES_CONTENT_TYPE) {
+            let set = id_set_decimal(foot_defs);
+            report_missing_note_decimal(acc, foot_refs, &set, "footnote");
+        }
+        if xml.defs_complete && !owner_kind_unavailable(pkg, owner.as_deref(), "endnotes", package::ENDNOTES_CONTENT_TYPE) {
+            let set = id_set_decimal(end_defs);
+            report_missing_note_decimal(acc, end_refs, &set, "endnote");
+        }
     }
     acc.ran("REF-HEADER");
     check_header_footer_refs(pkg, facts, acc);
@@ -1807,29 +1847,70 @@ fn check_story(pkg: &Package, facts: &scan::StoryFacts, compat: Compat, acc: &mu
     check_custom_xml(pkg, acc);
 }
 
-/// Collect a set of unique identifier strings from `(id, part)` pairs.
-fn id_set(items: &[(String, String)]) -> HashSet<String> {
-    items.iter().map(|(id, _)| id.clone()).collect()
+/// Split `(id, part)` facts by the owner scope that contains `part`.
+fn facts_by_owner<'a>(items: &'a [(String, String)], owner_map: &HashMap<String, usize>, owners: usize) -> Vec<Vec<&'a (String, String)>> {
+    let mut out: Vec<Vec<&(String, String)>> = vec![Vec::new(); owners];
+    for item in items {
+        if let Some(i) = part_owner(owner_map, &item.1)
+            && let Some(slot) = out.get_mut(i)
+        {
+            slot.push(item);
+        }
+    }
+    out
 }
 
-/// Whether the definitions a story kind would contribute to any owner are unestablished: either the
-/// supporting part resolves to one whose content could not be read, or the discovery source that
-/// would find it (the owner's `.rels`, or the manifest in the no-owner fallback scope) could not be
-/// read. In both cases the part's existence is unestablished, not established-absent, so references
-/// checked against it are not reported as dangling.
-fn kind_source_unavailable(pkg: &Package, kind: &str, ct: &str) -> bool {
-    owner_scopes(pkg).iter().any(|owner| {
-        discovery_unavailable(pkg, owner.as_deref()) || supporting_part(pkg, owner.as_deref(), kind, ct).is_some_and(|e| e.content_unavailable)
-    })
+/// A decimal identifier's canonical spelling, so `01`, `+1` and `1` compare equal
+/// (`ST_DecimalNumber` is an integer value, not a string). `None` for a non-integer spelling,
+/// which is compared by its raw text.
+fn canonical_decimal(id: &str) -> Option<String> {
+    let (negative, digits) = match id.as_bytes().first()? {
+        b'-' => (true, id.get(1..)?),
+        b'+' => (false, id.get(1..)?),
+        _ => (false, id),
+    };
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let trimmed = digits.trim_start_matches('0');
+    let magnitude = if trimmed.is_empty() { "0" } else { trimmed };
+    Some(if negative && magnitude != "0" { format!("-{magnitude}") } else { magnitude.to_string() })
 }
 
-/// Record a coverage note for each comment definition that is never referenced in the document.
-fn report_unreferenced_comments(facts: &scan::StoryFacts, acc: &mut Acc) {
-    let refs = id_set(&facts.comment_refs);
-    let mut seen = HashSet::new();
-    for (id, part) in &facts.comment_defs {
-        if !refs.contains(id) && seen.insert(id.as_str()) {
-            acc.note(format!("w:comment id {id} in {part} is never referenced"));
+/// The comparison key of a decimal id: its canonical spelling when it has one, else the raw text.
+fn decimal_key(id: &str) -> std::borrow::Cow<'_, str> {
+    match canonical_decimal(id) {
+        Some(c) if c != id => std::borrow::Cow::Owned(c),
+        _ => std::borrow::Cow::Borrowed(id),
+    }
+}
+
+/// Collect a set of unique decimal identifier values from `(id, part)` pairs.
+fn id_set_decimal(items: &[&(String, String)]) -> HashSet<String> {
+    items.iter().map(|(id, _)| decimal_key(id).into_owned()).collect()
+}
+
+/// Whether the definitions `owner` would contribute for `kind` are unestablished: the discovery
+/// source or the supporting part could not be read, or the manifest's declarations were truncated
+/// (so a supporting part may exist without being classified). In every case the part's existence is
+/// unestablished, not established-absent, so references checked against it are not reported as
+/// dangling.
+fn owner_kind_unavailable(pkg: &Package, owner: Option<&str>, kind: &str, ct: &str) -> bool {
+    package::manifest_incomplete(pkg)
+        || discovery_unavailable(pkg, owner)
+        || supporting_part(pkg, owner, kind, ct).is_some_and(|e| e.content_unavailable)
+}
+
+/// Record a coverage note for each comment definition that is never referenced in its owner scope.
+fn report_unreferenced_comments(defs: &[Vec<&(String, String)>], refs: &[Vec<&(String, String)>], acc: &mut Acc) {
+    for (i, owner_defs) in defs.iter().enumerate() {
+        let owner_refs: HashSet<String> = refs.get(i).map(|v| id_set_decimal(v)).unwrap_or_default();
+        let mut seen: HashSet<String> = HashSet::new();
+        for (id, part) in owner_defs.iter().copied() {
+            let key = decimal_key(id).into_owned();
+            if !owner_refs.contains(&key) && seen.insert(key) {
+                acc.note(format!("w:comment id {id} in {part} is never referenced"));
+            }
         }
     }
 }
@@ -1840,9 +1921,10 @@ fn report_unreferenced_comments(facts: &scan::StoryFacts, acc: &mut Acc) {
 fn check_header_footer_refs(pkg: &Package, facts: &scan::StoryFacts, acc: &mut Acc) {
     let Some(main) = &pkg.main else { return };
     let want = rels_part_name(main);
-    // The main part's relationships could not be read: its header/footer relationships are unknown,
-    // not absent, so a reference must not be reported as having no relationship.
-    if package::content_unavailable(pkg, &want) {
+    // The main part's relationships could not be read, or their declarations were truncated:
+    // its header/footer relationships are unknown, not absent, so a reference must not be
+    // reported as having no relationship.
+    if package::rels_incomplete(pkg, main) {
         return;
     }
     let Some(rp) = pkg.rels.iter().find(|r| r.name.eq_ignore_ascii_case(&want)) else {
@@ -1940,13 +2022,13 @@ fn supporting_part<'a>(pkg: &'a Package, owner: Option<&str>, kind: &str, ct: &s
     find_by_type(pkg, ct)
 }
 
-/// Whether the source that would discover an owner's supporting part could not be read, so the
+/// Whether the source that would discover an owner's supporting part is unestablished, so the
 /// part's existence is unestablished rather than established-absent. In an established owner scope
-/// that source is the owner's `.rels`; in the no-owner fallback scope it is the content-type
-/// manifest that [`find_by_type`] reads.
+/// that source is the owner's `.rels` (unreadable or truncated); in the no-owner fallback scope it is
+/// the content-type manifest that [`find_by_type`] reads.
 fn discovery_unavailable(pkg: &Package, owner: Option<&str>) -> bool {
     match owner {
-        Some(owner) => package::content_unavailable(pkg, &rels_part_name(owner)),
+        Some(owner) => package::rels_incomplete(pkg, owner),
         None => package::content_unavailable(pkg, "[Content_Types].xml"),
     }
 }
@@ -2644,21 +2726,48 @@ fn report_dups(acc: &mut Acc, rule: &'static str, items: &[(String, String)], wh
     }
 }
 
-/// Report missing definitions for references collected from story elements.
-fn report_missing(acc: &mut Acc, rule: &'static str, refs: &[(String, String)], defs: &HashSet<String>, what: &str) {
-    let mut reported: HashSet<&str> = HashSet::new();
-    for (id, part) in refs {
-        if !defs.contains(id) && reported.insert(id.as_str()) {
+/// Report duplicate decimal identifier findings for a given rule across items, within each part.
+/// Values are compared by their canonical spelling, so `1` and `01` count as the same id.
+fn report_dups_decimal(acc: &mut Acc, rule: &'static str, items: &[&(String, String)], what: &str) {
+    let mut first: HashMap<(&str, String), (&str, &str)> = HashMap::new();
+    let mut reported: HashSet<(&str, String)> = HashSet::new();
+    for item in items {
+        let (id, part) = (&item.0, &item.1);
+        let key = (part.as_str(), decimal_key(id).into_owned());
+        match first.entry(key.clone()) {
+            Entry::Vacant(v) => {
+                v.insert((id.as_str(), part.as_str()));
+            }
+            Entry::Occupied(o) => {
+                if reported.insert(key) {
+                    let (first_id, first_part) = *o.get();
+                    let spelled = if first_id == id.as_str() { String::new() } else { format!(" (also spelled {id})") };
+                    acc.add(rule, Some(part.clone()), format!("duplicate {what} {first_id}{spelled} (first in {first_part})"));
+                }
+            }
+        }
+    }
+}
+
+/// Report missing decimal definitions for references collected from story elements.
+fn report_missing_decimal(acc: &mut Acc, rule: &'static str, refs: &[&(String, String)], defs: &HashSet<String>, what: &str) {
+    let mut reported: HashSet<String> = HashSet::new();
+    for item in refs {
+        let (id, part) = (&item.0, &item.1);
+        let key = decimal_key(id).into_owned();
+        if !defs.contains(&key) && reported.insert(key) {
             acc.add(rule, Some(part.clone()), format!("{what} {id} in {part} has no definition in the package"));
         }
     }
 }
 
 /// Report missing footnote or endnote definitions.
-fn report_missing_note(acc: &mut Acc, refs: &[(String, String)], defs: &HashSet<String>, kind: &str) {
-    let mut reported: HashSet<&str> = HashSet::new();
-    for (id, part) in refs {
-        if !defs.contains(id) && reported.insert(id.as_str()) {
+fn report_missing_note_decimal(acc: &mut Acc, refs: &[&(String, String)], defs: &HashSet<String>, kind: &str) {
+    let mut reported: HashSet<String> = HashSet::new();
+    for item in refs {
+        let (id, part) = (&item.0, &item.1);
+        let key = decimal_key(id).into_owned();
+        if !defs.contains(&key) && reported.insert(key) {
             acc.add(
                 "REF-NOTE",
                 Some(part.clone()),
@@ -2827,6 +2936,63 @@ mod budget_tests {
         let _ = package::load(&zip, &mut acc);
         let report = acc.finish();
         assert_eq!(report.verdict, Verdict::Incomplete, "findings: {:?}", report.findings);
+    }
+
+    #[test]
+    /// A reference to a relationship past the declaration cap is not dangling: the omitted
+    /// declaration may exist, so the run is INCOMPLETE without a REL-REF-MISSING finding.
+    fn relationship_cap_truncation_does_not_make_a_reference_dangling() {
+        let mut body = String::new();
+        for i in 1..=5 {
+            body.push_str(&format!(
+                r#"<Relationship Id="rId{i}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="https://example.test/{i}" TargetMode="External"/>"#
+            ));
+        }
+        let doc = format!(
+            r#"<?xml version="1.0"?><w:document xmlns:w="{}" xmlns:r="{}"><w:body><w:p><w:hyperlink r:id="rId5"/></w:p></w:body></w:document>"#,
+            NS_W, NS_R
+        );
+        let zip = tiny_zip(&[
+            ("[Content_Types].xml", content_types()),
+            ("_rels/.rels", package_rels()),
+            ("word/document.xml", doc.into_bytes()),
+            ("word/_rels/document.xml.rels", rels(&body)),
+        ]);
+        let limits = Limits { entries: 4, ..Limits::default() };
+        let report = validate_bytes_limited(&zip, limits);
+        assert_eq!(report.verdict, Verdict::Incomplete, "findings: {:?}", report.findings);
+        assert!(
+            !report.findings.iter().any(|f| f.rule == "REL-REF-MISSING"),
+            "a reference past the declaration cap is unknown, not dangling: {:?}",
+            report.findings
+        );
+    }
+
+    #[test]
+    /// A main-part Override past the content-type declaration cap is not absent: the run is
+    /// INCOMPLETE without a CT-MAIN-TYPE finding.
+    fn content_type_cap_truncation_does_not_mistype_the_main_part() {
+        let mut manifest = String::from(
+            r#"<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/>"#,
+        );
+        for i in 1..=3 {
+            manifest.push_str(&format!(r#"<Override PartName="/word/unused{i}.xml" ContentType="application/xml"/>"#));
+        }
+        manifest.push_str(&format!(r#"<Override PartName="/word/document.xml" ContentType="{}"/></Types>"#, package::MAIN_CONTENT_TYPE));
+        let zip = tiny_zip(&[
+            ("[Content_Types].xml", manifest.into_bytes()),
+            ("_rels/.rels", package_rels()),
+            ("word/document.xml", document()),
+            ("word/_rels/document.xml.rels", doc_rels()),
+        ]);
+        let limits = Limits { entries: 4, ..Limits::default() };
+        let report = validate_bytes_limited(&zip, limits);
+        assert_eq!(report.verdict, Verdict::Incomplete, "findings: {:?}", report.findings);
+        assert!(
+            !report.findings.iter().any(|f| f.rule == "CT-MAIN-TYPE"),
+            "a main-part Override past the cap is unknown, not absent: {:?}",
+            report.findings
+        );
     }
 
     #[test]

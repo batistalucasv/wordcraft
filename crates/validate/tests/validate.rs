@@ -262,6 +262,80 @@ fn pkg_no_main() {
     assert_finding(&report, "PKG-NO-MAIN", None);
 }
 
+/// A relationship type is a complete URI: a custom type that merely ends in `/officeDocument` does
+/// not declare the package's main part.
+#[test]
+fn custom_office_document_relationship_type_is_not_a_main_part() {
+    let mut d = Doc::minimal();
+    d.set("_rels/.rels", rels_xml(r#"<Relationship Id="rId1" Type="urn:custom/officeDocument" Target="word/document.xml"/>"#));
+    let report = validate(&d);
+    assert_eq!(report.verdict, Verdict::Fail);
+    assert_finding(&report, "PKG-NO-MAIN", None);
+}
+
+/// The Strict spelling of the officeDocument type is the same relationship role.
+#[test]
+fn strict_office_document_relationship_type_is_a_main_part() {
+    let mut d = Doc::minimal();
+    d.set(
+        "_rels/.rels",
+        rels_xml(
+            r#"<Relationship Id="rId1" Type="http://purl.oclc.org/ooxml/officeDocument/relationships/officeDocument" Target="word/document.xml"/>"#,
+        ),
+    );
+    let report = validate(&d);
+    assert!(!has(&report, "PKG-NO-MAIN"), "{:?}", report.findings);
+}
+
+/// Relationship elements outside the OPC Relationships namespace are foreign XML, not package
+/// relationships, even when their local names and attributes match exactly.
+#[test]
+fn foreign_relationship_namespace_does_not_declare_the_main_part() {
+    let mut d = Doc::minimal();
+    d.set(
+        "_rels/.rels",
+        r#"<Relationships xmlns="urn:not-opc"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>"#
+            .as_bytes()
+            .to_vec(),
+    );
+    let report = validate(&d);
+    assert_eq!(report.verdict, Verdict::Fail);
+    assert_finding(&report, "PKG-NO-MAIN", None);
+}
+
+/// An `Override` in a foreign namespace is not a content-type declaration: the main part stays
+/// without a declared type, so CT-MAIN-TYPE fires.
+#[test]
+fn foreign_content_type_declaration_is_not_effective() {
+    let mut d = Doc::minimal();
+    d.set(
+        "[Content_Types].xml",
+        format!(
+            r#"<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><x:Override xmlns:x="urn:not-opc" PartName="/word/document.xml" ContentType="{CT_MAIN}"/></Types>"#
+        )
+        .into_bytes(),
+    );
+    let report = validate(&d);
+    assert_eq!(report.verdict, Verdict::Fail);
+    assert_finding(&report, "CT-MAIN-TYPE", Some("word/document.xml"));
+}
+
+/// A prefixed attribute with the declaration's local name is not that declaration's attribute.
+#[test]
+fn prefixed_part_name_attribute_is_not_a_declaration() {
+    let mut d = Doc::minimal();
+    d.set(
+        "[Content_Types].xml",
+        format!(
+            r#"<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types" xmlns:x="urn:not-opc"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override x:PartName="/word/document.xml" ContentType="{CT_MAIN}"/></Types>"#
+        )
+        .into_bytes(),
+    );
+    let report = validate(&d);
+    assert_eq!(report.verdict, Verdict::Fail);
+    assert_finding(&report, "CT-MAIN-TYPE", Some("word/document.xml"));
+}
+
 #[test]
 fn ct_undeclared() {
     let mut d = Doc::minimal();
@@ -1093,6 +1167,86 @@ fn a_matching_footnote_reference_is_fine() {
     d.set_document(r#"<w:p><w:r><w:footnoteReference w:id="1"/></w:r></w:p>"#);
     let report = validate(&d);
     assert!(!has(&report, "REF-NOTE"));
+}
+
+/// `w:id` is an `ST_DecimalNumber` value: a definition `1` and a reference `01` are the same note.
+#[test]
+fn decimal_note_ids_compare_by_value() {
+    let mut d = Doc::minimal();
+    d.add_with_override(
+        "word/footnotes.xml",
+        CT_FOOTNOTES,
+        format!(r#"<?xml version="1.0"?><w:footnotes xmlns:w="{W_NS}"><w:footnote w:id="1"><w:p/></w:footnote></w:footnotes>"#),
+    );
+    d.set_document(r#"<w:p><w:r><w:footnoteReference w:id="01"/></w:r></w:p>"#);
+    let report = validate(&d);
+    assert!(!has(&report, "REF-NOTE"), "01 and 1 are the same decimal id: {:?}", report.findings);
+    assert_eq!(report.verdict, Verdict::Pass);
+}
+
+/// Two definitions whose decimal spellings differ are still one duplicated id.
+#[test]
+fn decimal_note_ids_spelled_differently_are_a_duplicate() {
+    let mut d = Doc::minimal();
+    d.add_with_override(
+        "word/footnotes.xml",
+        CT_FOOTNOTES,
+        format!(
+            r#"<?xml version="1.0"?><w:footnotes xmlns:w="{W_NS}"><w:footnote w:id="1"><w:p/></w:footnote><w:footnote w:id="01"><w:p/></w:footnote></w:footnotes>"#
+        ),
+    );
+    let report = validate(&d);
+    assert_eq!(report.verdict, Verdict::Fail);
+    assert_finding(&report, "NOTE-DUP", Some("word/footnotes.xml"));
+}
+
+/// The same value comparison applies to comment ids.
+#[test]
+fn decimal_comment_ids_compare_by_value() {
+    let mut d = Doc::minimal();
+    d.add_with_override("word/comments.xml", CT_COMMENTS, comments(r#"<w:comment w:id="1"><w:p/></w:comment>"#));
+    d.set_document(r#"<w:p><w:r><w:commentReference w:id="01"/></w:r></w:p>"#);
+    let report = validate(&d);
+    assert!(!has(&report, "ID-COMMENT-REF"), "01 and 1 are the same decimal id: {:?}", report.findings);
+    assert_eq!(report.verdict, Verdict::Pass);
+}
+
+/// The glossary document is its own document: its footnotes part may define id 1 while the main
+/// document's footnotes part defines id 1 too, and each reference joins its own owner.
+#[test]
+fn glossary_and_main_notes_have_separate_id_spaces() {
+    let mut d = Doc::minimal();
+    d.set("[Content_Types].xml", content_types_xml(&[], &[("/word/glossary.xml", CT_GLOSSARY), ("/word/glossary-footnotes.xml", CT_FOOTNOTES)]));
+    d.add_with_override(
+        "word/footnotes.xml",
+        CT_FOOTNOTES,
+        format!(r#"<?xml version="1.0"?><w:footnotes xmlns:w="{W_NS}"><w:footnote w:id="1"><w:p/></w:footnote></w:footnotes>"#),
+    );
+    d.add_with_override(
+        "word/glossary-footnotes.xml",
+        CT_FOOTNOTES,
+        format!(r#"<?xml version="1.0"?><w:footnotes xmlns:w="{W_NS}"><w:footnote w:id="1"><w:p/></w:footnote></w:footnotes>"#),
+    );
+    d.set_doc_rels(
+        r#"<Relationship Id="rIdF" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/footnotes" Target="footnotes.xml"/><Relationship Id="rIdG" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/glossaryDocument" Target="glossary.xml"/>"#,
+    );
+    d.set(
+        "word/_rels/glossary.xml.rels",
+        rels_xml(
+            r#"<Relationship Id="rIdGF" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/footnotes" Target="glossary-footnotes.xml"/>"#,
+        ),
+    );
+    d.set(
+        "word/glossary.xml",
+        format!(
+            r#"<?xml version="1.0"?><w:glossaryDocument xmlns:w="{W_NS}"><w:docParts><w:docPart><w:docPartBody><w:p><w:r><w:footnoteReference w:id="1"/></w:r></w:p></w:docPartBody></w:docPart></w:docParts></w:glossaryDocument>"#
+        ),
+    );
+    d.set_document(r#"<w:p><w:r><w:footnoteReference w:id="1"/></w:r></w:p>"#);
+    let report = validate(&d);
+    assert!(!has(&report, "NOTE-DUP"), "each owner has its own note-id space: {:?}", report.findings);
+    assert!(!has(&report, "REF-NOTE"), "each reference joins its owner's definitions: {:?}", report.findings);
+    assert_eq!(report.verdict, Verdict::Pass, "{:?}", report.findings);
 }
 
 #[test]

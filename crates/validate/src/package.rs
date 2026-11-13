@@ -2,13 +2,26 @@
 //! reachability graph shared by the checks.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::io::{Cursor, Read};
+use std::io::{BufRead, Cursor, Read};
 
-use quick_xml::Reader;
 use quick_xml::events::{BytesStart, Event};
+use quick_xml::name::{Namespace, QName, ResolveResult};
+use quick_xml::reader::NsReader;
 
 use crate::Acc;
 use crate::scan::ParseGuard;
+
+/// The Transitional `officeDocument` relationship type (ECMA-376 Part 1 §9.3.2).
+pub(crate) const OFFICE_DOCUMENT_REL: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument";
+/// The Strict spelling of the `officeDocument` relationship type.
+pub(crate) const OFFICE_DOCUMENT_REL_STRICT: &str = "http://purl.oclc.org/ooxml/officeDocument/relationships/officeDocument";
+/// The OPC Relationships namespace, Transitional and Strict. Relationship elements outside these
+/// namespaces are foreign XML, not package relationships.
+const RELATIONSHIP_NAMESPACES: &[&str] =
+    &["http://schemas.openxmlformats.org/package/2006/relationships", "http://purl.oclc.org/ooxml/package/relationships"];
+/// The OPC content-types namespace, Transitional and Strict.
+const CONTENT_TYPE_NAMESPACES: &[&str] =
+    &["http://schemas.openxmlformats.org/package/2006/content-types", "http://purl.oclc.org/ooxml/package/content-types"];
 
 /// The main document part's content type (ECMA-376 Part 1 §11.3.10).
 pub(crate) const MAIN_CONTENT_TYPE: &str = "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml";
@@ -26,6 +39,12 @@ pub(crate) const MAIN_CONTENT_TYPES: &[&str] =
 /// Whether `ct` is one of the [`MAIN_CONTENT_TYPES`].
 pub(crate) fn is_main_content_type(ct: &str) -> bool {
     MAIN_CONTENT_TYPES.contains(&ct)
+}
+
+/// Whether `kind` is the complete `officeDocument` relationship type, Transitional or Strict.
+/// Relationship types are URIs, so a custom type that merely ends in `/officeDocument` is not one.
+pub(crate) fn is_office_document_rel(kind: &str) -> bool {
+    kind == OFFICE_DOCUMENT_REL || kind == OFFICE_DOCUMENT_REL_STRICT
 }
 /// A header part's content type.
 pub(crate) const HEADER_CONTENT_TYPE: &str = "application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml";
@@ -94,6 +113,10 @@ pub(crate) struct ContentTypes {
     pub dup_defaults: BTreeSet<String>,
     /// Part names with more than one Override entry (lowercased, leading `/` stripped).
     pub dup_overrides: BTreeSet<String>,
+    /// The declaration budget, or the XML budget, stopped the parse before every declaration was
+    /// read: a declaration that is not recorded may still exist, so absence of one is not
+    /// established.
+    pub truncated: bool,
 }
 
 impl ContentTypes {
@@ -121,6 +144,10 @@ pub(crate) struct Rel {
 pub(crate) struct RelsPart {
     pub name: String,
     pub rels: Vec<Rel>,
+    /// The declaration budget, or the XML budget, stopped the parse before every relationship was
+    /// read: a relationship that is not recorded may still exist, so a reference is not established
+    /// as unresolved against this part.
+    pub truncated: bool,
 }
 
 /// Everything loaded from a package once.
@@ -250,14 +277,17 @@ pub(crate) fn load(bytes: &[u8], acc: &mut Acc) -> Option<Package> {
     let mut ct_guard = ParseGuard::new(limits.events, limits.depth);
     if let Some(e) = ct_at.and_then(|i| entries.get(i))
         && let Some(text) = &e.decoded
-        && parse_content_types(text, &mut content_types, limits.entries, &mut ct_guard)
     {
-        acc.note(format!("[Content_Types].xml declares more than {} entries; later ones were not recorded", limits.entries));
-        acc.set_incomplete();
-    }
-    if ct_guard.exhausted() {
-        acc.note(format!("[Content_Types].xml exceeded the XML {} budget; later declarations were not recorded", ct_guard.budget()));
-        acc.set_incomplete();
+        if parse_content_types(text, &mut content_types, limits.entries, &mut ct_guard) {
+            acc.note(format!("[Content_Types].xml declares more than {} entries; later ones were not recorded", limits.entries));
+            acc.set_incomplete();
+            content_types.truncated = true;
+        }
+        if ct_guard.exhausted() {
+            acc.note(format!("[Content_Types].xml exceeded the XML {} budget; later declarations were not recorded", ct_guard.budget()));
+            acc.set_incomplete();
+            content_types.truncated = true;
+        }
     }
 
     let rels = load_rels(&entries, acc);
@@ -279,14 +309,16 @@ pub(crate) fn load(bytes: &[u8], acc: &mut Acc) -> Option<Package> {
     acc.ran("PKG-NO-MAIN");
     let package_rels = rels.iter().find(|r| r.name.eq_ignore_ascii_case("_rels/.rels"));
     let main = package_rels
-        .and_then(|rp| rp.rels.iter().find(|r| !r.external && tail(&r.kind) == "officeDocument"))
+        .and_then(|rp| rp.rels.iter().find(|r| !r.external && is_office_document_rel(&r.kind)))
         .and_then(|r| r.target_abs.as_deref())
         .and_then(|t| canonical(&entries, t));
     if main.is_none() {
-        // If `_rels/.rels` is present but its content could not be read, its officeDocument
-        // relationship is unknown, not absent: no absence conclusion is established.
+        // If `_rels/.rels` is present but its content could not be read, or its declarations were
+        // truncated, its officeDocument relationship is unknown, not absent: no absence conclusion
+        // is established.
         let package_rels_unavailable = entries.iter().any(|e| !e.is_dir && e.name.eq_ignore_ascii_case("_rels/.rels") && e.content_unavailable);
-        if !package_rels_unavailable {
+        let package_rels_truncated = package_rels.is_some_and(|rp| rp.truncated);
+        if !package_rels_unavailable && !package_rels_truncated {
             acc.add("PKG-NO-MAIN", None, no_main_message(package_rels));
         }
     }
@@ -421,7 +453,7 @@ fn no_main_message(package_rels: Option<&RelsPart>) -> String {
     let Some(rp) = package_rels else {
         return "the package has no _rels/.rels part, so it has no main document part".to_string();
     };
-    match rp.rels.iter().find(|r| !r.external && tail(&r.kind) == "officeDocument") {
+    match rp.rels.iter().find(|r| !r.external && is_office_document_rel(&r.kind)) {
         None => "the package's _rels/.rels has no officeDocument relationship".to_string(),
         Some(r) => format!("the officeDocument relationship targets {}, which is not in the package", r.target_abs.as_deref().unwrap_or("")),
     }
@@ -645,7 +677,8 @@ fn load_rels(entries: &[Entry], acc: &mut Acc) -> Vec<RelsPart> {
             acc.note(format!("{} exceeded the XML {} budget; later relationships were not recorded", e.name, guard.budget()));
             acc.set_incomplete();
         }
-        rels.push(RelsPart { name: e.name.clone(), rels: parsed });
+        let truncated = c || guard.exhausted();
+        rels.push(RelsPart { name: e.name.clone(), rels: parsed, truncated });
     }
     rels
 }
@@ -694,6 +727,24 @@ pub(crate) fn entry_by_name<'a>(pkg: &'a Package, name: &str) -> Option<&'a Entr
 /// lookup does (OPC names are case-insensitive), so `_RELS/.RELS` is recognised the same way.
 pub(crate) fn content_unavailable(pkg: &Package, name: &str) -> bool {
     entry_by_name(pkg, name).is_some_and(|e| e.content_unavailable)
+}
+
+/// Whether `part`'s relationship declarations are unestablished: its `.rels` part is present but
+/// unreadable, or its declarations were truncated by a budget. A check that would report a
+/// reference as unresolved must skip instead: a relationship that is not recorded may still exist.
+pub(crate) fn rels_incomplete(pkg: &Package, part: &str) -> bool {
+    let want = rels_part_name(part);
+    if content_unavailable(pkg, &want) {
+        return true;
+    }
+    pkg.rels.iter().find(|rp| rp.name.eq_ignore_ascii_case(&want)).is_some_and(|rp| rp.truncated)
+}
+
+/// Whether the manifest's declarations are unestablished: its content could not be read, or its
+/// declarations were truncated. A part whose effective type is not found may still be declared, so
+/// checks that would treat a missing declaration as absence must skip.
+pub(crate) fn manifest_incomplete(pkg: &Package) -> bool {
+    pkg.content_types.truncated || content_unavailable(pkg, "[Content_Types].xml")
 }
 
 /// Compute the set of lowercased package part paths reachable from the package relationships root and main document.
@@ -788,8 +839,12 @@ pub(crate) fn tail(t: &str) -> &str {
 }
 
 /// Parse `[Content_Types].xml`. Returns `true` when the declaration budget stopped it early.
+///
+/// Only `Default`/`Override` elements in an OPC content-types namespace are declarations. The same
+/// element names in a foreign namespace are application XML that happens to sit in the manifest
+/// part; treating them as declarations would let a foreign `Override` invent a part's type.
 fn parse_content_types(text: &str, ct: &mut ContentTypes, cap: usize, guard: &mut ParseGuard) -> bool {
-    let mut reader = Reader::from_reader(text.as_bytes());
+    let mut reader = NsReader::from_reader(text.as_bytes());
     let mut buf = Vec::new();
     let mut count = 0usize;
     let mut capped = false;
@@ -802,19 +857,23 @@ fn parse_content_types(text: &str, ct: &mut ContentTypes, cap: usize, guard: &mu
                 if !guard.enter() {
                     break;
                 }
-                if count >= cap {
-                    capped = true;
-                } else {
-                    record_content_type(&e, ct);
-                    count += 1;
+                if in_namespace(&reader, e.name(), CONTENT_TYPE_NAMESPACES) {
+                    if count >= cap {
+                        capped = true;
+                    } else {
+                        record_content_type(&e, ct);
+                        count += 1;
+                    }
                 }
             }
             Ok(Event::Empty(e)) => {
-                if count >= cap {
-                    capped = true;
-                } else {
-                    record_content_type(&e, ct);
-                    count += 1;
+                if in_namespace(&reader, e.name(), CONTENT_TYPE_NAMESPACES) {
+                    if count >= cap {
+                        capped = true;
+                    } else {
+                        record_content_type(&e, ct);
+                        count += 1;
+                    }
                 }
             }
             Ok(Event::End(_)) => guard.leave(),
@@ -825,6 +884,14 @@ fn parse_content_types(text: &str, ct: &mut ContentTypes, cap: usize, guard: &mu
         buf.clear();
     }
     capped
+}
+
+/// Whether an element, resolved against the reader's namespace stack, is in one of `namespaces`.
+fn in_namespace<R: BufRead>(reader: &NsReader<R>, name: QName<'_>, namespaces: &[&str]) -> bool {
+    matches!(
+        reader.resolver().resolve_element(name).0,
+        ResolveResult::Bound(Namespace(ns)) if namespaces.iter().any(|u| ns == u.as_bytes())
+    )
 }
 
 /// Extract and record an `Override` or `Default` content type declaration from an XML element.
@@ -847,10 +914,11 @@ fn record_content_type(e: &BytesStart, ct: &mut ContentTypes) {
 /// Parse a `.rels` part. Returns `(relationships, capped)` where `capped` is set when the budget
 /// stopped further relationships from being recorded. The depth bound is tracked like every other
 /// parser (J1), so a deeply nested relationships part stops before a later (possibly dangling)
-/// relationship is read.
+/// relationship is read. Only `Relationship` elements in an OPC Relationships namespace count: a
+/// foreign namespace in the part is application XML, not package relationships.
 fn parse_rels(dir: &str, text: &str, cap: usize, guard: &mut ParseGuard) -> (Vec<Rel>, bool) {
     let mut rels = Vec::new();
-    let mut reader = Reader::from_reader(text.as_bytes());
+    let mut reader = NsReader::from_reader(text.as_bytes());
     let mut buf = Vec::new();
     let mut capped = false;
     loop {
@@ -862,9 +930,15 @@ fn parse_rels(dir: &str, text: &str, cap: usize, guard: &mut ParseGuard) -> (Vec
                 if !guard.enter() {
                     break;
                 }
-                push_rel(dir, &e, &mut rels, cap, &mut capped);
+                if in_namespace(&reader, e.name(), RELATIONSHIP_NAMESPACES) {
+                    push_rel(dir, &e, &mut rels, cap, &mut capped);
+                }
             }
-            Ok(Event::Empty(e)) => push_rel(dir, &e, &mut rels, cap, &mut capped),
+            Ok(Event::Empty(e)) => {
+                if in_namespace(&reader, e.name(), RELATIONSHIP_NAMESPACES) {
+                    push_rel(dir, &e, &mut rels, cap, &mut capped);
+                }
+            }
             Ok(Event::End(_)) => guard.leave(),
             Ok(Event::Eof) => break,
             Err(_) => break,
@@ -898,11 +972,14 @@ fn parse_rel(dir: &str, e: &BytesStart) -> Option<Rel> {
     Some(Rel { id, kind, target_abs, external })
 }
 
-/// An attribute by its local name regardless of prefix (content types and rels use unprefixed
-/// or conventionally-prefixed attributes).
+/// An unqualified attribute by its local name. OPC attributes carry no namespace prefix, so a
+/// prefixed attribute with the same local name is foreign and is not the declaration's attribute.
 fn attr_local(e: &BytesStart, name: &[u8]) -> Option<String> {
     for a in e.attributes() {
         let a = a.ok()?;
+        if a.key.as_ref().contains(&b':') {
+            continue;
+        }
         if a.key.local_name().as_ref() == name {
             return a.normalized_value(quick_xml::XmlVersion::Implicit1_0).ok().map(|c| c.into_owned());
         }
