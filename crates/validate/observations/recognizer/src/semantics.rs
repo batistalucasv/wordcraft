@@ -50,7 +50,8 @@ impl Names {
             let mut result = String::new();
             let mut word = String::new();
             let flush = |word: &mut String, result: &mut String, active: &mut Vec<String>| {
-                if !active.contains(word)
+                if !result.trim_end().ends_with(':')
+                    && !active.contains(word)
                     && active.len() < 32
                     && let Some(target) = names.aliases.get(word)
                 {
@@ -98,6 +99,7 @@ struct Origin {
     callable: Option<String>,
     outcome: bool,
     raw: bool,
+    limits: bool,
     prefix: bool,
     membership: bool,
 }
@@ -116,21 +118,30 @@ pub(crate) fn analyze(sig: &Signature, block: &Block, names: &Names, file: &str,
         accessors: vec![],
         scrub_paths: vec![],
         positive_membership: vec![],
+        scalar_reads: vec![],
         callable_context: 0,
         state_depth: 0,
         state_predicates: vec![],
     };
     for input in &sig.inputs {
         match input {
-            FnArg::Typed(p) => audit.bind(&p.pat, Origin { raw: raw_type(&names.resolve(&tokens(&p.ty))), ..Origin::default() }),
+            FnArg::Typed(p) => audit.bind(
+                &p.pat,
+                Origin {
+                    raw: raw_type(&names.resolve(&tokens(&p.ty))),
+                    limits: names.resolve(&tokens(&p.ty)).split_whitespace().last() == Some("Limits"),
+                    ..Origin::default()
+                },
+            ),
             FnArg::Receiver(_) => {
                 audit.bindings.insert("self".into(), Origin { raw: raw_type(self_type), ..Origin::default() });
             }
         }
     }
     audit.visit_block(block);
-    json!({"issues":audit.issues,"lookups":audit.calls,"state_predicates":audit.state_predicates,"accessors":audit.accessors,"scrub_paths":audit.scrub_paths,"positive_membership":audit.positive_membership})
+    json!({"issues":audit.issues,"lookups":audit.calls,"state_predicates":audit.state_predicates,"accessors":audit.accessors,"scrub_paths":audit.scrub_paths,"positive_membership":audit.positive_membership,"scalar_reads":audit.scalar_reads})
 }
+#[derive(Clone)]
 struct Flow {
     names: Names,
     bindings: HashMap<String, Origin>,
@@ -144,6 +155,7 @@ struct Flow {
     accessors: Vec<String>,
     scrub_paths: Vec<String>,
     positive_membership: Vec<String>,
+    scalar_reads: Vec<String>,
     callable_context: usize,
     state_depth: usize,
     state_predicates: Vec<String>,
@@ -166,17 +178,35 @@ impl Flow {
         result
     }
     fn bind(&mut self, pat: &Pat, origin: Origin) {
-        struct Bindings(Vec<String>);
-        impl<'ast> Visit<'ast> for Bindings {
-            fn visit_pat_ident(&mut self, p: &'ast PatIdent) {
-                self.0.push(ident(&p.ident));
-                visit::visit_pat_ident(self, p);
+        match pat {
+            Pat::Ident(p) => {
+                self.bindings.insert(ident(&p.ident), origin);
             }
-        }
-        let mut bindings = Bindings(vec![]);
-        bindings.visit_pat(pat);
-        for name in bindings.0 {
-            self.bindings.insert(name, origin.clone());
+            Pat::Type(p) => self.bind(&p.pat, origin),
+            Pat::Paren(p) => self.bind(&p.pat, origin),
+            Pat::Reference(p) => self.bind(&p.pat, origin),
+            Pat::Tuple(p) => {
+                for p in &p.elems {
+                    self.bind(p, origin.clone());
+                }
+            }
+            Pat::Slice(p) => {
+                for p in &p.elems {
+                    self.bind(p, origin.clone());
+                }
+            }
+            Pat::TupleStruct(p) => {
+                let mut payload = origin;
+                if matches!(last(&self.names.resolve(&tokens(&p.path))), "One" | "Some") {
+                    // Extracting a proven payload removes the Option/Resolution query tag.
+                    payload.outcome = false;
+                    payload.membership = false;
+                }
+                for p in &p.elems {
+                    self.bind(p, payload.clone());
+                }
+            }
+            _ => {} // Unsupported named patterns are rejected by syntax recognition.
         }
     }
     fn origin(&self, expr: &Expr) -> Origin {
@@ -198,26 +228,79 @@ impl Flow {
                 match name.as_deref() {
                     Some("prefix") => Origin { prefix: true, ..Origin::default() },
                     Some(n) if lookup(n) => Origin { outcome: true, ..Origin::default() },
-                    _ => self.merge_origins(c.args.iter().map(|arg| self.origin(arg))),
+                    _ => {
+                        let mut value = self.merge_origins(c.args.iter().map(|arg| self.origin(arg)));
+                        if let Expr::Path(p) = c.func.as_ref()
+                            && matches!(last(&self.path(p)), "contains" | "contains_key" | "get" | "any")
+                        {
+                            value.membership |= value.prefix || value.raw;
+                        }
+                        value
+                    }
                 }
             }
             Expr::Tuple(t) => self.merge_origins(t.elems.iter().map(|e| self.origin(e))),
+            Expr::Array(t) => self.merge_origins(t.elems.iter().map(|e| self.origin(e))),
+            Expr::Index(i) => self.origin(&i.expr),
+            Expr::Block(b) => self.block_origin(&b.block),
+            Expr::If(i) => {
+                self.merge_origins([self.block_origin(&i.then_branch), i.else_branch.as_ref().map(|(_, e)| self.origin(e)).unwrap_or_default()])
+            }
+            Expr::Match(m) => self.merge_origins(m.arms.iter().map(|a| self.origin(&a.body))),
             Expr::Reference(r) => self.origin(&r.expr),
+            Expr::Unary(u) if matches!(u.op, UnOp::Deref(_)) => self.origin(&u.expr),
+            Expr::Cast(c) => self.origin(&c.expr),
+            Expr::Try(t) => self.origin(&t.expr),
             Expr::Paren(p) => self.origin(&p.expr),
             Expr::Group(g) => self.origin(&g.expr),
-            Expr::Field(f) => Origin { raw: self.origin(&f.base).raw, ..Origin::default() },
+            Expr::Field(f) => self.origin(&f.base),
             Expr::MethodCall(m) => {
                 let origin = self.origin(&m.receiver);
                 match ident(&m.method).as_str() {
                     "prefix" => Origin { prefix: true, ..Origin::default() },
                     "into_complete_set" | "is_complete" | "missing" => Origin::default(),
-                    "contains" | "contains_key" | "any" | "is_none" | "is_some" | "is_some_and" => {
+                    "contains" | "contains_key" | "any" | "get" | "find" | "is_none" | "is_some" | "is_some_and" => {
                         Origin { membership: origin.prefix || origin.raw, ..origin }
                     }
                     _ => origin,
                 }
             }
             _ => Origin::default(),
+        }
+    }
+    fn block_origin(&self, block: &Block) -> Origin {
+        let mut nested = self.clone();
+        for stmt in &block.stmts {
+            if let Stmt::Local(local) = stmt
+                && let Some(init) = &local.init
+            {
+                nested.bind(&local.pat, nested.origin(&init.expr));
+            }
+        }
+        match block.stmts.last() {
+            Some(Stmt::Expr(e, None)) => nested.origin(e),
+            _ => Origin::default(),
+        }
+    }
+    fn conditional_outcome(&self, expr: &Expr) -> bool {
+        if self.origin(expr).outcome {
+            return true;
+        }
+        match expr {
+            Expr::Let(l) => self.origin(&l.expr).outcome,
+            Expr::Binary(b) => self.conditional_outcome(&b.left) || self.conditional_outcome(&b.right),
+            Expr::Unary(u) => self.conditional_outcome(&u.expr),
+            Expr::Paren(p) => self.conditional_outcome(&p.expr),
+            Expr::Macro(m) if tokens(&m.mac.path).ends_with("matches") => {
+                fn subject(input: syn::parse::ParseStream<'_>) -> syn::Result<Expr> {
+                    let expr = input.parse()?;
+                    input.parse::<Token![,]>()?;
+                    let _: proc_macro2::TokenStream = input.parse()?;
+                    Ok(expr)
+                }
+                subject.parse2(m.mac.tokens.clone()).is_ok_and(|value| self.origin(&value).outcome)
+            }
+            _ => false,
         }
     }
     fn pattern(&mut self, pat: &Pat, guard: bool, presence_only: bool) {
@@ -311,10 +394,17 @@ impl<'ast> Visit<'ast> for Flow {
         if origin_here.callable.is_some() && self.callable_context == 0 {
             self.issue("tracked callable may only be invoked directly or bound to a local function value; escaping callable flow is unsupported");
         }
+        if self.negative && matches!(expr, Expr::Path(_)) && origin_here.membership && origin_here.raw && self.returns_absence {
+            self.issue("raw absence through a local boolean still requires completeness-carrying evidence");
+        }
         if self.negative && origin_here.membership && origin_here.prefix {
             self.issue("negative retained-prefix membership requires CompleteSet, regardless of contract or local binding");
         }
         match expr {
+            Expr::Field(f) if self.origin(&f.base).limits => {
+                self.scalar_reads.push(tokens(f));
+                visit::visit_expr(self, expr);
+            }
             Expr::Path(p) if accessor(last(&self.path(p))) => {
                 if p.qself.is_some() || p.path.segments.len() > 1 {
                     self.scrub_paths.push(tokens(p));
@@ -324,6 +414,9 @@ impl<'ast> Visit<'ast> for Flow {
                 self.issue("unauthorized literal Resolution::Absent construction; use discovered with package loss evidence");
             }
             Expr::Call(c) => {
+                if self.negative && c.args.iter().any(|arg| self.origin(arg).prefix) {
+                    self.issue("unmodeled negative retained-prefix call requires CompleteSet");
+                }
                 if let Some(name) = self.origin(&c.func).callable {
                     if lookup(&name) {
                         self.calls.push(name);
@@ -354,12 +447,19 @@ impl<'ast> Visit<'ast> for Flow {
                 self.visit_expr(&c.func);
                 self.callable_context -= 1;
                 for arg in &c.args {
+                    let origin = self.origin(arg);
+                    if origin.prefix && origin.membership {
+                        self.issue("unmodeled retained-membership callable flow requires CompleteSet");
+                    }
                     self.visit_expr(arg);
                 }
             }
             Expr::MethodCall(m) => {
                 let origin = self.origin(&m.receiver);
                 let method = ident(&m.method);
+                if origin.prefix && origin.membership && !matches!(method.as_str(), "is_none" | "is_some" | "is_some_and") {
+                    self.issue("unmodeled retained-membership method transform requires CompleteSet");
+                }
                 if accessor(&method) {
                     self.accessors.push(method.clone());
                 }
@@ -408,6 +508,16 @@ impl<'ast> Visit<'ast> for Flow {
                 }
                 visit::visit_expr(self, expr);
             }
+            Expr::If(i) => {
+                let cond = self.origin(&i.cond);
+                if i.else_branch.is_some() && cond.prefix && cond.membership {
+                    self.issue("unmodeled retained-membership if/else polarity requires CompleteSet");
+                }
+                if i.else_branch.is_some() && self.conditional_outcome(&i.cond) {
+                    self.issue("absence polarity: package lookup if-let/matches else collapse is unsupported; use explicit Resolution arms");
+                }
+                visit::visit_expr(self, expr);
+            }
             Expr::Let(l) => {
                 if self.origin(&l.expr).outcome {
                     self.pattern(&l.pat, false, true);
@@ -415,8 +525,37 @@ impl<'ast> Visit<'ast> for Flow {
                 visit::visit_expr(self, expr);
             }
             Expr::Unary(u) if matches!(u.op, UnOp::Not(_)) => self.negative_expr(&u.expr, true),
-            Expr::Binary(b) if matches!(b.op, BinOp::Eq(_)) && matches!(b.right.as_ref(), Expr::Lit(ExprLit {lit: Lit::Bool(v),..}) if !v.value) => {
-                self.negative_expr(&b.left, true);
+            Expr::Binary(b) => {
+                let membership = |e: &Expr| {
+                    let value = self.origin(e);
+                    value.membership && (value.prefix || (self.returns_absence && value.raw))
+                };
+                let left_member = membership(&b.left);
+                let right_member = membership(&b.right);
+                let boolean = |e: &Expr| match e {
+                    Expr::Lit(ExprLit { lit: Lit::Bool(v), .. }) => Some(v.value),
+                    _ => None,
+                };
+                let value = if left_member {
+                    boolean(&b.right)
+                } else if right_member {
+                    boolean(&b.left)
+                } else {
+                    None
+                };
+                if let Some(value) = value {
+                    let negative = (matches!(b.op, BinOp::Eq(_)) && !value) || (matches!(b.op, BinOp::Ne(_)) && value);
+                    if matches!(b.op, BinOp::Eq(_) | BinOp::Ne(_)) {
+                        self.negative_expr(&b.left, self.negative || negative);
+                        self.negative_expr(&b.right, self.negative || negative);
+                    } else {
+                        self.issue("unmodeled membership boolean transform requires CompleteSet");
+                    }
+                } else if (left_member || right_member) && !matches!(b.op, BinOp::And(_) | BinOp::Or(_)) {
+                    self.issue("unmodeled membership boolean comparison requires CompleteSet");
+                } else {
+                    visit::visit_expr(self, expr);
+                }
             }
             Expr::Macro(m) => {
                 let name = tokens(&m.mac.path);

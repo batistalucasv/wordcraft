@@ -1,6 +1,6 @@
 # WordCraft roadmap
 
-> **Validation status:** 2026-11-12 · minor · #5875 round 15: all established owner roots are checked by the Transitional root gate; custom-property ambiguity and unknown discovery report skipped coverage; incomplete graph memberships cannot prove an unused comment. Established-unowned reference exclusions receive one out-of-scope count without changing their verdict. The observation gate rejects destructuring and module-scope registry indirection; its documented guarantee is lexical, not general Rust alias analysis. Synthetic controls only; independent endpoint review remains required and readiness estimates are unchanged.
+> **Validation status:** 2026-11-12 · minor · #5875 round 18: package entry and availability lookups carry explicit absence/unknown states; the observation gate resolves bounded helper/accessor aliases and pins completeness predicates and reader derives. Qualified standard macros and four inert attributes are supported; named-field bindings and trait bodies remain closed grammar. Synthetic controls only; independent endpoint review remains required and readiness estimates are unchanged.
 
 > **Last reviewed:** 2026-10-31 · **Last updated:** 2026-10-31 · **Change:** minor (#3398: persistent screen paper colors; parity estimates unchanged); previously minor (#3693: additional Delete Previous Sentence command and shortcut; Word-parity estimates unchanged)
 > **CLI path update:** 2026-11-04 · Options before a non-Unicode input filename no longer make the CLI reject that filename; text option values still require Unicode; `run --file` and `run --script` retain native paths. No ranked gap or readiness estimate changes.
@@ -151,6 +151,8 @@ Ranked, to beta (detail and remaining milestones in [docs/roadmap.md](docs/roadm
    (20–30 h).
 
 ## Progress log
+
+- 2026-11-12: #5875 round 18: package entry and availability lookups carry explicit absence/unknown states; the observation gate resolves bounded helper/accessor aliases and pins completeness predicates and reader derives. Qualified standard macros and four inert attributes are supported; named-field bindings and trait bodies remain closed grammar. Synthetic controls only; independent endpoint review remains required and readiness estimates are unchanged.
 
 - 2026-11-12: #5875 round 15: gate every owner root, report unresolved custom-property checks, suppress unused-comment absence on incomplete memberships, count unowned exclusions as out of scope, and harden the lexical contract gate; synthetic controls only, readiness estimates unchanged.
 

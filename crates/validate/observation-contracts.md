@@ -5,12 +5,45 @@ Run with `--check` to audit consumers and drift; `--self-test` exercises rejecti
 
 The gate enforces fail-closed syntax recognition over the production Rust in `src/lib.rs`, `src/observed.rs`, `src/ownership.rs`, `src/package.rs`, `src/resolution.rs`, and `src/scan.rs`. Inline `#[cfg(test)]` modules, separate test files, generated policy, and the non-consuming `model.rs`/`reserved.rs` tables are outside this boundary.
 Every item, expression body and pattern in those files must match the closed grammar in `observations/recognizer/src/main.rs`; unsupported syntax fails. External module declarations must resolve to a supplied source file or an explicit table/test/policy exclusion. Functions and impl methods, nested closures, const/static initializers, discriminants and type-level expressions are audited. Named-field patterns in binding, parameter, closure, match and assignment positions, pattern macros, traits and unaudited item/body kinds are rejected. Raw identifiers are normalized before footprint and registry checks.
-Single-arm item macro templates with ident/literal fragments and no repetition are instantiated and audited, both at definition and invocation; all other definitions and item macros fail. `observation_contract!` must expand to no code. The recognized `format!`, `vec!`, `matches!` and `debug_assert!` argument grammars are parsed and traversed, including their patterns and nested bodies; other expression macros and local definitions/imports shadowing these standard macros and glob imports fail. Named collection fields are discovered from recognized expansions too. Footprint identifiers retain complete Unicode identifiers, including combining marks; Python word boundaries are not Rust identifier boundaries.
+Single-arm item macro templates with ident/literal fragments and no repetition are instantiated and audited, both at definition and invocation; all other definitions and item macros fail. `observation_contract!` must expand to no code. The recognized `format!`, `vec!`, `matches!` and `debug_assert!` argument grammars (unqualified or canonical `std::` paths only) are parsed and traversed, including their patterns and nested bodies; other expression macros and local definitions/imports shadowing these standard macros and glob imports fail. Named collection fields are discovered from recognized expansions too. Footprint identifiers retain complete Unicode identifiers, including combining marks; Python word boundaries are not Rust identifier boundaries.
 Exact declared lexical footprints cover structural adapters and collection-typed locals; enum values alone do not trigger a collection declaration. Private representation providers have explicit signature/footprint contracts in `observations/representation-contracts.json`, with no file-wide function exemption. Macro instances with identical normalized bodies/headers/contracts share a register row. Package helper imports, module aliases and local function bindings are resolved in the closed grammar. Entry lookups carry Resolution; absence requires an explicit Absent arm, with Unknown separate. Literal Absent construction is sealed to resolution.rs, discovered lookups must consult both entry-loss states, and producer/conservative state predicates are pinned in observations/entry-loss-contracts.json. Raw iterator/map absence cannot be laundered by a contract. Fixtures check semantic truth; this is not general Rust name resolution or a whole-program dataflow proof.
-Build scripts, compiler expansion and procedural-macro implementations are outside the audit: recognized built-in derives and the existing serde `Serialize` derive are accepted by attribute name, without auditing their generated code. Other attribute macros and `cfg_attr` fail. Rust privacy seals the observation representation. The standalone locked recognizer is build-time tooling and does not enter validator/WASM dependencies.
+Reader derives requested in audited files are enforced by canonical identity (Debug, serde::Serialize and serde::Deserialize), including qualified and renamed imports. Exact type+derive+field/generic shapes, including the existing package/registry representation readers, are recorded in `observations/reader-contracts.json`; new pairs and added registry fields fail closed. The existing DTO pairs and representation pairs are listed below. Build scripts, compiler implementations and expansions not requested by these audited files remain outside this boundary. Other attribute macros and `cfg_attr` fail. The closed inert codegen list is `inline`, `inline(always)`, `inline(never)`, and `cold`; cfg and derives retain their separate traversed/identity-checked treatment. Serde field attributes are not inert. Named-field bindings and trait items/default bodies remain rejected. Rust privacy seals the observation representation. The standalone locked recognizer is build-time tooling and does not enter validator/WASM dependencies.
 Only `check_custom_xml` (CUSTOMXML-SCHEMA) and `report_unreferenced_comments` (informational coverage) may consult PackageRegistryContext.
 That context admits established-unowned declarations to the primary package registry; it never grants story ownership.
 Duplicate relationship IDs bind the first XML declaration in every reference path; swapping duplicates changes binding evidence.
+
+Recorded reader pairs (exact shapes in the policy):
+
+- `lib.rs::Evidence + Debug`
+- `lib.rs::Evidence + serde::Serialize`
+- `lib.rs::Finding + Debug`
+- `lib.rs::Finding + serde::Serialize`
+- `lib.rs::Limits + Debug`
+- `lib.rs::Report + Debug`
+- `lib.rs::Report + serde::Serialize`
+- `lib.rs::RuleSpec + Debug`
+- `lib.rs::Severity + Debug`
+- `lib.rs::Severity + serde::Serialize`
+- `lib.rs::Verdict + Debug`
+- `lib.rs::Verdict + serde::Serialize`
+- `observed.rs::CompleteSet + Debug`
+- `observed.rs::Completeness + Debug`
+- `observed.rs::Observed + Debug`
+- `ownership.rs::Membership + Debug`
+- `ownership.rs::OwnerContext + Debug`
+- `ownership.rs::OwnerId + Debug`
+- `ownership.rs::PartGraph + Debug`
+- `ownership.rs::PartId + Debug`
+- `resolution.rs::Resolution + Debug`
+- `scan.rs::<template lexical_id>::AuditPlaceholder + Debug`
+- `scan.rs::<template numeric_id>::AuditPlaceholder + Debug`
+- `scan.rs::DecimalId + Debug`
+- `scan.rs::DecodeError + Debug`
+- `scan.rs::HexId + Debug`
+- `scan.rs::NumericKey + Debug`
+- `scan.rs::PartRole + Debug`
+- `scan.rs::RelId + Debug`
+- `scan.rs::StyleId + Debug`
 
 | Helper | Rules/conclusion | Collections/accessors | Intentional scope | Incompleteness causes | Fallback | Unknown package identity |
 |---|---|---|---|---|---|---|
@@ -124,8 +157,8 @@ Duplicate relationship IDs bind the first XML declaration in every reference pat
 | package.rs::check_case_collisions | PKG-CASE-COLLISION | field.names*1,type.HashMap*4,type.Vec*5 | source-local bounded extraction; no implicit document owner | source unavailable or malformed; XML event/depth budget; category allocation cap | retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set | independent |
 | package.rs::load_rels | - | field.entries*1,parser.parse_rels*1,type.Vec*3 | source-local bounded extraction; no implicit document owner | source unavailable or malformed; XML event/depth budget; category allocation cap | retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set | independent |
 | package.rs::canonical | - | - | internal presence-only entry-name extraction; only package lookup and reader assembly may call canonical | raw entries may be an examined prefix | None is no observed candidate, never established package absence | independent |
-| package.rs::canonical_entry | - | field.entries*1 | source-local bounded extraction; no implicit document owner | source unavailable or malformed; XML event/depth budget; category allocation cap | retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set | independent |
-| package.rs::entry_by_name | - | field.entries*1 | source-local bounded extraction; no implicit document owner | source unavailable or malformed; XML event/depth budget; category allocation cap | retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set | independent |
+| package.rs::canonical_entry | - | field.entries*1 | package entry identity and stored spelling; named unreadable entries remain present | archive entry cap or unreadable entry with unrecoverable identity; named byte/decode loss preserves presence | One for observed identity; Absent only after complete entry discovery; otherwise Unknown | independent |
+| package.rs::entry_by_name | - | field.entries*1 | package entry identity and retained entry reference; named unreadable entries remain present | archive entry cap or unreadable entry with unrecoverable identity; named byte/decode loss preserves presence | One for observed identity; Absent only after complete entry discovery; otherwise Unknown | independent |
 | package.rs::content_unavailable | - | lookup.entry_by_name*1 | entry content availability; missing entries retain package completeness | archive entry cap; unknown entry identity; unreadable or undecodable bytes | Unknown supplies neither availability nor unavailability | independent |
 | package.rs::reachability | - | field.rels*2,type.HashMap*1,type.HashSet*4,type.Vec*2 | source-local bounded extraction; no implicit document owner | source unavailable or malformed; XML event/depth budget; category allocation cap | retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set | independent |
 | package.rs::resolve | - | type.Vec*2 | source-local bounded extraction; no implicit document owner | source unavailable or malformed; XML event/depth budget; category allocation cap | retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set | independent |

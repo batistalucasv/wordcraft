@@ -106,6 +106,8 @@ def recognize(sources):
 
 def consumption(code, enum_variants=(), semantic=None):
     if semantic:
+        for scalar in semantic.get('scalar_reads', []):
+            code = code.replace(scalar, '__scalar_budget')
         for path in sorted(set(semantic.get('scrub_paths', [])), key=len, reverse=True):
             code = code.replace(path, '__audited_accessor')
     # Qualified enum values are expressions, not collection types. Infer these
@@ -156,6 +158,12 @@ def declarations(sources):
     audited = {name: text for name, text in sources.items()
                if not name.endswith('_tests.rs') and name not in {'model.rs','reserved.rs','contracts_generated.rs'}}
     recognized = recognize(audited)
+    reader_contracts = json.loads((Path(__file__).parent / 'reader-contracts.json').read_text())
+    allowed_readers = Counter(json.dumps(r, sort_keys=True) for r in reader_contracts['readers'])
+    actual_readers = Counter(json.dumps(r, sort_keys=True) for f in recognized.values() for r in f['readers'])
+    for record in actual_readers - allowed_readers:
+        reader = json.loads(record)
+        errors.append(f"{reader['type']}: unauthorized reader derive {reader['derive']} or changed representation/DTO field shape")
     FIELDS.update(f for file in recognized.values() for f in file['collection_fields'])
     enum_variants = [v for file in recognized.values() for v in file['enum_variants']]
     for name,text in sorted(sources.items()):
@@ -271,14 +279,19 @@ def outputs(rows):
         'Run with `--check` to audit consumers and drift; `--self-test` exercises rejection paths.\n\n'
         'The gate enforces fail-closed syntax recognition over the production Rust in `src/lib.rs`, `src/observed.rs`, `src/ownership.rs`, `src/package.rs`, `src/resolution.rs`, and `src/scan.rs`. Inline `#[cfg(test)]` modules, separate test files, generated policy, and the non-consuming `model.rs`/`reserved.rs` tables are outside this boundary.\n'
         'Every item, expression body and pattern in those files must match the closed grammar in `observations/recognizer/src/main.rs`; unsupported syntax fails. External module declarations must resolve to a supplied source file or an explicit table/test/policy exclusion. Functions and impl methods, nested closures, const/static initializers, discriminants and type-level expressions are audited. Named-field patterns in binding, parameter, closure, match and assignment positions, pattern macros, traits and unaudited item/body kinds are rejected. Raw identifiers are normalized before footprint and registry checks.\n'
-        'Single-arm item macro templates with ident/literal fragments and no repetition are instantiated and audited, both at definition and invocation; all other definitions and item macros fail. `observation_contract!` must expand to no code. The recognized `format!`, `vec!`, `matches!` and `debug_assert!` argument grammars are parsed and traversed, including their patterns and nested bodies; other expression macros and local definitions/imports shadowing these standard macros and glob imports fail. Named collection fields are discovered from recognized expansions too. Footprint identifiers retain complete Unicode identifiers, including combining marks; Python word boundaries are not Rust identifier boundaries.\n'
+        'Single-arm item macro templates with ident/literal fragments and no repetition are instantiated and audited, both at definition and invocation; all other definitions and item macros fail. `observation_contract!` must expand to no code. The recognized `format!`, `vec!`, `matches!` and `debug_assert!` argument grammars (unqualified or canonical `std::` paths only) are parsed and traversed, including their patterns and nested bodies; other expression macros and local definitions/imports shadowing these standard macros and glob imports fail. Named collection fields are discovered from recognized expansions too. Footprint identifiers retain complete Unicode identifiers, including combining marks; Python word boundaries are not Rust identifier boundaries.\n'
         'Exact declared lexical footprints cover structural adapters and collection-typed locals; enum values alone do not trigger a collection declaration. Private representation providers have explicit signature/footprint contracts in `observations/representation-contracts.json`, with no file-wide function exemption. Macro instances with identical normalized bodies/headers/contracts share a register row. Package helper imports, module aliases and local function bindings are resolved in the closed grammar. Entry lookups carry Resolution; absence requires an explicit Absent arm, with Unknown separate. Literal Absent construction is sealed to resolution.rs, discovered lookups must consult both entry-loss states, and producer/conservative state predicates are pinned in observations/entry-loss-contracts.json. Raw iterator/map absence cannot be laundered by a contract. Fixtures check semantic truth; this is not general Rust name resolution or a whole-program dataflow proof.\n'
-        'Build scripts, compiler expansion and procedural-macro implementations are outside the audit: recognized built-in derives and the existing serde `Serialize` derive are accepted by attribute name, without auditing their generated code. Other attribute macros and `cfg_attr` fail. Rust privacy seals the observation representation. The standalone locked recognizer is build-time tooling and does not enter validator/WASM dependencies.\n'
+        'Reader derives requested in audited files are enforced by canonical identity (Debug, serde::Serialize and serde::Deserialize), including qualified and renamed imports. Exact type+derive+field/generic shapes, including the existing package/registry representation readers, are recorded in `observations/reader-contracts.json`; new pairs and added registry fields fail closed. The existing DTO pairs and representation pairs are listed below. Build scripts, compiler implementations and expansions not requested by these audited files remain outside this boundary. Other attribute macros and `cfg_attr` fail. The closed inert codegen list is `inline`, `inline(always)`, `inline(never)`, and `cold`; cfg and derives retain their separate traversed/identity-checked treatment. Serde field attributes are not inert. Named-field bindings and trait items/default bodies remain rejected. Rust privacy seals the observation representation. The standalone locked recognizer is build-time tooling and does not enter validator/WASM dependencies.\n'
         'Only `check_custom_xml` (CUSTOMXML-SCHEMA) and `report_unreferenced_comments` (informational coverage) may consult PackageRegistryContext.\n'
         'That context admits established-unowned declarations to the primary package registry; it never grants story ownership.\n'
         'Duplicate relationship IDs bind the first XML declaration in every reference path; swapping duplicates changes binding evidence.\n\n'
         '| Helper | Rules/conclusion | Collections/accessors | Intentional scope | Incompleteness causes | Fallback | Unknown package identity |\n'
         '|---|---|---|---|---|---|---|\n')
+    policy = json.loads((Path(__file__).parent / 'reader-contracts.json').read_text())
+    pairs = sorted({r['type']+' + '+r['derive'] for r in policy['readers']})
+    marker = '| Helper | Rules/conclusion |'
+    at = header.index(marker)
+    header = header[:at] + 'Recorded reader pairs (exact shapes in the policy):\n\n' + ''.join('- `'+pair+'`\n' for pair in pairs) + '\n' + header[at:]
     md=header+''.join('| '+' | '.join(row[k].replace('|','/') for k in ['helper','rules','collections','scope','loss','fallback','package_loss'])+' |\n' for row in rows)
     rules=sorted({r for row in rows if row['package_loss']!='independent' for r in row['package_loss'].split(',')})
     rust='//! Generated observation-contract policy. Do not edit; see observations/generate.py.\n'
@@ -411,6 +424,29 @@ fn unregistered_read(pkg: &Package) -> usize { (|package_pattern!(items): &Packa
     mutations['R18 aliased UFCS'] = ('lib.rs', lambda s: s+'\ntype HiddenDefinitions = Observed<HashSet<String>>; fn unregistered_absence(value: &HiddenDefinitions, key: &String) -> bool { !HiddenDefinitions::prefix(value).contains(key) }')
     mutations['R18 local prefix with exact original contract'] = ('lib.rs', lambda s: s.replace('self.parts.values().flat_map(|p| p.special_notes.prefix().iter().cloned()).collect()', 'self.parts.values().flat_map(|p| { let retained = p.special_notes.prefix(); retained.iter().filter(|candidate| !retained.contains(candidate)).cloned() }).collect()', 1))
     mutations['R18 retained map get absence'] = ('lib.rs', lambda s: s+'\nimpl Observed<HashMap<String, String>> { fn unregistered_absence(&self, key: &String) -> bool { Self::prefix(self).get(key).is_none() } }')
+    for spelling in ['serde::Serialize', 'serde::Deserialize', 'Debug']:
+        mutations['R18 unauthorized ContentTypes reader '+spelling] = ('package.rs', lambda s, d=spelling: s.replace('#[derive(Default)]\npub(crate) struct ContentTypes', '#[derive(Default, '+d+')]\npub(crate) struct ContentTypes', 1))
+    mutations['R18 renamed reader derive'] = ('package.rs', lambda s: s.replace('#[derive(Default)]\npub(crate) struct ContentTypes', '#[derive(Default, RegistrySerialize)]\npub(crate) struct ContentTypes', 1)+'\nuse serde::Serialize as RegistrySerialize;\n')
+    mutations['R18 unauthorized reader on DTO'] = ('lib.rs', lambda s: s.replace('pub struct Finding {', '#[derive(serde::Deserialize)] pub struct Finding {', 1))
+    mutations['R18 registry fields added to allowed DTO'] = ('lib.rs', lambda s: s.replace('pub struct Finding {', 'pub struct Finding { hidden_registry: package::ContentTypes,', 1))
+    def nested_reader(source):
+        definition = re.search(r'(pub\(crate\) struct Limits \{.*?\n\})', source, re.S)
+        if not definition: raise ValueError('nested reader fixture did not find Limits')
+        source = source.replace('#[derive(Debug, Clone, Copy)]\npub(crate) struct Limits', '#[derive(Clone, Copy)]\npub(crate) struct Limits', 1)
+        return source+'\nfn unregistered_nested_reader() { #[derive(Debug)] '+definition[1]+' }'
+    mutations['R18 reader allowance cannot transfer into a function scope'] = ('lib.rs', nested_reader)
+    mutations['R18 same-named DTO in another module'] = ('package.rs', lambda s: s+'\n#[derive(Debug)] struct Finding { rule: String }')
+    mutations['R18 unsupported qualified env macro'] = ('lib.rs', lambda s: s+'\nfn unregistered() { std::env!("X"); }')
+    # Amendment 1's sole advance diagnostic change: audit the supported path's arguments.
+    mutations['seam/other-macro-path (R18 argument footprint)'] = ('lib.rs', lambda s: s+'\nfn unregistered_read(pkg: &Package) -> usize { std::format!("{}", pkg.entries.len()); pkg.entries.len() }')
+    mutations['R18 qualified consuming macro arguments'] = ('lib.rs', lambda s: s+'\nfn unregistered_read(pkg: &Package) -> String { std::format!("{}", pkg.entries.len()) }')
+    mutations['R18 standard namespace import shadow'] = ('lib.rs', lambda s: s+'\nuse external as std;')
+    mutations['R18 derive outside type context'] = ('lib.rs', lambda s: s+'\n#[derive(Debug)] fn unregistered() {}')
+    mutations['R18 serde field attribute outside policy'] = ('lib.rs', lambda s: s+'\n#[serde(skip)] fn unregistered() {}')
+    mutations['R18 inline outside closed options'] = ('lib.rs', lambda s: s+'\n#[inline(sometimes)] fn unregistered() {}')
+    getter_contract = 'observation_contract! { rules: "-"; collections: "access.prefix*1"; scope: "prefix presence control"; loss: "incomplete observed map"; fallback: "only presence is established"; package_loss: "independent"; }'
+    mutations['R18 contracted retained get equality absence'] = ('lib.rs', lambda s: s+'\nimpl Observed<HashMap<String, String>> { fn unregistered_absence(&self, key: &String) -> bool { '+getter_contract+' Self::prefix(self).get(key) == None } }')
+    mutations['R18 local Resolution matches else collapse'] = ('lib.rs', lambda s: re.sub(r'if match package::canonical_entry\(pkg, target\) \{.*?\n            \} \{', 'if { let outcome = package::canonical_entry(pkg, target); if matches!(outcome, Resolution::One(_)) { false } else { true } } {', s, count=1, flags=re.S))
     # The new-accessor mutation must introduce a different access kind to test exact declaration matching.
     mutations['new undeclared accessor']=('lib.rs', lambda s:s.replace('acc.ran("CUSTOMXML-SCHEMA");','acc.ran("CUSTOMXML-SCHEMA"); let _ = new_collection.retain_budget(n, cap);',1))
     for label,(name,mutation) in mutations.items():
@@ -448,6 +484,26 @@ fn unregistered_read(pkg: &Package) -> usize { (|package_pattern!(items): &Packa
     changed = dict(sources)
     changed['lib.rs'] = changed['lib.rs'].replace('self.parts.values().flat_map(|p| p.special_notes.prefix().iter().cloned()).collect()', 'self.parts.values().flat_map(|p| { let retained = p.special_notes.prefix(); retained.iter().filter(|candidate| retained.contains(candidate)).cloned() }).collect()', 1)
     assert declarations(changed) == rows, 'positive retained-prefix presence must remain accepted'
+    for attribute in ['inline', 'inline(always)', 'inline(never)', 'cold']:
+        changed = dict(sources)
+        changed['lib.rs'] += '\n#['+attribute+'] fn configured_entry_limit(limits: &Limits) -> usize { limits.entries }'
+        assert declarations(changed) == rows, attribute
+    for body in ['std::format!("rule: {rule}")', '{ let v = std::vec![1, 2]; v.len().to_string() }', '{ std::debug_assert!(true); String::new() }', '{ let _ = std::matches!(true, true); String::new() }']:
+        changed = dict(sources)
+        changed['lib.rs'] += '\nfn display_rule(rule: &str) -> String { '+body+' }'
+        assert declarations(changed) == rows, body
+    for name in ['lib.rs', 'observed.rs', 'ownership.rs', 'resolution.rs', 'scan.rs']:
+        changed = dict(sources)
+        def qualified_derives(match):
+            paths = ['std::fmt::Debug' if p.strip() == 'Debug' else 'serde::Serialize' if p.strip() == 'Serialize' else p.strip() for p in match[1].split(',')]
+            return '#[derive('+', '.join(paths)+')]'
+        changed[name] = re.sub(r'#\[derive\(([^)]*)\)\]', qualified_derives, changed[name])
+        assert declarations(changed) == rows, 'canonical reader identities with existing imports: '+name
+    changed = dict(sources)
+    changed['lib.rs'] += '\nimpl Observed<HashMap<String, String>> { fn declared_presence(&self, key: &String) -> bool { '+getter_contract+' Self::prefix(self).get(key).is_some() } }'
+    presence_rows = declarations(changed)
+    assert len(presence_rows) == len(rows)+1
+    assert next(r for r in presence_rows if r['helper'] == 'lib.rs::declared_presence')['collections'] == 'access.prefix*1'
     print('accepted: current production corpus and non-consuming body controls')
     original=outputs(rows)
     try: verify_output('in-memory register', original[0]+'drift', original[0])

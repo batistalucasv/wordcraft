@@ -995,28 +995,30 @@ fn canonical(entries: &[Entry], name: &str) -> Option<String> {
     entries.iter().find(|e| !e.is_dir && e.name.eq_ignore_ascii_case(n)).map(|e| e.name.clone())
 }
 
-/// The stored spelling of the part at `name` (case-insensitive, leading `/` ignored), if present.
+/// The stored spelling of the part at `name` (case-insensitive, leading `/` ignored).
+/// A missing candidate is Absent only after complete entry-identity discovery; otherwise Unknown.
 pub(crate) fn canonical_entry(pkg: &Package, name: &str) -> Resolution<String> {
     observation_contract! {
         rules: "-";
         collections: "field.entries*1";
-        scope: "source-local bounded extraction; no implicit document owner";
-        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
-        fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+        scope: "package entry identity and stored spelling; named unreadable entries remain present";
+        loss: "archive entry cap or unreadable entry with unrecoverable identity; named byte/decode loss preserves presence";
+        fallback: "One for observed identity; Absent only after complete entry discovery; otherwise Unknown";
         package_loss: "independent";
     }
 
     Resolution::discovered(canonical(&pkg.entries, name), !pkg.entries_truncated && !pkg.identity_incomplete)
 }
 
-/// The entry at `name` (case-insensitive, leading `/` ignored), if present.
+/// The entry at `name` (case-insensitive, leading `/` ignored), with entry-identity completeness.
+/// Named unreadable entries remain One; an unexamined suffix or unnamed entry prevents Absent.
 pub(crate) fn entry_by_name<'a>(pkg: &'a Package, name: &str) -> Resolution<&'a Entry> {
     observation_contract! {
         rules: "-";
         collections: "field.entries*1";
-        scope: "source-local bounded extraction; no implicit document owner";
-        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
-        fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
+        scope: "package entry identity and retained entry reference; named unreadable entries remain present";
+        loss: "archive entry cap or unreadable entry with unrecoverable identity; named byte/decode loss preserves presence";
+        fallback: "One for observed identity; Absent only after complete entry discovery; otherwise Unknown";
         package_loss: "independent";
     }
 
@@ -1031,6 +1033,8 @@ pub(crate) fn entry_by_name<'a>(pkg: &'a Package, name: &str) -> Resolution<&'a 
 /// cross-part check that would conclude *absence* from this part's content must skip instead:
 /// absence is not established from unavailable content. Part identity is matched exactly as part
 /// lookup does (OPC names are case-insensitive), so `_RELS/.RELS` is recognised the same way.
+/// One(false) is observed readability, One(true) observed unavailability, Absent a fully searched
+/// missing entry, and Unknown neither readability nor unavailability. Callers must distinguish them.
 pub(crate) fn content_unavailable(pkg: &Package, name: &str) -> Resolution<bool> {
     observation_contract! {
         rules: "-";

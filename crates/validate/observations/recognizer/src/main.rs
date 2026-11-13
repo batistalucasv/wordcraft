@@ -134,6 +134,27 @@ fn substitute(stream: TokenStream, captures: &HashMap<String, TokenTree>) -> Che
     Ok(out)
 }
 
+fn derive_identity(path: &Path, names: &semantics::Names) -> Option<String> {
+    let resolved = names.resolve(&tokens(path)).replace(' ', "");
+    match resolved.as_str() {
+        "serde::Serialize" | "serde::Deserialize" => Some(resolved),
+        "Debug" | "std::fmt::Debug" | "core::fmt::Debug" => Some("Debug".into()),
+        "Clone" | "Copy" | "Default" | "PartialEq" | "Eq" | "PartialOrd" | "Ord" | "Hash" => Some(resolved),
+        _ => None,
+    }
+}
+fn field_shape(fields: &Fields, names: &semantics::Names) -> Value {
+    json!(
+        fields
+            .iter()
+            .map(|f| json!({
+                "name":f.ident.as_ref().map(ident), "type":names.resolve(&tokens(&f.ty)),
+                "attributes":f.attrs.iter().filter(|a| !a.path().is_ident("doc")).map(tokens).collect::<Vec<_>>()
+            }))
+            .collect::<Vec<_>>()
+    )
+}
+
 struct Audit {
     file: String,
     names: semantics::Names,
@@ -143,6 +164,9 @@ struct Audit {
     surface: Vec<String>,
     enum_variants: Vec<String>,
     collection_fields: Vec<String>,
+    readers: Vec<Value>,
+    derive_context: bool,
+    scope: Vec<String>,
     modules: Vec<String>,
     templates: HashMap<String, Template>,
     depth: usize,
@@ -150,6 +174,22 @@ struct Audit {
     syntax_depth: usize,
 }
 impl Audit {
+    fn reader_derives(&mut self, name: &proc_macro2::Ident, attrs: &[Attribute], generics: &Generics, shape: Value) {
+        for attr in attrs.iter().filter(|a| a.path().is_ident("derive")) {
+            if let Meta::List(list) = &attr.meta
+                && let Ok(paths) = Punctuated::<Path, Token![,]>::parse_terminated.parse2(list.tokens.clone())
+            {
+                for path in paths {
+                    if let Some(derive) = derive_identity(&path, &self.names)
+                        && matches!(derive.as_str(), "Debug" | "serde::Serialize" | "serde::Deserialize")
+                    {
+                        self.readers
+                            .push(json!({"type":format!("{}::{}{}",self.file,if self.scope.is_empty() { String::new() } else { self.scope.join("::")+"::" },ident(name)),"derive":derive,"generics":tokens(generics),"shape":shape}));
+                    }
+                }
+            }
+        }
+    }
     fn fail(&mut self, message: String) {
         if self.error.is_none() {
             self.error = Some(message);
@@ -162,8 +202,10 @@ impl Audit {
         let semantic = semantics::analyze(sig, block, &self.names, &self.file, &self.self_type);
         self.units.push(json!({"name":ident(&sig.ident),"header":tokens(sig),"body":tokens(block),"semantic":semantic}));
         self.in_unit += 1;
+        self.scope.push(format!("<function {}>", ident(&sig.ident)));
         self.visit_signature(sig);
         self.visit_block(block);
+        self.scope.pop();
         self.in_unit -= 1;
     }
     fn initializer(&mut self, name: &proc_macro2::Ident, ty: &Type, expr: &Expr) {
@@ -231,7 +273,7 @@ impl<'ast> Visit<'ast> for Audit {
             }
             UseTree::Path(_) | UseTree::Group(_) => None,
         };
-        if binding.is_some_and(|n| matches!(n.as_str(), "format" | "vec" | "matches" | "debug_assert" | "observation_contract")) {
+        if binding.is_some_and(|n| matches!(n.as_str(), "std" | "format" | "vec" | "matches" | "debug_assert" | "observation_contract")) {
             self.fail(bad("macro-shadowing import", tree));
             return;
         }
@@ -246,28 +288,40 @@ impl<'ast> Visit<'ast> for Audit {
         {
             self.collection_fields.push(ident(name));
         }
+        let old = std::mem::replace(&mut self.derive_context, false);
         visit::visit_field(self, field);
+        self.derive_context = old;
     }
     fn visit_attribute(&mut self, attr: &'ast Attribute) {
         // Attribute macros/cfg_attr may replace bodies and are outside this grammar.
         let name = tokens(attr.path());
-        if !matches!(name.as_str(), "doc" | "derive" | "default" | "allow" | "deny" | "forbid" | "cfg") {
+        if !matches!(name.as_str(), "doc" | "derive" | "default" | "allow" | "deny" | "forbid" | "cfg" | "inline" | "cold") {
             self.fail(bad("attribute", attr));
         }
-        // Only built-in and the already used serde derive are in scope.
+        if name == "inline" {
+            let valid = match &attr.meta {
+                Meta::Path(_) => true,
+                Meta::List(list) => matches!(list.tokens.to_string().as_str(), "always" | "never"),
+                _ => false,
+            };
+            if !valid {
+                self.fail(bad("inline attribute", attr));
+            }
+        }
+        if name == "cold" && !matches!(attr.meta, Meta::Path(_)) {
+            self.fail(bad("cold attribute", attr));
+        }
+        // Canonical derive identities are subsequently checked against exact type/field contracts.
         if name == "derive" {
+            if !self.derive_context {
+                self.fail("derive is permitted only on a recorded struct/enum, never a function, field or other attribute context".into());
+            }
             let Meta::List(list) = &attr.meta else {
                 self.fail(bad("derive", attr));
                 return;
             };
             match Punctuated::<Path, Token![,]>::parse_terminated.parse2(list.tokens.clone()) {
-                Ok(paths)
-                    if paths.iter().all(|p| {
-                        matches!(
-                            tokens(p).as_str(),
-                            "Clone" | "Copy" | "Debug" | "Default" | "PartialEq" | "Eq" | "PartialOrd" | "Ord" | "Hash" | "Serialize"
-                        )
-                    }) => {}
+                Ok(paths) if paths.iter().all(|p| derive_identity(p, &self.names).is_some()) => {}
                 _ => self.fail(bad("derive", attr)),
             }
         }
@@ -308,15 +362,22 @@ impl<'ast> Visit<'ast> for Audit {
                 self.self_type = old;
             }
             Item::Struct(s) => {
+                self.reader_derives(&s.ident, &s.attrs, &s.generics, json!({"struct":field_shape(&s.fields,&self.names)}));
                 self.surface.push(tokens(&s.fields));
+                let old = std::mem::replace(&mut self.derive_context, true);
                 visit::visit_item_struct(self, s);
+                self.derive_context = old;
             }
             Item::Enum(e) => {
+                let shape = json!({"enum":e.variants.iter().map(|v| json!({"variant":ident(&v.ident),"fields":field_shape(&v.fields,&self.names)})).collect::<Vec<_>>()});
+                self.reader_derives(&e.ident, &e.attrs, &e.generics, shape);
                 for v in &e.variants {
                     self.enum_variants.push(format!("{}::{}", ident(&e.ident), ident(&v.ident)));
                 }
                 self.surface.push(tokens(&e.variants));
+                let old = std::mem::replace(&mut self.derive_context, true);
                 visit::visit_item_enum(self, e);
+                self.derive_context = old;
             }
             Item::Type(t) => {
                 self.surface.push(tokens(t));
@@ -345,7 +406,11 @@ impl<'ast> Visit<'ast> for Audit {
                 match template(&m.mac) {
                     Ok(t) => {
                         match instantiate(&t, None) {
-                            Ok(stream) => self.expanded_items(stream),
+                            Ok(stream) => {
+                                self.scope.push(format!("<template {}>", ident(name)));
+                                self.expanded_items(stream);
+                                self.scope.pop();
+                            }
                             Err(e) => self.fail(e),
                         }
                         if self.templates.insert(ident(name), t).is_some() {
@@ -392,6 +457,11 @@ impl<'ast> Visit<'ast> for Audit {
             }
             _ => self.fail(bad("impl item", item)),
         }
+    }
+    fn visit_variant(&mut self, variant: &'ast Variant) {
+        let old = std::mem::replace(&mut self.derive_context, false);
+        visit::visit_variant(self, variant);
+        self.derive_context = old;
     }
     fn visit_pat(&mut self, pat: &'ast Pat) {
         match pat {
@@ -495,13 +565,20 @@ impl<'ast> Visit<'ast> for Audit {
         self.in_unit -= 1;
     }
     fn visit_macro(&mut self, mac: &'ast Macro) {
-        let name = tokens(&mac.path);
-        match name.as_str() {
+        let path = tokens(&mac.path);
+        let name = match path.as_str() {
+            "std :: format" => "format",
+            "std :: vec" => "vec",
+            "std :: matches" => "matches",
+            "std :: debug_assert" => "debug_assert",
+            other => other,
+        };
+        match name {
             "observation_contract" => {
                 // Validate the actual no-code template, not just the invocation name.
                 match self
                     .templates
-                    .get(&name)
+                    .get(name)
                     .ok_or("undeclared observation contract macro".into())
                     .and_then(|t| instantiate(t, Some(mac.tokens.clone())))
                 {
@@ -571,6 +648,9 @@ fn audit(name: &str, source: &str, templates: HashMap<String, Template>) -> Chec
         surface: vec![],
         enum_variants: vec![],
         collection_fields: vec![],
+        readers: vec![],
+        derive_context: false,
+        scope: vec![],
         modules: vec![],
         templates,
         depth: 0,
@@ -582,7 +662,7 @@ fn audit(name: &str, source: &str, templates: HashMap<String, Template>) -> Chec
         return Err(e);
     }
     Ok((
-        json!({"units":audit.units,"surface":audit.surface,"enum_variants":audit.enum_variants,"collection_fields":audit.collection_fields,"modules":audit.modules}),
+        json!({"units":audit.units,"surface":audit.surface,"enum_variants":audit.enum_variants,"collection_fields":audit.collection_fields,"modules":audit.modules,"readers":audit.readers}),
         audit.templates,
     ))
 }

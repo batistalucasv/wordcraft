@@ -1,6 +1,6 @@
 # File-format parity with Microsoft Word
 
-> **Validation status:** 2026-11-12 · minor · #5875 round 15: all established owner roots are checked by the Transitional root gate; custom-property ambiguity and unknown discovery report skipped coverage; incomplete graph memberships cannot prove an unused comment. Established-unowned reference exclusions receive one out-of-scope count without changing their verdict. The observation gate rejects destructuring and module-scope registry indirection; its documented guarantee is lexical, not general Rust alias analysis. Synthetic controls only; independent endpoint review remains required and readiness estimates are unchanged.
+> **Validation status:** 2026-11-12 · minor · #5875 round 18: package entry and availability lookups carry explicit absence/unknown states; the observation gate resolves bounded helper/accessor aliases and pins completeness predicates and reader derives. Qualified standard macros and four inert attributes are supported; named-field bindings and trait bodies remain closed grammar. Synthetic controls only; independent endpoint review remains required and readiness estimates are unchanged.
 
 > **2026-11-08:** `wordcraft-cli convert --strict` refuses a PDF or PNG that would draw an empty box for a character or leave out a picture, including those a DOCX names outside the file or not at all (#6005); never fetched.
 > **2026-11-05:** A Word template opened from the file manager starts a new document based on it, and is never saved over (#3433).
@@ -340,6 +340,7 @@ For field results, the engine parser treats a backslash in quoted arguments as e
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-11-12 | minor | #5875 round 18: package entry and availability lookups carry explicit absence/unknown states; the observation gate resolves bounded helper/accessor aliases and pins completeness predicates and reader derives. Qualified standard macros and four inert attributes are supported; named-field bindings and trait bodies remain closed grammar. Synthetic controls only; independent endpoint review remains required and readiness estimates are unchanged. |
 | 2026-11-12 | minor | #5875 round 15: gate every owner root, report unresolved custom-property checks, suppress unused-comment absence on incomplete memberships, count unowned exclusions as out of scope, and harden the lexical contract gate; synthetic controls only, readiness estimates unchanged |
 | 2026-11-12 | minor | #5875 W6: generated observation contracts and access gate, per-part auxiliary completeness, explicit package-registry exception; independent endpoint review required, estimates unchanged |
 | 2026-11-12 | minor | #5875 W5: symmetric extension activation and one duplicate-ID binding policy; estimates unchanged |

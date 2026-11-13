@@ -44,13 +44,16 @@ labels={
 9:'false-rejection/qualified-format',10:'false-rejection/inline-attribute',11:'false-rejection/trait-default-nonconsumer',12:'history/closure-parameter-destructure',13:'history/destructuring-assignment',14:'history/parenthesized-destructuring-assignment',15:'history/macro-produced-pattern',16:'history/raw-field',17:'history/raw-registry-method',18:'history/module-callback',19:'seam/type-alias-carrying-callback',20:'seam/trait-default-body',21:'seam/associated-const-callback',22:'seam/include-item',23:'seam/cfg-gated-consumer',24:'seam/other-macro-path',25:'seam/supported-macro-arguments-audited'}
 def command(args,env=None):
  return subprocess.run(args,cwd=TMP,env={**os.environ,**(env or {})},capture_output=True,text=True,timeout=300)
-def probe(number,label,name,mutation,accept=False,compile=False,test=None,diagnostic=None):
+def probe(number,label,name,mutation,accept=False,compile=False,test=None,diagnostic=None,test_fail=False):
  if selected and str(number) not in selected:return
  path=SRC/name
  before=path.read_text();changed=mutation(before)
  assert changed!=before,(number,label,'fixture did not land')
- path.write_text(changed)
- record={'probe':number,'variant':label,'file':name,'fixture_sha256':hashlib.sha256(changed.encode()).hexdigest(),'expected':'accept' if accept else 'reject'}
+ changes = changed if isinstance(changed, dict) else {name:changed}
+ saved = {n:(SRC/n).read_text() for n in changes}
+ assert all(changes[n]!=saved[n] for n in changes), 'composite fixture did not land'
+ for n,value in changes.items(): (SRC/n).write_text(value)
+ record={'probe':number,'variant':label,'file':name,'fixture_sha256':hashlib.sha256(json.dumps(changes,sort_keys=True).encode()).hexdigest(),'expected':'accept' if accept else 'reject'}
  try:
   run=command(['python3',str(GEN),'--check']);record.update(exit=run.returncode,output=run.stdout+run.stderr)
   record['pass']=(run.returncode==0)==accept
@@ -60,9 +63,10 @@ def probe(number,label,name,mutation,accept=False,compile=False,test=None,diagno
    args=['cargo','test','--offline','--lib',test] if test else ['cargo','check','--offline']
    check=command(args,{'CARGO_TARGET_DIR':str(ROOT/'target/r18-probe-compile')})
    record.update(compile_or_test_command=args,compile_or_test_exit=check.returncode,compile_or_test_output=check.stdout+check.stderr)
-   record['pass'] &= check.returncode==0
+   record['pass'] &= (check.returncode!=0 and (test_fail if isinstance(test_fail,str) else 'REL-DANGLING') in record['compile_or_test_output'] and 'test result: FAILED' in record['compile_or_test_output']) if test_fail else check.returncode==0
   assert all(p.read_bytes()==b for p,b in original_outputs.items()),'probe altered register'
- finally:path.write_text(before)
+ finally:
+  for n,value in saved.items(): (SRC/n).write_text(value)
  RESULTS.append(record)
  print(number,label,'PASS' if record['pass'] else 'FAIL',record['exit'],record['output'].splitlines()[0] if record['output'] else '',flush=True)
  (ROOT/'log/fredfix-round18-probe-results.json').write_text(json.dumps(RESULTS,indent=2)+'\n')
@@ -76,13 +80,23 @@ try:
   if n==1:mutation=lambda s:condition(s,'if package::canonical_entry(pkg, target).is_none() {')
   else:mutation=lambda s,l=label,f=name,a=addition:ctx['mutate'](l,f,a)
   probe(n,label,name,mutation,accept=n in {4,9,10},compile=n in {4,8,9,10},test='round5_archive_prefix_absence' if n==4 else None)
+ label='seam/trait-impl-body'
+ _,name,addition=next(p for p in ctx['PROBES'] if p[0]==label)
+ probe(20,label,name,lambda s:ctx['mutate'](label,name,addition))
  for pat,label in [('Resolution::Absent | Resolution::Unknown(_) => true,','or-pattern'),('_ => true,','wildcard')]:
   body='''if match package::canonical_entry(pkg, target) {
                 Resolution::One(_) => false,
                 PAT
                 Resolution::Ambiguous(_) => false,
             } {'''.replace('PAT',pat)
-  probe(26,label,'lib.rs',lambda s,b=body:condition(s,b),diagnostic='absence polarity')
+  probe(26,label,'lib.rs',lambda s,b=body:condition(s,b),diagnostic='absence polarity',test='round5_archive_prefix_absence' if label=='or-pattern' else None,test_fail=label=='or-pattern')
+ for label,new in [
+  ('matches collapse','if matches!(package::canonical_entry(pkg, target), Resolution::Absent | Resolution::Unknown(_)) {'),
+  ('if-let collapse','if let Resolution::Absent | Resolution::Unknown(_) = package::canonical_entry(pkg, target) {'),
+  ('block-bound result collapse','if match { let outcome = package::canonical_entry(pkg, target); outcome } { Resolution::One(_) => false, Resolution::Absent | Resolution::Unknown(_) => true, Resolution::Ambiguous(_) => false } {'),
+  ('local matches else collapse','if { let outcome = package::canonical_entry(pkg, target); if matches!(outcome, Resolution::One(_)) { false } else { true } } {'),
+  ('guard collapse','if match package::canonical_entry(pkg, target) { Resolution::One(_) => false, value if matches!(value, Resolution::Absent | Resolution::Unknown(_)) => true, _ => false } {')]:
+  probe(26,label,'lib.rs',lambda s,n=new:condition(s,n),diagnostic='absence polarity')
  body='''if match package::canonical_entry(pkg, target) {
                 Resolution::One(_) => false,
                 Resolution::Absent => true,
@@ -93,6 +107,9 @@ try:
  probe(28,'literal true completeness','package.rs',lambda s:s.replace('Resolution::discovered(canonical(&pkg.entries, name), !pkg.entries_truncated && !pkg.identity_incomplete)','Resolution::discovered(canonical(&pkg.entries, name), true)',1),diagnostic='completeness')
  contract='observation_contract! { rules: "-"; collections: "field.entries*1"; scope: "x"; loss: "x"; fallback: "x"; package_loss: "independent"; }'
  probe(29,'contracted raw absence','package.rs',lambda s:s+'\nfn unregistered_absence(entries: &[Entry], name: &str) -> bool { '+contract+' !entries.iter().any(|entry| entry.name == name) }',diagnostic='an observation contract cannot establish')
+ def wired_raw(s):
+  return {'package.rs':s+'\npub(crate) fn unregistered_absence(entries: &[Entry], name: &str) -> bool { '+contract+' !entries.iter().any(|entry| entry.name == name) }', 'lib.rs':condition(originals['lib.rs'],'if package::unregistered_absence(&pkg.entries, target) {')}
+ probe(29,'contracted raw absence wired to REL-DANGLING','package.rs',wired_raw,diagnostic='raw absence',test='round5_archive_prefix_absence',test_fail=True)
  for ty,param,op in [('type HiddenEntries = [Entry];','entries: &HiddenEntries','!entries.iter().any(|entry| entry.name == name)'),('type HiddenMap = HashMap<String, String>;','entries: &HiddenMap','entries.get(name).is_none()'),('type HiddenPackage = Package;','entries: &HiddenPackage','!entries.entries.iter().any(|entry| entry.name == name)')]:
   probe(30,ty,'package.rs',lambda s,t=ty,p=param,o=op:s+'\n'+t+' fn unregistered_absence('+p+', name: &str) -> bool { '+o+' }',diagnostic='raw absence')
  for helper in ['canonical_entry','entry_by_name','content_unavailable']:
@@ -105,7 +122,7 @@ try:
   ('pkg.entries_truncated || pkg.identity_incomplete','!pkg.entries_truncated || pkg.identity_incomplete','2751 negate'),
   ('!pkg.entries_truncated\n        && !pkg.identity_incomplete','!pkg.identity_incomplete','2777 delete'),
   ('!pkg.entries_truncated\n        && !pkg.identity_incomplete','pkg.entries_truncated\n        && !pkg.identity_incomplete','2777 negate')]:
-  probe(32,label,'lib.rs',lambda s,o=old,n=new:s.replace(o,n,1),diagnostic='entry-loss')
+  probe(32,label,'lib.rs',lambda s,o=old,n=new:s.replace(o,n,1),diagnostic='entry-loss',test='round18_discovery_loss_polarity',test_fail='round18_discovery_loss_polarity')
  for callable in ['Self::prefix','HiddenDefinitions::prefix']:
   a='\ntype HiddenDefinitions = Observed<HashSet<String>>; impl Observed<HashSet<String>> { fn unregistered_absence(&self, key: &String) -> bool { let prefix = '+callable+'; !prefix(self).contains(key) } }'
   probe(33,callable,'lib.rs',lambda s,a=a:s+a,diagnostic='CompleteSet')
@@ -124,6 +141,61 @@ try:
   probe(37,'negative/'+prefix,'lib.rs',lambda s,a=a:s+a,diagnostic='CompleteSet')
  for expression in ['Observed::is_complete(&self)','Self::is_complete(&self)','HiddenObservation::is_complete(&self)','<Self>::is_complete(&self)','<Observed<HashSet<K>>>::is_complete(&self)','{ let test = Self::is_complete; test(&self) }']:
   probe(37,'CompleteSet provider/'+expression,'observed.rs',lambda s,e=expression:s.replace('if self.is_complete() {','if '+e+' {',1)+'\ntype HiddenObservation<T> = Observed<T>;\n',accept=True,test='observed::tests')
+ for derive in ['serde::Serialize','RegistrySerialize']:
+  addition='\nfn unregistered_registry_serde<S: serde::Serializer>(registry: &ContentTypes, serializer: S) -> Result<S::Ok, S::Error> { serde::Serialize::serialize(registry, serializer) }'
+  if derive=='RegistrySerialize':addition+='\nuse serde::Serialize as RegistrySerialize;'
+  probe(38 if derive=='serde::Serialize' else 39,derive,'package.rs',lambda s,d=derive,a=addition:s.replace('#[derive(Default)]\npub(crate) struct ContentTypes {','#[derive(Default, '+d+')]\npub(crate) struct ContentTypes {',1)+a,diagnostic='unauthorized reader derive serde::Serialize')
+ for derive in ['Debug','serde::Deserialize']:
+  addition='\nfn unregistered_registry_debug(registry: &ContentTypes) -> String { std::format!("{registry:?}") }' if derive=='Debug' else ''
+  probe(40,derive,'package.rs',lambda s,d=derive,a=addition:s.replace('#[derive(Default)]\npub(crate) struct ContentTypes {','#[derive(Default, '+d+')]\npub(crate) struct ContentTypes {',1)+a,diagnostic='unauthorized reader derive')
+ policy=json.loads((COPY/'observations/reader-contracts.json').read_text())
+ for file in sorted({r['type'].split('::')[0] for r in policy['readers']}):
+  def qualified(s):
+   def attrs(m):
+    return '#[derive('+re.sub(r'(?<![\w:])Debug(?!\w)','std::fmt::Debug',re.sub(r'(?<![\w:])Serialize(?!\w)','serde::Serialize',m[1]))+')]'
+   return re.sub(r'#\[derive\(([^)]*)\)\]',attrs,s)
+  probe(41,'all existing reader pairs in '+file,file,qualified,accept=True,compile=True)
+ for type_id in sorted({r['type'] for r in policy['readers']}):
+  file,qualified_type=type_id.split('::',1)
+  ty=qualified_type.rsplit('::',1)[-1]
+  source_ty=re.escape(ty)
+  if not re.search(r'(?:struct|enum)\s+'+source_ty+r'(?=[\s<(;{])',originals[file]): source_ty=r'\$name'
+  def unauthorized(s,ty=source_ty):
+   value,n=re.subn(r'((?:pub(?:\(crate\))?\s+)?(?:struct|enum)\s+'+ty+r'(?=[\s<(;{]))',r'#[derive(serde::Deserialize)] \1',s,count=1)
+   assert n==1,(file,ty)
+   return value
+  probe(41,'unauthorized pair/'+type_id,file,unauthorized,diagnostic='unauthorized reader derive')
+ def nested_reader(s):
+  definition=re.search(r'(pub\(crate\) struct Limits \{.*?\n\})',s,re.S)
+  assert definition
+  s=s.replace('#[derive(Debug, Clone, Copy)]\npub(crate) struct Limits','#[derive(Clone, Copy)]\npub(crate) struct Limits',1)
+  return s+'\nfn unregistered_nested_reader() { #[derive(Debug)] '+definition[1]+' }'
+ probe(41,'same exact DTO fields transferred into function scope','lib.rs',nested_reader,diagnostic='<function unregistered_nested_reader>::Limits',compile=True)
+ probe(41,'same named DTO in another module','package.rs',lambda s:s+'\n#[derive(Debug)] struct Finding { rule: String }',diagnostic='unauthorized reader derive')
+ probe(41,'registry field added to allowed DTO','lib.rs',lambda s:s.replace('pub struct Finding {','pub struct Finding { hidden_registry: package::ContentTypes,',1),diagnostic='changed representation/DTO field shape')
+ probe(42,'qualified consuming format','lib.rs',lambda s:s+'\nfn unregistered_read(pkg: &Package) -> String { std::format!("{}", pkg.entries.len()) }',diagnostic='field.entries*1')
+ for body in ['{ let v = std::vec![1, 2]; v.len() }','{ std::debug_assert!(true); 1 }','{ if std::matches!(true, true) { 1 } else { 0 } }']:
+  probe(42,'qualified nonconsuming grammar/'+body,'lib.rs',lambda s,b=body:s+'\nfn nonconsuming() -> usize '+b,accept=True,compile=True)
+ impostor='\nmacro_rules! hidden_format { ($package:expr) => { $package.entries.len() }; }\nuse hidden_format as format;\nfn unregistered_read(pkg: &Package) -> usize { crate::format!(pkg) }\n'
+ probe(43,'macro name impostor','lib.rs',lambda s:s+impostor,diagnostic='unsupported macro')
+ probe(43,'std namespace impostor','lib.rs',lambda s:s+'\nuse external as std;',diagnostic='macro-shadowing import')
+ for attribute in ['inline','inline(always)','inline(never)','cold']:
+  probe(44,attribute,'lib.rs',lambda s,a=attribute:s+'\n#['+a+'] fn configured_entry_limit(limits: &Limits) -> usize { limits.entries }',accept=True,compile=True)
+ for attribute in ['cfg(all())','derive(Debug)','serde(skip)']:
+  probe(44,'unauthorized '+attribute,'lib.rs',lambda s,a=attribute:s+'\n#['+a+'] fn unregistered_read(pkg: &Package) -> usize { pkg.entries.len() }')
+ probe(24,'new unsupported std env seam','lib.rs',lambda s:s+'\nfn unregistered() { std::env!("X"); }',diagnostic='unrecognized expression/pattern macro')
+ # Every remaining package field-read occurrence is independently deleted and negated.
+ for index,match in enumerate(re.finditer(r'!pkg\.entries_truncated',originals['package.rs'])):
+  for change in ['true','pkg.entries_truncated']:
+   probe(32,'package field read '+str(index)+' -> '+change,'package.rs',lambda s,m=match,c=change:s[:m.start()]+c+s[m.end():],diagnostic='entry-loss')
+ for old,new,label in [
+  ('zip.len() > limits.entries','zip.len() < limits.entries','loader limit inversion'),
+  ('if entries_truncated {','if !entries_truncated {','loader informational polarity'),
+  ('!content_types_present && !entries_truncated','!content_types_present','loader manifest guard delete'),
+  ('!content_types_present && entries_truncated','!content_types_present && !entries_truncated','loader manifest incomplete negate'),
+  ('!entries_truncated && !unknown_unreadable','!unknown_unreadable','loader main discovery delete'),
+  ('!entries_truncated && !unknown_unreadable','entries_truncated && !unknown_unreadable','loader main discovery negate')]:
+  probe(32,label,'package.rs',lambda s,o=old,n=new:s.replace(o,n,1),diagnostic='entry-loss')
  # Later stage probes are installed below this marker.
 finally:
  shutil.rmtree(TMP)

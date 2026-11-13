@@ -163,3 +163,53 @@ fn round18_content_availability_sites() {
         }
     }
 }
+
+/// R18/47: actual ZIP limits move a target between the examined prefix and suffix.
+#[test]
+fn round18_archive_prefix_permutations() {
+    let mut d = Doc::minimal();
+    d.add_with_override("word/header.xml", common::CT_HEADER, format!(r#"<w:hdr {NS}><w:p/></w:hdr>"#));
+    d.set_doc_rels(r#"<Relationship Id="h" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/header" Target="header.xml"/>"#);
+    let complete = serde_json::to_vec(&validate_bytes(&d.build())).unwrap();
+    let entries = d.entries.clone();
+    for shift in 0..entries.len() {
+        d.entries = entries.clone();
+        d.entries.rotate_left(shift);
+        assert_eq!(serde_json::to_vec(&validate_bytes(&d.build())).unwrap(), complete);
+        for cap in 0..=entries.len() {
+            let mut acc = Acc::with_limits(Limits { entries: cap, ..Limits::default() });
+            let pkg = package::load(&d.build(), &mut acc).unwrap();
+            let examined = d.entries.iter().take(cap).any(|(name, _)| name == "word/header.xml");
+            assert_eq!(matches!(canonical_entry(&pkg, "word/header.xml"), Resolution::One(_)), examined);
+            if !examined {
+                assert!(matches!(canonical_entry(&pkg, "word/header.xml"), Resolution::Unknown(_)));
+            }
+            let report = validate_bytes_limited(&d.build(), Limits { entries: cap, ..Limits::default() });
+            assert!(!report.findings.iter().any(|f| f.rule == "REL-DANGLING"), "shift={shift}/cap={cap}: {report:?}");
+        }
+    }
+}
+
+/// R18/2304: the name lookup only supplies display spelling to an independent typed finding.
+#[test]
+fn round18_typed_finding_display_polarity() {
+    for state in ["found", "absent", "unknown"] {
+        let mut d = Doc::minimal();
+        d.add_with_override("word/Mixed.XML", common::CT_STYLES, format!(r#"<w:styles {NS}/>"#));
+        d.set_doc_rels(
+            r#"<Relationship Id="c" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart" Target="mixed.xml"/>"#,
+        );
+        let mut pkg = package::load(&d.build(), &mut Acc::with_limits(Limits::default())).unwrap();
+        if state != "found" {
+            pkg.entries.retain(|e| e.name != "word/Mixed.XML");
+        }
+        pkg.entries_truncated = state == "unknown";
+        let mut acc = Acc::with_limits(Limits::default());
+        let xml = check_xml(&pkg, &mut acc);
+        let mut acc = Acc::with_limits(Limits::default());
+        check_typed_content(&pkg, &xml, &mut acc);
+        let report = acc.finish();
+        let finding = report.findings.iter().find(|f| f.rule == "CT-MISMATCH").unwrap();
+        assert_eq!(finding.part.as_deref(), Some(if state == "found" { "word/Mixed.XML" } else { "word/mixed.xml" }), "{state}");
+    }
+}
