@@ -584,11 +584,14 @@ def table_xml(ctx, rows, cols, depth):
            + '</w:tblPr>',
            grid]
     if rows > 2 and cols > 2:
-        # Never column 0: the first cell may gridSpan 2 there, which would leave the vertically
-        # merged cells of one run with different widths (and the merge column covered by the span).
+        # Never columns 0 or 1: the first cell may gridSpan 2 there, which would leave the
+        # vertically merged cells of one run with different widths (and the merge column covered by
+        # the span), and row 0 would then never write the w:vMerge restart that later rows continue.
         vmerge_col = rng.randrange(2, cols)
     elif rows > 2 and cols == 2:
-        vmerge_col = rng.randrange(cols)
+        # Column 1, never 0: the nested table sits in row 1, cell 0, and consumers discard the
+        # content of a w:vMerge continue cell.
+        vmerge_col = 1
     else:
         vmerge_col = -1
     for ri in range(rows):
@@ -1586,13 +1589,62 @@ def audit_namespaces(label, data, result):
                 f"{label}: namespace used but never declared: {uri}")
 
 
+def audit_tables(name, root, result):
+    """Check every table's grid math and its w:vMerge chain.
+
+    The generator promises exact grid math: each row's gridSpan sum equals the
+    table's column count, and every continuation cell continues a restart cell
+    of the same width directly above it. A continuation without a restart, or
+    a nested table placed in a continuation cell (consumers discard that cell's
+    content), is a generator defect, not a corpus feature.
+    """
+    w = "{%s}" % NS["w"]
+    for tbl in root.iter(w + "tbl"):
+        grid = tbl.find(w + "tblGrid")
+        cols = len(grid.findall(w + "gridCol")) if grid is not None else None
+        previous = {}
+        for ridx, tr in enumerate(tbl.findall(w + "tr")):
+            current = {}
+            col = 0
+            for tc in tr.findall(w + "tc"):
+                span = 1
+                merge = None
+                tcpr = tc.find(w + "tcPr")
+                if tcpr is not None:
+                    gs = tcpr.find(w + "gridSpan")
+                    if gs is not None:
+                        try:
+                            span = int(gs.get(w + "val"))
+                        except (TypeError, ValueError):
+                            span = 1
+                    vm = tcpr.find(w + "vMerge")
+                    if vm is not None:
+                        merge = vm.get(w + "val") or "continue"
+                current[col] = (span, merge)
+                if merge == "continue":
+                    above = previous.get(col)
+                    if above is None or above[0] != span:
+                        result["table_violations"].append(
+                            f"{name}: row {ridx} continues a vertical merge at column {col} "
+                            f"with no restart of the same width directly above")
+                    if tc.find(w + "tbl") is not None:
+                        result["table_violations"].append(
+                            f"{name}: nested table in a vertical-merge continuation cell "
+                            f"at row {ridx} column {col}")
+                col += span
+            if cols is not None and col != cols:
+                result["table_violations"].append(
+                    f"{name}: row {ridx} spans {col} grid columns, table declares {cols}")
+            previous = current
+
+
 def check_file(path):
     """Unzip, parse every XML part, resolve every r:id against its owner's rels."""
     z = zipfile.ZipFile(path)
     names = z.namelist()
     result = {"parts": len(names), "xml_parsed": 0, "refs": 0, "unresolved": [],
               "crc_bad": z.testzip(), "ct_missing": [], "ns_violations": [],
-              "ct_pairing": []}
+              "ct_pairing": [], "table_violations": []}
     rels_by_owner = {}
     for name in names:
         if name.endswith(".rels"):
@@ -1638,6 +1690,7 @@ def check_file(path):
             result["unresolved"].append(f"PARSE FAIL {name}: {e}")
             continue
         audit_namespaces(name, data, result)
+        audit_tables(name, root, result)
         if name.endswith(".rels"):
             continue
         owner_ids = rels_by_owner.get(name, set())
@@ -1722,7 +1775,7 @@ def check_file(path):
                         f"manifest declares {eff}")
     result["ok"] = (result["crc_bad"] is None and not result["unresolved"]
                     and not result["ct_missing"] and not result["ns_violations"]
-                    and not result["ct_pairing"])
+                    and not result["ct_pairing"] and not result["table_violations"])
     return result
 
 
@@ -1863,8 +1916,10 @@ def main(argv=None):
         print(f"{status} {name}: seed={seed} size={size} parts={chk['parts']} "
               f"xml_parsed={chk['xml_parsed']} r:id_refs={chk['refs']} "
               f"unresolved={len(chk['unresolved'])} ct_missing={chk['ct_missing']} "
-              f"ns_violations={len(chk['ns_violations'])}")
-        for u in chk["unresolved"][:10] + chk["ns_violations"][:10]:
+              f"ns_violations={len(chk['ns_violations'])} "
+              f"table_violations={len(chk['table_violations'])}")
+        for u in (chk["unresolved"][:10] + chk["ns_violations"][:10]
+                  + chk["table_violations"][:10]):
             print("    ", u)
     return 1 if failures else 0
 

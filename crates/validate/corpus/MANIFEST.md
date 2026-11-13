@@ -5,6 +5,12 @@ Every entry below was computed from the shipped generator output on
 its separator notes in footnotePr/endnotePr (NOTE-PR-LISTING). Regenerating with the same seeds reproduces these SHA-256
 hashes byte-for-byte (verified: two `--all` runs, identical hashes).
 
+The generator also audits every table's grid math and `w:vMerge` chain: a
+continuation must follow a same-width restart directly above it, and a nested
+table must not sit in a continuation cell. The audit rejects the defect class
+the review found in `table_xml`; the shipped presets still reproduce the hashes
+below byte-for-byte (re-verified 2026-11-13).
+
 ## Stress corpus (generated, binaries not committed)
 
 Regenerate: `python3 gen_stress.py --all` (writes `corpus/` beside the
