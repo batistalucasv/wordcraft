@@ -444,7 +444,7 @@ def main():
     default_out = "content_model_dml.json" if profile == "dml" else "content_model.json"
     out_path = args[1] if len(args) > 1 else os.path.join(here, default_out)
     data = build(schema_dir, profile)
-    with open(out_path, "w", encoding="utf-8") as fh:
+    with open(out_path, "w", encoding="utf-8", newline="\n") as fh:
         json.dump(data, fh, indent=1, sort_keys=True)
         fh.write("\n")
     print(json.dumps(data["meta"]["counts"], indent=1))

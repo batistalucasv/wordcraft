@@ -1,1 +1,8 @@
 craft-i18n.rev text eol=lf
+
+# The content-model verifier hashes working-tree bytes. Pin LF so a Windows
+# checkout with core.autocrlf=true does not rewrite the hashed assets
+# (verify_model.py also normalizes CRLF as a fallback for existing checkouts).
+crates/validate/model/*.py text eol=lf
+crates/validate/model/*.json text eol=lf
+crates/validate/src/model.rs text eol=lf

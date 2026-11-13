@@ -37,11 +37,29 @@ TABLES = [
 
 
 def sha256_of(path):
-    """Return the SHA-256 hex digest of a file's bytes."""
+    """Return the SHA-256 hex digest of a file's canonical (LF) bytes.
+
+    The recorded hashes are over LF bytes. A Windows checkout with
+    ``core.autocrlf=true`` materializes CRLF in the working tree, which is a
+    checkout transformation, not model drift; ``.gitattributes`` pins LF for
+    these files, and normalizing here also keeps an existing checkout
+    verifiable. A line-ending change is still a change to the content, so a
+    real edit remains detectable.
+    """
     h = hashlib.sha256()
+    pending = b""
     with open(path, "rb") as f:
         for chunk in iter(lambda: f.read(1 << 20), b""):
-            h.update(chunk)
+            data = pending + chunk
+            # Keep a trailing CR for the next chunk: the CRLF pair may straddle
+            # the read boundary, and splitting it would leave a stray CR.
+            if data.endswith(b"\r"):
+                data, pending = data[:-1], b"\r"
+            else:
+                pending = b""
+            h.update(data.replace(b"\r\n", b"\n"))
+    if pending:
+        h.update(pending)
     return h.hexdigest()
 
 

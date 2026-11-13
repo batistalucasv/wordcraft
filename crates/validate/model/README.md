@@ -29,7 +29,7 @@ SHA-256 of the checked-in files:
 
 | File | SHA-256 |
 |---|---|
-| `extract_content_model.py` | `259d43e4cfe6785c2a62e5b4a68ca61f971332d7205b643c25a5ee1b66b81466` |
+| `extract_content_model.py` | `9f01d61ad5a53521dd0be56462d34df0909f14a3ebe6fc86c23d7741123a63cf` |
 | `generate_model.py` | `0732c987ce12378365e9a36c88690fb0bde757830d027af7706bbbe23a55f1fe` |
 | `content_model_v2.json` | `f36a42e324bae4cf4d6ce03ebbfb53e2e5729d76ae5f4929332a272d02545978` |
 | `content_model_v2_transitional.json` | `92c433577c914785908f42553718cc41b4f12161125596383ab6836ac3c54fbf` |
@@ -69,8 +69,12 @@ python3 generate_model.py --model-dir . --xsd-dir <strict> --out ../src/model.rs
 
 Both scripts are deterministic. Re-running either one over the same inputs gives byte-identical
 output — and the output does not depend on the schema directories' paths or names, only on the
-schema bytes (each JSON records them in `meta.file_sha256`). Then run `cargo test -p wordcraft-validate`. The tests in `src/model_tests.rs` pin the
-table sizes, the spot values the grammar checks depend on, and the `ST_NumberFormat` count.
+schema bytes (each JSON records them in `meta.file_sha256`). Generated text is written with LF line
+endings, and `.gitattributes` pins LF for these files, so a Windows checkout with
+`core.autocrlf=true` verifies against the same bytes. `verify_model.py` also normalizes CRLF in its
+hash as a fallback for an existing checkout. Then run `cargo test -p wordcraft-validate`. The tests
+in `src/model_tests.rs` pin the table sizes, the spot values the grammar checks depend on, and the
+`ST_NumberFormat` count.
 
 To check the checked-in files have not drifted (no schemas needed):
 
