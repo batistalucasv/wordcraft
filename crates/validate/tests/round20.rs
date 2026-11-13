@@ -131,7 +131,11 @@ fn duplicate_orders(base: Vec<Record>, pair: Vec<Record>, keys: &[&str], extra: 
     reports
 }
 fn fn_pair(first: Record, second: Record, name: &str) -> [Report; 2] {
-    duplicate_orders(records(note_doc(name)), vec![first, second], &[name], &[])
+    let reports = duplicate_orders(records(note_doc(name)), vec![first, second], &[name], &[]);
+    for report in &reports {
+        assert!(!report.checks_run.contains(&"REF-NOTE"));
+    }
+    reports
 }
 
 #[test]
@@ -141,6 +145,9 @@ fn h6_p1_p7_p13_decoded_and_raw_note_duplicates_both_orders_and_path() {
         let second = Record::new(second, flag, footnotes(&[]));
         let base = records(note_doc(name));
         let reports = duplicate_orders(base, vec![first, second], &[name], &[]);
+        for report in &reports {
+            assert!(!report.checks_run.contains(&"REF-NOTE"));
+        }
         for reverse in [false, true] {
             let mut all = records(note_doc(name));
             let mut pair = vec![
@@ -246,7 +253,7 @@ fn h6_p3_leading_slash_and_directory_duplicates() {
 }
 #[test]
 fn h6_p8_combined_groups() {
-    duplicate_orders(
+    let reports = duplicate_orders(
         records(note_doc("word/fü.xml")),
         vec![
             Record::new("word/fü.xml", 0x800, footnotes(&[1])),
@@ -257,6 +264,9 @@ fn h6_p8_combined_groups() {
         &["word/fü.xml", "word/g.xml"],
         &[],
     );
+    for report in reports {
+        assert!(!report.checks_run.contains(&"REF-NOTE"));
+    }
 }
 #[test]
 fn h6_p14_collapse_keeps_unrelated_style_absence() {
@@ -273,6 +283,7 @@ fn h6_p14_collapse_keeps_unrelated_style_absence() {
     );
     for report in reports {
         assert!(report.checks_run.contains(&"REF-STYLE"));
+        assert!(!report.checks_run.contains(&"REF-NOTE"));
         assert_eq!(report.findings.iter().find(|f| f.rule == "REF-STYLE").unwrap().part.as_deref(), Some("word/document.xml"));
     }
 }

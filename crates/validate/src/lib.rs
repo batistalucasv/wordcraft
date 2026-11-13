@@ -1908,7 +1908,7 @@ fn relationship_role(kind: Option<&str>) -> Option<scan::PartRole> {
 /// Verify relationships: duplicate IDs, dangling targets, typed targets, and content type matches.
 fn check_rels(pkg: &Package, xml: &XmlScan, acc: &mut Acc) {
     observation_contract! {
-        rules: "REL-DANGLING,REL-DUP-ID,REL-TYPED";
+        rules: "REL-DANGLING,REL-DUP-ID,REL-REF-MISSING,REL-TYPED";
         collections: "field.references*1,field.rels*3,lookup.canonical_entry*1";
         scope: "source-local bounded extraction; no implicit document owner";
         loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
@@ -1946,7 +1946,9 @@ fn check_rels(pkg: &Package, xml: &XmlScan, acc: &mut Acc) {
     acc.ran("REL-TYPED");
     check_typed_targets(pkg, acc);
     check_typed_image_refs(pkg, &refs, acc);
-    check_part_refs(pkg, &refs, acc);
+    if check_part_refs(pkg, xml, acc).ran() {
+        acc.ran("REL-REF-MISSING");
+    }
     check_typed_content(pkg, xml, acc);
 }
 
@@ -1973,27 +1975,36 @@ fn report_duplicate_rel_ids(rp: &RelsPart, acc: &mut Acc) {
 }
 
 /// Every `r:id`/`r:embed`/`r:link` value in a part must resolve in that part's own `.rels`.
-fn check_part_refs(pkg: &Package, refs: &[(String, Vec<RefFact>)], acc: &mut Acc) {
+fn check_part_refs(pkg: &Package, xml: &XmlScan, acc: &mut Acc) -> JoinCompletion {
     observation_contract! {
         rules: "REL-REF-MISSING";
-        collections: "access.into_complete_set*1,access.missing*1,field.collapsed_names*2,type.HashSet*2,type.Observed*1,type.Vec*1";
+        collections: "access.into_complete_set*1,access.is_complete*1,access.missing*1,access.prefix*1,field.collapsed_names*2,field.parts*1,field.references*2,field.rels*1,type.HashSet*2,type.Observed*1";
         scope: "source-local bounded extraction; no implicit document owner";
         loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
         fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
         package_loss: "REL-REF-MISSING";
     }
 
-    acc.ran("REL-REF-MISSING");
-    for (part, values) in refs {
+    let mut completion = JoinCompletion::vacuous();
+    // Empty reference sets are obligations too: they cannot launder a skipped active part.
+    for facts in xml.parts.values() {
+        let part = &facts.name;
         // The part's own `.rels` could not be read: which relationships it declares is unknown, so
         // its `r:id`/`r:embed`/`r:link` values are not established as unresolved.
         if pkg.collapsed_names.contains(part)
             || pkg.collapsed_names.iter().any(|name| name.eq_ignore_ascii_case(&rels_part_name(part)))
             || package::relationships_incomplete(pkg, part)
+            || !facts.references.is_complete()
         {
+            completion.skipped = true;
             continue;
         }
-        let Some(ids) = Observed::complete(part_rel_ids(pkg, part)).into_complete_set() else { continue };
+        let Some(ids) = Observed::complete(part_rel_ids(pkg, part)).into_complete_set() else {
+            completion.skipped = true;
+            continue;
+        };
+        let values = facts.references.prefix();
+        completion.active |= !values.is_empty() || pkg.rels.iter().any(|rp| rp.name.eq_ignore_ascii_case(&rels_part_name(part)));
         let mut reported: HashSet<&str> = HashSet::new();
         for r in values {
             if ids.missing(&r.value) && reported.insert(r.value.as_str()) {
@@ -2005,6 +2016,7 @@ fn check_part_refs(pkg: &Package, refs: &[(String, Vec<RefFact>)], acc: &mut Acc
             }
         }
     }
+    completion
 }
 
 /// An image element (`a:blip`, `v:imagedata`) must resolve to an image relationship whose target is
@@ -2409,8 +2421,9 @@ fn check_story(pkg: &Package, xml: &XmlScan, acc: &mut Acc) {
     }
     acc.ran("ID-COMMENT-DUP");
     report_definition_dups(acc, "ID-COMMENT-DUP", facts.comment_defs.prefix(), "w:comment id");
-    acc.ran("ID-COMMENT-REF");
-    check_owned_ids(pkg, xml, "comments", package::COMMENTS_CONTENT_TYPE, |f| &f.comment_defs, |f| &f.comment_refs, acc);
+    if check_owned_ids(pkg, xml, "comments", package::COMMENTS_CONTENT_TYPE, |f| &f.comment_defs, |f| &f.comment_refs, acc).ran() {
+        acc.ran("ID-COMMENT-REF");
+    }
     report_unreferenced_comments(pkg, xml, acc);
     acc.ran("ID-DOCPR-DUP");
     report_dups(acc, "ID-DOCPR-DUP", facts.docpr.prefix(), "wp:docPr id");
@@ -2428,9 +2441,11 @@ fn check_story(pkg: &Package, xml: &XmlScan, acc: &mut Acc) {
     acc.ran("NOTE-DUP");
     report_definition_dups(acc, "NOTE-DUP", facts.footnote_defs.prefix(), "w:footnote id");
     report_definition_dups(acc, "NOTE-DUP", facts.endnote_defs.prefix(), "w:endnote id");
-    acc.ran("REF-NOTE");
-    check_owned_ids(pkg, xml, "footnotes", package::FOOTNOTES_CONTENT_TYPE, |f| &f.footnote_defs, |f| &f.footnote_refs, acc);
-    check_owned_ids(pkg, xml, "endnotes", package::ENDNOTES_CONTENT_TYPE, |f| &f.endnote_defs, |f| &f.endnote_refs, acc);
+    let footnotes = check_owned_ids(pkg, xml, "footnotes", package::FOOTNOTES_CONTENT_TYPE, |f| &f.footnote_defs, |f| &f.footnote_refs, acc);
+    let endnotes = check_owned_ids(pkg, xml, "endnotes", package::ENDNOTES_CONTENT_TYPE, |f| &f.endnote_defs, |f| &f.endnote_refs, acc);
+    if footnotes.merge(endnotes).ran() {
+        acc.ran("REF-NOTE");
+    }
     acc.ran("REF-HEADER");
     check_header_footer_refs(pkg, facts, acc);
     acc.ran("REF-STYLE");
@@ -2497,6 +2512,24 @@ fn report_definition_dups(acc: &mut Acc, rule: &'static str, items: &[(DecimalId
     }
 }
 
+/// A completed active scope counts as a run even when another scope was skipped. Vacuous
+/// scopes count only if none were skipped; in particular empty endnotes cannot launder footnote loss.
+struct JoinCompletion {
+    active: bool,
+    skipped: bool,
+}
+impl JoinCompletion {
+    fn vacuous() -> Self {
+        Self { active: false, skipped: false }
+    }
+    fn merge(self, other: Self) -> Self {
+        Self { active: self.active || other.active, skipped: self.skipped || other.skipped }
+    }
+    fn ran(self) -> bool {
+        self.active || !self.skipped
+    }
+}
+
 /// Join each owner's references only to the definition part reached by its own relationships.
 /// Unavailable or truncated discovery/definition sources cannot establish missing IDs.
 fn check_owned_ids(
@@ -2507,10 +2540,10 @@ fn check_owned_ids(
     definitions: fn(&scan::StoryFacts) -> &Observed<Vec<(DecimalId, String)>>,
     references: fn(&scan::StoryFacts) -> &Observed<Vec<(DecimalId, String)>>,
     acc: &mut Acc,
-) {
+) -> JoinCompletion {
     observation_contract! {
         rules: "ID-COMMENT-REF,REF-NOTE";
-        collections: "access.into_complete_set*1,access.prefix*1,access.project*1,field.collapsed_names*1,field.parts*2,type.HashSet*2,type.Observed*3,type.Vec*3";
+        collections: "access.append*1,access.into_complete_set*1,access.invalidate*1,access.is_complete*1,access.prefix*1,access.project*1,field.collapsed_names*2,field.parts*2,type.HashSet*2,type.Observed*4,type.Vec*2";
         scope: "each established owner and its selected supporting sources; shared parts in every owner; unowned references excluded; explicit no-root fallback only";
         loss: "source unavailable or malformed; XML event/depth budget; category allocation cap; unknown or ambiguous source discovery; source-local pooled-budget loss";
         fallback: "suppress only dependent absence directions and report Incomplete; independent owner and prefix findings survive";
@@ -2519,34 +2552,59 @@ fn check_owned_ids(
 
     let owners = owner_scopes(pkg);
     let owner_map = &xml.graph;
+    let mut completion = JoinCompletion::vacuous();
     for (index, owner) in owners.iter().enumerate() {
         let index = OwnerId(index);
         let source = supporting_part(pkg, owner.root(), kind, ct, acc);
         let observed = match source {
             Resolution::One(entry) => {
                 if pkg.collapsed_names.contains(&entry.name) || discovery_unavailable(pkg, owner.root()) {
+                    completion.skipped = true;
                     continue;
                 }
-                let Some(part) = xml.parts.get(&PartId::new(&entry.name)) else { continue };
+                let Some(part) = xml.parts.get(&PartId::new(&entry.name)) else {
+                    completion.skipped = true;
+                    continue;
+                };
                 definitions(&part.facts).project(|items| items.iter().map(|(id, _)| id.clone()).collect::<HashSet<_>>())
             }
             Resolution::Absent => Observed::complete(HashSet::new()),
-            Resolution::Ambiguous(_) | Resolution::Unknown(_) => continue,
+            Resolution::Ambiguous(_) | Resolution::Unknown(_) => {
+                completion.skipped = true;
+                continue;
+            }
         };
-        let Some(defs) = observed.into_complete_set() else { continue };
-        let refs: Vec<_> = xml
-            .parts
-            .iter()
-            .filter(|(part, _)| owner_map.owners(part.as_str()).contains(&index))
-            .flat_map(|(_, part)| references(&part.facts).prefix().iter().cloned())
-            .collect();
+        let Some(defs) = observed.into_complete_set() else {
+            completion.skipped = true;
+            continue;
+        };
+        let mut refs = Observed::default();
+        for (part, facts) in &xml.parts {
+            if owner_map.owners(part.as_str()).contains(&index) {
+                // A mid-scan stop invalidates every contributed category. Never-loaded parts
+                // contribute nothing; they do not turn unrelated reference categories incomplete.
+                refs.append(references(&facts.facts));
+                // The retained copy cannot establish all references from a competing record.
+                // Keep its positive facts, but decide join completeness from the duplicate group.
+                if pkg.collapsed_names.contains(&facts.name) {
+                    refs.invalidate("duplicate story reference source");
+                }
+            }
+        }
+        if !refs.is_complete() {
+            completion.skipped = true;
+            continue;
+        }
+        let refs = refs.prefix();
+        completion.active |= matches!(source, Resolution::One(_)) || !refs.is_empty();
         match kind {
-            "comments" => report_missing(acc, "ID-COMMENT-REF", &refs, &defs, "w:commentReference id"),
-            "footnotes" => report_missing_note(acc, &refs, &defs, "footnote"),
-            "endnotes" => report_missing_note(acc, &refs, &defs, "endnote"),
+            "comments" => report_missing(acc, "ID-COMMENT-REF", refs, &defs, "w:commentReference id"),
+            "footnotes" => report_missing_note(acc, refs, &defs, "footnote"),
+            "endnotes" => report_missing_note(acc, refs, &defs, "endnote"),
             _ => {}
         }
     }
+    completion
 }
 
 /// Record unreferenced comments only when the owner's entire reference set was observed.

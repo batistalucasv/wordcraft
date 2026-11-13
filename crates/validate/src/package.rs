@@ -722,7 +722,6 @@ fn check_duplicate_entries(dir: Option<&CentralDirectory>, unique_count: usize, 
         package_loss: "independent";
     }
 
-    acc.ran("PKG-DUP-ENTRY");
     // The zip reader collapses duplicate names into one entry, so the central directory itself is
     // read to see every stored name (a package may legally list the same name twice). The parse is
     // bounded by the entry budget, exactly as the entry loop is.
@@ -734,6 +733,7 @@ fn check_duplicate_entries(dir: Option<&CentralDirectory>, unique_count: usize, 
         acc.set_incomplete();
         return (HashSet::new(), false);
     };
+    acc.ran("PKG-DUP-ENTRY");
     let mut counts: HashMap<&str, usize> = HashMap::new();
     for n in &dir.decoded_names {
         *counts.entry(n.trim_start_matches('/')).or_default() += 1;
