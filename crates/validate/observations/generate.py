@@ -57,9 +57,16 @@ def mask(text):
                 if depth == 0:
                     end = match.end() + delimiter.end()
                     break
-        pieces.extend((text[at:match.start()], re.sub(r'[^\n]', ' ', text[match.start():end])))
+        pieces.extend((text[at:match.start()], blank(text[match.start():end])))
         at = end
     return ''.join(pieces) + text[at:]
+
+
+def blank(text):
+    """Preserve offsets/newlines without a regex replacement for every literal character."""
+    if '\n' not in text:
+        return ' ' * len(text)
+    return '\n'.join(' ' * len(line) for line in text.split('\n'))
 
 
 def close_brace(code, opening):
@@ -77,7 +84,7 @@ def production(text):
     # Exclude inline test modules, but not #[cfg(test)] external mod declarations at the crate root.
     for match in list(re.finditer(r'#\[cfg\(test\)\]\s*(?:#\[[^\]]*\]\s*)*mod\s+\w+\s*\{', code)):
         end = close_brace(code, match.end()-1)+1
-        text = text[:match.start()] + re.sub(r'[^\n]', ' ', text[match.start():end]) + text[end:]
+        text = text[:match.start()] + blank(text[match.start():end]) + text[end:]
     return text
 
 
@@ -88,6 +95,34 @@ def normalized(code):
 
 _RECOGNIZER = None
 _TIMINGS = False
+
+
+def file_sha256(path):
+    digest=hashlib.sha256()
+    with path.open('rb') as source:
+        while block := source.read(1024*1024):
+            digest.update(block)
+    return digest.digest()
+
+
+def recognizer_binary(target):
+    # Cargo republishes the public executable even on a warm no-op build. Another
+    # worker can unlink that image during macOS startup. Match its freshly built
+    # bytes to Cargo's stable dependency artifact; never select a pre-build binary.
+    executable=target/'debug'/('observation-recognizer.exe' if os.name=='nt' else 'observation-recognizer')
+    deadline=time.monotonic()+2
+    while True:
+        try:
+            expected=file_sha256(executable)
+            for candidate in sorted((target/'debug/deps').glob('observation_recognizer-*')):
+                if re.fullmatch(r'observation_recognizer-[0-9a-f]+(?:\.exe)?', candidate.name) and file_sha256(candidate)==expected:
+                    return candidate
+        except FileNotFoundError:
+            # A concurrent warm build may briefly remove the public alias.
+            pass
+        if time.monotonic() >= deadline:
+            raise ValueError('no stable recognizer artifact matches the freshly built executable')
+        time.sleep(0.01)
 
 
 def recognize(sources):
@@ -105,7 +140,9 @@ def recognize(sources):
         subprocess.run(['cargo', 'build', '--locked', '--quiet', '--manifest-path', str(manifest),
                         '--target-dir', str(target)], check=True)
         if _TIMINGS: print(f'recognizer build: {time.perf_counter()-build_start:.3f}s', file=sys.stderr)
-        _RECOGNIZER = subprocess.Popen([str(target / 'debug/observation-recognizer')],
+        binary=recognizer_binary(target)
+        if _TIMINGS: print(f'recognizer artifact: {binary.name}', file=sys.stderr)
+        _RECOGNIZER = subprocess.Popen([str(binary)],
                                       stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
         atexit.register(_RECOGNIZER.terminate)
     _RECOGNIZER.stdin.write(json.dumps(sources) + '\n')
@@ -149,11 +186,16 @@ def representation_footprint(header, code, semantic=None):
                   + [f'membership.{k}*{v}' for k,v in sorted(membership.items())])
 
 
+@cache_large_text
+def discovered_fields(text):
+    code=normalized(mask(production(text)))
+    return tuple(re.findall(r'^[ \t]*(?:pub(?:\(crate\))?[ \t]+)?(\w+)[ \t]*:[^\n]*(?:Observed|Vec|HashSet|HashMap|BTreeSet|BTreeMap)',code,re.M))
+
+
 def discover_fields(sources):
     for name,text in sources.items():
         if name in {"model.rs", "reserved.rs", "contracts_generated.rs"} or name.endswith("_tests.rs"): continue
-        code=normalized(mask(production(text)))
-        FIELDS.update(re.findall(r'^[ \t]*(?:pub(?:\(crate\))?[ \t]+)?(\w+)[ \t]*:[^\n]*(?:Observed|Vec|HashSet|HashMap|BTreeSet|BTreeMap)',code,re.M))
+        FIELDS.update(discovered_fields(text))
 
 
 
@@ -793,21 +835,51 @@ def check_controls(controls, rows):
         accept_control(label, case, rows)
 
 
-def mutation_pool(sources, rows, mutations, controls, jobs, timings):
+def checked_controls(sources):
+    controls=positive_cases(sources)
+    inventory_check(controls, POSITIVE_INVENTORY, 'positive control')
+    if len(POSITIVE_INVENTORY) != 32:
+        raise ValueError('pinned round-18 positive-control count changed')
+    return controls
+
+
+def shard_cases(mutations, controls):
+    return [('mutation', label) for label in mutations] + [('positive', label) for label in controls]
+
+
+def artifact_self_test():
+    # A later Cargo publication must neither remove our selected image nor make
+    # us execute an older artifact, even if that artifact sorts first.
+    with tempfile.TemporaryDirectory() as directory:
+        target=Path(directory)
+        deps=target/'debug/deps'; deps.mkdir(parents=True)
+        suffix='.exe' if os.name=='nt' else ''
+        alias=target/'debug'/('observation-recognizer'+suffix)
+        stale=deps/('observation_recognizer-0000000000000000'+suffix)
+        fresh=deps/('observation_recognizer-1111111111111111'+suffix)
+        alias.write_bytes(b'fresh build'); stale.write_bytes(b'old build'); fresh.write_bytes(b'fresh build')
+        selected=recognizer_binary(target)
+        alias.unlink()
+        assert file_sha256(selected)==hashlib.sha256(b'fresh build').digest(), 'recognizer image changed with its public alias'
+
+
+def case_pool(rows, mutations, controls, jobs, timings):
     # Fresh interpreters own their recognizer pipes and content-addressed caches.
-    # Files (rather than PIPEs) prevent blocked children while the parent audits controls.
+    # Files prevent blocked children; stdin carries only the parent's verified rows.
+    cases=shard_cases(mutations, controls)
     with ExitStack() as stack:
         children=[]
         try:
             for index in range(jobs):
+                stdin=stack.enter_context(tempfile.TemporaryFile(mode='w+t'))
+                json.dump(rows, stdin); stdin.seek(0)
                 stdout=stack.enter_context(tempfile.TemporaryFile(mode='w+t'))
                 stderr=stack.enter_context(tempfile.TemporaryFile(mode='w+t'))
                 command=[sys.executable, str(Path(__file__).resolve()), '--self-test',
                          '--shard', f'{index}/{jobs}', '--no-verify']
                 if timings: command.append('--timings')
-                process=subprocess.Popen(command, stdout=stdout, stderr=stderr)
+                process=subprocess.Popen(command, stdin=stdin, stdout=stdout, stderr=stderr)
                 children.append((index, process, stdout, stderr))
-            check_controls(controls, rows)
             results=[]
             for index, process, stdout, stderr in children:
                 code=process.wait()
@@ -818,17 +890,23 @@ def mutation_pool(sources, rows, mutations, controls, jobs, timings):
                 shard=[]
                 for line in output.splitlines():
                     item=json.loads(line)
-                    if (not isinstance(item, dict) or set(item) != {'label','message'}
+                    if (not isinstance(item, dict) or set(item) != {'kind','label','message'}
+                            or not isinstance(item['kind'], str) or item['kind'] not in {'mutation','positive'}
                             or not isinstance(item['label'], str) or not isinstance(item['message'], str)
-                            or not item['message'].strip() or len(item['message'].splitlines()) != 1):
-                        raise ValueError(f'shard {index}/{jobs} emitted an invalid rejection: {line}')
+                            or not item['message'].strip() or len(item['message'].splitlines()) != 1
+                            or (item['kind'] == 'positive' and item['message'] != 'accepted')):
+                        raise ValueError(f'shard {index}/{jobs} emitted an invalid rejection/control: {line}')
                     shard.append(item)
-                inventory_check((r['label'] for r in shard), list(mutations)[index::jobs], f'shard {index}/{jobs}')
+                inventory_check(((r['kind'],r['label']) for r in shard), cases[index::jobs], f'shard {index}/{jobs}')
                 if timings:
-                    print(f'shard {index}/{jobs}: {len(shard)} mutations\n{errors}', file=sys.stderr)
+                    count=sum(r['kind']=='mutation' for r in shard)
+                    print(f'shard {index}/{jobs}: {count} mutations; {len(shard)-count} positive controls\n{errors}', file=sys.stderr)
                 results.extend(shard)
-            inventory_check((r['label'] for r in results), MUTATION_INVENTORY, 'merged mutation')
-            return {r['label']: r for r in results}
+            rejected=[r for r in results if r['kind']=='mutation']
+            accepted=[r for r in results if r['kind']=='positive']
+            inventory_check((r['label'] for r in rejected), MUTATION_INVENTORY, 'merged mutation')
+            inventory_check((r['label'] for r in accepted), POSITIVE_INVENTORY, 'merged positive control')
+            return {r['label']: r for r in rejected}
         finally:
             # A failed control or child cannot leave orphaned workers/recognizers running.
             for _, process, _, _ in children:
@@ -838,17 +916,15 @@ def mutation_pool(sources, rows, mutations, controls, jobs, timings):
 
 
 def self_test(sources, rows, jobs=1, timings=False):
+    artifact_self_test()
     mutations=checked_mutations()
-    controls=positive_cases(sources)
-    inventory_check(controls, POSITIVE_INVENTORY, 'positive control')
-    if len(POSITIVE_INVENTORY) != 32:
-        raise ValueError('pinned round-18 positive-control count changed')
+    controls=checked_controls(sources)
     if jobs == 1:
         results={label: reject_mutation(sources, label, case) for label, case in mutations.items()}
         inventory_check(results, MUTATION_INVENTORY, 'serial mutation')
         check_controls(controls, rows)
     else:
-        results=mutation_pool(sources, rows, mutations, controls, jobs, timings)
+        results=case_pool(rows, mutations, controls, jobs, timings)
     # Preserve the pre-sharding stdout order, regardless of worker completion order.
     for label in mutations:
         print('rejected:', label, '-', results[label]['message'])
@@ -890,7 +966,7 @@ def main():
     parser.add_argument('--self-test',action='store_true')
     parser.add_argument('--jobs',type=jobs_value,default=min(4, os.cpu_count() or 1),
                         help='mutation workers, 1 for sequential debugging (default: min(4, cores))')
-    parser.add_argument('--shard',type=shard_value,help='internal worker/debug slice i/n (zero-based)')
+    parser.add_argument('--shard',type=shard_value,help='internal worker/debug slice i/n (zero-based); verified parent rows on stdin')
     parser.add_argument('--no-verify',action='store_true',help=argparse.SUPPRESS)
     parser.add_argument('--timings',action='store_true',help='print timing and inventory details to stderr')
     args=parser.parse_args()
@@ -903,8 +979,19 @@ def main():
     if args.shard is not None:
         index, count=args.shard
         mutations=checked_mutations()
-        for label in list(mutations)[index::count]:
-            print(json.dumps(reject_mutation(sources, label, mutations[label])))
+        controls=checked_controls(sources)
+        # The verified parent sends its pristine rows over stdin. Workers never
+        # re-audit the pristine tree or share a live recognizer pipe.
+        rows=json.load(sys.stdin)
+        if not isinstance(rows, list): raise ValueError('expected parent row list')
+        for kind, label in shard_cases(mutations, controls)[index::count]:
+            if kind == 'mutation':
+                item=reject_mutation(sources, label, mutations[label])
+                item['kind']='mutation'
+            else:
+                accept_control(label, controls[label], rows)
+                item=dict(kind='positive', label=label, message='accepted')
+            print(json.dumps(item))
         if args.timings: print(f'shard {index}/{count} wall: {time.perf_counter()-start:.3f}s', file=sys.stderr)
         return
     print(f'observation gate: cores={os.cpu_count() or 1} jobs={args.jobs}', file=sys.stderr)
