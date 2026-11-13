@@ -745,6 +745,59 @@ fn check_duplicate_entries(dir: Option<&CentralDirectory>, acc: &mut Acc) {
     }
 }
 
+/// IEEE CRC32 for the Info-ZIP Unicode Path field (APPNOTE 4.6.9).
+/// Names and extra fields are bounded by their 16-bit central-directory lengths.
+fn name_crc32(bytes: &[u8]) -> u32 {
+    let mut crc = !0u32;
+    for &byte in bytes {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (0xEDB8_8320u32 & 0u32.wrapping_sub(crc & 1));
+        }
+    }
+    !crc
+}
+
+/// Decode a central name as zip 3.0.0 does, before the package's leading-slash trim.
+/// Unicode Path fields replace the current raw name in order, even with the UTF-8 flag.
+/// Bad CRCs and non-UTF-8 replacements are rejected, never treated as fallback names.
+fn decode_zip_name<'a>(mut raw: &'a [u8], utf8: bool, extra: &'a [u8]) -> Option<String> {
+    let mut unicode = false;
+    let mut offset = 0usize;
+    while offset < extra.len() {
+        let tag = u16_at(extra, offset)?;
+        let len = usize::from(u16_at(extra, offset + 2)?);
+        offset = offset.checked_add(4)?;
+        let end = offset.checked_add(len)?;
+        let field = extra.get(offset..end)?;
+        if tag == 0x7075 {
+            // The version byte is deliberately unvalidated, matching the archive reader.
+            let content = field.get(5..)?;
+            if u32_at(field, 1)? != name_crc32(raw) {
+                return None;
+            }
+            std::str::from_utf8(content).ok()?;
+            raw = content;
+            unicode = true;
+        }
+        offset = end;
+    }
+    if utf8 || unicode {
+        Some(String::from_utf8_lossy(raw).into_owned())
+    } else {
+        Some(raw.iter().map(|&b| if b < 128 { char::from(b) } else { CP437_HIGH.get(usize::from(b - 128)).copied().unwrap_or('�') }).collect())
+    }
+}
+
+/// CP437's upper half; ASCII/control bytes in the lower half keep their byte values.
+const CP437_HIGH: [char; 128] = [
+    'Ç', 'ü', 'é', 'â', 'ä', 'à', 'å', 'ç', 'ê', 'ë', 'è', 'ï', 'î', 'ì', 'Ä', 'Å', 'É', 'æ', 'Æ', 'ô', 'ö', 'ò', 'û', 'ù', 'ÿ', 'Ö', 'Ü', '¢', '£',
+    '¥', '₧', 'ƒ', 'á', 'í', 'ó', 'ú', 'ñ', 'Ñ', 'ª', 'º', '¿', '⌐', '¬', '½', '¼', '¡', '«', '»', '░', '▒', '▓', '│', '┤', '╡', '╢', '╖', '╕', '╣',
+    '║', '╗', '╝', '╜', '╛', '┐', '└', '┴', '┬', '├', '─', '┼', '╞', '╟', '╚', '╔', '╩', '╦', '╠', '═', '╬', '╧', '╨', '╤', '╥', '╙', '╘', '╒', '╓',
+    '╫', '╪', '┘', '┌', '█', '▄', '▌', '▐', '▀', 'α', 'ß', 'Γ', 'π', 'Σ', 'σ', 'µ', 'τ', 'Φ', 'Θ', 'Ω', 'δ', '∞', 'φ', 'ε', '∩', '≡', '±', '≥', '≤',
+    '⌠', '⌡', '÷', '≈', '°', '∙', '·', '√', 'ⁿ', '²', '■', ' ',
+];
+
 /// Read an unsigned 16-bit little-endian integer at byte offset `i`.
 fn u16_at(b: &[u8], i: usize) -> Option<u16> {
     Some(u16::from_le_bytes(b.get(i..i + 2)?.try_into().ok()?))
@@ -817,6 +870,9 @@ fn central_directory<'a>(bytes: &'a [u8], limit: usize) -> Option<CentralDirecto
         let extra_len = usize::from(u16_at(bytes, i + 30)?);
         let comment_len = usize::from(u16_at(bytes, i + 32)?);
         let name = bytes.get(i + 46..i + 46 + name_len)?;
+        let extra = bytes.get(i + 46 + name_len..i + 46 + name_len + extra_len)?;
+        // Validate the name metadata against the reader before trusting this directory record.
+        decode_zip_name(name, u16_at(bytes, i + 8)? & 0x800 != 0, extra)?;
         names.push(name);
         i = i.checked_add(46 + name_len + extra_len + comment_len)?;
     }
@@ -1438,4 +1494,9 @@ fn attr_plain(e: &BytesStart, name: &[u8]) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    include!("zip_name_tests.rs");
 }
