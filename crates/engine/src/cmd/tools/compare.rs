@@ -116,7 +116,11 @@ pub(super) fn compare(s: &mut Session, v: &Value) -> CmdResult {
                     if !same_objects(&s.doc, pa, pb) {
                         // Same text, but objects (text boxes, pictures…) differ: diffed, so the
                         // original's objects aren't lost.
-                        out.push(para_block(word_diff(&s.doc, pa, pb, &mut ctx)));
+                        let mut p = word_diff(&s.doc, pa, pb, &mut ctx);
+                        if opts.formatting && pa.props.formatting() != pb.props.formatting() {
+                            crate::cmd::fmt_revisions::compare_formatting(pa, &mut p, &mut s.doc.revisions, &author, &date);
+                        }
+                        out.push(para_block(p));
                         changes += 1;
                         i += 1;
                         j += 1;
@@ -132,6 +136,12 @@ pub(super) fn compare(s: &mut Session, v: &Value) -> CmdResult {
                         }
                     }
                     out.push(para_block(p));
+                } else if let (Some(Block::Table(ta)), Some(Block::Table(tb))) = (a.map(|x| &**x), b.map(|x| &**x)) {
+                    let mut t = tb.clone();
+                    if opts.formatting {
+                        crate::cmd::fmt_revisions::compare_table_formatting(ta, &mut t, &mut s.doc.revisions, &author, &date);
+                    }
+                    out.push(Arc::new(Block::Table(t)));
                 } else if let Some(x) = b.or(a) {
                     out.push(x.clone());
                 }
@@ -148,7 +158,13 @@ pub(super) fn compare(s: &mut Session, v: &Value) -> CmdResult {
                 for x in 0..dels.max(inss) {
                     let (a, b) = (if x < dels { old.get(i + x) } else { None }, if x < inss { new.get(j + x) } else { None });
                     match (a.map(|x| &**x), b.map(|x| &**x)) {
-                        (Some(Block::Para(pa)), Some(Block::Para(pb))) => out.push(para_block(word_diff(&s.doc, pa, pb, &mut ctx))),
+                        (Some(Block::Para(pa)), Some(Block::Para(pb))) => {
+                            let mut p = word_diff(&s.doc, pa, pb, &mut ctx);
+                            if opts.formatting && pa.props.formatting() != pb.props.formatting() {
+                                crate::cmd::fmt_revisions::compare_formatting(pa, &mut p, &mut s.doc.revisions, &author, &date);
+                            }
+                            out.push(para_block(p));
+                        }
                         _ => {
                             if let Some(x) = a {
                                 out.push(Arc::new(mark_block(x, &|c| c.del = Some(del), 0)));
@@ -229,6 +245,8 @@ fn sync_style_definitions(
             if let Some(target) = result_styles.styles.iter_mut().find(|st| st.id == new_st.id) {
                 let old_st = target.clone();
                 let mut updated = new_st.clone();
+                updated.para_change = None;
+                updated.chr_change = None;
                 updated.para.fmt_change = None;
                 updated.chr.fmt_change = None;
                 let needs_remapping = updated.para.numbering.is_some_and(|n| {
@@ -246,24 +264,30 @@ fn sync_style_definitions(
                 *target = updated;
             } else {
                 let mut added = new_st.clone();
+                added.para_change = None;
+                added.chr_change = None;
                 added.para.fmt_change = None;
                 added.chr.fmt_change = None;
                 remap_style_numbering(&mut s.doc, &revised.numbering, &mut added.para.numbering, maps);
                 result_styles.styles.push(added);
             }
         }
+        crate::cmd::fmt_revisions::recompute_inherited_numbering(&mut result_styles);
         s.doc.styles = Arc::new(result_styles);
     } else {
         let mut result_styles = (*s.doc.styles).clone();
         for new_st in &revised.styles.styles {
             if !result_styles.styles.iter().any(|st| st.id == new_st.id) {
                 let mut added = new_st.clone();
+                added.para_change = None;
+                added.chr_change = None;
                 added.para.fmt_change = None;
                 added.chr.fmt_change = None;
                 remap_style_numbering(&mut s.doc, &revised.numbering, &mut added.para.numbering, maps);
                 result_styles.styles.push(added);
             }
         }
+        crate::cmd::fmt_revisions::recompute_inherited_numbering(&mut result_styles);
         s.doc.styles = Arc::new(result_styles);
     }
     changes
@@ -312,6 +336,7 @@ fn remap_revised_numbering(doc: &mut Document, revised: &mut Document, maps: &mu
     }
 }
 
+/// Remap list numbering references in `blocks` to avoid collisions with existing lists in `doc`.
 fn remap_blocks_numbering(
     doc: &mut Document,
     source: &wordcraft_doc::numbering::Numbering,
