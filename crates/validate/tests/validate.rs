@@ -3050,8 +3050,10 @@ fn unreadable_entry_after_a_duplicate_keeps_its_own_identity() {
         report.coverage_notes
     );
     assert!(
-        !report.coverage_notes.iter().any(|n| n.contains("word/styles.xml")),
-        "no note may blame the duplicated part for the unreadable entry: {:?}",
+        report.coverage_notes.iter().filter(|n| n.contains("word/styles.xml")).all(|n| {
+            n == "duplicate records for word/styles.xml: the other record's content was not examined; dependent absence checks were skipped"
+        }),
+        "only the separate duplicate-record note may name styles; no unreadable-entry note may blame it: {:?}",
         report.coverage_notes
     );
     assert!(

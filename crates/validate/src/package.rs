@@ -230,6 +230,8 @@ pub(crate) struct RelsPart {
 /// Everything loaded from a package once.
 pub(crate) struct Package {
     pub entries: Vec<Entry>,
+    /// Decoded, leading-slash-trimmed names with unexamined competing records.
+    pub collapsed_names: HashSet<String>,
     pub content_types: ContentTypes,
     pub content_types_present: bool,
     pub rels: Vec<RelsPart>,
@@ -350,11 +352,12 @@ pub(crate) fn load(bytes: &[u8], acc: &mut Acc) -> Option<Package> {
         }
     }
 
+    let cd = central_directory(bytes, acc.limits.entries);
+    let (collapsed_names, unexplained) = check_duplicate_entries(cd.as_ref(), zip.len(), acc);
+    unknown_unreadable |= unexplained;
     if unknown_unreadable {
         acc.set_unknown_unreadable();
     }
-    let cd = central_directory(bytes, acc.limits.entries);
-    check_duplicate_entries(cd.as_ref(), acc);
     check_case_collisions(cd.as_ref(), &entries, acc);
 
     let ct_at = entries.iter().position(|e| !e.is_dir && e.name.eq_ignore_ascii_case("[Content_Types].xml"));
@@ -405,12 +408,17 @@ pub(crate) fn load(bytes: &[u8], acc: &mut Acc) -> Option<Package> {
 
     acc.ran("PKG-NO-MAIN");
     let package_rels = rels.iter().find(|r| r.name.eq_ignore_ascii_case("_rels/.rels"));
-    let main_ambiguous = competing_targets(package_rels, is_office_document_relationship);
-    if main_ambiguous {
-        acc.note(
-            "ambiguous officeDocument selection for the package: distinct official targets compete; owner-dependent document checks were skipped"
-                .to_string(),
-        );
+    let package_rels_collapsed = collapsed_names.iter().any(|name| name.eq_ignore_ascii_case("_rels/.rels"));
+    let main_ambiguous = package_rels_collapsed || competing_targets(package_rels, is_office_document_relationship);
+    let main_loss = match (package_rels_collapsed, main_ambiguous) {
+        (true, _) => Some("the package main is unproven because _rels/.rels is duplicated; the other record was not examined"),
+        (false, true) => Some(
+            "ambiguous officeDocument selection for the package: distinct official targets compete; owner-dependent document checks were skipped",
+        ),
+        (false, false) => None,
+    };
+    if let Some(note) = main_loss {
+        acc.note(note.to_string());
         acc.set_incomplete();
     }
     let main = package_rels
@@ -419,8 +427,13 @@ pub(crate) fn load(bytes: &[u8], acc: &mut Acc) -> Option<Package> {
         .and_then(|t| canonical(&entries, t));
     let package_rels_unavailable = entries.iter().any(|e| !e.is_dir && e.name.eq_ignore_ascii_case("_rels/.rels") && e.content_unavailable);
     let discovery_complete = !entries_truncated && !unknown_unreadable && !package_rels_unavailable && !package_rels.is_some_and(|rp| rp.incomplete);
-    let main =
-        if main_ambiguous { Resolution::Ambiguous("distinct official targets compete") } else { Resolution::discovered(main, discovery_complete) };
+    let main = if package_rels_collapsed {
+        Resolution::Unknown("_rels/.rels is duplicated")
+    } else if main_ambiguous {
+        Resolution::Ambiguous("distinct official targets compete")
+    } else {
+        Resolution::discovered(main, discovery_complete)
+    };
     if matches!(main, Resolution::Absent) {
         acc.add("PKG-NO-MAIN", None, no_main_message(package_rels));
     }
@@ -442,6 +455,7 @@ pub(crate) fn load(bytes: &[u8], acc: &mut Acc) -> Option<Package> {
     let reachable = reachability(&rels, main_name);
     Some(Package {
         entries,
+        collapsed_names,
         content_types,
         content_types_present,
         rels,
@@ -698,10 +712,10 @@ fn trim_leading_slash(mut b: &[u8]) -> &[u8] {
 }
 
 /// Inspect the raw zip central directory for duplicate entry names and report `PKG-DUP-ENTRY` findings.
-fn check_duplicate_entries(dir: Option<&CentralDirectory>, acc: &mut Acc) {
+fn check_duplicate_entries(dir: Option<&CentralDirectory>, unique_count: usize, acc: &mut Acc) -> (HashSet<String>, bool) {
     observation_contract! {
         rules: "PKG-DUP-ENTRY";
-        collections: "field.entries*1,field.names*1,type.HashMap*2,type.Vec*1";
+        collections: "field.decoded_names*1,field.entries*1,type.HashMap*2,type.HashSet*3,type.Vec*1";
         scope: "source-local bounded extraction; no implicit document owner";
         loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
         fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
@@ -718,17 +732,27 @@ fn check_duplicate_entries(dir: Option<&CentralDirectory>, acc: &mut Acc) {
         // the all-or-nothing counterpart of the truncated parse below: a partial check is reported
         // INCOMPLETE, so a completely unrun one must be too, rather than leaving a silent PASS.
         acc.set_incomplete();
-        return;
+        return (HashSet::new(), false);
     };
-    let mut counts: HashMap<&[u8], usize> = HashMap::new();
-    for n in &dir.names {
-        *counts.entry(trim_leading_slash(n)).or_default() += 1;
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    for n in &dir.decoded_names {
+        *counts.entry(n.trim_start_matches('/')).or_default() += 1;
     }
-    let mut dups: Vec<&[u8]> = counts.into_iter().filter(|(_, c)| *c > 1).map(|(n, _)| n).collect();
+    let excess = counts.values().map(|c| c.saturating_sub(1) as u64).sum();
+    let mut dups: Vec<&str> = counts.into_iter().filter(|(_, c)| *c > 1).map(|(n, _)| n).collect();
     dups.sort_unstable();
+    let mut collapsed_names = HashSet::new();
     for n in dups {
-        let name_str = String::from_utf8_lossy(n);
-        acc.add("PKG-DUP-ENTRY", None, format!("the entry {name_str} appears more than once in the archive"));
+        acc.add("PKG-DUP-ENTRY", None, format!("the entry {n} appears more than once in the archive"));
+        acc.note(format!("duplicate records for {n}: the other record's content was not examined; dependent absence checks were skipped"));
+        collapsed_names.insert(n.to_string());
+    }
+    let unexplained = directory_residual(dir.total, unique_count, excess, dir.truncated).is_some_and(|n| n != 0);
+    if unexplained {
+        acc.note(
+            "the zip directory record count disagrees with the reader after decoded duplicates; unaccounted records were not examined".to_string(),
+        );
+        acc.set_incomplete();
     }
     // The raw directory holds more records than the budget allowed the parse to examine. The
     // unexamined records' names (and so any duplicate among them) are unknown, so duplicate
@@ -743,6 +767,13 @@ fn check_duplicate_entries(dir: Option<&CentralDirectory>, acc: &mut Acc) {
         ));
         acc.set_incomplete();
     }
+    (collapsed_names, unexplained)
+}
+
+/// A complete directory must account for every reader entry and decoded duplicate.
+/// A capped prefix cannot establish a count disagreement about its unexamined suffix.
+fn directory_residual(total: u64, unique_count: usize, excess: u64, truncated: bool) -> Option<i128> {
+    if truncated { None } else { Some(i128::from(total) - unique_count as i128 - i128::from(excess)) }
 }
 
 /// IEEE CRC32 for the Info-ZIP Unicode Path field (APPNOTE 4.6.9).
@@ -818,6 +849,8 @@ fn u64_at(b: &[u8], i: usize) -> Option<u64> {
 struct CentralDirectory<'a> {
     /// The raw entry names examined, in stored order, including duplicate names.
     names: Vec<&'a [u8]>,
+    /// Reader-equivalent decoded names, in the same bounded directory order.
+    decoded_names: Vec<String>,
     /// The total raw record count the directory declares.
     total: u64,
     /// True when fewer than `total` records were examined because the entry budget stopped the
@@ -830,15 +863,14 @@ struct CentralDirectory<'a> {
 /// unexamined. `None` when the directory cannot be parsed (not a zip, or a layout this reader does
 /// not understand), in which case duplicate names are simply not checked.
 ///
-/// Entry names are returned as raw byte slices rather than decoded strings, allowing duplicate-entry
-/// detection to compare byte-exact names. This guarantees that distinct legacy-encoded (non-UTF-8)
-/// byte sequences are never falsely reported as duplicates if they share lossy replacement characters;
-/// decoding occurs only when formatting finding messages. Records past the entry budget are
-/// unexamined by design, and the run reports INCOMPLETE instead of claiming coverage.
+/// Raw bytes remain available for the separate ASCII case-collision check. The duplicate key
+/// decodes non-flagged names as CP437 (never lossy UTF-8), flagged names as lossy UTF-8,
+/// and applies Unicode Path overrides exactly as the reader does. Records past the entry budget
+/// remain unexamined and report INCOMPLETE rather than claiming coverage.
 fn central_directory<'a>(bytes: &'a [u8], limit: usize) -> Option<CentralDirectory<'a>> {
     observation_contract! {
         rules: "-";
-        collections: "type.Vec*1";
+        collections: "type.Vec*2";
         scope: "source-local bounded extraction; no implicit document owner";
         loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
         fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
@@ -861,6 +893,7 @@ fn central_directory<'a>(bytes: &'a [u8], limit: usize) -> Option<CentralDirecto
     let truncated = count > limit;
     let examined = count.min(limit);
     let mut names = Vec::with_capacity(examined.min(1 << 16) as usize);
+    let mut decoded_names = Vec::with_capacity(examined.min(1 << 16) as usize);
     let mut i = usize::try_from(cd_off).ok()?;
     for _ in 0..examined {
         if u32_at(bytes, i)? != 0x0201_4B50 {
@@ -872,11 +905,11 @@ fn central_directory<'a>(bytes: &'a [u8], limit: usize) -> Option<CentralDirecto
         let name = bytes.get(i + 46..i + 46 + name_len)?;
         let extra = bytes.get(i + 46 + name_len..i + 46 + name_len + extra_len)?;
         // Validate the name metadata against the reader before trusting this directory record.
-        decode_zip_name(name, u16_at(bytes, i + 8)? & 0x800 != 0, extra)?;
+        decoded_names.push(decode_zip_name(name, u16_at(bytes, i + 8)? & 0x800 != 0, extra)?);
         names.push(name);
         i = i.checked_add(46 + name_len + extra_len + comment_len)?;
     }
-    Some(CentralDirectory { names, total: count, truncated })
+    Some(CentralDirectory { names, decoded_names, total: count, truncated })
 }
 
 /// The zip64 end-of-central-directory `(entry count, central directory offset)`.

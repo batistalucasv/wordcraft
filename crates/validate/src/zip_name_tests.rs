@@ -37,3 +37,12 @@ fn unicode_path_rejects_bad_crc_and_utf8_like_zip() {
         assert!(zip::ZipArchive::new(Cursor::new(build(&[r]))).is_err());
     }
 }
+
+#[test]
+fn directory_count_residual_is_signed_and_ignores_truncation() {
+    assert_eq!(directory_residual(6, 4, 2, false), Some(0));
+    assert_eq!(directory_residual(7, 4, 2, false), Some(1));
+    assert_eq!(directory_residual(5, 4, 2, false), Some(-1));
+    assert_eq!(directory_residual(7, 4, 2, true), None);
+    assert_eq!(directory_residual(5, 4, 2, true), None);
+}

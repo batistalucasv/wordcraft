@@ -1976,7 +1976,7 @@ fn report_duplicate_rel_ids(rp: &RelsPart, acc: &mut Acc) {
 fn check_part_refs(pkg: &Package, refs: &[(String, Vec<RefFact>)], acc: &mut Acc) {
     observation_contract! {
         rules: "REL-REF-MISSING";
-        collections: "access.into_complete_set*1,access.missing*1,type.HashSet*2,type.Observed*1,type.Vec*1";
+        collections: "access.into_complete_set*1,access.missing*1,field.collapsed_names*2,type.HashSet*2,type.Observed*1,type.Vec*1";
         scope: "source-local bounded extraction; no implicit document owner";
         loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
         fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
@@ -1987,7 +1987,10 @@ fn check_part_refs(pkg: &Package, refs: &[(String, Vec<RefFact>)], acc: &mut Acc
     for (part, values) in refs {
         // The part's own `.rels` could not be read: which relationships it declares is unknown, so
         // its `r:id`/`r:embed`/`r:link` values are not established as unresolved.
-        if package::relationships_incomplete(pkg, part) {
+        if pkg.collapsed_names.contains(part)
+            || pkg.collapsed_names.iter().any(|name| name.eq_ignore_ascii_case(&rels_part_name(part)))
+            || package::relationships_incomplete(pkg, part)
+        {
             continue;
         }
         let Some(ids) = Observed::complete(part_rel_ids(pkg, part)).into_complete_set() else { continue };
@@ -2507,7 +2510,7 @@ fn check_owned_ids(
 ) {
     observation_contract! {
         rules: "ID-COMMENT-REF,REF-NOTE";
-        collections: "access.into_complete_set*1,access.prefix*1,access.project*1,field.parts*2,type.HashSet*2,type.Observed*3,type.Vec*3";
+        collections: "access.into_complete_set*1,access.prefix*1,access.project*1,field.collapsed_names*1,field.parts*2,type.HashSet*2,type.Observed*3,type.Vec*3";
         scope: "each established owner and its selected supporting sources; shared parts in every owner; unowned references excluded; explicit no-root fallback only";
         loss: "source unavailable or malformed; XML event/depth budget; category allocation cap; unknown or ambiguous source discovery; source-local pooled-budget loss";
         fallback: "suppress only dependent absence directions and report Incomplete; independent owner and prefix findings survive";
@@ -2521,7 +2524,7 @@ fn check_owned_ids(
         let source = supporting_part(pkg, owner.root(), kind, ct, acc);
         let observed = match source {
             Resolution::One(entry) => {
-                if discovery_unavailable(pkg, owner.root()) {
+                if pkg.collapsed_names.contains(&entry.name) || discovery_unavailable(pkg, owner.root()) {
                     continue;
                 }
                 let Some(part) = xml.parts.get(&PartId::new(&entry.name)) else { continue };

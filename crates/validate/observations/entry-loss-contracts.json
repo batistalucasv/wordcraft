@@ -16,6 +16,7 @@
     "entries_truncated",
     "producer mut unknown_unreadable = false",
     "unknown_unreadable = true",
+    "unknown_unreadable |= unexplained",
     "unknown_unreadable",
     "! content_types_present && ! entries_truncated",
     "! content_types_present && entries_truncated",
