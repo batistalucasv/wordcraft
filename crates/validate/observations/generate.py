@@ -5,7 +5,9 @@ The audit checks declared collection consumption, typed-accessor bypasses and re
 It deliberately does not certify the semantic truth of a declaration; fixtures do that.
 """
 from pathlib import Path
-import argparse, atexit, json, re, subprocess, sys
+import argparse, atexit, hashlib, json, os, re, subprocess, sys, tempfile, time
+from contextlib import ExitStack
+from functools import lru_cache, wraps
 from collections import Counter
 
 FIELDS = {
@@ -27,6 +29,15 @@ MEMBERSHIP = IDENT_START + r'((?:' + IDENT + r'\s*\.\s*)*' + IDENT + r')\s*\.\s*
 
 
 
+def cache_large_text(function):
+    cached = lru_cache(maxsize=256)(function)
+    @wraps(function)
+    def call(text):
+        return cached(text) if len(text) >= 4096 else function(text)
+    return call
+
+
+@cache_large_text
 def mask(text):
     """Blank Rust comments and literals, preserving all byte offsets and newlines."""
     pattern = r'//[^\n]*|/\*|r(#+)?"[\s\S]*?"\1|"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])\''
@@ -60,6 +71,7 @@ def close_brace(code, opening):
     raise ValueError('unbalanced Rust braces in contract audit')
 
 
+@cache_large_text
 def production(text):
     code = mask(text)
     # Exclude inline test modules, but not #[cfg(test)] external mod declarations at the crate root.
@@ -75,6 +87,7 @@ def normalized(code):
 
 
 _RECOGNIZER = None
+_TIMINGS = False
 
 
 def recognize(sources):
@@ -88,8 +101,10 @@ def recognize(sources):
         root = Path(__file__).resolve().parents[3]
         manifest = Path(__file__).parent / 'recognizer/Cargo.toml'
         target = root / 'target/observation-recognizer'
+        build_start=time.perf_counter()
         subprocess.run(['cargo', 'build', '--locked', '--quiet', '--manifest-path', str(manifest),
                         '--target-dir', str(target)], check=True)
+        if _TIMINGS: print(f'recognizer build: {time.perf_counter()-build_start:.3f}s', file=sys.stderr)
         _RECOGNIZER = subprocess.Popen([str(target / 'debug/observation-recognizer')],
                                       stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
         atexit.register(_RECOGNIZER.terminate)
@@ -142,19 +157,125 @@ def discover_fields(sources):
 
 
 
-def rule_registry(sources):
-    return set(re.findall(r'RuleSpec\s*\{\s*id:\s*"([A-Z0-9-]+)"', sources['lib.rs']))
+@lru_cache(maxsize=256)
+def rule_registry(lib_text):
+    return frozenset(re.findall(r'RuleSpec\s*\{\s*id:\s*"([A-Z0-9-]+)"', lib_text))
+
+
+@lru_cache(maxsize=256)
+def surface_text(name, items, lib_text):
+    return normalized(mask(' '.join(items)))
+
+
+# The semantic is cross-unit (notably helper/alias resolution), so raw body text
+# alone is not a valid key. Policy text and the complete field/rule context also
+# participate; cached records are only read by declarations().
+@lru_cache(maxsize=4096)
+def unit_audit(name, func, header, body, semantic_json, fields, enum_variants,
+               known_rules, providers_text, entry_loss_text, provider_seen):
+    errors=[]; rows=[]; seen=set(); seen_providers=set(); seen_entry_loss={}
+    providers=json.loads(providers_text); entry_loss=json.loads(entry_loss_text)
+    known_rules=frozenset(known_rules)
+    def record():
+        return (tuple(errors), tuple(rows), frozenset(seen), frozenset(seen_providers), tuple(seen_entry_loss.items()))
+    header = normalized(mask(header)); code = normalized(mask(body))
+    semantic = json.loads(semantic_json)
+    errors.extend(f'{name}::{func}: {issue}' for issue in semantic.get('issues', []))
+    state_predicates = semantic.get('state_predicates', [])
+    state_key = f'{name}::{func}'
+    if state_predicates:
+        seen_entry_loss[state_key] = state_predicates
+    if state_predicates != entry_loss.get(state_key, []):
+        errors.append(f'{state_key}: entry-loss predicate differs from its named conservative/lookup contract')
+    lookup_uses = [f'lookup.{k}*{v}' for k,v in sorted(Counter(semantic.get('lookups', [])).items())]
+    uses = sorted(consumption(header+code, semantic=semantic) + lookup_uses)
+    bounded_uses = consumption(header+code, enum_variants, semantic) + lookup_uses
+    decl = re.search(r'observation_contract\s*!\s*\{', code)
+    declaration = body[decl.end():close_brace(code, decl.end()-1)] if decl else ''
+    if name != 'observed.rs' and re.search(r'\.\s*(?:observed_value|observed_status)\b',code):
+        errors.append(f'{name}::{func}: bypasses private observation representation')
+    if 'PackageRegistryContext' in header+code or re.search(r'(?:\.|::)\s*contexts\b',code):
+        if (name,func) not in {('lib.rs','report_unreferenced_comments'),('lib.rs','check_custom_xml'),('ownership.rs','contexts')}:
+            errors.append(f'{name}::{func}: undeclared package-registry exception')
+    if re.search(r'\.\s*difference\s*\(', code):
+        errors.append(f'{name}::{func}: raw absence difference bypasses CompleteSet')
+    if name == 'observed.rs':
+        # The private implementation has explicit build-time contracts too.
+        # No function, initializer or consuming body can escape by file name.
+        footprint = representation_footprint(header, code, semantic)
+        if providers.get(func) != dict(header=header, collections=footprint) or provider_seen:
+            errors.append(f'{name}::{func}: representation contract differs or is missing')
+        seen_providers.add(func)
+        rows.append(dict(helper=f'{name}::{func}', rules='-', collections=','.join(footprint) or '-',
+            scope='private Observed/CompleteSet representation provider; signature and footprint pinned in observations/representation-contracts.json',
+            loss='local completeness and allocation budgets carried by the typed representation',
+            fallback='retain prefix; incomplete observations cannot construct CompleteSet; fixtures check semantics',
+            package_loss='independent'))
+        return record()
+    # Raw definition membership must not bypass CompleteSet, even after copying a prefix.
+    # These receivers are structural metadata, lexical validation, or allocation guards.
+    structural_membership = {
+        ('lib.rs', 'absence_suppressed', 'PACKAGE_ABSENCE_RULES'),
+        ('lib.rs', 'check_note_pr', 'reverse_ok'),
+        ('lib.rs', 'report_malformed', 'pkg.reachable'),
+        ('lib.rs', 'check_typed_content', 'non_main_owner_rels'),
+        ('lib.rs', 'report_unreferenced_comments', 'incomplete_owners'),
+        ('lib.rs', 'supporting_part', 'acc.coverage'),
+        ('lib.rs', 'check_custom_xml', 'custom_xml_owners'),
+        ('lib.rs', 'check_media', 'image_targets'),
+        ('scan.rs', 'check_protection', 'k'),
+        ('scan.rs', 'check_para_ids', 'state.para_ids'),
+        ('scan.rs', 'attr_plain', 'k'),
+        ('package.rs', 'is_main_content_type', 'MAIN_CONTENT_TYPES'),
+        ('package.rs', 'load', 'xml_parts'),
+        ('package.rs', 'classified_xml_parts', 'role_targets'),
+        ('package.rs', 'is_xml_part', 'pkg.xml_parts'),
+        ('ownership.rs', 'with_budget', 'roots'),
+        ('ownership.rs', 'parts', 'owners'),
+    }
+    for access in re.finditer(MEMBERSHIP, code):
+        receiver=re.sub(r'\s+', '', access.group(1))
+        if (name,func,receiver) not in structural_membership and not (decl and receiver in semantic.get('positive_membership', [])):
+            errors.append(f'{name}::{func}: raw membership {receiver} bypasses CompleteSet or undeclared structural scope')
+    if not bounded_uses and not decl and not re.search(r'\bacc\s*\.\s*(?:add|add_graded|ran)\s*\(', code):
+        return record()
+    if not decl:
+        errors.append(f'{name}::{func}: bounded consumption has no observation contract: {uses}')
+        return record()
+    data=dict(re.findall(r'(\w+)\s*:\s*"((?:\\.|[^"\\])*)"\s*;',declaration))
+    required={'rules','collections','scope','loss','fallback','package_loss'}
+    if set(data)!=required or any(not data.get(k,'').strip() for k in required):
+        errors.append(f'{name}::{func}: missing contract field/fallback')
+        return record()
+    declared=[] if data['collections']=='-' else sorted(data['collections'].split(','))
+    if declared!=uses:
+        errors.append(f'{name}::{func}: declared collections differ from bounded accesses: declared={declared}, used={uses}')
+    declared_rules=set(data['rules'].split(',')) - {'-'}
+    called_rules=set(re.findall(r'"([A-Z0-9-]+)"',body)) & known_rules
+    if not called_rules <= declared_rules:
+        errors.append(f'{name}::{func}: rule consumption omitted: {called_rules-declared_rules}')
+    if not declared_rules <= known_rules:
+        errors.append(f'{name}::{func}: unknown rule IDs: {declared_rules-known_rules}')
+    if data['package_loss'] != 'independent' and not set(data['package_loss'].split(',')) <= declared_rules:
+        errors.append(f'{name}::{func}: undeclared unknown-package-identity rule policy')
+    key = (func, header, code, tuple(sorted(data.items())))
+    if key not in seen:
+        rows.append(dict(helper=f'{name}::{func}', **data))
+        seen.add(key)
+    return record()
 
 
 def declarations(sources):
     rows=[];errors=[]
-    providers = json.loads((Path(__file__).parent / 'representation-contracts.json').read_text())
+    providers_text = (Path(__file__).parent / 'representation-contracts.json').read_text()
+    providers = json.loads(providers_text)
     seen_providers = set()
-    entry_loss = json.loads((Path(__file__).parent / 'entry-loss-contracts.json').read_text())
+    entry_loss_text = (Path(__file__).parent / 'entry-loss-contracts.json').read_text()
+    entry_loss = json.loads(entry_loss_text)
     seen_entry_loss = {}
     FIELDS.clear(); FIELDS.update(BASE_FIELDS)
     discover_fields(sources)
-    known_rules=rule_registry(sources)
+    known_rules=rule_registry(sources['lib.rs'])
     audited = {name: text for name, text in sources.items()
                if not name.endswith('_tests.rs') and name not in {'model.rs','reserved.rs','contracts_generated.rs'}}
     recognized = recognize(audited)
@@ -166,13 +287,14 @@ def declarations(sources):
         errors.append(f"{reader['type']}: unauthorized reader derive {reader['derive']} or changed representation/DTO field shape")
     FIELDS.update(f for file in recognized.values() for f in file['collection_fields'])
     enum_variants = [v for file in recognized.values() for v in file['enum_variants']]
+    field_key=frozenset(FIELDS); variant_key=tuple(enum_variants); rule_key=tuple(sorted(known_rules))
     for name,text in sorted(sources.items()):
         if name.endswith('_tests.rs') or name in {'model.rs','reserved.rs','contracts_generated.rs'}:
             continue
         for module in recognized[name]['modules']:
             if module + '.rs' not in sources:
                 errors.append(f'{name}: external module {module} has no supplied audited source or explicit excluded table/test/policy source')
-        surface = normalized(mask(' '.join(recognized[name]['surface'])))
+        surface = surface_text(name, tuple(recognized[name]['surface']), sources['lib.rs'])
         if re.search(r'\bPackageRegistryContext\b|(?:\.|::)\s*contexts\b', surface):
             errors.append(f'{name}: module-scope package-registry aliases/queries are unsupported')
         # A template and an invocation may yield identical units. Audit all instances;
@@ -180,90 +302,17 @@ def declarations(sources):
         seen = set()
         for unit in recognized[name]['units']:
             func, header, body = unit['name'], unit['header'], unit['body']
-            header = normalized(mask(header)); code = normalized(mask(body))
-            semantic = unit.get('semantic', {})
-            errors.extend(f'{name}::{func}: {issue}' for issue in semantic.get('issues', []))
-            state_predicates = semantic.get('state_predicates', [])
-            state_key = f'{name}::{func}'
-            if state_predicates:
-                seen_entry_loss[state_key] = state_predicates
-            if state_predicates != entry_loss.get(state_key, []):
-                errors.append(f'{state_key}: entry-loss predicate differs from its named conservative/lookup contract')
-            lookup_uses = [f'lookup.{k}*{v}' for k,v in sorted(Counter(semantic.get('lookups', [])).items())]
-            uses = sorted(consumption(header+code, semantic=semantic) + lookup_uses)
-            bounded_uses = consumption(header+code, enum_variants, semantic) + lookup_uses
-            decl = re.search(r'observation_contract\s*!\s*\{', code)
-            declaration = body[decl.end():close_brace(code, decl.end()-1)] if decl else ''
-            if name != 'observed.rs' and re.search(r'\.\s*(?:observed_value|observed_status)\b',code):
-                errors.append(f'{name}::{func}: bypasses private observation representation')
-            if 'PackageRegistryContext' in header+code or re.search(r'(?:\.|::)\s*contexts\b',code):
-                if (name,func) not in {('lib.rs','report_unreferenced_comments'),('lib.rs','check_custom_xml'),('ownership.rs','contexts')}:
-                    errors.append(f'{name}::{func}: undeclared package-registry exception')
-            if re.search(r'\.\s*difference\s*\(', code):
-                errors.append(f'{name}::{func}: raw absence difference bypasses CompleteSet')
-            if name == 'observed.rs':
-                # The private implementation has explicit build-time contracts too.
-                # No function, initializer or consuming body can escape by file name.
-                footprint = representation_footprint(header, code, semantic)
-                if providers.get(func) != dict(header=header, collections=footprint) or func in seen_providers:
-                    errors.append(f'{name}::{func}: representation contract differs or is missing')
-                seen_providers.add(func)
-                rows.append(dict(helper=f'{name}::{func}', rules='-', collections=','.join(footprint) or '-',
-                    scope='private Observed/CompleteSet representation provider; signature and footprint pinned in observations/representation-contracts.json',
-                    loss='local completeness and allocation budgets carried by the typed representation',
-                    fallback='retain prefix; incomplete observations cannot construct CompleteSet; fixtures check semantics',
-                    package_loss='independent'))
-                continue
-            # Raw definition membership must not bypass CompleteSet, even after copying a prefix.
-            # These receivers are structural metadata, lexical validation, or allocation guards.
-            structural_membership = {
-                ('lib.rs', 'absence_suppressed', 'PACKAGE_ABSENCE_RULES'),
-                ('lib.rs', 'check_note_pr', 'reverse_ok'),
-                ('lib.rs', 'report_malformed', 'pkg.reachable'),
-                ('lib.rs', 'check_typed_content', 'non_main_owner_rels'),
-                ('lib.rs', 'report_unreferenced_comments', 'incomplete_owners'),
-                ('lib.rs', 'supporting_part', 'acc.coverage'),
-                ('lib.rs', 'check_custom_xml', 'custom_xml_owners'),
-                ('lib.rs', 'check_media', 'image_targets'),
-                ('scan.rs', 'check_protection', 'k'),
-                ('scan.rs', 'check_para_ids', 'state.para_ids'),
-                ('scan.rs', 'attr_plain', 'k'),
-                ('package.rs', 'is_main_content_type', 'MAIN_CONTENT_TYPES'),
-                ('package.rs', 'load', 'xml_parts'),
-                ('package.rs', 'classified_xml_parts', 'role_targets'),
-                ('package.rs', 'is_xml_part', 'pkg.xml_parts'),
-                ('ownership.rs', 'with_budget', 'roots'),
-                ('ownership.rs', 'parts', 'owners'),
-            }
-            for access in re.finditer(MEMBERSHIP, code):
-                receiver=re.sub(r'\s+', '', access.group(1))
-                if (name,func,receiver) not in structural_membership and not (decl and receiver in semantic.get('positive_membership', [])):
-                    errors.append(f'{name}::{func}: raw membership {receiver} bypasses CompleteSet or undeclared structural scope')
-            if not bounded_uses and not decl and not re.search(r'\bacc\s*\.\s*(?:add|add_graded|ran)\s*\(', code):
-                continue
-            if not decl:
-                errors.append(f'{name}::{func}: bounded consumption has no observation contract: {uses}')
-                continue
-            data=dict(re.findall(r'(\w+)\s*:\s*"((?:\\.|[^"\\])*)"\s*;',declaration))
-            required={'rules','collections','scope','loss','fallback','package_loss'}
-            if set(data)!=required or any(not data.get(k,'').strip() for k in required):
-                errors.append(f'{name}::{func}: missing contract field/fallback')
-                continue
-            declared=[] if data['collections']=='-' else sorted(data['collections'].split(','))
-            if declared!=uses:
-                errors.append(f'{name}::{func}: declared collections differ from bounded accesses: declared={declared}, used={uses}')
-            declared_rules=set(data['rules'].split(',')) - {'-'}
-            called_rules=set(re.findall(r'"([A-Z0-9-]+)"',body)) & known_rules
-            if not called_rules <= declared_rules:
-                errors.append(f'{name}::{func}: rule consumption omitted: {called_rules-declared_rules}')
-            if not declared_rules <= known_rules:
-                errors.append(f'{name}::{func}: unknown rule IDs: {declared_rules-known_rules}')
-            if data['package_loss'] != 'independent' and not set(data['package_loss'].split(',')) <= declared_rules:
-                errors.append(f'{name}::{func}: undeclared unknown-package-identity rule policy')
-            key = (func, header, code, tuple(sorted(data.items())))
-            if key not in seen:
-                rows.append(dict(helper=f'{name}::{func}', **data))
-                seen.add(key)
+            record = unit_audit(name, func, header, body,
+                json.dumps(unit.get('semantic', {}), sort_keys=True, separators=(',', ':')),
+                field_key, variant_key, rule_key,
+                providers_text, entry_loss_text, func in seen_providers)
+            unit_errors, unit_rows, keys, providers_seen, entry_seen = record
+            errors.extend(unit_errors)
+            seen_providers.update(providers_seen)
+            seen_entry_loss.update(entry_seen)
+            if not keys or not keys <= seen:
+                rows.extend(unit_rows)
+                seen.update(keys)
     if seen_entry_loss != entry_loss: errors.append('entry-loss producer/conservative-reader contracts missing')
     if seen_providers != set(providers): errors.append('representation contracts missing providers')
     covered={rule for row in rows for rule in row['rules'].split(',')}
@@ -300,7 +349,7 @@ def outputs(rows):
     return md,rust
 
 
-def self_test(sources, rows):
+def mutation_cases():
     # Mutate in memory only. Neither repository source nor generated output is rewritten.
     mutations = {
       'undeclared consumer': ('lib.rs', lambda s:s+'\nfn invented_check(value: Observed<Vec<u8>>) { let _ = value.prefix(); }\n'),
@@ -454,17 +503,16 @@ fn unregistered_read(pkg: &Package) -> usize { (|package_pattern!(items): &Packa
     mutations['R18 opaque function cannot collapse package Resolution'] = ('lib.rs', lambda s: re.sub(r'if match package::canonical_entry\(pkg, target\) \{.*?\n            \} \{', 'if opaque_verdict(package::canonical_entry(pkg, target)) {', s, count=1, flags=re.S)+'\nfn opaque_verdict<T>(_value: T) -> bool { true }')
     # The new-accessor mutation must introduce a different access kind to test exact declaration matching.
     mutations['new undeclared accessor']=('lib.rs', lambda s:s.replace('acc.ran("CUSTOMXML-SCHEMA");','acc.ran("CUSTOMXML-SCHEMA"); let _ = new_collection.retain_budget(n, cap);',1))
-    for label,(name,mutation) in mutations.items():
-        changed=dict(sources);changed[name]=mutation(changed[name])
-        if changed[name] == sources[name]: raise ValueError('mutation did not change source: '+label)
-        try: declarations(changed)
-        except ValueError as error: print('rejected:',label, '-', str(error).splitlines()[0])
-        else: raise ValueError('audit accepted mutation: '+label)
-    print(f'{len(mutations)} source mutations rejected')
-    assert declarations(sources)==rows, "mutation audit contaminated the original sources"
+    return mutations
+
+
+def positive_cases(sources):
+    controls={}
+    def add(label, changed, presence=False):
+        controls[label] = (changed, presence)
     # Positive corpus: every current production construct is parsed and audited above.
     # Additional non-consuming bodies exercise recognition without declarations.
-    for control in [
+    for index, control in enumerate([
         'fn multiple() { consume(|a| { a }, |b| { b }); consume(|| { 1 }); }',
         'fn nested() { consume(|a| consume(|b| { a + b })); }',
         'fn r#raw_name(r#value: u8) -> u8 { r#value }',
@@ -476,66 +524,403 @@ fn unregistered_read(pkg: &Package) -> usize { (|package_pattern!(items): &Packa
         '/* outer /* inner */ |Package { entries, .. }| */ fn explicit() {}',
         '#[cfg(test)] mod tests { fn read() { consume(|Package { entries, .. }| entries.len()); } }',
         'const F: fn(u8) -> u8 = |x| x; static S: fn(u8) -> u8 = |x| (|y| y)(x);',
-    ]:
+    ]):
         changed = dict(sources); changed['lib.rs'] += '\n' + control
-        assert declarations(changed) == rows
+        add('body/'+str(index), changed)
     # CompleteSet's production provider must keep the exact representation footprint
     # under all callable spellings, including a local function binding.
-    for expression in ['Observed::is_complete(&self)', 'Self::is_complete(&self)', 'HiddenObservation::is_complete(&self)', '<Self>::is_complete(&self)', '<Observed<HashSet<K>>>::is_complete(&self)', '{ let test = Self::is_complete; test(&self) }']:
+    for index, expression in enumerate(['Observed::is_complete(&self)', 'Self::is_complete(&self)', 'HiddenObservation::is_complete(&self)', '<Self>::is_complete(&self)', '<Observed<HashSet<K>>>::is_complete(&self)', '{ let test = Self::is_complete; test(&self) }']):
         changed = dict(sources)
         changed['observed.rs'] += '\ntype HiddenObservation<T> = Observed<T>;\n'
         changed['observed.rs'] = changed['observed.rs'].replace('if self.is_complete() {', 'if '+expression+' {', 1)
-        assert declarations(changed) == rows, expression
+        add('provider/'+str(index), changed)
     changed = dict(sources)
     changed['lib.rs'] = changed['lib.rs'].replace('self.parts.values().flat_map(|p| p.special_notes.prefix().iter().cloned()).collect()', 'self.parts.values().flat_map(|p| { let retained = p.special_notes.prefix(); retained.iter().filter(|candidate| retained.contains(candidate)).cloned() }).collect()', 1)
-    assert declarations(changed) == rows, 'positive retained-prefix presence must remain accepted'
+    add('retained-prefix presence', changed)
     for attribute in ['inline', 'inline(always)', 'inline(never)', 'cold']:
         changed = dict(sources)
         changed['lib.rs'] += '\n#['+attribute+'] fn configured_entry_limit(limits: &Limits) -> usize { limits.entries }'
-        assert declarations(changed) == rows, attribute
-    for body in ['std::format!("rule: {rule}")', '{ let v = std::vec![1, 2]; v.len().to_string() }', '{ std::debug_assert!(true); String::new() }', '{ let _ = std::matches!(true, true); String::new() }']:
+        add('attribute/'+attribute, changed)
+    for index, body in enumerate(['std::format!("rule: {rule}")', '{ let v = std::vec![1, 2]; v.len().to_string() }', '{ std::debug_assert!(true); String::new() }', '{ let _ = std::matches!(true, true); String::new() }']):
         changed = dict(sources)
         changed['lib.rs'] += '\nfn display_rule(rule: &str) -> String { '+body+' }'
-        assert declarations(changed) == rows, body
+        add('standard/'+str(index), changed)
     for name in ['lib.rs', 'observed.rs', 'ownership.rs', 'resolution.rs', 'scan.rs']:
         changed = dict(sources)
         def qualified_derives(match):
             paths = ['std::fmt::Debug' if p.strip() == 'Debug' else 'serde::Serialize' if p.strip() == 'Serialize' else p.strip() for p in match[1].split(',')]
             return '#[derive('+', '.join(paths)+')]'
         changed[name] = re.sub(r'#\[derive\(([^)]*)\)\]', qualified_derives, changed[name])
-        assert declarations(changed) == rows, 'canonical reader identities with existing imports: '+name
+        add('reader/'+name, changed)
     changed = dict(sources)
+    getter_contract = 'observation_contract! { rules: "-"; collections: "access.prefix*1"; scope: "prefix presence control"; loss: "incomplete observed map"; fallback: "only presence is established"; package_loss: "independent"; }'
     changed['lib.rs'] += '\nimpl Observed<HashMap<String, String>> { fn declared_presence(&self, key: &String) -> bool { '+getter_contract+' Self::prefix(self).get(key).is_some() } }'
-    presence_rows = declarations(changed)
-    assert len(presence_rows) == len(rows)+1
-    assert next(r for r in presence_rows if r['helper'] == 'lib.rs::declared_presence')['collections'] == 'access.prefix*1'
-    print('accepted: current production corpus and non-consuming body controls')
-    original=outputs(rows)
-    try: verify_output('in-memory register', original[0]+'drift', original[0])
-    except ValueError: print('rejected: generated register drift (exact byte comparison)')
-    else: raise ValueError('audit accepted generated drift')
+    add('declared-presence row', changed, presence=True)
+    return controls
+
 
 
 def verify_output(name, actual, expected):
     if actual != expected: raise ValueError(f'{name} drift; regenerate observation contracts')
 
 
+# Frozen round-18 labels: deletion, duplication or an incomplete shard must fail.
+MUTATION_INVENTORY = (
+    'R18 Resolution Self collapse',
+    'R18 Resolution parameter collapse HiddenResolution',
+    'R18 Resolution parameter collapse Resolution<String>',
+    'R18 Unknown-or-Absent',
+    'R18 accessor function binding HiddenDefinitions::prefix',
+    'R18 accessor function binding Self::prefix',
+    'R18 aliased UFCS',
+    'R18 aliased bool cannot launder raw absence',
+    'R18 canonical external call',
+    'R18 contracted raw iterator absence',
+    'R18 contracted retained get equality absence',
+    'R18 derive outside type context',
+    'R18 direct state deletion',
+    'R18 direct state negation',
+    'R18 discovery complete deletion',
+    'R18 discovery complete negation',
+    'R18 fabricated absence',
+    'R18 fabricated completeness',
+    'R18 helper alias/value canonical_entry/hidden_lookup',
+    'R18 helper alias/value canonical_entry/package::canonical_entry',
+    'R18 helper alias/value content_unavailable/hidden_lookup',
+    'R18 helper alias/value content_unavailable/package::content_unavailable',
+    'R18 helper alias/value entry_by_name/hidden_lookup',
+    'R18 helper alias/value entry_by_name/package::entry_by_name',
+    'R18 helper-mediated absence',
+    'R18 inline outside closed options',
+    'R18 local Resolution matches else collapse',
+    'R18 local prefix with exact original contract',
+    'R18 missing Unknown',
+    'R18 obsolete Option absence',
+    'R18 opaque function cannot collapse package Resolution',
+    'R18 qualified consuming macro arguments',
+    'R18 raw iterator absence',
+    'R18 raw slice alias',
+    'R18 reader allowance cannot transfer into a function scope',
+    'R18 reader assembly limit inversion',
+    'R18 registry fields added to allowed DTO',
+    'R18 renamed reader derive',
+    'R18 retained map get absence',
+    'R18 retained prefix !<Observed<HashSet<String>>>::prefix(self).contains(key)',
+    'R18 retained prefix !<Observed<HashSet<String>>>::prefix(self).iter().any(|candidate| candidate == key)',
+    'R18 retained prefix !<Self>::prefix(self).contains(key)',
+    'R18 retained prefix !<Self>::prefix(self).iter().any(|candidate| candidate == key)',
+    'R18 retained prefix !Self::prefix(self).contains(key)',
+    'R18 retained prefix !Self::prefix(self).iter().any(|candidate| candidate == key)',
+    'R18 retained prefix <Observed<HashSet<String>>>::prefix(self).contains(key) == false',
+    'R18 retained prefix <Self>::prefix(self).contains(key) == false',
+    'R18 retained prefix Self::prefix(self).contains(key) == false',
+    'R18 retained prefix match <Observed<HashSet<String>>>::prefix(self).contains(key) { false => true, true => false }',
+    'R18 retained prefix match <Self>::prefix(self).contains(key) { false => true, true => false }',
+    'R18 retained prefix match Self::prefix(self).contains(key) { false => true, true => false }',
+    'R18 retained prefix matches!(<Observed<HashSet<String>>>::prefix(self).contains(key), false)',
+    'R18 retained prefix matches!(<Self>::prefix(self).contains(key), false)',
+    'R18 retained prefix matches!(Self::prefix(self).contains(key), false)',
+    'R18 same-named DTO in another module',
+    'R18 serde field attribute outside policy',
+    'R18 standard namespace import shadow',
+    'R18 unauthorized ContentTypes reader Debug',
+    'R18 unauthorized ContentTypes reader serde::Deserialize',
+    'R18 unauthorized ContentTypes reader serde::Serialize',
+    'R18 unauthorized reader on DTO',
+    'R18 unsupported qualified env macro',
+    'Unicode combining collection field',
+    'Unicode combining membership receiver',
+    'Unicode combining parser identifier',
+    'accessor bypass',
+    'adjacent inner destructured closure',
+    'array-element destructured closure',
+    'async destructured closure',
+    'attribute macro on definition',
+    'attribute macro on item invocation',
+    'closure argument with nested pattern',
+    'closure pattern after associated-type constraint',
+    'closure pattern with attributes and comments',
+    'closure with Unicode identifier continuation',
+    'closure with generic struct path',
+    'closure with nested block comment',
+    'closure with parenthesized or-pattern',
+    'closure with qualified struct path',
+    'const fn-pointer destructured closure',
+    'contract macro starts emitting code',
+    'contract text in literal is not a declaration',
+    'delta16 destructuring assignment',
+    'delta16 macro-produced closure pattern',
+    'delta16 module callback body',
+    'delta16 parenthesized destructuring assignment',
+    'delta16 raw field read',
+    'delta16 raw registry method',
+    'destructured closure returning adjacent closure',
+    'destructured for read',
+    'destructured match read',
+    'destructured package read',
+    'destructured parameter read',
+    'enum discriminant body',
+    'exception leakage',
+    'external module without supplied source',
+    'glob import could hide standard macro shadow',
+    'immediately invoked destructured closure',
+    'impl callback initializer',
+    'let-bound destructured closure',
+    'macro-captured collection field',
+    'macro-generated consumer',
+    'missing fallback',
+    'module registry alias and method pointer',
+    'module registry method pointer',
+    'module registry type alias',
+    'nested closure body',
+    'nested struct closure pattern',
+    'new undeclared accessor',
+    'raw absence difference',
+    'raw accessor',
+    'raw membership bypass',
+    'raw private representation',
+    'raw registry function name',
+    'raw registry type alias',
+    'registry in representation provider',
+    'representation membership bypass',
+    'returned closure with later parameter',
+    'seam/other-macro-path (R18 argument footprint)',
+    'standard macro alias shadow',
+    'standard macro import shadow',
+    'standard macro shadow hides consuming expansion',
+    'static callback body',
+    'static fn-pointer destructured closure',
+    'type-level constant body',
+    'undeclared array consumer',
+    'undeclared consumer',
+    'undeclared representation consumer',
+    'unsupported async body',
+    'unsupported attribute macro',
+    'unsupported expression macro',
+    'unsupported foreign item',
+    'unsupported macro repetition',
+    'unsupported pattern macro in assignment',
+    'unsupported pattern macro in binding',
+    'unsupported pattern macro in match',
+    'unsupported pattern macro in parameter',
+    'unsupported production module',
+    'unsupported trait body',
+    'unsupported union item',
+)
+POSITIVE_INVENTORY = (
+    'body/0',
+    'body/1',
+    'body/2',
+    'body/3',
+    'body/4',
+    'body/5',
+    'body/6',
+    'body/7',
+    'body/8',
+    'body/9',
+    'body/10',
+    'provider/0',
+    'provider/1',
+    'provider/2',
+    'provider/3',
+    'provider/4',
+    'provider/5',
+    'retained-prefix presence',
+    'attribute/inline',
+    'attribute/inline(always)',
+    'attribute/inline(never)',
+    'attribute/cold',
+    'standard/0',
+    'standard/1',
+    'standard/2',
+    'standard/3',
+    'reader/lib.rs',
+    'reader/observed.rs',
+    'reader/ownership.rs',
+    'reader/resolution.rs',
+    'reader/scan.rs',
+    'declared-presence row',
+)
+
+def inventory_check(actual, expected, kind):
+    counts = Counter(iter(actual))
+    missing = sorted(set(expected)-counts.keys())
+    extra = sorted(counts.keys()-set(expected))
+    repeated = sorted(label for label, count in counts.items() if count != 1)
+    if missing or extra or repeated:
+        raise ValueError(f'{kind} inventory differs: missing={missing}; extra={extra}; repeated={repeated}')
+
+
+def inventory_digest():
+    return hashlib.sha256(('\n'.join(sorted(MUTATION_INVENTORY))+'\n').encode()).hexdigest()
+
+
+def checked_mutations():
+    mutations = mutation_cases()
+    inventory_check(mutations, MUTATION_INVENTORY, 'mutation')
+    if len(MUTATION_INVENTORY) != 140 or inventory_digest() != 'cb823adedb87fc9ba64516406abdf954635f7579ed2e695ae42599fcbd7f51d7':
+        raise ValueError('pinned round-18 mutation inventory changed')
+    return mutations
+
+
+def reject_mutation(sources, label, case):
+    name, mutation = case
+    changed=dict(sources); changed[name]=mutation(changed[name])
+    if changed[name] == sources[name]:
+        raise ValueError('mutation did not change source: '+label)
+    try:
+        declarations(changed)
+    except ValueError as error:
+        message = str(error).splitlines()[0] if str(error) else ''
+        if not message.strip():
+            raise ValueError('mutation has no rejection message: '+label)
+        return dict(label=label, message=message)
+    raise ValueError('audit accepted mutation: '+label)
+
+
+def accept_control(label, case, rows):
+    changed, presence = case
+    actual = declarations(changed)
+    if presence:
+        assert len(actual) == len(rows)+1, label
+        assert next(r for r in actual if r['helper'] == 'lib.rs::declared_presence')['collections'] == 'access.prefix*1', label
+    else:
+        assert actual == rows, label
+
+
+def check_controls(controls, rows):
+    for label, case in controls.items():
+        accept_control(label, case, rows)
+
+
+def mutation_pool(sources, rows, mutations, controls, jobs, timings):
+    # Fresh interpreters own their recognizer pipes and content-addressed caches.
+    # Files (rather than PIPEs) prevent blocked children while the parent audits controls.
+    with ExitStack() as stack:
+        children=[]
+        try:
+            for index in range(jobs):
+                stdout=stack.enter_context(tempfile.TemporaryFile(mode='w+t'))
+                stderr=stack.enter_context(tempfile.TemporaryFile(mode='w+t'))
+                command=[sys.executable, str(Path(__file__).resolve()), '--self-test',
+                         '--shard', f'{index}/{jobs}', '--no-verify']
+                if timings: command.append('--timings')
+                process=subprocess.Popen(command, stdout=stdout, stderr=stderr)
+                children.append((index, process, stdout, stderr))
+            check_controls(controls, rows)
+            results=[]
+            for index, process, stdout, stderr in children:
+                code=process.wait()
+                stdout.seek(0); stderr.seek(0)
+                output=stdout.read(); errors=stderr.read()
+                if code:
+                    raise ValueError(f'shard {index}/{jobs} failed (exit {code}):\n{errors}\n{output}')
+                shard=[]
+                for line in output.splitlines():
+                    item=json.loads(line)
+                    if (not isinstance(item, dict) or set(item) != {'label','message'}
+                            or not isinstance(item['label'], str) or not isinstance(item['message'], str)
+                            or not item['message'].strip() or len(item['message'].splitlines()) != 1):
+                        raise ValueError(f'shard {index}/{jobs} emitted an invalid rejection: {line}')
+                    shard.append(item)
+                inventory_check((r['label'] for r in shard), list(mutations)[index::jobs], f'shard {index}/{jobs}')
+                if timings:
+                    print(f'shard {index}/{jobs}: {len(shard)} mutations\n{errors}', file=sys.stderr)
+                results.extend(shard)
+            inventory_check((r['label'] for r in results), MUTATION_INVENTORY, 'merged mutation')
+            return {r['label']: r for r in results}
+        finally:
+            # A failed control or child cannot leave orphaned workers/recognizers running.
+            for _, process, _, _ in children:
+                if process.poll() is None: process.terminate()
+            for _, process, _, _ in children:
+                process.wait()
+
+
+def self_test(sources, rows, jobs=1, timings=False):
+    mutations=checked_mutations()
+    controls=positive_cases(sources)
+    inventory_check(controls, POSITIVE_INVENTORY, 'positive control')
+    if len(POSITIVE_INVENTORY) != 32:
+        raise ValueError('pinned round-18 positive-control count changed')
+    if jobs == 1:
+        results={label: reject_mutation(sources, label, case) for label, case in mutations.items()}
+        inventory_check(results, MUTATION_INVENTORY, 'serial mutation')
+        check_controls(controls, rows)
+    else:
+        results=mutation_pool(sources, rows, mutations, controls, jobs, timings)
+    # Preserve the pre-sharding stdout order, regardless of worker completion order.
+    for label in mutations:
+        print('rejected:', label, '-', results[label]['message'])
+    print(f'{len(mutations)} source mutations rejected')
+    print('accepted: current production corpus and non-consuming body controls')
+    original=outputs(rows)
+    try: verify_output('in-memory register', original[0]+'drift', original[0])
+    except ValueError: print('rejected: generated register drift (exact byte comparison)')
+    else: raise ValueError('audit accepted generated drift')
+
+    assert declarations(sources)==rows, 'mutation audit contaminated the original sources'
+    if timings:
+        print(f'inventory: {len(mutations)} mutations; sha256={inventory_digest()}; {len(controls)} positive controls', file=sys.stderr)
+
+
+def shard_value(value):
+    try:
+        index, count = map(int, value.split('/'))
+    except ValueError:
+        raise argparse.ArgumentTypeError('shard must be i/n (zero-based)')
+    if not 1 <= count <= 4 or not 0 <= index < count:
+        raise argparse.ArgumentTypeError('shard must satisfy 0 <= i < n <= 4')
+    return index, count
+
+
+def jobs_value(value):
+    try:
+        jobs=int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError('jobs must be an integer from 1 to 4')
+    if not 1 <= jobs <= 4:
+        raise argparse.ArgumentTypeError('jobs must be from 1 to 4')
+    return jobs
+
 def main():
+    global _TIMINGS
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--check',action='store_true')
     parser.add_argument('--self-test',action='store_true')
+    parser.add_argument('--jobs',type=jobs_value,default=min(4, os.cpu_count() or 1),
+                        help='mutation workers, 1 for sequential debugging (default: min(4, cores))')
+    parser.add_argument('--shard',type=shard_value,help='internal worker/debug slice i/n (zero-based)')
+    parser.add_argument('--no-verify',action='store_true',help=argparse.SUPPRESS)
+    parser.add_argument('--timings',action='store_true',help='print timing and inventory details to stderr')
     args=parser.parse_args()
+    _TIMINGS=args.timings
+    if args.no_verify != (args.shard is not None) or (args.shard is not None and (not args.self_test or args.check)):
+        parser.error('--no-verify is only for --self-test --shard i/n workers without --check')
     root=Path(__file__).resolve().parents[1]
     sources={p.name:p.read_text() for p in (root/'src').glob('*.rs')}
+    start=time.perf_counter()
+    if args.shard is not None:
+        index, count=args.shard
+        mutations=checked_mutations()
+        for label in list(mutations)[index::count]:
+            print(json.dumps(reject_mutation(sources, label, mutations[label])))
+        if args.timings: print(f'shard {index}/{count} wall: {time.perf_counter()-start:.3f}s', file=sys.stderr)
+        return
+    print(f'observation gate: cores={os.cpu_count() or 1} jobs={args.jobs}', file=sys.stderr)
     rows=declarations(sources)
-    if args.self_test: self_test(sources,rows)
     values=outputs(rows)
     files=[root/'observation-contracts.md',root/'src/contracts_generated.rs']
+    # Verify currency before spending time on mutations, even on the default test path.
     for path,value in zip(files,values):
         if args.check or args.self_test:
             verify_output(path.name, path.read_text() if path.exists() else '', value)
         else: path.write_text(value)
+    if args.self_test: self_test(sources, rows, args.jobs, args.timings)
     print(f'{len(rows)} declared bounded consumers; register and access audit passed')
+    if args.timings:
+        print(f'gate wall: {time.perf_counter()-start:.3f}s; units: {unit_audit.cache_info()}', file=sys.stderr)
+
 
 if __name__=='__main__':
     try: main()
