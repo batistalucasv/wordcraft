@@ -1249,6 +1249,48 @@ fn glossary_and_main_notes_have_separate_id_spaces() {
     assert_eq!(report.verdict, Verdict::Pass, "{:?}", report.findings);
 }
 
+/// A definition in the glossary document does not satisfy a main-document reference: the two
+/// definition sets are joined per owner, so a main reference to a glossary-only id is dangling.
+#[test]
+fn a_glossary_note_does_not_satisfy_a_main_reference() {
+    let mut d = Doc::minimal();
+    d.set("[Content_Types].xml", content_types_xml(&[], &[("/word/glossary.xml", CT_GLOSSARY), ("/word/glossary-footnotes.xml", CT_FOOTNOTES)]));
+    d.add_with_override(
+        "word/footnotes.xml",
+        CT_FOOTNOTES,
+        format!(r#"<?xml version="1.0"?><w:footnotes xmlns:w="{W_NS}"><w:footnote w:id="1"><w:p/></w:footnote></w:footnotes>"#),
+    );
+    d.add_with_override(
+        "word/glossary-footnotes.xml",
+        CT_FOOTNOTES,
+        format!(r#"<?xml version="1.0"?><w:footnotes xmlns:w="{W_NS}"><w:footnote w:id="2"><w:p/></w:footnote></w:footnotes>"#),
+    );
+    d.set_doc_rels(
+        r#"<Relationship Id="rIdF" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/footnotes" Target="footnotes.xml"/><Relationship Id="rIdG" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/glossaryDocument" Target="glossary.xml"/>"#,
+    );
+    d.set(
+        "word/_rels/glossary.xml.rels",
+        rels_xml(
+            r#"<Relationship Id="rIdGF" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/footnotes" Target="glossary-footnotes.xml"/>"#,
+        ),
+    );
+    d.set(
+        "word/glossary.xml",
+        format!(
+            r#"<?xml version="1.0"?><w:glossaryDocument xmlns:w="{W_NS}"><w:docParts><w:docPart><w:docPartBody><w:p><w:r><w:footnoteReference w:id="2"/></w:r></w:p></w:docPartBody></w:docPart></w:docParts></w:glossaryDocument>"#
+        ),
+    );
+    d.set_document(r#"<w:p><w:r><w:footnoteReference w:id="2"/></w:r></w:p>"#);
+    let report = validate(&d);
+    let f = assert_finding(&report, "REF-NOTE", Some("word/document.xml"));
+    assert!(f.message.contains("note body is absent"), "{}", f.message);
+    assert!(
+        !report.findings.iter().any(|f| f.rule == "REF-NOTE" && f.part.as_deref() == Some("word/glossary.xml")),
+        "the glossary reference resolves in its own owner: {:?}",
+        report.findings
+    );
+}
+
 #[test]
 fn ref_header() {
     let mut d = Doc::minimal();
