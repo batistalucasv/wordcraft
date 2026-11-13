@@ -71,10 +71,10 @@ def blank(text):
 
 def close_brace(code, opening):
     depth = 1
-    for index in range(opening + 1, len(code)):
-        depth += (code[index] == '{') - (code[index] == '}')
+    for match in re.finditer(r'[{}]', code[opening+1:]):
+        depth += 1 if match.group() == '{' else -1
         if depth == 0:
-            return index
+            return opening+1+match.start()
     raise ValueError('unbalanced Rust braces in contract audit')
 
 
@@ -189,7 +189,17 @@ def representation_footprint(header, code, semantic=None):
 @cache_large_text
 def discovered_fields(text):
     code=normalized(mask(production(text)))
-    return tuple(re.findall(r'^[ \t]*(?:pub(?:\(crate\))?[ \t]+)?(\w+)[ \t]*:[^\n]*(?:Observed|Vec|HashSet|HashMap|BTreeSet|BTreeMap)',code,re.M))
+    # The original regex is line-local. Cache unchanged lines across full-file
+    # mutations, without retaining arbitrarily large line keys.
+    return tuple(field for line in code.split('\n')
+                 for field in (cached_field_line(line) if len(line)<=4096 else field_line(line)))
+
+
+def field_line(line):
+    return tuple(re.findall(r'^[ \t]*(?:pub(?:\(crate\))?[ \t]+)?(\w+)[ \t]*:[^\n]*(?:Observed|Vec|HashSet|HashMap|BTreeSet|BTreeMap)',line,re.M))
+
+
+cached_field_line=lru_cache(maxsize=8192)(field_line)
 
 
 def discover_fields(sources):
