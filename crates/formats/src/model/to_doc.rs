@@ -908,7 +908,11 @@ impl<'a> Builder<'a> {
             .map(|ci| (ci, tb.grid_col(0, ci)))
             .collect();
         for (ci, g) in starts {
-            let more = tb.cell_at_grid(1, g).and_then(|i| tb.rows.get(1)?.cells.get(i)).is_some_and(|c| c.props.vmerge == VMerge::Continue);
+            let more = tb
+                .cell_at_grid(1, g)
+                .filter(|&i| tb.grid_col(1, i) == g)
+                .and_then(|i| tb.rows.get(1)?.cells.get(i))
+                .is_some_and(|c| c.props.vmerge == VMerge::Continue);
             if let Some(cell) = tb.rows.first_mut().and_then(|r| r.cells.get_mut(ci)) {
                 cell.props.vmerge = if more { VMerge::Restart } else { VMerge::None };
             }

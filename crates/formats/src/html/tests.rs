@@ -854,6 +854,16 @@ fn to_doc_normalises_row_0_continue_cell() {
     let doc_single = crate::model::to_doc(&f_single);
     let wordcraft_doc::Block::Table(tb_single) = &*doc_single.body[0] else { panic!() };
     assert_eq!(tb_single.rows[0].cells[0].props.vmerge, VMerge::None, "orphaned row 0 continue normalised to none");
+
+    // Case 3: Row 0 col 1 has continue, Row 1 has a spanning continue starting at col 0 -> col 1 normalised to None.
+    let html_span = "<table>\
+        <tr><td>A0</td><td style='mso-yfti-vmerge:continue'>B0</td></tr>\
+        <tr><td colspan='2' style='mso-yfti-vmerge:continue'>SpanCont</td></tr>\
+    </table>";
+    let f_span = parse(html_span);
+    let doc_span = crate::model::to_doc(&f_span);
+    let wordcraft_doc::Block::Table(tb_span) = &*doc_span.body[0] else { panic!() };
+    assert_eq!(tb_span.rows[0].cells[1].props.vmerge, VMerge::None, "unaligned spanning continuation in row 1 must not mark row 0 cell as restart");
 }
 
 #[test]
