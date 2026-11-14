@@ -22,7 +22,8 @@ const KIND: &str = "wordcraft-compare-hf-v1";
 pub(crate) fn write(flags: &CompareHfFlags) -> Result<Vec<u8>, DocxError> {
     let json = serde_json::to_string(flags).map_err(|e| DocxError::Xml(e.to_string()))?;
     let esc_json = quick_xml::escape::escape(&json);
-    Ok(format!(r#"<?xml version="1.0" encoding="UTF-8"?><{ROOT} xmlns="{NS}" kind="{KIND}"><compareHf>{}</compareHf></{ROOT}>"#, esc_json).into_bytes())
+    Ok(format!(r#"<?xml version="1.0" encoding="UTF-8"?><{ROOT} xmlns="{NS}" kind="{KIND}"><compareHf>{}</compareHf></{ROOT}>"#, esc_json)
+        .into_bytes())
 }
 
 /// Read the flags from a custom XML part's bytes, if it is ours.
