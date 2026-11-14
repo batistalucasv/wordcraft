@@ -432,8 +432,12 @@ pub(crate) fn load(bytes: &[u8], acc: &mut Acc) -> Option<Package> {
         Resolution::Unknown("_rels/.rels is duplicated")
     } else if main_ambiguous {
         Resolution::Ambiguous("distinct official targets compete")
+    } else if !discovery_complete {
+        // A retained target proves presence, not uniqueness: an unseen declaration
+        // may select a competing document owner.
+        Resolution::Unknown("officeDocument selection was not fully examined")
     } else {
-        Resolution::discovered(main, discovery_complete)
+        Resolution::discovered(main, true)
     };
     if matches!(main, Resolution::Absent) {
         acc.add("PKG-NO-MAIN", None, no_main_message(package_rels));
