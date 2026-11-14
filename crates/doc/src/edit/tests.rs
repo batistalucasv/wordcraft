@@ -1045,9 +1045,9 @@ fn copy_range_preserves_table_between_paragraphs() {
 fn copy_range_linear_cross_cells_preserves_all_traversed_paragraphs() {
     let mut d = Document::new();
     let mut t = Table::new(3, 3, 300.0);
-    for r in 0..3 {
-        for c in 0..3 {
-            t.rows[r].cells[c].blocks = vec![para_block(Paragraph::with_text(&format!("R{r}C{c}"), CharProps::default()))];
+    for (r, row) in t.rows.iter_mut().enumerate() {
+        for (c, cell) in row.cells.iter_mut().enumerate() {
+            cell.blocks = vec![para_block(Paragraph::with_text(&format!("R{r}C{c}"), CharProps::default()))];
         }
     }
     d.body = vec![Arc::new(Block::Table(t))];
@@ -1072,9 +1072,9 @@ fn copy_range_linear_cross_cells_preserves_all_traversed_paragraphs() {
 fn copy_range_from_para_before_table_to_non_corner_cell() {
     let mut d = Document::new();
     let mut t = Table::new(3, 3, 300.0);
-    for r in 0..3 {
-        for c in 0..3 {
-            t.rows[r].cells[c].blocks = vec![para_block(Paragraph::with_text(&format!("R{r}C{c}"), CharProps::default()))];
+    for (r, row) in t.rows.iter_mut().enumerate() {
+        for (c, cell) in row.cells.iter_mut().enumerate() {
+            cell.blocks = vec![para_block(Paragraph::with_text(&format!("R{r}C{c}"), CharProps::default()))];
         }
     }
     d.body = vec![Arc::new(Block::Para(Paragraph::with_text("LeadingText", CharProps::default()))), Arc::new(Block::Table(t))];
