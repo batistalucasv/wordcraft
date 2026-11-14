@@ -991,8 +991,8 @@ impl FTable {
             let mut g = 0usize;
             let mut ci = 0usize;
             while let Some(c) = self.rows.get(r).and_then(|row| row.get(ci)) {
-                let (span, rs, covered) = (c.colspan.clamp(1, 63) as usize, c.rowspan.clamp(1, 1000) as usize, c.covered);
-                if rs > 1 && !covered {
+                let (span, rs) = (c.colspan.clamp(1, 63) as usize, c.rowspan.clamp(1, 1000) as usize);
+                if rs > 1 {
                     for k in 1..rs {
                         work += 1;
                         if work > MAX_COVERED_WORK {

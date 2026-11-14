@@ -866,6 +866,24 @@ fn to_doc_normalises_row_0_continue_cell() {
     assert_eq!(tb_span.rows[0].cells[1].props.vmerge, VMerge::None, "unaligned spanning continuation in row 1 must not mark row 0 cell as restart");
 }
 
+/// #5906: A covered continuation cell with `rowspan > 1` expands into the following row when
+/// no restart cell above spans it.
+#[test]
+fn covered_continuation_with_rowspan_expands_into_next_row() {
+    use wordcraft_doc::props::VMerge;
+    let html = "<table>\
+        <tr><td style='mso-yfti-vmerge:restart'>Top</td><td>B0</td></tr>\
+        <tr><td rowspan='2' style='mso-yfti-vmerge:continue'>Mid</td><td>B1</td></tr>\
+        <tr><td>B2</td></tr>\
+    </table>";
+    let f = parse(html);
+    let doc = crate::model::to_doc(&f);
+    let wordcraft_doc::Block::Table(tb) = &*doc.body[0] else { panic!() };
+    assert_eq!(tb.rows.len(), 3);
+    assert_eq!(tb.rows[2].cells.len(), 2, "row 2 should have placeholder + B2");
+    assert_eq!(tb.rows[2].cells[0].props.vmerge, VMerge::Continue);
+}
+
 #[test]
 fn cells_take_their_css_borders() {
     use wordcraft_doc::props::{Border, BorderStyle};
