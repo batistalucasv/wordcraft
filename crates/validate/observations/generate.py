@@ -114,8 +114,8 @@ def recognizer_binary(target):
     while True:
         try:
             expected=file_sha256(executable)
-            for candidate in sorted((target/'debug/deps').glob('observation_recognizer-*')):
-                if re.fullmatch(r'observation_recognizer-[0-9a-f]+(?:\.exe)?', candidate.name) and file_sha256(candidate)==expected:
+            for candidate in sorted((target/'debug/deps').glob('observation_recognizer*')):
+                if re.fullmatch(r'observation_recognizer(?:-[0-9a-f]+)?(?:\.exe)?', candidate.name) and file_sha256(candidate)==expected:
                     return candidate
         except FileNotFoundError:
             # A concurrent warm build may briefly remove the public alias.
@@ -858,19 +858,25 @@ def shard_cases(mutations, controls):
 
 
 def artifact_self_test():
-    # A later Cargo publication must neither remove our selected image nor make
-    # us execute an older artifact, even if that artifact sorts first.
-    with tempfile.TemporaryDirectory() as directory:
-        target=Path(directory)
-        deps=target/'debug/deps'; deps.mkdir(parents=True)
-        suffix='.exe' if os.name=='nt' else ''
-        alias=target/'debug'/('observation-recognizer'+suffix)
-        stale=deps/('observation_recognizer-0000000000000000'+suffix)
-        fresh=deps/('observation_recognizer-1111111111111111'+suffix)
-        alias.write_bytes(b'fresh build'); stale.write_bytes(b'old build'); fresh.write_bytes(b'fresh build')
-        selected=recognizer_binary(target)
-        alias.unlink()
-        assert file_sha256(selected)==hashlib.sha256(b'fresh build').digest(), 'recognizer image changed with its public alias'
+    # Cargo versions may publish either a hashed or an unhashed dependency
+    # executable. Both must match the freshly built alias, never a stale image.
+    for name in ('observation_recognizer-1111111111111111', 'observation_recognizer'):
+        with tempfile.TemporaryDirectory() as directory:
+            target=Path(directory)
+            deps=target/'debug/deps'; deps.mkdir(parents=True)
+            suffix='.exe' if os.name=='nt' else ''
+            alias=target/'debug'/('observation-recognizer'+suffix)
+            stale=deps/('observation_recognizer-0000000000000000'+suffix)
+            fresh=deps/(name+suffix)
+            alias.write_bytes(b'fresh build'); stale.write_bytes(b'old build')
+            # Matching bytes in non-executable artifacts must not be selected.
+            (deps/'observation_recognizer.d').write_bytes(b'fresh build')
+            (deps/'observation_recognizer.pdb').write_bytes(b'fresh build')
+            fresh.write_bytes(b'fresh build')
+            selected=recognizer_binary(target)
+            assert selected==fresh, 'recognizer selected a non-executable or stale artifact'
+            alias.unlink()
+            assert file_sha256(selected)==hashlib.sha256(b'fresh build').digest(), 'recognizer image changed with its public alias'
 
 
 def case_pool(rows, mutations, controls, jobs, timings):

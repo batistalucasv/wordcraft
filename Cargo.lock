@@ -7267,7 +7267,7 @@ dependencies = [
 
 [[package]]
 name = "wordcraft-validate"
-version = "0.15.1"
+version = "0.18.1"
 dependencies = [
  "quick-xml 0.41.0",
  "serde",
