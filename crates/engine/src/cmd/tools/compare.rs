@@ -599,7 +599,7 @@ fn note_score(a: &NoteInfo, b: &NoteInfo, budget: &mut u64) -> u32 {
 /// reference paragraph and that location holds exactly one unpaired note on each side. Notes
 /// without an anchor stay whole deletions or insertions: pairing them by position would attach
 /// individual accept/reject revisions to a different original note.
-fn align_note_run_by_anchors(old_notes: &[NoteInfo], new_notes: &[NoteInfo]) -> (Vec<(u32, u32)>, Vec<u32>, Vec<u32>) {
+fn align_note_run_by_anchors(old_notes: &[&NoteInfo], new_notes: &[&NoteInfo]) -> (Vec<(u32, u32)>, Vec<u32>, Vec<u32>) {
     let mut anchors: Vec<(usize, usize)> = Vec::new();
     let mut exact_old = vec![false; old_notes.len()];
     let mut exact_new = vec![false; new_notes.len()];
@@ -683,7 +683,7 @@ fn align_note_run_by_anchors(old_notes: &[NoteInfo], new_notes: &[NoteInfo]) -> 
 }
 
 /// Aligns a run of original notes and revised notes using dynamic programming over note similarity and reference context.
-fn align_note_run(old_notes: &[NoteInfo], new_notes: &[NoteInfo], budget: &mut u64) -> (Vec<(u32, u32)>, Vec<u32>, Vec<u32>) {
+fn align_note_run(old_notes: &[&NoteInfo], new_notes: &[&NoteInfo], budget: &mut u64) -> (Vec<(u32, u32)>, Vec<u32>, Vec<u32>) {
     let n = old_notes.len();
     let m = new_notes.len();
     if n == 0 {
@@ -772,6 +772,77 @@ fn align_note_run(old_notes: &[NoteInfo], new_notes: &[NoteInfo], budget: &mut u
     (paired_out, inserted_out, deleted_out)
 }
 
+/// Pairs notes whose text repeats on either side by reference location, before the text LCS.
+///
+/// Identical text cannot tell two notes apart, and `lcs_ops` would commit a surviving note to the
+/// first duplicate. A reference paragraph that holds exactly one unpaired note of that text on
+/// each side identifies the pair, so the survivor keeps its own identity whatever the comparison
+/// budget does later.
+fn pair_duplicate_note_texts(
+    old_info: &[NoteInfo],
+    new_info: &[NoteInfo],
+    paired: &mut Vec<(u32, u32)>,
+    old_used: &mut [bool],
+    new_used: &mut [bool],
+) {
+    let mut counts: std::collections::HashMap<&str, (usize, usize)> = std::collections::HashMap::new();
+    for note in old_info.iter().filter(|n| !n.key.is_empty()) {
+        counts.entry(note.key.as_str()).or_default().0 += 1;
+    }
+    for note in new_info.iter().filter(|n| !n.key.is_empty()) {
+        counts.entry(note.key.as_str()).or_default().1 += 1;
+    }
+    let duplicated = |key: &str| counts.get(key).is_some_and(|&(old, new)| old > 1 || new > 1);
+
+    let mut old_groups: std::collections::HashMap<&str, Vec<usize>> = std::collections::HashMap::new();
+    for (idx, note) in old_info.iter().enumerate() {
+        if !note.key.is_empty() && duplicated(note.key.as_str()) {
+            old_groups.entry(note.key.as_str()).or_default().push(idx);
+        }
+    }
+    let mut new_groups: std::collections::HashMap<&str, Vec<usize>> = std::collections::HashMap::new();
+    for (idx, note) in new_info.iter().enumerate() {
+        if !note.key.is_empty() && duplicated(note.key.as_str()) {
+            new_groups.entry(note.key.as_str()).or_default().push(idx);
+        }
+    }
+
+    for (key, olds) in old_groups {
+        let Some(news) = new_groups.get(key) else { continue };
+        // The reference paragraph's text identifies the location; block numbers shift when the
+        // revised body drops a paragraph above the note.
+        let mut old_at: std::collections::HashMap<&str, Vec<usize>> = std::collections::HashMap::new();
+        for &idx in &olds {
+            if let Some((_, para)) = old_info.get(idx).and_then(|n| n.ref_pos.as_ref())
+                && !para.is_empty()
+            {
+                old_at.entry(para.as_str()).or_default().push(idx);
+            }
+        }
+        let mut new_at: std::collections::HashMap<&str, Vec<usize>> = std::collections::HashMap::new();
+        for &idx in news {
+            if let Some((_, para)) = new_info.get(idx).and_then(|n| n.ref_pos.as_ref())
+                && !para.is_empty()
+            {
+                new_at.entry(para.as_str()).or_default().push(idx);
+            }
+        }
+        for (loc, old_idxs) in old_at {
+            let [old_idx] = old_idxs.as_slice() else { continue };
+            let Some(new_idxs) = new_at.get(&loc) else { continue };
+            let [new_idx] = new_idxs.as_slice() else { continue };
+            let (Some(o), Some(r)) = (old_info.get(*old_idx), new_info.get(*new_idx)) else { continue };
+            paired.push((o.id, r.id));
+            if let Some(flag) = old_used.get_mut(*old_idx) {
+                *flag = true;
+            }
+            if let Some(flag) = new_used.get_mut(*new_idx) {
+                *flag = true;
+            }
+        }
+    }
+}
+
 /// Pairs original and revised note IDs using sequence alignment over note plain text and body reference positions.
 ///
 /// Returns `(paired, inserted, deleted)`:
@@ -789,18 +860,25 @@ fn align_notes(
 ) -> (Vec<(u32, u32)>, Vec<u32>, Vec<u32>) {
     let old_info = collect_note_info(orig_doc, orig_ids, kind, opts);
     let new_info = collect_note_info(rev_doc, rev_ids, kind, opts);
-    let keys_orig: Vec<String> = old_info.iter().map(|n| n.key.clone()).collect();
-    let keys_rev: Vec<String> = new_info.iter().map(|n| n.key.clone()).collect();
-    let ops = lcs_ops(&keys_orig, &keys_rev, budget);
+
     let mut paired = Vec::new();
+    let mut old_used = vec![false; old_info.len()];
+    let mut new_used = vec![false; new_info.len()];
+    pair_duplicate_note_texts(&old_info, &new_info, &mut paired, &mut old_used, &mut new_used);
+    let old_left: Vec<&NoteInfo> = old_info.iter().zip(&old_used).filter(|(_, used)| !**used).map(|(note, _)| note).collect();
+    let new_left: Vec<&NoteInfo> = new_info.iter().zip(&new_used).filter(|(_, used)| !**used).map(|(note, _)| note).collect();
+
+    let keys_orig: Vec<&str> = old_left.iter().map(|n| n.key.as_str()).collect();
+    let keys_rev: Vec<&str> = new_left.iter().map(|n| n.key.as_str()).collect();
+    let ops = lcs_ops(&keys_orig, &keys_rev, budget);
     let mut inserted = Vec::new();
     let mut deleted = Vec::new();
     let (mut i, mut j, mut k) = (0, 0, 0);
     while k < ops.len() {
         match ops.get(k) {
             Some(Op::Same) => {
-                if let (Some(&o), Some(&r)) = (orig_ids.get(i), rev_ids.get(j)) {
-                    paired.push((o, r));
+                if let (Some(o), Some(r)) = (old_left.get(i), new_left.get(j)) {
+                    paired.push((o.id, r.id));
                 }
                 i += 1;
                 j += 1;
@@ -810,8 +888,8 @@ fn align_notes(
                 let run = ops.get(k..).unwrap_or_default().iter().take_while(|o| **o != Op::Same).count();
                 let dels = ops.get(k..k + run).unwrap_or_default().iter().filter(|o| **o == Op::Del).count();
                 let inss = run - dels;
-                let old_slice = old_info.get(i..i + dels).unwrap_or_default();
-                let new_slice = new_info.get(j..j + inss).unwrap_or_default();
+                let old_slice = old_left.get(i..i + dels).unwrap_or_default();
+                let new_slice = new_left.get(j..j + inss).unwrap_or_default();
                 let (p, ins, del) = align_note_run(old_slice, new_slice, budget);
                 paired.extend(p);
                 inserted.extend(ins);
@@ -1421,14 +1499,27 @@ fn piece_link<'a>(p: &'a TokPiece<'_>) -> Option<&'a str> {
     }
 }
 
-/// Returns whether two tokens have identical hyperlink targets across their pieces.
+/// Returns whether two tokens have the same hyperlink target over the same characters.
+///
+/// A link is a property of a character, not of the run pieces it arrives in: moving a link's end
+/// (`"ab"` linked vs `"abc"` linked) is a change even when the pieces' link targets line up.
 fn same_tok_links(a: &Tok<'_>, b: &Tok<'_>) -> bool {
-    if a.pieces.len() != b.pieces.len() {
-        let a_has = a.pieces.iter().any(|p| piece_link(p).is_some());
-        let b_has = b.pieces.iter().any(|p| piece_link(p).is_some());
-        return !a_has && !b_has;
+    fn links<'a>(t: &'a Tok<'_>) -> Vec<Option<&'a str>> {
+        let mut out = Vec::new();
+        for piece in &t.pieces {
+            let len = match piece {
+                TokPiece::Text(text, _) => text.chars().count(),
+                TokPiece::Obj(..) => 1,
+            };
+            out.extend(std::iter::repeat_n(piece_link(piece), len));
+        }
+        out
     }
-    a.pieces.iter().zip(&b.pieces).all(|(pa, pb)| piece_link(pa) == piece_link(pb))
+    let (a_links, b_links) = (links(a), links(b));
+    if a_links.len() != b_links.len() {
+        return !a_links.iter().chain(&b_links).any(|link| link.is_some());
+    }
+    a_links == b_links
 }
 
 /// Returns whether two paragraphs have identical hyperlink targets across their runs.
@@ -1489,6 +1580,8 @@ fn word_diff(parts: &std::collections::BTreeMap<u32, wordcraft_doc::Part>, a: &P
     p.mark.ins = None;
     p.mark.del = None;
     p.mark.fmt_change = None;
+    // The section break belongs to the paragraph, not its text: a diffed paragraph must keep it.
+    p.section = b.section.clone();
     let (mut i, mut j) = (0, 0);
     for op in ops {
         match op {

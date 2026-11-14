@@ -2119,3 +2119,118 @@ fn compare_ignores_table_width_when_formatting_false() {
     assert_eq!(tables.len(), 1, "Table matched as identical container");
     assert_eq!(tables[0].grid, vec![200.0], "Original grid preserved");
 }
+
+/// #5842: A diffed paragraph keeps the revised paragraph's section break; `word_diff` rebuilds the
+/// paragraph from its text properties, so the section boundary must be copied from the revised one.
+#[test]
+fn compare_keeps_section_break_on_diffed_paragraph() {
+    let orig = Session::new(Document::from_text("Alpha one.\nAlpha two."));
+    let mut rev = Session::new(Document::from_text("Alpha one revised.\nAlpha two."));
+    let section = wordcraft_doc::SectionProps { landscape: true, page_w: 792.0, page_h: 612.0, ..Default::default() };
+    if let Some(Block::Para(p)) = rev.doc.body.first_mut().map(Arc::make_mut) {
+        p.section = Some(Box::new(section));
+    }
+
+    let rev_path = std::env::temp_dir().join(format!("wc-rev-sectbreak-{}.docx", std::process::id()));
+    crate::io::save_path(&rev_path, &rev.doc).unwrap();
+
+    let mut s = orig;
+    let r = s.run("review.compare", &json!({"path": rev_path.to_string_lossy()})).unwrap();
+    let _ = std::fs::remove_file(&rev_path);
+
+    assert!(r["changes"].as_u64().unwrap() >= 1);
+    let Block::Para(p) = &*s.doc.body[0] else { panic!("expected paragraph") };
+    assert!(p.runs.iter().any(|run| run.props.ins.is_some()), "paragraph 0 was diffed");
+    assert!(p.section.as_ref().is_some_and(|s| s.landscape), "section break survives the diff");
+}
+
+/// #5842: Notes whose text repeats must pair by reference location: deleting the first duplicate
+/// leaves the surviving note with its own original identity, not the first one's.
+#[test]
+fn compare_pairs_duplicate_note_text_by_reference() {
+    let mut orig = Session::new(Document::from_text("Para one.\nPara two."));
+    orig.run("caret.set", &json!({"pos": Pos::body(0, "Para one.".len())})).unwrap();
+    orig.run("references.footnote", &json!({"text": "Identical note text."})).unwrap();
+    orig.run("caret.set", &json!({"pos": Pos::body(1, "Para two.".len())})).unwrap();
+    orig.run("references.footnote", &json!({"text": "Identical note text."})).unwrap();
+    let note_ids: Vec<u32> = orig
+        .doc
+        .body
+        .iter()
+        .filter_map(|b| b.as_para())
+        .flat_map(|p| p.objects.iter())
+        .filter_map(|o| if let InlineObject::NoteRef { id, .. } = o { Some(*id) } else { None })
+        .collect();
+    assert_eq!(note_ids.len(), 2);
+
+    // The revised document keeps only the second paragraph and its note, word for word.
+    let mut rev = Session::new(Document::from_text("Para two."));
+    rev.run("caret.set", &json!({"pos": Pos::body(0, "Para two.".len())})).unwrap();
+    rev.run("references.footnote", &json!({"text": "Identical note text."})).unwrap();
+
+    let rev_path = std::env::temp_dir().join(format!("wc-rev-dupnotes-{}.docx", std::process::id()));
+    crate::io::save_path(&rev_path, &rev.doc).unwrap();
+
+    let mut s = orig;
+    let _ = s.run("review.compare", &json!({"path": rev_path.to_string_lossy()})).unwrap();
+    let _ = std::fs::remove_file(&rev_path);
+
+    let ref_ids: Vec<u32> = s
+        .doc
+        .body
+        .iter()
+        .filter_map(|b| b.as_para())
+        .flat_map(|p| p.objects.iter())
+        .filter_map(|o| if let InlineObject::NoteRef { id, .. } = o { Some(*id) } else { None })
+        .collect();
+    assert!(ref_ids.contains(&note_ids[1]), "the surviving reference resolves to the second note: {ref_ids:?}");
+    assert_eq!(ref_ids.iter().filter(|&&id| id == note_ids[0]).count(), 1, "the first note keeps only its deleted reference");
+    let kept = s.doc.parts.get(&note_ids[1]).unwrap();
+    assert!(
+        kept.blocks[0].as_para().unwrap().runs.iter().all(|run| run.props.ins.is_none() && run.props.del.is_none()),
+        "the surviving note is unchanged"
+    );
+    let gone = s.doc.parts.get(&note_ids[0]).unwrap();
+    assert!(gone.blocks[0].as_para().unwrap().runs.iter().all(|run| run.props.del.is_some()), "the first duplicate note is fully deleted");
+}
+
+/// #5842: A link covering a different span is a content change, even when the pieces' targets line
+/// up and formatting comparison is off; rejecting restores the original link extent.
+#[test]
+fn compare_tracks_hyperlink_extent_changes_as_content() {
+    let url = "https://example.com/page";
+    let mut orig = Session::new(Document::new());
+    let mut p_orig = Paragraph::new();
+    p_orig.insert_text(0, "ab", &CharProps { link: Some(url.to_string()), ..Default::default() }).unwrap();
+    p_orig.insert_text(2, "cd", &CharProps::default()).unwrap();
+    orig.doc.body = vec![para_block(p_orig)];
+
+    let mut rev = Session::new(Document::new());
+    let mut p_rev = Paragraph::new();
+    p_rev.insert_text(0, "abc", &CharProps { link: Some(url.to_string()), ..Default::default() }).unwrap();
+    p_rev.insert_text(3, "d", &CharProps::default()).unwrap();
+    rev.doc.body = vec![para_block(p_rev)];
+
+    let rev_path = std::env::temp_dir().join(format!("wc-rev-linkextent-{}.docx", std::process::id()));
+    crate::io::save_path(&rev_path, &rev.doc).unwrap();
+
+    let mut s = orig;
+    let r = s.run("review.compare", &json!({"path": rev_path.to_string_lossy(), "formatting": false})).unwrap();
+    let _ = std::fs::remove_file(&rev_path);
+
+    assert!(r["changes"].as_u64().unwrap() >= 1, "link extent difference is a change");
+    let Block::Para(p) = &*s.doc.body[0] else { panic!("expected paragraph") };
+    let marked = |wanted: &str, insertion: bool| {
+        p.run_ranges().any(|(r, c)| {
+            let tracked = if insertion { c.ins.is_some() } else { c.del.is_some() };
+            tracked && c.link.as_deref() == Some(url) && &p.text[r] == wanted
+        })
+    };
+    assert!(marked("ab", false), "original link extent marked deleted");
+    assert!(marked("abc", true), "revised link extent marked inserted");
+
+    s.run("review.rejectAll", &json!({})).unwrap();
+    let Block::Para(p) = &*s.doc.body[0] else { panic!("expected paragraph") };
+    let linked: Vec<&str> = p.run_ranges().filter(|(_, c)| c.link.as_deref() == Some(url)).map(|(r, _)| &p.text[r]).collect();
+    assert_eq!(linked, vec!["ab"], "rejecting restores the original link extent");
+}
