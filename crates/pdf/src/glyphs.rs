@@ -37,8 +37,8 @@ pub(crate) fn left_to_right(glyphs: &[(u32, f32, f32)]) -> bool {
 /// reversing a right-to-left word puts every mark back after its letter. In Thai and Lao clusters
 /// with composite vowels (such as SARA AM `\u{0E33}` or `\u{0EB3}`), separates the base consonant
 /// to its own range so ToUnicode maps it cleanly while keeping the composite vowel glyphs sharing
-/// their range for `/ActualText` extraction. Other clusters, such as a ligature drawn as two
-/// glyphs, keep their shared range.
+/// their range for `/ActualText` extraction. Clusters of any other script, such as a Devanagari
+/// pre-base vowel or a ligature drawn as two glyphs, keep their shared logical range.
 pub(crate) fn split_clusters(
     text: &str,
     glyphs: &[(u32, f32, f32)],
@@ -72,7 +72,11 @@ pub(crate) fn split_clusters(
             }
         }
         let chars: Vec<(usize, char)> = text.get(r.clone()).map(|t| t.char_indices().map(|(k, c)| (r.start + k, c)).collect()).unwrap_or_default();
-        if n > 1 && chars.len() == n {
+        // Only clusters a viewer needs split: right-to-left marks (so the word reads in order)
+        // and Thai/Lao marks. Other scripts keep one range so `/ActualText` stays logical.
+        let viewer_splits =
+            text.get(r.clone()).is_some_and(|t| t.chars().any(|c| wordcraft_fonts::is_rtl(c) || matches!(c, '\u{0E00}'..='\u{0EFF}')));
+        if n > 1 && chars.len() == n && viewer_splits {
             // Glyphs the character map knows take their characters; one left over (a letter's
             // contextual form, which the map doesn't list) takes the one character left.
             let mut used = vec![false; n];

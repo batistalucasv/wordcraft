@@ -2193,6 +2193,21 @@ fn right_to_left_clusters_are_written_whole_left_to_right() {
     assert_eq!(visual_order(text, &glyphs, &ranges, &parts), [5, 4, 2, 3, 0, 1]);
 }
 
+/// A Devanagari pre-base vowel sharing a range with its consonant keeps that shared range when
+/// the same run also has a Thai composite vowel that does need splitting (#5883).
+#[test]
+fn thai_cluster_splitting_leaves_other_scripts_alone() {
+    // "कि น้ำ": the Devanagari cluster is glyphs 1 (ि) and 2 (क) at 0..6; the Thai cluster is
+    // glyphs 3 (น), 4 (้) and 5 (ำ) at 7..16.
+    let text = "कि น้ำ";
+    let glyphs = [(1, 10.0, 0.0), (2, 0.0, 0.0), (3, 20.0, 0.0), (4, 21.0, 0.0), (5, 22.0, 0.0)];
+    let ranges = [0..6, 0..6, 7..16, 7..16, 7..16];
+    let rev: std::collections::HashMap<u32, char> = [(1, '\u{93F}'), (2, 'क'), (3, 'น'), (4, '\u{0E49}'), (5, '\u{0E33}')].into_iter().collect();
+    let parts = split_clusters(text, &glyphs, &ranges, &rev);
+    assert_eq!(parts[..2], [0..6, 0..6], "Devanagari keeps its shared logical range");
+    assert_eq!(parts[2..], [7..10, 10..16, 10..16], "the Thai base and its marks split");
+}
+
 /// The image XObjects in a PDF: (width, height, filters, decoded samples per pixel).
 fn pdf_images(bytes: &[u8]) -> Vec<(u32, u32, Vec<String>, Vec<Vec<u8>>)> {
     use hayro_syntax::object::{Name, Object};
