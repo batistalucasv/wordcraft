@@ -428,17 +428,7 @@ pub(crate) fn load(bytes: &[u8], acc: &mut Acc) -> Option<Package> {
         .and_then(|t| canonical(&entries, t));
     let package_rels_unavailable = entries.iter().any(|e| !e.is_dir && e.name.eq_ignore_ascii_case("_rels/.rels") && e.content_unavailable);
     let discovery_complete = !entries_truncated && !unknown_unreadable && !package_rels_unavailable && !package_rels.is_some_and(|rp| rp.incomplete);
-    let main = if package_rels_collapsed {
-        Resolution::Unknown("_rels/.rels is duplicated")
-    } else if main_ambiguous {
-        Resolution::Ambiguous("distinct official targets compete")
-    } else if !discovery_complete {
-        // A retained target proves presence, not uniqueness: an unseen declaration
-        // may select a competing document owner.
-        Resolution::Unknown("officeDocument selection was not fully examined")
-    } else {
-        Resolution::discovered(main, true)
-    };
+    let main = main_selection(main, package_rels_collapsed, main_ambiguous, discovery_complete);
     if matches!(main, Resolution::Absent) {
         acc.add("PKG-NO-MAIN", None, no_main_message(package_rels));
     }
@@ -472,6 +462,20 @@ pub(crate) fn load(bytes: &[u8], acc: &mut Acc) -> Option<Package> {
         entries_truncated,
         identity_incomplete: unknown_unreadable,
     })
+}
+
+fn main_selection(main: Option<String>, package_rels_collapsed: bool, main_ambiguous: bool, discovery_complete: bool) -> Resolution<String> {
+    if package_rels_collapsed {
+        Resolution::Unknown("_rels/.rels is duplicated")
+    } else if main_ambiguous {
+        Resolution::Ambiguous("distinct official targets compete")
+    } else if !discovery_complete {
+        // A retained target proves presence, not uniqueness: an unseen declaration
+        // may select a competing document owner.
+        Resolution::Unknown("officeDocument selection was not fully examined")
+    } else {
+        Resolution::discovered(main, discovery_complete)
+    }
 }
 
 /// Whether official relationships for one singleton role name distinct internal target parts.
