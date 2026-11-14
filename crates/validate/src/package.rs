@@ -428,17 +428,7 @@ pub(crate) fn load(bytes: &[u8], acc: &mut Acc) -> Option<Package> {
         .and_then(|t| canonical(&entries, t));
     let package_rels_unavailable = entries.iter().any(|e| !e.is_dir && e.name.eq_ignore_ascii_case("_rels/.rels") && e.content_unavailable);
     let discovery_complete = !entries_truncated && !unknown_unreadable && !package_rels_unavailable && !package_rels.is_some_and(|rp| rp.incomplete);
-    let main = if package_rels_collapsed {
-        Resolution::Unknown("_rels/.rels is duplicated")
-    } else if main_ambiguous {
-        Resolution::Ambiguous("distinct official targets compete")
-    } else if !discovery_complete {
-        // A retained target proves presence, not uniqueness: an unseen declaration
-        // may select a competing document owner.
-        Resolution::Unknown("officeDocument selection was not fully examined")
-    } else {
-        Resolution::discovered(main, true)
-    };
+    let main = main_selection(main, package_rels_collapsed, main_ambiguous, discovery_complete);
     if matches!(main, Resolution::Absent) {
         acc.add("PKG-NO-MAIN", None, no_main_message(package_rels));
     }
@@ -454,6 +444,11 @@ pub(crate) fn load(bytes: &[u8], acc: &mut Acc) -> Option<Package> {
     let glossary_ambiguous = matches!(glossary, Resolution::Ambiguous(_));
     if let Resolution::Ambiguous(reason) = &glossary {
         acc.note(format!("ambiguous glossaryDocument selection: {reason}; owner-dependent document checks were skipped"));
+        acc.set_incomplete();
+    } else if let Resolution::Unknown(reason) = &glossary {
+        acc.note(format!(
+            "unknown glossaryDocument selection: {reason}; no owner was established by selection; independently typed roots remain checkable"
+        ));
         acc.set_incomplete();
     }
     let roots_ambiguous = main_ambiguous || glossary_ambiguous;
@@ -472,6 +467,20 @@ pub(crate) fn load(bytes: &[u8], acc: &mut Acc) -> Option<Package> {
         entries_truncated,
         identity_incomplete: unknown_unreadable,
     })
+}
+
+fn main_selection(main: Option<String>, package_rels_collapsed: bool, main_ambiguous: bool, discovery_complete: bool) -> Resolution<String> {
+    if package_rels_collapsed {
+        Resolution::Unknown("_rels/.rels is duplicated")
+    } else if main_ambiguous {
+        Resolution::Ambiguous("distinct official targets compete")
+    } else if !discovery_complete {
+        // A retained target proves presence, not uniqueness: an unseen declaration
+        // may select a competing document owner.
+        Resolution::Unknown("officeDocument selection was not fully examined")
+    } else {
+        Resolution::discovered(main, discovery_complete)
+    }
 }
 
 /// Whether official relationships for one singleton role name distinct internal target parts.
@@ -508,7 +517,7 @@ fn competing_targets(rp: Option<&RelsPart>, matches: impl Fn(&str) -> bool) -> b
 fn glossary_part(entries: &[Entry], ct: &ContentTypes, rels: &[RelsPart], main: Option<&str>, entries_complete: bool) -> Resolution<String> {
     observation_contract! {
         rules: "-";
-        collections: "field.incomplete*2,field.rels*1";
+        collections: "field.incomplete*3,field.rels*1";
         scope: "source-local bounded extraction; no implicit document owner";
         loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
         fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
@@ -520,6 +529,9 @@ fn glossary_part(entries: &[Entry], ct: &ContentTypes, rels: &[RelsPart], main: 
         let rp = rels.iter().find(|r| r.name.eq_ignore_ascii_case(&want));
         if competing_targets(rp, |kind| relationship_kind(kind) == Some("glossaryDocument")) {
             return Resolution::Ambiguous("distinct official targets compete");
+        }
+        if rp.is_some_and(|r| r.incomplete) {
+            return Resolution::Unknown("glossaryDocument relationships were not fully examined");
         }
         if let Some(rp) = rp
             && let Some(r) = rp.rels.iter().find(|r| !r.external && r.role.kind() == Some("glossaryDocument"))
