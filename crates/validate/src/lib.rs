@@ -804,7 +804,7 @@ pub(crate) fn validate_bytes_limited(bytes: &[u8], limits: Limits) -> Report {
 fn owner_roots_supported(pkg: &Package, acc: &mut Acc) -> bool {
     observation_contract! {
         rules: "-";
-        collections: "lookup.entry_by_name*1,type.Vec*1";
+        collections: "field.entries*1,lookup.entry_by_name*1,type.Vec*3";
         scope: "every independently established main/glossary owner root; Transitional namespace and expected root element";
         loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
         fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
@@ -812,14 +812,22 @@ fn owner_roots_supported(pkg: &Package, acc: &mut Acc) -> bool {
     }
 
     use quick_xml::{NsReader, events::Event, name::ResolveResult};
-    let mut supported = true;
+    let mut roots: Vec<(String, &str)> = Vec::new();
     for owner in owner_scopes(pkg) {
-        let (name, expected) = match &owner {
-            OwnerContext::Main(name) => (name, "document"),
-            OwnerContext::Glossary(name) => (name, "glossaryDocument"),
-            OwnerContext::Fallback => continue,
-        };
-        let Resolution::One(entry) = entry_by_name(pkg, name) else { continue };
+        match owner {
+            OwnerContext::Main(name) => roots.push((name, "document")),
+            OwnerContext::Glossary(name) => roots.push((name, "glossaryDocument")),
+            OwnerContext::Fallback => {}
+        }
+    }
+    if matches!(&pkg.main, Resolution::Unknown(_)) {
+        for entry in pkg.entries.iter().filter(|e| !e.is_dir && is_main_typed(pkg, &e.name)) {
+            roots.push((entry.name.clone(), "document"));
+        }
+    }
+    let mut supported = true;
+    for (name, expected) in roots {
+        let Resolution::One(entry) = entry_by_name(pkg, &name) else { continue };
         let Some(text) = entry.decoded.as_deref() else { continue };
         let mut reader = NsReader::from_str(text);
         let mut buf = Vec::new();
