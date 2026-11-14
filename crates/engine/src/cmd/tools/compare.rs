@@ -425,7 +425,7 @@ const MAX_SIMILARITY_TOKENS: usize = 200;
 const MAX_NOTE_ALIGN_BUDGET: u64 = 200_000;
 
 /// Maximum number of notes in a single run allowed for dynamic programming matrix allocation.
-const MAX_NOTE_ALIGN_RUN: usize = 200;
+pub(super) const MAX_NOTE_ALIGN_RUN: usize = 200;
 
 /// Maximum number of DP matrix cells allowed for note run alignment.
 const MAX_NOTE_ALIGN_CELLS: usize = 40_000;
@@ -593,6 +593,95 @@ fn note_score(a: &NoteInfo, b: &NoteInfo, budget: &mut u64) -> u32 {
     }
 }
 
+/// Pairs notes inside a run too large for the similarity matrix, using identity anchors only.
+///
+/// A note is paired when its text is identical, or when its reference sits at the same block and
+/// reference paragraph and that location holds exactly one unpaired note on each side. Notes
+/// without an anchor stay whole deletions or insertions: pairing them by position would attach
+/// individual accept/reject revisions to a different original note.
+fn align_note_run_by_anchors(old_notes: &[NoteInfo], new_notes: &[NoteInfo]) -> (Vec<(u32, u32)>, Vec<u32>, Vec<u32>) {
+    let mut anchors: Vec<(usize, usize)> = Vec::new();
+    let mut exact_old = vec![false; old_notes.len()];
+    let mut exact_new = vec![false; new_notes.len()];
+
+    // Same text, in document order: each revised note answers at most one original note.
+    let mut by_key: std::collections::HashMap<&str, std::collections::VecDeque<usize>> = std::collections::HashMap::new();
+    for (idx, note) in new_notes.iter().enumerate() {
+        if !note.key.is_empty() {
+            by_key.entry(note.key.as_str()).or_default().push_back(idx);
+        }
+    }
+    let mut next_new = 0usize;
+    for (old_idx, note) in old_notes.iter().enumerate() {
+        let Some(queue) = by_key.get_mut(note.key.as_str()) else { continue };
+        while queue.front().is_some_and(|&idx| idx < next_new) {
+            queue.pop_front();
+        }
+        if let Some(new_idx) = queue.pop_front() {
+            anchors.push((old_idx, new_idx));
+            if let Some(flag) = exact_old.get_mut(old_idx) {
+                *flag = true;
+            }
+            if let Some(flag) = exact_new.get_mut(new_idx) {
+                *flag = true;
+            }
+            next_new = new_idx.saturating_add(1);
+        }
+    }
+
+    // Same reference location, when it names a single unpaired note on each side.
+    let mut old_refs: std::collections::HashMap<(usize, &str), Vec<usize>> = std::collections::HashMap::new();
+    for (idx, note) in old_notes.iter().enumerate() {
+        if let Some((block, para)) = &note.ref_pos
+            && !para.is_empty()
+            && !exact_old.get(idx).copied().unwrap_or(true)
+        {
+            old_refs.entry((*block, para.as_str())).or_default().push(idx);
+        }
+    }
+    let mut new_refs: std::collections::HashMap<(usize, &str), Vec<usize>> = std::collections::HashMap::new();
+    for (idx, note) in new_notes.iter().enumerate() {
+        if let Some((block, para)) = &note.ref_pos
+            && !para.is_empty()
+            && !exact_new.get(idx).copied().unwrap_or(true)
+        {
+            new_refs.entry((*block, para.as_str())).or_default().push(idx);
+        }
+    }
+    for (key, olds) in old_refs {
+        let [old_idx] = olds.as_slice() else { continue };
+        let Some(news) = new_refs.get(&key) else { continue };
+        let [new_idx] = news.as_slice() else { continue };
+        anchors.push((*old_idx, *new_idx));
+    }
+
+    // Anchors must keep document order on both sides. A dropped anchor stays a whole
+    // deletion or insertion, never a silent loss.
+    anchors.sort_unstable();
+    let mut paired = Vec::new();
+    let mut old_paired = vec![false; old_notes.len()];
+    let mut new_paired = vec![false; new_notes.len()];
+    let mut last_new = 0usize;
+    for (old_idx, new_idx) in anchors {
+        if new_idx < last_new {
+            continue;
+        }
+        let (Some(o), Some(r)) = (old_notes.get(old_idx), new_notes.get(new_idx)) else { continue };
+        paired.push((o.id, r.id));
+        if let Some(flag) = old_paired.get_mut(old_idx) {
+            *flag = true;
+        }
+        if let Some(flag) = new_paired.get_mut(new_idx) {
+            *flag = true;
+        }
+        last_new = new_idx.saturating_add(1);
+    }
+
+    let deleted = old_notes.iter().zip(&old_paired).filter(|(_, p)| !**p).map(|(info, _)| info.id).collect();
+    let inserted = new_notes.iter().zip(&new_paired).filter(|(_, p)| !**p).map(|(info, _)| info.id).collect();
+    (paired, inserted, deleted)
+}
+
 /// Aligns a run of original notes and revised notes using dynamic programming over note similarity and reference context.
 fn align_note_run(old_notes: &[NoteInfo], new_notes: &[NoteInfo], budget: &mut u64) -> (Vec<(u32, u32)>, Vec<u32>, Vec<u32>) {
     let n = old_notes.len();
@@ -604,15 +693,7 @@ fn align_note_run(old_notes: &[NoteInfo], new_notes: &[NoteInfo], budget: &mut u
         return (Vec::new(), Vec::new(), old_notes.iter().map(|info| info.id).collect());
     }
     if n > MAX_NOTE_ALIGN_RUN || m > MAX_NOTE_ALIGN_RUN || n.saturating_mul(m) > MAX_NOTE_ALIGN_CELLS {
-        if n == m {
-            let paired = old_notes.iter().zip(new_notes.iter()).map(|(o, r)| (o.id, r.id)).collect();
-            return (paired, Vec::new(), Vec::new());
-        }
-        let common = n.min(m);
-        let paired = old_notes.iter().take(common).zip(new_notes.iter().take(common)).map(|(o, r)| (o.id, r.id)).collect();
-        let deleted = old_notes.get(common..).unwrap_or_default().iter().map(|info| info.id).collect();
-        let inserted = new_notes.get(common..).unwrap_or_default().iter().map(|info| info.id).collect();
-        return (paired, inserted, deleted);
+        return align_note_run_by_anchors(old_notes, new_notes);
     }
 
     let mut scores = vec![vec![0u32; m]; n];
@@ -674,10 +755,9 @@ fn align_note_run(old_notes: &[NoteInfo], new_notes: &[NoteInfo], budget: &mut u
     dels.reverse();
     inss.reverse();
 
-    // Fall back to 1-to-1 positional pairing only when counts match (n == m) and no pair met threshold.
-    if pairs.is_empty() && n == m {
-        let paired = old_notes.iter().zip(new_notes.iter()).map(|(o, r)| (o.id, r.id)).collect();
-        return (paired, Vec::new(), Vec::new());
+    // No note met the similarity threshold: keep only identity anchors, never positional ones.
+    if pairs.is_empty() {
+        return align_note_run_by_anchors(old_notes, new_notes);
     }
 
     let mut paired_out = Vec::new();

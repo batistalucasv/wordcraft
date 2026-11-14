@@ -1284,6 +1284,111 @@ fn compare_pairs_many_notes_when_budget_exhausted() {
     }
 }
 
+/// #5842: Past `MAX_NOTE_ALIGN_RUN` an edited run of notes must still pair by identity, not by
+/// position. The revised document deletes note 0 and edits every remaining note, so no note text
+/// anchors a pairing and the run is too large for the similarity matrix. Every remaining note
+/// must keep its own original counterpart: its body reference stays clean, its part diffs its own
+/// text, and rejecting one note's revision restores that note alone.
+#[test]
+fn compare_pairs_notes_above_alignment_run_boundary() {
+    let note_count = super::compare::MAX_NOTE_ALIGN_RUN + 1;
+    let mut orig_text = String::new();
+    let mut rev_text = String::new();
+    for i in 0..note_count {
+        if i > 0 {
+            orig_text.push('\n');
+            rev_text.push('\n');
+        }
+        orig_text.push_str(&format!("Paragraph {i} anchors a note."));
+        rev_text.push_str(&format!("Paragraph {i} anchors a note."));
+    }
+    let mut orig = Session::new(Document::from_text(&orig_text));
+    let mut rev = Session::new(Document::from_text(&rev_text));
+
+    let mut orig_note_ids = Vec::with_capacity(note_count);
+    for i in 0..note_count {
+        let len = orig.doc.body[i].as_para().unwrap().text.len();
+        orig.run("caret.set", &json!({"pos": Pos::body(i, len)})).unwrap();
+        orig.run("references.footnote", &json!({"text": format!("note[{i}] original observation.")})).unwrap();
+        let id = orig.doc.body[i]
+            .as_para()
+            .and_then(|p| p.objects.iter().find_map(|o| if let InlineObject::NoteRef { id, .. } = o { Some(*id) } else { None }))
+            .unwrap();
+        orig_note_ids.push(id);
+
+        // The revised document keeps every paragraph but deletes note 0 and edits all others.
+        if i > 0 {
+            let len = rev.doc.body[i].as_para().unwrap().text.len();
+            rev.run("caret.set", &json!({"pos": Pos::body(i, len)})).unwrap();
+            rev.run("references.footnote", &json!({"text": format!("note[{i}] revised commentary.")})).unwrap();
+        }
+    }
+
+    let rev_path = std::env::temp_dir().join(format!("wc-rev-manyfn-boundary-{}.docx", std::process::id()));
+    crate::io::save_path(&rev_path, &rev.doc).unwrap();
+
+    let mut s = orig;
+    let r = s.run("review.compare", &json!({"path": rev_path.to_string_lossy()})).unwrap();
+    let _ = std::fs::remove_file(&rev_path);
+    assert!(r["changes"].as_u64().unwrap() >= note_count as u64);
+
+    // Note 0's reference is deleted and its story is fully deleted.
+    let p0 = s.doc.body[0].as_para().unwrap();
+    assert!(p0.runs.iter().any(|run| run.props.del.is_some()), "paragraph 0 note reference is deleted");
+    let gone = s.doc.parts.get(&orig_note_ids[0]).unwrap();
+    assert!(gone.blocks[0].as_para().unwrap().runs.iter().all(|run| run.props.del.is_some()), "note 0 story is fully marked deleted");
+
+    // Every remaining paragraph keeps its own reference, and every remaining note diffs its own text.
+    for (i, &note_id) in orig_note_ids.iter().enumerate().skip(1) {
+        let para = s.doc.body.get(i).and_then(|b| b.as_para()).unwrap();
+        assert!(para.runs.iter().all(|run| run.props.del.is_none() && run.props.ins.is_none()), "paragraph {i} note reference is unchanged");
+        let part = s.doc.parts.get(&note_id).unwrap();
+        let text = part.blocks[0].as_para().unwrap().plain_text();
+        assert!(text.contains(&format!("note[{i}] original observation")), "note {i} keeps its own original text: {text}");
+        assert!(text.contains("revised commentary"), "note {i} tracks its revised text: {text}");
+        for other in [i.saturating_sub(1), i.saturating_add(1)] {
+            if other != i && other < note_count {
+                assert!(!text.contains(&format!("note[{other}]")), "note {i} must not carry note {other}'s text: {text}");
+            }
+        }
+    }
+
+    // Rejecting one note's revision restores that note and leaves its neighbours revised.
+    let victim = 150usize;
+    let victim_id = orig_note_ids[victim];
+    let end = s.doc.parts.get(&victim_id).and_then(|p| p.blocks.first()).and_then(|b| b.as_para()).map(Paragraph::len).unwrap();
+    let story = StoryRef::Part(victim_id);
+    s.run(
+        "select.range",
+        &json!({
+            "anchor": Pos::new(story, wordcraft_doc::Path::top(0), 0),
+            "focus": Pos::new(story, wordcraft_doc::Path::top(0), end),
+        }),
+    )
+    .unwrap();
+    s.run("review.reject", &json!({})).unwrap();
+
+    assert_eq!(
+        s.doc.plain_text(StoryRef::Part(victim_id)).trim(),
+        format!("note[{victim}] original observation."),
+        "rejecting note {victim}'s revision restores its original text"
+    );
+    let restored = s.doc.parts.get(&victim_id).unwrap();
+    assert!(
+        restored.blocks[0].as_para().unwrap().runs.iter().all(|run| run.props.ins.is_none() && run.props.del.is_none()),
+        "note {victim} has no tracked revisions left"
+    );
+    let neighbour = s.doc.parts.get(&orig_note_ids[victim + 1]).unwrap();
+    let neighbour_para = neighbour.blocks[0].as_para().unwrap();
+    assert!(
+        neighbour_para.runs.iter().any(|run| run.props.ins.is_some()),
+        "note {} keeps its own tracked revision: {}",
+        victim + 1,
+        neighbour_para.plain_text()
+    );
+    assert!(neighbour_para.plain_text().contains(&format!("note[{}]", victim + 1)));
+}
+
 /// #5842: Inserted footnotes with dependent text boxes and media items adopt their text box
 /// stories under independent IDs in `s.doc` and retain image bytes in `s.doc.media`.
 #[test]
