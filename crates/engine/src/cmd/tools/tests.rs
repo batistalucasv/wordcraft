@@ -753,6 +753,126 @@ fn compare_table_unrelated_revision_inside_tracked_row() {
     assert!(p.runs.iter().all(|r| r.props.del.is_none()));
 }
 
+/// #5921: When a row carries both an insertion marker (Alice) and a deletion marker (Bob),
+/// `review.changes` exposes both and accepting/rejecting one marker resolves only that marker.
+#[test]
+fn compare_table_dual_row_markers_resolve_independently() {
+    let mut tbl = make_test_table(&[&["Keep"], &["Dual"]]);
+    tbl.rows[1].props.ins = Some(0);
+    tbl.rows[1].props.del = Some(1);
+    let mut doc = Document::new();
+    doc.revisions.push(wordcraft_doc::Revision::new(wordcraft_doc::RevisionKind::Insert, "Alice", "2026-11-09T00:00:00Z"));
+    doc.revisions.push(wordcraft_doc::Revision::new(wordcraft_doc::RevisionKind::Delete, "Bob", "2026-11-09T01:00:00Z"));
+    doc.body = vec![Arc::new(Block::Table(tbl)), para_block(Paragraph::new())];
+
+    // Both markers appear separately in review.changes with distinct authors and kinds.
+    let mut s = Session::new(doc.clone());
+    let listed = s.run("review.changes", &json!({})).unwrap();
+    let arr = listed.as_array().unwrap();
+    assert_eq!(arr.len(), 2, "expected separate insert and delete row markers: {listed}");
+    assert_eq!(arr[0]["kind"], "insert");
+    assert_eq!(arr[0]["author"], "Alice");
+    assert_eq!(arr[1]["kind"], "delete");
+    assert_eq!(arr[1]["author"], "Bob");
+
+    // Accepting Alice's insertion leaves Bob's deletion pending and keeps the row.
+    s.sel = crate::Selection::caret(s.doc.end_of(StoryRef::Body));
+    s.run("review.nextChange", &json!({})).unwrap();
+    s.run("review.accept", &json!({"next": true})).unwrap();
+    let tbl_after = s.doc.body[0].as_table().unwrap();
+    assert_eq!(tbl_after.rows.len(), 2);
+    assert_eq!(tbl_after.rows[1].props.ins, None);
+    assert_eq!(tbl_after.rows[1].props.del, Some(1));
+    // Next change is now Bob's pending deletion; accepting it removes the row.
+    s.run("review.accept", &json!({})).unwrap();
+    let tbl_final = s.doc.body[0].as_table().unwrap();
+    assert_eq!(tbl_final.rows.len(), 1);
+    assert_eq!(tbl_final.rows[0].cells[0].blocks[0].as_para().unwrap().plain_text(), "Keep");
+
+    // Navigating past Alice's insertion to Bob's deletion and rejecting clears only del.
+    let mut s_rej_del = Session::new(doc.clone());
+    s_rej_del.sel = crate::Selection::caret(s_rej_del.doc.end_of(StoryRef::Body));
+    s_rej_del.run("review.nextChange", &json!({})).unwrap();
+    s_rej_del.run("review.nextChange", &json!({})).unwrap();
+    s_rej_del.run("review.reject", &json!({})).unwrap();
+    let tbl_after = s_rej_del.doc.body[0].as_table().unwrap();
+    assert_eq!(tbl_after.rows.len(), 2);
+    assert_eq!(tbl_after.rows[1].props.ins, Some(0));
+    assert_eq!(tbl_after.rows[1].props.del, None);
+
+    // Rejecting Alice's insertion directly removes the row.
+    let mut s_rej_ins = Session::new(doc);
+    s_rej_ins.sel = crate::Selection::caret(s_rej_ins.doc.end_of(StoryRef::Body));
+    s_rej_ins.run("review.nextChange", &json!({})).unwrap();
+    s_rej_ins.run("review.reject", &json!({})).unwrap();
+    assert_eq!(s_rej_ins.doc.body[0].as_table().unwrap().rows.len(), 1);
+
+    // Range-resolving a deleted run inside a row that carries both ins and del resolves only del.
+    let mut run_tbl = make_test_table(&[&["Keep"], &["AB"]]);
+    run_tbl.rows[1].props.ins = Some(0);
+    run_tbl.rows[1].props.del = Some(1);
+    let mut p = Paragraph::with_text("AB", CharProps::default());
+    p.format(0, 1, &|c| c.ins = Some(0)).unwrap();
+    p.format(1, 2, &|c| c.del = Some(1)).unwrap();
+    run_tbl.rows[1].cells[0].blocks = vec![para_block(p)];
+    let mut run_doc = Document::new();
+    run_doc.revisions.push(wordcraft_doc::Revision::new(wordcraft_doc::RevisionKind::Insert, "Alice", "2026-11-09T00:00:00Z"));
+    run_doc.revisions.push(wordcraft_doc::Revision::new(wordcraft_doc::RevisionKind::Delete, "Bob", "2026-11-09T01:00:00Z"));
+    run_doc.body = vec![Arc::new(Block::Table(run_tbl)), para_block(Paragraph::new())];
+    let mut s_run = Session::new(run_doc);
+    s_run.sel = crate::Selection {
+        anchor: Pos { story: StoryRef::Body, path: wordcraft_doc::Path(vec![0, 1, 0, 0]), off: 1 },
+        focus: Pos { story: StoryRef::Body, path: wordcraft_doc::Path(vec![0, 1, 0, 0]), off: 2 },
+    };
+    s_run.run("review.reject", &json!({})).unwrap();
+    let tbl_run = s_run.doc.body[0].as_table().unwrap();
+    assert_eq!(tbl_run.rows.len(), 2);
+    assert_eq!(tbl_run.rows[1].props.ins, Some(0));
+    assert_eq!(tbl_run.rows[1].props.del, None);
+}
+
+/// #5921: Comparing an original document with a previously inserted row against a revised table
+/// that deletes that row preserves Alice's insertion and leaves Bob's deletion pending on accept.
+#[test]
+fn compare_table_deleted_preinserted_row_resolves_independently() {
+    let mut orig_tbl = make_test_table(&[&["Keep"], &["PreIns"]]);
+    orig_tbl.rows[1].props.ins = Some(0);
+    let mut pre_p = Paragraph::with_text("PreIns", CharProps::default());
+    pre_p.format(0, 6, &|c| c.ins = Some(0)).unwrap();
+    pre_p.mark.ins = Some(0);
+    orig_tbl.rows[1].cells[0].blocks = vec![para_block(pre_p)];
+    let mut orig_doc = Document::new();
+    orig_doc.revisions.push(wordcraft_doc::Revision::new(wordcraft_doc::RevisionKind::Insert, "Alice", "2026-11-09T00:00:00Z"));
+    orig_doc.body = vec![Arc::new(Block::Table(orig_tbl)), para_block(Paragraph::new())];
+
+    let rev_tbl = make_test_table(&[&["Keep"]]);
+    let mut rev_doc = Document::new();
+    rev_doc.body = vec![Arc::new(Block::Table(rev_tbl)), para_block(Paragraph::new())];
+
+    let path = std::env::temp_dir().join(format!("wc-compare-preins-row-{}.docx", std::process::id()));
+    crate::io::save_path(&path, &rev_doc).unwrap();
+    let mut s = Session::new(orig_doc);
+    let res = s.run("review.compare", &json!({"path": path.to_string_lossy(), "author": "Bob"}));
+    let _ = std::fs::remove_file(&path);
+    res.unwrap();
+
+    let listed = s.run("review.changes", &json!({})).unwrap();
+    let arr = listed.as_array().unwrap();
+    assert!(arr.iter().any(|c| c["kind"] == "insert" && c["author"] == "Alice"), "expected Alice insertion in {listed}");
+    assert!(arr.iter().any(|c| c["kind"] == "delete" && c["author"] == "Bob"), "expected Bob deletion in {listed}");
+
+    s.sel = crate::Selection::caret(s.doc.end_of(StoryRef::Body));
+    s.run("review.nextChange", &json!({})).unwrap();
+    s.run("review.accept", &json!({})).unwrap();
+
+    let tbl = s.doc.body[0].as_table().unwrap();
+    assert_eq!(tbl.rows.len(), 2, "accepting Alice's insertion must not delete Bob's deleted row");
+    assert_eq!(tbl.rows[1].props.ins, None);
+    assert!(tbl.rows[1].props.del.is_some(), "Bob's deletion marker must stay pending");
+    let cell_p = tbl.rows[1].cells[0].blocks[0].as_para().unwrap();
+    assert!(cell_p.runs.iter().all(|r| r.props.ins.is_none() && r.props.del.is_some()));
+}
+
 /// #5921: Table, row, and cell formatting changes in surviving tables are recorded as tracked
 /// formatting revisions and restored on Reject All.
 #[test]
