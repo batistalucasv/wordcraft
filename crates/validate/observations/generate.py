@@ -5,7 +5,7 @@ The audit checks declared collection consumption, typed-accessor bypasses and re
 It deliberately does not certify the semantic truth of a declaration; fixtures do that.
 """
 from pathlib import Path
-import argparse, atexit, hashlib, json, os, re, subprocess, sys, tempfile, time
+import argparse, atexit, hashlib, json, os, re, shutil, subprocess, sys, tempfile, time
 from contextlib import ExitStack
 from functools import lru_cache, wraps
 from collections import Counter
@@ -105,24 +105,51 @@ def file_sha256(path):
     return digest.digest()
 
 
-def recognizer_binary(target):
-    # Cargo republishes the public executable even on a warm no-op build. Another
-    # worker can unlink that image during macOS startup. Match its freshly built
-    # bytes to Cargo's stable dependency artifact; never select a pre-build binary.
-    executable=target/'debug'/('observation-recognizer.exe' if os.name=='nt' else 'observation-recognizer')
+def recognizer_artifact(output, manifest):
+    # Cargo owns the target/profile/platform layout. Never guess a dependency
+    # artifact name, or fall back to a binary left by an earlier build.
+    artifacts=set()
+    for line in output.splitlines():
+        item=json.loads(line)
+        target=item.get('target', {})
+        if (item.get('reason')=='compiler-artifact'
+                and Path(item.get('manifest_path', '')).resolve()==manifest.resolve()
+                and target.get('name')=='observation-recognizer'
+                and target.get('kind')==['bin']
+                and item.get('executable')):
+            artifacts.add(Path(item['executable']))
+    if len(artifacts)!=1:
+        raise ValueError('Cargo did not report exactly one recognizer executable')
+    return artifacts.pop()
+
+
+def recognizer_binary(executable, directory):
+    # Workers may republish Cargo's alias during process startup. Launch a
+    # private copy instead, verified against a stable read of the fresh alias.
+    destination=Path(directory)/executable.name
     deadline=time.monotonic()+2
     while True:
         try:
             expected=file_sha256(executable)
-            for candidate in sorted((target/'debug/deps').glob('observation_recognizer*')):
-                if re.fullmatch(r'observation_recognizer(?:-[0-9a-f]+)?(?:\.exe)?', candidate.name) and file_sha256(candidate)==expected:
-                    return candidate
+            shutil.copy2(executable, destination)
+            if file_sha256(destination)==expected==file_sha256(executable):
+                return destination
         except FileNotFoundError:
-            # A concurrent warm build may briefly remove the public alias.
             pass
-        if time.monotonic() >= deadline:
-            raise ValueError('no stable recognizer artifact matches the freshly built executable')
+        if time.monotonic()>=deadline:
+            raise ValueError('could not snapshot the freshly built recognizer executable')
         time.sleep(0.01)
+
+
+def stop_recognizer(process, directory):
+    if process.poll() is None:
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+    directory.cleanup()
 
 
 def recognize(sources):
@@ -137,14 +164,21 @@ def recognize(sources):
         manifest = Path(__file__).parent / 'recognizer/Cargo.toml'
         target = root / 'target/observation-recognizer'
         build_start=time.perf_counter()
-        subprocess.run(['cargo', 'build', '--locked', '--quiet', '--manifest-path', str(manifest),
-                        '--target-dir', str(target)], check=True)
+        build=subprocess.run(['cargo', 'build', '--locked', '--quiet', '--manifest-path', str(manifest),
+                              '--target-dir', str(target), '--message-format=json'],
+                             check=True, stdout=subprocess.PIPE, text=True)
         if _TIMINGS: print(f'recognizer build: {time.perf_counter()-build_start:.3f}s', file=sys.stderr)
-        binary=recognizer_binary(target)
-        if _TIMINGS: print(f'recognizer artifact: {binary.name}', file=sys.stderr)
-        _RECOGNIZER = subprocess.Popen([str(binary)],
-                                      stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
-        atexit.register(_RECOGNIZER.terminate)
+        executable=recognizer_artifact(build.stdout, manifest)
+        directory=tempfile.TemporaryDirectory(prefix='wordcraft-observation-recognizer-')
+        try:
+            binary=recognizer_binary(executable, directory.name)
+            if _TIMINGS: print(f'recognizer artifact: {executable}', file=sys.stderr)
+            _RECOGNIZER = subprocess.Popen([str(binary)],
+                                          stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        except BaseException:
+            directory.cleanup()
+            raise
+        atexit.register(stop_recognizer, _RECOGNIZER, directory)
     _RECOGNIZER.stdin.write(json.dumps(sources) + '\n')
     _RECOGNIZER.stdin.flush()
     line = _RECOGNIZER.stdout.readline()
@@ -858,25 +892,34 @@ def shard_cases(mutations, controls):
 
 
 def artifact_self_test():
-    # Cargo versions may publish either a hashed or an unhashed dependency
-    # executable. Both must match the freshly built alias, never a stale image.
-    for name in ('observation_recognizer-1111111111111111', 'observation_recognizer'):
+    # No assumption about hyphens, hashes, profiles, targets or a deps directory.
+    for name in ('observation_recognizer-1111111111111111', 'observation_recognizer',
+                 'observation-recognizer'):
         with tempfile.TemporaryDirectory() as directory:
-            target=Path(directory)
-            deps=target/'debug/deps'; deps.mkdir(parents=True)
-            suffix='.exe' if os.name=='nt' else ''
-            alias=target/'debug'/('observation-recognizer'+suffix)
-            stale=deps/('observation_recognizer-0000000000000000'+suffix)
-            fresh=deps/(name+suffix)
-            alias.write_bytes(b'fresh build'); stale.write_bytes(b'old build')
-            # Matching bytes in non-executable artifacts must not be selected.
-            (deps/'observation_recognizer.d').write_bytes(b'fresh build')
-            (deps/'observation_recognizer.pdb').write_bytes(b'fresh build')
-            fresh.write_bytes(b'fresh build')
-            selected=recognizer_binary(target)
-            assert selected==fresh, 'recognizer selected a non-executable or stale artifact'
-            alias.unlink()
-            assert file_sha256(selected)==hashlib.sha256(b'fresh build').digest(), 'recognizer image changed with its public alias'
+            root=Path(directory)
+            manifest=root/'Cargo.toml'
+            binary=root/'custom-target/profile'/(name+('.exe' if os.name=='nt' else ''))
+            binary.parent.mkdir(parents=True)
+            binary.write_bytes(b'fresh build')
+            private=root/'private'; private.mkdir()
+            stale=binary.parent/'stale'; stale.write_bytes(b'old build')
+            item=dict(reason='compiler-artifact', manifest_path=str(manifest),
+                      target=dict(name='observation-recognizer', kind=['bin']),
+                      executable=str(binary))
+            output=json.dumps(item)
+            selected=recognizer_binary(recognizer_artifact(output, manifest), private)
+            assert selected.parent==private
+            binary.unlink()
+            assert selected.read_bytes()==b'fresh build', 'private image depends on Cargo alias'
+            for bad in ('', json.dumps(dict(item, executable=None)),
+                        json.dumps(dict(item, manifest_path=str(root/'other/Cargo.toml'))),
+                        output+'\n'+json.dumps(dict(item, executable=str(stale)))):
+                try:
+                    recognizer_artifact(bad, manifest)
+                except ValueError:
+                    pass
+                else:
+                    raise AssertionError('missing or ambiguous Cargo artifact was accepted')
 
 
 def case_pool(rows, mutations, controls, jobs, timings):
