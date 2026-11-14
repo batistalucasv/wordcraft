@@ -352,7 +352,8 @@ pub(crate) fn load(bytes: &[u8], acc: &mut Acc) -> Option<Package> {
         }
     }
 
-    let cd = central_directory(bytes, acc.limits.entries);
+    let (cd, directory_disagreement) = reader_checked_directory(bytes, &zip, acc.limits.entries, acc);
+    unknown_unreadable |= directory_disagreement;
     let (collapsed_names, unexplained) = check_duplicate_entries(cd.as_ref(), zip.len(), acc);
     unknown_unreadable |= unexplained;
     if unknown_unreadable {
@@ -858,6 +859,48 @@ struct CentralDirectory<'a> {
     truncated: bool,
 }
 
+/// Reject disputed directory identities before deriving duplicates or absence from them.
+fn reader_checked_directory<'a>(
+    bytes: &'a [u8],
+    zip: &zip::ZipArchive<Cursor<&[u8]>>,
+    limit: usize,
+    acc: &mut Acc,
+) -> (Option<CentralDirectory<'a>>, bool) {
+    let cd = central_directory(bytes, limit);
+    if cd.as_ref().is_some_and(|dir| !directory_matches_reader(dir, zip)) {
+        // A different directory can invent duplicates and conceal real parts even when its
+        // count residual is zero. Do not derive findings or absence from its identities.
+        acc.note("the zip central directory's decoded names disagree with the reader; entry identities are unknown and dependent absence checks were skipped".to_string());
+        (None, true)
+    } else {
+        (cd, false)
+    }
+}
+
+/// Compare the reader's exact decoded-name keys, before the package's slash trim.
+/// The reader retains one record per decoded name; collapse that same multiplicity here.
+fn directory_matches_reader(dir: &CentralDirectory, zip: &zip::ZipArchive<Cursor<&[u8]>>) -> bool {
+    observation_contract! {
+        rules: "-";
+        collections: "field.decoded_names*1,type.HashSet*1";
+        scope: "bounded directory identities compared with the reader's decoded-name table";
+        loss: "directory selection or decoded-name disagreement";
+        fallback: "unknown entry identity; no duplicate finding from the disputed directory; global absence suppression";
+        package_loss: "independent";
+    }
+
+    // A capped prefix cannot establish equality with the unexamined suffix. Its existing
+    // truncation handling retains prefix duplicate checks and reports incomplete coverage.
+    if dir.truncated {
+        return true;
+    }
+    let mut names: HashSet<&str> = dir.decoded_names.iter().map(String::as_str).collect();
+    if names.len() != zip.len() {
+        return false;
+    }
+    (0..zip.len()).all(|i| zip.name_for_index(i).is_some_and(|name| names.remove(name))) && names.is_empty()
+}
+
 /// The raw entry name bytes in the zip central directory, in stored order, including duplicates,
 /// stopping after `limit` names (the entry budget), together with whether any raw record remained
 /// unexamined. `None` when the directory cannot be parsed (not a zip, or a layout this reader does
@@ -880,8 +923,9 @@ fn central_directory<'a>(bytes: &'a [u8], limit: usize) -> Option<CentralDirecto
     let eocd = find_eocd(bytes)?;
     let mut count = u64::from(u16_at(bytes, eocd + 10)?);
     let mut cd_off = u64::from(u32_at(bytes, eocd + 16)?);
-    let cd_size = u64::from(u32_at(bytes, eocd + 12)?);
-    if count == 0xFFFF || cd_off == 0xFFFF_FFFF || cd_size == 0xFFFF_FFFF {
+    // zip 3.0.0's may_be_zip64 uses only these two sentinels. A size sentinel alone
+    // must not let a decoy ZIP64 record select a different directory than the reader.
+    if count == 0xFFFF || cd_off == 0xFFFF_FFFF {
         let (c, o) = zip64_directory(bytes, eocd)?;
         count = c;
         cd_off = o;
