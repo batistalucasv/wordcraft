@@ -241,7 +241,61 @@ fn resolve_loose_blocks(blocks: &mut wordcraft_doc::Blocks, accept: bool) -> Res
     Ok(())
 }
 
+/// How deep a nested table's cells are searched for Compare's whole-table revision.
+const MAX_TABLE_DEPTH: usize = 16;
+
+/// Whether every paragraph in `b` — a table's cells and its nested tables included — carries
+/// the same revision on its paragraph mark: the whole block is that one insertion or deletion.
+///
+/// Compare replaces a table whose structure changed by a deleted original and an inserted
+/// revised one, marking every paragraph of each. Resolving takes those paragraphs' text away,
+/// which would leave an empty table shell beside the other one, so the table has to go whole.
+fn wholly_revised(b: &wordcraft_doc::Block, del: bool, depth: usize) -> bool {
+    match b {
+        wordcraft_doc::Block::Para(p) => {
+            if del {
+                p.mark.del.is_some()
+            } else {
+                p.mark.ins.is_some()
+            }
+        }
+        wordcraft_doc::Block::Table(t) if depth < MAX_TABLE_DEPTH => {
+            !t.rows.is_empty()
+                && t.rows
+                    .iter()
+                    .flat_map(|r| r.cells.iter())
+                    .all(|c| !c.blocks.is_empty() && c.blocks.iter().all(|b| wholly_revised(b, del, depth + 1)))
+        }
+        wordcraft_doc::Block::Table(_) => false,
+    }
+}
+
+/// Takes away the tables that are entirely the revision being resolved (Compare's deleted
+/// originals when accepting, its inserted revisions when rejecting), so neither leaves an empty
+/// shell behind (#6122).
+fn drop_wholly_revised_tables(blocks: &mut wordcraft_doc::Blocks, del: bool, depth: usize) {
+    if depth > MAX_TABLE_DEPTH {
+        return;
+    }
+    blocks.retain(|b| !matches!(&**b, wordcraft_doc::Block::Table(_)) || !wholly_revised(b, del, depth));
+    for b in blocks.iter_mut() {
+        if matches!(&**b, wordcraft_doc::Block::Table(_))
+            && let wordcraft_doc::Block::Table(t) = &mut *std::sync::Arc::make_mut(b)
+        {
+            for cell in t.rows.iter_mut().flat_map(|r| r.cells.iter_mut()) {
+                drop_wholly_revised_tables(&mut cell.blocks, del, depth + 1);
+            }
+        }
+    }
+}
+
 fn resolve_all(s: &mut Session, accept: bool) -> CmdResult {
+    // Tables first: a replaced table is one revision, and resolving its paragraphs one by one
+    // would leave the empty table behind.
+    drop_wholly_revised_tables(&mut s.doc.body, accept, 0);
+    for part in s.doc.parts.values_mut() {
+        drop_wholly_revised_tables(&mut part.blocks, accept, 0);
+    }
     let stories: Vec<StoryRef> = std::iter::once(StoryRef::Body).chain(s.doc.parts.keys().map(|k| StoryRef::Part(*k))).collect();
     for st in stories {
         for path in s.doc.para_paths(st).into_iter().rev() {
@@ -271,8 +325,8 @@ fn resolve_all(s: &mut Session, accept: bool) -> CmdResult {
     // stories it inserts can be shown; rejecting takes those stories back out, so the flags go
     // back to what they were. Accepting keeps them, as the revised document had them.
     if accept {
-        s.compare_hf_flags = None;
-    } else if let Some(flags) = s.compare_hf_flags.take() {
+        s.doc.compare_hf = None;
+    } else if let Some(flags) = s.doc.compare_hf.take() {
         for (end, title_page) in flags.title_page {
             let sect = match end {
                 Some(e) => s.doc.section_mut(e),

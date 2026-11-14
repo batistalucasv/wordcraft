@@ -126,6 +126,10 @@ impl Reader<'_> {
                     // writer recreates it under the reserved name.
                     continue;
                 }
+                if self.doc.compare_hf.is_some() && root.as_ref().is_some_and(crate::compare_hf::is_state) {
+                    // Same for the Compare flag record: read, then recreated by the writer.
+                    continue;
+                }
                 if !self.doc.sources.is_empty() && root.as_ref().is_some_and(|r| r.local() == "Sources") {
                     continue;
                 }
@@ -157,6 +161,24 @@ impl Reader<'_> {
                 let Some(root) = self.xml(&rel.target).ok().flatten() else { continue };
                 if let Some(fit) = crate::fit::read(&root) {
                     self.doc.fit_state = Some(fit);
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Read the Compare header/footer flag record from our custom XML store, if the file has one.
+    ///
+    /// Inspects custom XML relationships referenced by either the document or package root.
+    pub(super) fn read_compare_hf(&mut self, package: &Rels, document: &Rels) {
+        for rels in [document, package] {
+            for rel in rels.list.iter().filter(|r| !r.external && rel_is(&r.kind, rt::CUSTOM_XML)).take(MAX_EMBEDDED_RELS) {
+                if !manifest_field_ok(&rel.target) {
+                    continue;
+                }
+                let Some(root) = self.xml(&rel.target).ok().flatten() else { continue };
+                if let Some(flags) = crate::compare_hf::read(&root) {
+                    self.doc.compare_hf = Some(flags);
                     return;
                 }
             }

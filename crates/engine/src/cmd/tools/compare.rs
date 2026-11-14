@@ -143,7 +143,7 @@ pub(super) fn compare(s: &mut Session, v: &Value) -> CmdResult {
     let mut budget = MAX_COMPARE_CELLS;
     let mut char_fallbacks = 0usize;
     // This comparison owns the flags it turns on, not those a previous one recorded.
-    s.compare_hf_flags = None;
+    s.doc.compare_hf = None;
     let mut ctx = DiffCtx { ins, del, opts: &opts, budget: &mut budget, char_fallbacks: &mut char_fallbacks };
     let (out, body_changes, sources) = compare_blocks(&mut s.doc, &run, &mut ctx, &old, &new, true);
     s.doc.body = out;
@@ -336,11 +336,11 @@ fn assign_section_slot(s: &mut Session, res_ends: &[usize], res_si: usize, foote
         }
     }
     if let Some(entry) = title_page_before {
-        s.compare_hf_flags.get_or_insert_with(Default::default).title_page.push(entry);
+        s.doc.compare_hf.get_or_insert_with(Default::default).title_page.push(entry);
     }
     if enable_flag && slot == HfSlot::Even && !s.doc.settings.even_odd_headers {
         s.doc.settings.even_odd_headers = true;
-        s.compare_hf_flags.get_or_insert_with(Default::default).even_odd.get_or_insert(false);
+        s.doc.compare_hf.get_or_insert_with(Default::default).even_odd.get_or_insert(false);
     }
 }
 
@@ -395,18 +395,22 @@ fn adopt_hf_blocks(doc: &mut Document, revised: &Document, blocks: &[Arc<Block>]
     doc.adopt_fragment(&frag).into_iter().map(Arc::new).collect()
 }
 
-/// Returns true if two slices of header/footer blocks and all referenced text boxes in `doc_parts`
-/// and `rev_parts` have identical structure and content.
-fn hf_blocks_identical(
-    snap_blocks: &[Arc<Block>],
-    rev_blocks: &[Arc<Block>],
-    doc_parts: &std::collections::BTreeMap<u32, wordcraft_doc::Part>,
-    rev_parts: &std::collections::BTreeMap<u32, wordcraft_doc::Part>,
-) -> bool {
+/// Returns true if two slices of header/footer blocks, the text boxes they reference and the
+/// images those blocks draw have identical structure and content. Two stories may name an image
+/// with the same key and hold different bytes (each document keys its own media), so the bytes
+/// are compared too: otherwise the revised image would be called unchanged and never adopted.
+fn hf_blocks_identical(doc: &Document, revised: &Document, snap_blocks: &[Arc<Block>], rev_blocks: &[Arc<Block>]) -> bool {
     if snap_blocks.len() != rev_blocks.len() {
         return false;
     }
     if !snap_blocks.iter().zip(rev_blocks).all(|(a, b)| Arc::ptr_eq(a, b) || a == b) {
+        return false;
+    }
+    // `media_of_blocks` walks plain blocks; cloning a header's is cheap next to reading a file.
+    let owned = |blocks: &[Arc<Block>]| blocks.iter().map(|b| (**b).clone()).collect::<Vec<Block>>();
+    let snap_media = doc.media_of_blocks(&owned(snap_blocks));
+    let rev_media = revised.media_of_blocks(&owned(rev_blocks));
+    if snap_media.len() != rev_media.len() || snap_media.iter().any(|(key, bytes)| rev_media.get(key) != Some(bytes)) {
         return false;
     }
     let mut snap_boxes = Vec::new();
@@ -424,7 +428,7 @@ fn hf_blocks_identical(
         return false;
     }
     for id in snap_boxes {
-        match (doc_parts.get(&id), rev_parts.get(&id)) {
+        match (doc.parts.get(&id), revised.parts.get(&id)) {
             (Some(p1), Some(p2)) => {
                 if p1.blocks != p2.blocks {
                     return false;
@@ -543,7 +547,7 @@ fn compare_headers_and_footers(
                                 orig_parts_snapshot.get(&o).map(|(k, b)| (*k, b.as_slice())).unwrap_or((wordcraft_doc::PartKind::Header, &[]));
                             let rev_blocks_raw = revised.parts.get(&r).map(|p| p.blocks.as_slice()).unwrap_or(&[]);
 
-                            let are_identical = hf_blocks_identical(snap_blocks, rev_blocks_raw, &s.doc.parts, &revised.parts);
+                            let are_identical = hf_blocks_identical(&s.doc, revised, snap_blocks, rev_blocks_raw);
 
                             let target = if matched_orig_parts.insert(o) && !seen_deleted.contains(&o) {
                                 o
@@ -1041,65 +1045,137 @@ fn same_objects(doc: &Document, a: &Paragraph, b: &Paragraph) -> bool {
 /// Words with the spaces after them ("The ", "cat "), or single characters, and the objects
 /// between them. Objects with text (fields, equations…) count as their text.
 ///
-/// Each token carries the byte offset in the paragraph's text where it starts, so the token
-/// keeps its own run's formatting when the diff puts it back.
-fn tokens(p: &Paragraph, characters: bool) -> Vec<(Tok<'_>, usize)> {
-    fn push(v: &mut Vec<(Tok<'_>, usize)>, cur: &mut String, start: &mut Option<usize>, off: usize, c: char, characters: bool) {
-        if start.is_none() {
-            *start = Some(off);
+/// Each token carries the byte offset in the paragraph's text where it starts and the formatting
+/// of each stretch of it, so a word that spans a formatting boundary (a plain "N" then a bold
+/// "ew") is put back with both stretches' own props.
+type Token<'a> = (Tok<'a>, usize, Vec<(usize, CharProps)>);
+
+/// Collects the tokens of one paragraph with each character's own formatting.
+struct Tokens<'a> {
+    out: Vec<Token<'a>>,
+    text: String,
+    fmt: Vec<(usize, CharProps)>,
+    start: Option<usize>,
+}
+
+impl<'a> Tokens<'a> {
+    /// Adds `c`, formatted as `props` and starting at `off`; a space (or every character) ends
+    /// the token, as in a word diff.
+    fn push(&mut self, c: char, props: &CharProps, off: usize, characters: bool) {
+        if self.start.is_none() {
+            self.start = Some(off);
         }
-        cur.push(c);
-        if (characters || c == ' ')
-            && let Some(at) = start.take()
-        {
-            v.push((Tok::Text(std::mem::take(cur)), at));
+        self.text.push(c);
+        match self.fmt.last_mut() {
+            Some((len, last)) if last == props => *len += c.len_utf8(),
+            _ => self.fmt.push((c.len_utf8(), props.clone())),
+        }
+        if characters || c == ' ' {
+            self.flush();
         }
     }
-    let mut v = Vec::new();
-    let mut cur = String::new();
-    let mut start = None;
+
+    /// Adds an object, compared and kept whole.
+    fn object(&mut self, o: &'a InlineObject, off: usize) {
+        self.flush();
+        self.out.push((Tok::Obj(o), off, Vec::new()));
+    }
+
+    /// Ends the token being built, if there is one.
+    fn flush(&mut self) {
+        if let Some(off) = self.start.take() {
+            self.out.push((Tok::Text(std::mem::take(&mut self.text)), off, std::mem::take(&mut self.fmt)));
+        }
+    }
+}
+
+/// A paragraph's runs, read one character at a time: tokens visit characters in order, so the
+/// whole paragraph costs one pass over its runs instead of a scan per character.
+struct Runs<'a> {
+    runs: Vec<(std::ops::Range<usize>, &'a CharProps)>,
+    next: usize,
+    mark: &'a CharProps,
+}
+
+impl<'a> Runs<'a> {
+    fn new(p: &'a Paragraph) -> Runs<'a> {
+        Runs { runs: p.run_ranges().collect(), next: 0, mark: &p.mark }
+    }
+
+    /// The formatting of the character starting at `off`.
+    fn at(&mut self, off: usize) -> &'a CharProps {
+        loop {
+            let (end, start, props) = match self.runs.get(self.next) {
+                Some((range, props)) => (range.end, range.start, *props),
+                None => return self.mark,
+            };
+            if end <= off {
+                self.next += 1;
+            } else if start <= off {
+                return props;
+            } else {
+                return self.mark;
+            }
+        }
+    }
+}
+
+fn tokens(p: &Paragraph, characters: bool) -> Vec<Token<'_>> {
+    let mut v = Tokens { out: Vec::new(), text: String::new(), fmt: Vec::new(), start: None };
+    let mut runs = Runs::new(p);
     let mut objects = p.objects.iter();
     let mut off = 0usize;
     for c in p.text.chars() {
+        let props = runs.at(off);
         if c != OBJ {
-            push(&mut v, &mut cur, &mut start, off, c, characters);
+            v.push(c, props, off, characters);
             off += c.len_utf8();
             continue;
         }
-        if let Some(at) = start.take() {
-            v.push((Tok::Text(std::mem::take(&mut cur)), at));
-        }
+        v.flush();
         match objects.next() {
             Some(o) if o.plain_text().is_empty() => {
-                v.push((Tok::Obj(o), off));
+                v.object(o, off);
             }
-            Some(o) => o.plain_text().chars().for_each(|ch| push(&mut v, &mut cur, &mut start, off, ch, characters)),
+            Some(o) => o.plain_text().chars().for_each(|ch| v.push(ch, props, off, characters)),
             None => {
                 // A marker without its object (a broken paragraph): kept as a visible
                 // placeholder, so the loss shows in the result instead of vanishing.
                 log::warn!("compare: an object marker without its object");
-                push(&mut v, &mut cur, &mut start, off, char::REPLACEMENT_CHARACTER, characters);
+                v.push(char::REPLACEMENT_CHARACTER, props, off, characters);
             }
         }
         off += c.len_utf8();
     }
-    if let Some(at) = start.take() {
-        v.push((Tok::Text(std::mem::take(&mut cur)), at));
-    }
-    v
+    v.flush();
+    v.out
 }
 
-/// Add a token at the end of `p` with `props`.
-fn put(p: &mut Paragraph, t: Option<&Tok<'_>>, props: &CharProps) {
-    let at = p.len();
+/// Add a token at the end of `p`, in its own formatting: each stretch of the token keeps the
+/// formatting of the characters it came from, with `ins`/`del` as its revision mark.
+fn put(p: &mut Paragraph, tok: Option<&Token<'_>>, src: &Paragraph, ins: Option<u32>, del: Option<u32>) {
+    let Some((t, off, fmt)) = tok else { return };
+    let marked = |props: &CharProps| {
+        let mut props = props.clone();
+        props.ins = ins;
+        props.del = del;
+        props.fmt_change = None;
+        props
+    };
     match t {
-        Some(Tok::Text(t)) => {
-            let _ = p.insert_text(at, t, props);
+        Tok::Obj(o) => {
+            let _ = p.insert_object(p.len(), (*o).clone(), &marked(src.props_of_char(*off)));
         }
-        Some(Tok::Obj(o)) => {
-            let _ = p.insert_object(at, (*o).clone(), props);
+        Tok::Text(text) => {
+            let mut at = 0usize;
+            for (len, props) in fmt {
+                let end = at.saturating_add(*len);
+                if let Some(seg) = text.get(at..end) {
+                    let _ = p.insert_text(p.len(), seg, &marked(props));
+                }
+                at = end;
+            }
         }
-        None => {}
     }
 }
 
@@ -1131,7 +1207,7 @@ fn word_diff(doc: &Document, a: &Paragraph, b: &Paragraph, run: &CompareRun<'_>,
         false
     };
     let (ta, tb) = (tokens(a, chars), tokens(b, chars));
-    let key = |t: &(Tok<'_>, usize)| match &t.0 {
+    let key = |t: &Token<'_>| match &t.0 {
         Tok::Text(t) => Key::Text(ctx.opts.key(t)),
         Tok::Obj(o) => obj_key(doc, o),
     };
@@ -1152,32 +1228,19 @@ fn word_diff(doc: &Document, a: &Paragraph, b: &Paragraph, run: &CompareRun<'_>,
             Op::Same => {
                 // Equal as compared (perhaps up to case or spacing): the revised text and its
                 // own formatting, so accepting the text keeps the revised runs.
-                put(&mut p, tb.get(j).map(|(t, _)| t), &token_props(b, tb.get(j)));
+                put(&mut p, tb.get(j), b, None, None);
                 i += 1;
                 j += 1;
             }
             Op::Del => {
-                let mut props = token_props(a, ta.get(i));
-                props.del = Some(ctx.del);
-                put(&mut p, ta.get(i).map(|(t, _)| t), &props);
+                put(&mut p, ta.get(i), a, None, Some(ctx.del));
                 i += 1;
             }
             Op::Ins => {
-                let mut props = token_props(b, tb.get(j));
-                props.ins = Some(ctx.ins);
-                put(&mut p, tb.get(j).map(|(t, _)| t), &props);
+                put(&mut p, tb.get(j), b, Some(ctx.ins), None);
                 j += 1;
             }
         }
     }
     p
-}
-
-/// The formatting of the run a token starts at, without the source paragraph's revision marks.
-fn token_props(p: &Paragraph, t: Option<&(Tok<'_>, usize)>) -> CharProps {
-    let mut props = t.map(|(_, off)| p.props_of_char(*off).clone()).unwrap_or_default();
-    props.ins = None;
-    props.del = None;
-    props.fmt_change = None;
-    props
 }

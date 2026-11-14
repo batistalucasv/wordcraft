@@ -57,6 +57,21 @@ impl Document {
     }
 }
 
+/// The header/footer selection flags Compare turned on for the First and Even stories it inserted,
+/// with the values they had before, so `Reject All` can put them back (#5837).
+///
+/// It belongs to the document, not the session: a comparison result that is saved, reopened and
+/// then rejected must restore the flags the original had.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default, rename_all = "camelCase")]
+pub struct CompareHfFlags {
+    /// Sections whose `title_page` compare turned on: the section's end block (`None` = the last
+    /// section) and the value it had.
+    pub title_page: Vec<(Option<usize>, bool)>,
+    /// `even_odd_headers` before compare turned it on.
+    pub even_odd: Option<bool>,
+}
+
 /// A building block (Insert › Quick Parts, AutoText…) kept in the document's glossary
 /// (ECMA-376 §17.12: `w:docPart`).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]

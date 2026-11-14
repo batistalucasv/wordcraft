@@ -83,6 +83,10 @@ impl<'d> EmbedWriter<'d> {
         if doc.fit_state.is_some() {
             taken.insert(crate::fit::PART.to_ascii_lowercase());
         }
+        // The Compare flag record is written at this path on save, like it.
+        if doc.compare_hf.is_some() {
+            taken.insert(crate::compare_hf::PART.to_ascii_lowercase());
+        }
         // The macro project's parts keep their names (see `write_as`).
         if let Some(m) = doc.passthrough.get(VBA_RELATED) {
             for line in String::from_utf8_lossy(m).lines() {

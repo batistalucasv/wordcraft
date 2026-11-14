@@ -9,6 +9,7 @@
 
 mod bibliography;
 mod chart_spec;
+mod compare_hf;
 mod crypt;
 mod custom;
 mod fit;
