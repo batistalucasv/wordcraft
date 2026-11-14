@@ -2209,6 +2209,28 @@ fn thai_cluster_splitting_leaves_other_scripts_alone() {
     assert_eq!(parts[2..], [7..10, 13..16, 10..13, 13..16], "the Thai base, tone mark and vowel split");
 }
 
+/// A font that draws SARA AM as one precomposed glyph gets the base and vowel ranges (#5883).
+#[test]
+fn precomposed_sara_am_takes_its_own_range() {
+    let text = "นำ";
+    let glyphs = [(1, 0.0, 0.0), (2, 10.0, 0.0)];
+    let ranges = [0..6, 0..6];
+    let rev: std::collections::HashMap<u32, char> = [(1, 'น'), (2, '\u{0E33}')].into_iter().collect();
+    assert_eq!(split_clusters(text, &glyphs, &ranges, &rev), [0..3, 3..6]);
+}
+
+/// Glyphs that don't match the NIKHAHIT/SARA AA structure keep the shared mark range, so
+/// `/ActualText` still carries the original text (#5883).
+#[test]
+fn unexpected_thai_glyph_order_keeps_the_shared_range() {
+    let text = "น้ำ";
+    // The glyph after the base is the tone mark, not NIKHAHIT.
+    let glyphs = [(1, 0.0, 0.0), (2, 10.0, 0.0), (3, 11.0, 0.0), (4, 12.0, 0.0)];
+    let ranges = [0..9, 0..9, 0..9, 0..9];
+    let rev: std::collections::HashMap<u32, char> = [(1, 'น'), (2, '\u{0E49}'), (3, '\u{0E4D}'), (4, '\u{0E32}')].into_iter().collect();
+    assert_eq!(split_clusters(text, &glyphs, &ranges, &rev), [0..3, 3..9, 3..9, 3..9]);
+}
+
 /// The image XObjects in a PDF: (width, height, filters, decoded samples per pixel).
 fn pdf_images(bytes: &[u8]) -> Vec<(u32, u32, Vec<String>, Vec<Vec<u8>>)> {
     use hayro_syntax::object::{Name, Object};
