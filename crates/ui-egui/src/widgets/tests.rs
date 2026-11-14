@@ -586,21 +586,33 @@ fn uninstalled_current_font_not_in_list_commits_box_text_on_enter_without_replac
     h.run_steps(2);
     assert_eq!(picked.borrow().as_deref(), Some("Courier New"), "ArrowDown moves highlight to first available font");
 
-    // Re-open, type partial query "ti", blur/refocus while open: verify query is not re-selected
+    // Re-open, type partial query "co", lose and regain focus while pointer is over the popup:
+    // verify the dropdown stays open and the query is not re-selected.
     *picked.borrow_mut() = None;
     h.get(By::new().role(Role::TextInput)).click();
     h.run_steps(2);
-    h.event(egui::Event::Text("ti".into()));
+    h.event(egui::Event::Text("co".into()));
     h.run_steps(2);
-    assert_eq!(h.get(By::new().role(Role::TextInput)).value().as_deref(), Some("ti"));
+    assert_eq!(h.get(By::new().role(Role::TextInput)).value().as_deref(), Some("co"));
+    let popup_pos = h.get_by_label("Courier New").rect().center();
 
-    // Simulating focus cycle while dropdown is already open (e.g. scrollbar click / refocus)
+    // Move pointer over the popup and force a genuine blur + refocus cycle while open.
+    h.event(egui::Event::PointerMoved(popup_pos));
+    h.step();
+    let te_id = h.ctx.memory(|m| m.focused()).expect("text input is focused before blur");
+    h.ctx.memory_mut(|m| m.surrender_focus(te_id));
+    assert!(!h.ctx.memory(|m| m.has_focus(te_id)), "text input lost focus before regaining it");
+
+    // Refocus while `was_open` is true so `resp.gained_focus()` actually fires.
     h.get(By::new().role(Role::TextInput)).focus();
     h.run_steps(2);
-    // Next keystroke should append rather than overwrite "ti"
-    h.event(egui::Event::Text("m".into()));
+    assert!(h.get(By::new().role(Role::TextInput)).is_focused(), "text input regains focus while popup remains open");
+    assert!(h.query_by_label("Courier New").is_some(), "dropdown remains open after regaining focus");
+
+    // Next keystroke should append rather than overwrite "co"
+    h.event(egui::Event::Text("u".into()));
     h.run_steps(2);
-    assert_eq!(h.get(By::new().role(Role::TextInput)).value().as_deref(), Some("tim"), "typing appends to existing query without re-selecting all");
+    assert_eq!(h.get(By::new().role(Role::TextInput)).value().as_deref(), Some("cou"), "typing appends to existing query without re-selecting all");
 }
 
 /// The rows of a sectioned font list, and where the keyboard highlight lands among them.
