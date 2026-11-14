@@ -1125,6 +1125,8 @@ fn flow_table(doc: &Document, t: &Table, depth: usize, tracked: FlowOpts) -> FTa
                     Some(Box::new(crate::model::CellPic { img, repeat: p.repeat, align: p.align }))
                 }),
                 width: None,
+                vmerge_restart: c.props.vmerge == VMerge::Restart,
+                synthetic_covered: false,
             });
         }
         rows.push(cells);

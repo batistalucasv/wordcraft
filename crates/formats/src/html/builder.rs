@@ -1240,6 +1240,7 @@ impl<'r> Builder<'r> {
                     }
                 }
                 let is_mso_vmerge_continue = decls(&css).any(|(k, v)| k == "mso-yfti-vmerge" && v.trim().eq_ignore_ascii_case("continue"));
+                let is_mso_vmerge_restart = decls(&css).any(|(k, v)| k == "mso-yfti-vmerge" && v.trim().eq_ignore_ascii_case("restart"));
                 let rowspan = attr(attrs, "rowspan").and_then(|v| v.trim().parse::<u32>().ok()).map(|v| v.clamp(1, 1000)).unwrap_or(1);
                 self.cells.push(Cell {
                     blocks: Vec::new(),
@@ -1254,6 +1255,8 @@ impl<'r> Builder<'r> {
                     direction: Default::default(),
                     picture: None,
                     width: if colspan == 1 { cell_width(&css, attrs) } else { None },
+                    vmerge_restart: is_mso_vmerge_restart,
+                    synthetic_covered: false,
                 });
                 fmt.background = None;
                 self.containers.push(Vec::new());

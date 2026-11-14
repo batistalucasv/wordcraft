@@ -884,6 +884,31 @@ fn covered_continuation_with_rowspan_expands_into_next_row() {
     assert_eq!(tb.rows[2].cells[0].props.vmerge, VMerge::Continue);
 }
 
+/// #5906: A plain `rowspan=2` cell `A` in col 0 followed by `B` (`vmerge:restart`) and `D`
+/// must still insert a placeholder for `A` in row 1 even when `B`'s explicit `vmerge:continue`
+/// is the first `<td>` in row 1.
+#[test]
+fn rowspan_before_explicit_vmerge_continue_keeps_grid_columns() {
+    use wordcraft_doc::props::VMerge;
+    let html = "<table>\
+        <tr><td rowspan='2'>A</td><td rowspan='2' style='mso-yfti-vmerge:restart'>B</td><td>D</td></tr>\
+        <tr><td style='mso-yfti-vmerge:continue'>B_cont</td><td>D1</td></tr>\
+    </table>";
+    let f = parse(html);
+    let doc = crate::model::to_doc(&f);
+    let wordcraft_doc::Block::Table(tb) = &*doc.body[0] else { panic!() };
+    assert_eq!(tb.rows.len(), 2);
+    assert_eq!(tb.rows[0].cells.len(), 3);
+    assert_eq!(tb.rows[1].cells.len(), 3, "row 1 should have placeholder for A, B_cont, and D1");
+    assert_eq!(tb.rows[1].cells[0].props.vmerge, VMerge::Continue);
+    assert_eq!(tb.rows[1].cells[1].props.vmerge, VMerge::Continue);
+    let wordcraft_doc::Block::Para(p1) = &*tb.rows[1].cells[1].blocks[0] else { panic!() };
+    assert_eq!(p1.text, "B_cont");
+    assert_eq!(tb.rows[1].cells[2].props.vmerge, VMerge::None);
+    let wordcraft_doc::Block::Para(p2) = &*tb.rows[1].cells[2].blocks[0] else { panic!() };
+    assert_eq!(p2.text, "D1");
+}
+
 #[test]
 fn cells_take_their_css_borders() {
     use wordcraft_doc::props::{Border, BorderStyle};
