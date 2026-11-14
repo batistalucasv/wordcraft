@@ -2567,7 +2567,7 @@ fn check_owned_ids(
 ) -> JoinCompletion {
     observation_contract! {
         rules: "ID-COMMENT-REF,REF-NOTE";
-        collections: "access.append*1,access.into_complete_set*1,access.invalidate*1,access.is_complete*1,access.prefix*1,access.project*1,field.collapsed_names*2,field.parts*2,type.HashSet*2,type.Observed*4,type.Vec*2";
+        collections: "access.append*1,access.into_complete_set*1,access.invalidate*1,access.is_complete*1,access.prefix*1,access.project*1,field.collapsed_names*2,field.content_types*1,field.entries*1,field.parts*2,type.HashSet*2,type.Observed*4,type.Vec*2";
         scope: "each established owner and its selected supporting sources; shared parts in every owner; unowned references excluded; explicit no-root fallback only";
         loss: "source unavailable or malformed; XML event/depth budget; category allocation cap; unknown or ambiguous source discovery; source-local pooled-budget loss";
         fallback: "suppress only dependent absence directions and report Incomplete; independent owner and prefix findings survive";
@@ -2579,7 +2579,15 @@ fn check_owned_ids(
     let mut completion = JoinCompletion::vacuous();
     for (index, owner) in owners.iter().enumerate() {
         let index = OwnerId(index);
-        if owner_document_unreadable(pkg, owner) {
+        // An unknown main can leave a story-typed root outside the fallback scope.
+        // Its references were never joined, so vacuous success would overclaim coverage.
+        let unselected_root = matches!(owner, OwnerContext::Fallback)
+            && matches!(&pkg.main, Resolution::Unknown(_))
+            && pkg
+                .entries
+                .iter()
+                .any(|e| !e.is_dir && (is_main_typed(pkg, &e.name) || pkg.content_types.of(&e.name) == Some(package::GLOSSARY_CONTENT_TYPE)));
+        if owner_document_unreadable(pkg, owner) || unselected_root {
             completion.skipped = true;
             continue;
         }

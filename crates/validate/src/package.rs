@@ -727,10 +727,8 @@ fn check_duplicate_entries(dir: Option<&CentralDirectory>, unique_count: usize, 
     // read to see every stored name (a package may legally list the same name twice). The parse is
     // bounded by the entry budget, exactly as the entry loop is.
     let Some(dir) = dir else {
-        acc.note("the zip central directory could not be parsed; duplicate entry names were not checked".to_string());
-        // The parse did not run at all, so duplicate checking covered none of the directory. This is
-        // the all-or-nothing counterpart of the truncated parse below: a partial check is reported
-        // INCOMPLETE, so a completely unrun one must be too, rather than leaving a silent PASS.
+        // The selection helper has already distinguished unparsed from disputed bytes in
+        // its note. Neither path ran duplicate checking, so neither may claim a clean PASS.
         acc.set_incomplete();
         return (HashSet::new(), false);
     };
@@ -848,6 +846,10 @@ fn u64_at(b: &[u8], i: usize) -> Option<u64> {
 /// The parsed zip central directory: the raw records examined within the entry budget, and
 /// whether the budget stopped the parse before the last raw record.
 struct CentralDirectory<'a> {
+    /// Absolute byte offset actually used by the bounded parser (archive offset zero).
+    start: u64,
+    /// The selected footer's disk and count fields are consistent.
+    consistent: bool,
     /// The raw entry names examined, in stored order, including duplicate names.
     names: Vec<&'a [u8]>,
     /// Reader-equivalent decoded names, in the same bounded directory order.
@@ -866,11 +868,25 @@ fn reader_checked_directory<'a>(
     limit: usize,
     acc: &mut Acc,
 ) -> (Option<CentralDirectory<'a>>, bool) {
-    let cd = central_directory(bytes, limit);
-    if cd.as_ref().is_some_and(|dir| !directory_matches_reader(dir, zip)) {
-        // A different directory can invent duplicates and conceal real parts even when its
-        // count residual is zero. Do not derive findings or absence from its identities.
-        acc.note("the zip central directory's decoded names disagree with the reader; entry identities are unknown and dependent absence checks were skipped".to_string());
+    let selection = find_eocd(bytes);
+    let cd = selection.as_ref().and_then(|selected| central_directory(bytes, limit, selected));
+    let structural_disagreement = selection.as_ref().is_some_and(|selected| {
+        selected.disputed
+            || (cd.is_none()
+                && selected
+                    .directory
+                    .as_ref()
+                    .is_some_and(|directory| usize::try_from(directory.start).ok().and_then(|start| u32_at(bytes, start)) == Some(0x0201_4B50)))
+    });
+    if structural_disagreement || cd.as_ref().is_some_and(|dir| !dir.consistent || !directory_matches_reader(dir, zip)) {
+        // A different directory or an inconsistent count can invent duplicates even when
+        // decoded names and the residual agree. No finding may rely on those identities.
+        acc.note("the zip central directory's selection or decoded names disagree with the reader; entry identities are unknown and dependent absence checks were skipped".to_string());
+        (None, true)
+    } else if cd.is_none() {
+        // Retain the unsupported-layout path, including trailing data and prepended stubs.
+        // Unknown multiplicity can conceal a competing source, so suppress absence too.
+        acc.note("the zip central directory could not be parsed; duplicate entry names were not checked".to_string());
         (None, true)
     } else {
         (cd, false)
@@ -889,6 +905,13 @@ fn directory_matches_reader(dir: &CentralDirectory, zip: &zip::ZipArchive<Cursor
         package_loss: "independent";
     }
 
+    // Both starts are absolute: read.rs adds zip.offset() to the footer's relative
+    // offset before exposing central_directory_start(). This parser uses footer offsets
+    // as absolute and assumes archive offset zero; do not add the reader offset twice.
+    // Check selection even for capped prefixes, whose names cannot prove suffix equality.
+    if dir.start != zip.central_directory_start() || zip.offset() != 0 {
+        return false;
+    }
     // A capped prefix cannot establish equality with the unexamined suffix. Its existing
     // truncation handling retains prefix duplicate checks and reports incomplete coverage.
     if dir.truncated {
@@ -910,7 +933,7 @@ fn directory_matches_reader(dir: &CentralDirectory, zip: &zip::ZipArchive<Cursor
 /// decodes non-flagged names as CP437 (never lossy UTF-8), flagged names as lossy UTF-8,
 /// and applies Unicode Path overrides exactly as the reader does. Records past the entry budget
 /// remain unexamined and report INCOMPLETE rather than claiming coverage.
-fn central_directory<'a>(bytes: &'a [u8], limit: usize) -> Option<CentralDirectory<'a>> {
+fn central_directory<'a>(bytes: &'a [u8], limit: usize, selected: &EocdSelection) -> Option<CentralDirectory<'a>> {
     observation_contract! {
         rules: "-";
         collections: "type.Vec*2";
@@ -920,16 +943,9 @@ fn central_directory<'a>(bytes: &'a [u8], limit: usize) -> Option<CentralDirecto
         package_loss: "independent";
     }
 
-    let eocd = find_eocd(bytes)?;
-    let mut count = u64::from(u16_at(bytes, eocd + 10)?);
-    let mut cd_off = u64::from(u32_at(bytes, eocd + 16)?);
-    // zip 3.0.0's may_be_zip64 uses only these two sentinels. A size sentinel alone
-    // must not let a decoy ZIP64 record select a different directory than the reader.
-    if count == 0xFFFF || cd_off == 0xFFFF_FFFF {
-        let (c, o) = zip64_directory(bytes, eocd)?;
-        count = c;
-        cd_off = o;
-    }
+    let directory = selected.directory.as_ref()?;
+    let count = directory.count;
+    let cd_off = directory.start;
     if count > 1_000_000 {
         return None;
     }
@@ -952,40 +968,123 @@ fn central_directory<'a>(bytes: &'a [u8], limit: usize) -> Option<CentralDirecto
         decoded_names.push(decode_zip_name(name, u16_at(bytes, i + 8)? & 0x800 != 0, extra)?);
         names.push(name);
         i = i.checked_add(46 + name_len + extra_len + comment_len)?;
+        bytes.get(..i)?;
     }
-    Some(CentralDirectory { names, decoded_names, total: count, truncated })
+    // Only the declared count selects records: directory size and bytes before the
+    // footer do not bound the reader's walk. A capped prefix keeps its duplicate policy.
+    let consistent = directory.footer_consistent && (truncated || u64::try_from(names.len()).ok()? == count);
+    Some(CentralDirectory { start: cd_off, consistent, names, decoded_names, total: count, truncated })
 }
 
-/// The zip64 end-of-central-directory `(entry count, central directory offset)`.
-fn zip64_directory(bytes: &[u8], eocd: usize) -> Option<(u64, u64)> {
+/// A footer's count-driven directory selection. Size is not a reader selection parameter.
+struct DirectoryView {
+    start: u64,
+    count: u64,
+    zip64: bool,
+    footer_consistent: bool,
+}
+impl DirectoryView {
+    fn tuple(&self) -> (u64, u64, bool) {
+        (self.start, self.count, self.zip64)
+    }
+}
+
+struct EocdSelection {
+    directory: Option<DirectoryView>,
+    disputed: bool,
+}
+
+/// The locator-targeted ZIP64 record only; never follow the reader's forward scan.
+fn zip64_directory(bytes: &[u8], eocd: usize) -> Option<DirectoryView> {
     let locator = eocd.checked_sub(20)?;
     if u32_at(bytes, locator)? != 0x0706_4B50 {
         return None;
     }
     let off = usize::try_from(u64_at(bytes, locator + 8)?).ok()?;
+    let expected = u64::try_from(locator.checked_sub(off)?).ok()?;
     if u32_at(bytes, off)? != 0x0606_4B50 {
         return None;
     }
-    Some((u64_at(bytes, off + 32)?, u64_at(bytes, off + 48)?))
+    let size = u64_at(bytes, off + 4)?;
+    let count = u64_at(bytes, off + 32)?;
+    let cd_off = u64_at(bytes, off + 48)?;
+    // The locator is only a hint to the reader. A non-adjacent record can steer this
+    // parser to a decoy; reject it rather than following the reader's forward scan.
+    if size < 44
+        || size.checked_add(12)? != expected
+        || u32_at(bytes, locator + 16)? > 1
+        || u32_at(bytes, off + 20)? != u32_at(bytes, locator + 4)?
+        || u32_at(bytes, off + 16)? != u32_at(bytes, off + 20)?
+        || u64_at(bytes, off + 24)? > count
+        || u16_at(bytes, off + 14)? > u16_at(bytes, off + 12)?
+        || u64::try_from(off).ok()? < count.saturating_mul(46).saturating_add(cd_off)
+    {
+        return None;
+    }
+    Some(DirectoryView { start: cd_off, count, zip64: true, footer_consistent: true })
 }
 
-/// The offset of the end-of-central-directory record, matched against the trailing comment length.
-fn find_eocd(bytes: &[u8]) -> Option<usize> {
+/// Select in the reader's backward order, then reject competing selection tuples.
+/// Exact-comment-end remains a layout eligibility guard, never a selection rule:
+/// removing it would newly parse trailing-data archives frozen as unsupported.
+fn find_eocd(bytes: &[u8]) -> Option<EocdSelection> {
     const SIG: [u8; 4] = [0x50, 0x4B, 0x05, 0x06];
+    const CDFH: [u8; 4] = [0x50, 0x4B, 0x01, 0x02];
     let start = bytes.len().saturating_sub(22 + 0xFFFF);
-    let mut i = bytes.len().checked_sub(22)?;
-    loop {
-        if bytes.get(i..i + 4) == Some(&SIG) {
-            let comment_len = usize::from(u16_at(bytes, i + 20)?);
-            if i + 22 + comment_len == bytes.len() {
-                return Some(i);
+    let end = bytes.len().checked_sub(22)?;
+    let mut exact_end = false;
+    let mut selected: Option<EocdSelection> = None;
+    // Existence of a CDFH in [relative offset, EOCD) is the ZIP32 finder predicate.
+    // Move this cursor only backward so many footer candidates cannot multiply a
+    // whole-file signature scan. We do not use the found position to parse records.
+    let mut last_header = bytes.get(..end)?.windows(4).rposition(|w| w == CDFH);
+    for i in (start..=end).rev() {
+        if bytes.get(i..i + 4) != Some(&SIG) {
+            continue;
+        }
+        let comment_end = i.checked_add(22)?.checked_add(usize::from(u16_at(bytes, i + 20)?))?;
+        exact_end |= comment_end == bytes.len();
+        if comment_end > bytes.len() {
+            continue;
+        }
+        if last_header.is_some_and(|header| header.checked_add(4).is_none_or(|after| after > i)) {
+            last_header = bytes.get(..i)?.windows(4).rposition(|w| w == CDFH);
+        }
+        let total = u64::from(u16_at(bytes, i + 10)?);
+        let offset = u64::from(u32_at(bytes, i + 16)?);
+        let zip64 = (total == 0xFFFF || offset == 0xFFFF_FFFF) && i.checked_sub(20).and_then(|locator| u32_at(bytes, locator)) == Some(0x0706_4B50);
+        let directory = if zip64 {
+            // An unsupported locator target is not permission to choose an earlier
+            // footer: the reader may accept it by scanning. Keep identity unknown.
+            zip64_directory(bytes, i)
+        } else {
+            if total != 0
+                && (offset >= u64::try_from(i).ok()? || !last_header.is_some_and(|header| u64::try_from(header).is_ok_and(|header| header >= offset)))
+            {
+                continue;
             }
+            // read.rs uses files-on-this-disk for ZIP32, not the total field.
+            let count = u64::from(u16_at(bytes, i + 8)?);
+            Some(DirectoryView {
+                start: offset,
+                count,
+                zip64: false,
+                // Disk mismatch is rejected only after spec.rs selects this footer.
+                // Reject its identities rather than silently selecting an earlier one.
+                footer_consistent: count == total && u16_at(bytes, i + 4)? == u16_at(bytes, i + 6)?,
+            })
+        };
+        if let Some(first) = selected.as_mut() {
+            // No tuple can be established for an unsupported ZIP64 target. It
+            // cannot certify agreement with another candidate either.
+            if first.directory.as_ref().map(DirectoryView::tuple) != directory.as_ref().map(DirectoryView::tuple) || directory.is_none() {
+                first.disputed = true;
+            }
+        } else {
+            selected = Some(EocdSelection { directory, disputed: false });
         }
-        if i == start {
-            return None;
-        }
-        i -= 1;
     }
+    if exact_end { selected } else { None }
 }
 
 /// Check for package entries that differ only by ASCII case and report `PKG-CASE-COLLISION` findings.
