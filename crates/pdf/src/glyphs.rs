@@ -57,10 +57,49 @@ pub(crate) fn split_clusters(
                 && fc != '\u{0EB3}'
             {
                 let c_len = fc.len_utf8();
-                let consonant_range = r.start..r.start + c_len;
+                // HarfBuzz draws SARA AM as NIKHAHIT followed by SARA AA, with the cluster's
+                // other marks between them. A glyph can take only one ToUnicode mapping, and
+                // these glyphs are reused in other clusters (`นำ` and `น้ำ`), so the two vowel
+                // glyphs share the vowel's range and each mark takes its own. `glyphs()` then
+                // writes them in text order.
+                let chars: Vec<(usize, char)> = t.char_indices().collect();
+                let marks = chars.len().saturating_sub(2);
+                let nikhahit = |g: u32| matches!(rev.get(&g), Some('\u{0E4D}' | '\u{0ECD}'));
+                let sara_aa = |g: u32| matches!(rev.get(&g), Some('\u{0E32}' | '\u{0EB2}'));
+                let structure = matches!(chars.last().map(|c| c.1), Some('\u{0E33}' | '\u{0EB3}'))
+                    && if n == 2 {
+                        marks == 0
+                    } else {
+                        marks == n - 3 && glyphs.get(i + 1).is_some_and(|g| nikhahit(g.0)) && glyphs.get(i + n - 1).is_some_and(|g| sara_aa(g.0))
+                    };
+                if structure && let Some(&(vowel_off, _)) = chars.last() {
+                    let mut parts = Vec::with_capacity(n);
+                    parts.push(r.start..r.start + chars.first().map_or(0, |c| c.1.len_utf8()));
+                    let vowel = (r.start + vowel_off)..r.end;
+                    if n == 2 {
+                        parts.push(vowel);
+                    } else {
+                        parts.push(vowel.clone());
+                        for k in 0..marks {
+                            let Some(&(a, ch)) = chars.get(k + 1) else { break };
+                            let a = r.start + a;
+                            parts.push(a..a + ch.len_utf8());
+                        }
+                        parts.push(vowel);
+                    }
+                    if parts.len() == n
+                        && let Some(dst) = out.get_mut(i..i + n)
+                    {
+                        dst.clone_from_slice(&parts);
+                        i += n;
+                        continue;
+                    }
+                }
+                // The glyphs don't line up with the characters: keep one range for the marks,
+                // and let `/ActualText` carry the original text (`t`).
                 let rest_range = (r.start + c_len)..r.end;
                 if let Some(first) = out.get_mut(i) {
-                    *first = consonant_range;
+                    *first = r.start..r.start + c_len;
                 }
                 for g in i + 1..i + n {
                     if let Some(slot) = out.get_mut(g) {

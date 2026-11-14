@@ -137,7 +137,18 @@ impl Exporter<'_> {
             ((0..glyphs.len()).collect(), ranges)
         } else {
             let parts = split_clusters(&txt, glyphs, &ranges, &self.cmap(face));
-            let order = if needs_reorder { visual_order(&txt, glyphs, &ranges, &parts) } else { (0..glyphs.len()).collect() };
+            let order = if needs_reorder {
+                visual_order(&txt, glyphs, &ranges, &parts)
+            } else if has_thai_or_lao_clusters && !is_rtl {
+                // Marks come out of shaping in visual order; write them in text order so a
+                // viewer without `/ActualText` reads the cluster as it is spelled. Right-to-left
+                // runs keep their visual order for the extractor to reverse.
+                let mut order: Vec<usize> = (0..glyphs.len()).collect();
+                order.sort_by_key(|&g| parts.get(g).map_or(usize::MAX, |r| r.start));
+                order
+            } else {
+                (0..glyphs.len()).collect()
+            };
             (order, Cow::Owned(parts))
         };
         let placed: Vec<(u32, f32, f32, std::ops::Range<usize>)> =

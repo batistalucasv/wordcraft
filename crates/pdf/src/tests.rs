@@ -2198,14 +2198,15 @@ fn right_to_left_clusters_are_written_whole_left_to_right() {
 #[test]
 fn thai_cluster_splitting_leaves_other_scripts_alone() {
     // "कि น้ำ": the Devanagari cluster is glyphs 1 (ि) and 2 (क) at 0..6; the Thai cluster is
-    // glyphs 3 (น), 4 (้) and 5 (ำ) at 7..16.
+    // glyphs 3 (น), 4 (nikhahit), 5 (tone) and 6 (sara aa) at 7..16, in shaping order.
     let text = "कि น้ำ";
-    let glyphs = [(1, 10.0, 0.0), (2, 0.0, 0.0), (3, 20.0, 0.0), (4, 21.0, 0.0), (5, 22.0, 0.0)];
-    let ranges = [0..6, 0..6, 7..16, 7..16, 7..16];
-    let rev: std::collections::HashMap<u32, char> = [(1, '\u{93F}'), (2, 'क'), (3, 'น'), (4, '\u{0E49}'), (5, '\u{0E33}')].into_iter().collect();
+    let glyphs = [(1, 10.0, 0.0), (2, 0.0, 0.0), (3, 20.0, 0.0), (4, 20.0, 0.0), (5, 20.0, 0.0), (6, 25.0, 0.0)];
+    let ranges = [0..6, 0..6, 7..16, 7..16, 7..16, 7..16];
+    let rev: std::collections::HashMap<u32, char> =
+        [(1, '\u{93F}'), (2, 'क'), (3, 'น'), (4, '\u{0E4D}'), (5, '\u{0E49}'), (6, '\u{0E32}')].into_iter().collect();
     let parts = split_clusters(text, &glyphs, &ranges, &rev);
     assert_eq!(parts[..2], [0..6, 0..6], "Devanagari keeps its shared logical range");
-    assert_eq!(parts[2..], [7..10, 10..16, 10..16], "the Thai base and its marks split");
+    assert_eq!(parts[2..], [7..10, 13..16, 10..13, 13..16], "the Thai base, tone mark and vowel split");
 }
 
 /// The image XObjects in a PDF: (width, height, filters, decoded samples per pixel).
@@ -3123,6 +3124,16 @@ fn lao_text_extracts_correctly() {
     assert!(text.contains("ສະບາຍດີ"), "{text:?}");
     assert!(text.contains("ນ້ຳດື່ມ"), "{text:?}");
     assert_eq!(text.trim(), "ສະບາຍດີ ນ້ຳດື່ມ");
+}
+
+/// A font glyph shared by `นำ` and `น้ำ` still extracts exactly through raw ToUnicode, without
+/// `/ActualText` filling in for it (#5883).
+#[test]
+fn thai_repeated_sara_am_raw_tounicode_is_exact() {
+    let d = Document::from_text("นำ น้ำ");
+    let bytes = export(&d, &PdfOptions::default()).unwrap();
+    let raw = extract_raw_tounicode_text(&bytes).concat();
+    assert_eq!(raw.trim(), "นำ น้ำ", "{raw:?}");
 }
 
 /// Verifies that mixed RTL and LTR text preserves correct visual and extraction ordering
