@@ -445,6 +445,11 @@ pub(crate) fn load(bytes: &[u8], acc: &mut Acc) -> Option<Package> {
     if let Resolution::Ambiguous(reason) = &glossary {
         acc.note(format!("ambiguous glossaryDocument selection: {reason}; owner-dependent document checks were skipped"));
         acc.set_incomplete();
+    } else if let Resolution::Unknown(reason) = &glossary {
+        acc.note(format!(
+            "unknown glossaryDocument selection: {reason}; no owner was established by selection; independently typed roots remain checkable"
+        ));
+        acc.set_incomplete();
     }
     let roots_ambiguous = main_ambiguous || glossary_ambiguous;
     let reachable = reachability(&rels, main_name);
@@ -512,7 +517,7 @@ fn competing_targets(rp: Option<&RelsPart>, matches: impl Fn(&str) -> bool) -> b
 fn glossary_part(entries: &[Entry], ct: &ContentTypes, rels: &[RelsPart], main: Option<&str>, entries_complete: bool) -> Resolution<String> {
     observation_contract! {
         rules: "-";
-        collections: "field.incomplete*2,field.rels*1";
+        collections: "field.incomplete*3,field.rels*1";
         scope: "source-local bounded extraction; no implicit document owner";
         loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
         fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
@@ -524,6 +529,9 @@ fn glossary_part(entries: &[Entry], ct: &ContentTypes, rels: &[RelsPart], main: 
         let rp = rels.iter().find(|r| r.name.eq_ignore_ascii_case(&want));
         if competing_targets(rp, |kind| relationship_kind(kind) == Some("glossaryDocument")) {
             return Resolution::Ambiguous("distinct official targets compete");
+        }
+        if rp.is_some_and(|r| r.incomplete) {
+            return Resolution::Unknown("glossaryDocument relationships were not fully examined");
         }
         if let Some(rp) = rp
             && let Some(r) = rp.rels.iter().find(|r| !r.external && r.role.kind() == Some("glossaryDocument"))
