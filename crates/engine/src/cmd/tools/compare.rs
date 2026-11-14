@@ -117,8 +117,8 @@ pub(super) fn compare(s: &mut Session, v: &Value) -> CmdResult {
                         // Same text, but objects (text boxes, pictures…) differ: diffed, so the
                         // original's objects aren't lost.
                         let mut p = word_diff(&s.doc, pa, pb, &mut ctx);
-                        if opts.formatting && pa.props.formatting() != pb.props.formatting() {
-                            crate::cmd::fmt_revisions::compare_formatting(pa, &mut p, &mut s.doc.revisions, &author, &date);
+                        if opts.formatting {
+                            crate::cmd::fmt_revisions::compare_para_props(pa, &mut p, &mut s.doc.revisions, &author, &date);
                         }
                         out.push(para_block(p));
                         changes += 1;
@@ -160,8 +160,8 @@ pub(super) fn compare(s: &mut Session, v: &Value) -> CmdResult {
                     match (a.map(|x| &**x), b.map(|x| &**x)) {
                         (Some(Block::Para(pa)), Some(Block::Para(pb))) => {
                             let mut p = word_diff(&s.doc, pa, pb, &mut ctx);
-                            if opts.formatting && pa.props.formatting() != pb.props.formatting() {
-                                crate::cmd::fmt_revisions::compare_formatting(pa, &mut p, &mut s.doc.revisions, &author, &date);
+                            if opts.formatting {
+                                crate::cmd::fmt_revisions::compare_para_props(pa, &mut p, &mut s.doc.revisions, &author, &date);
                             }
                             out.push(para_block(p));
                         }
@@ -249,9 +249,10 @@ fn sync_style_definitions(
                 updated.chr_change = None;
                 updated.para.fmt_change = None;
                 updated.chr.fmt_change = None;
-                let needs_remapping = updated.para.numbering.is_some_and(|n| {
-                    n.num != 0 && (old_st.para.numbering != Some(n) || !same_numbering(&s.doc.numbering, &revised.numbering, n.num))
-                });
+                let needs_remapping = !updated.numbering_from_base
+                    && updated.para.numbering.is_some_and(|n| {
+                        n.num != 0 && (old_st.para.numbering != Some(n) || !same_numbering(&s.doc.numbering, &revised.numbering, n.num))
+                    });
                 if needs_remapping {
                     remap_style_numbering(&mut s.doc, &revised.numbering, &mut updated.para.numbering, maps);
                 }
@@ -263,13 +264,7 @@ fn sync_style_definitions(
                 }
                 *target = updated;
             } else {
-                let mut added = new_st.clone();
-                added.para_change = None;
-                added.chr_change = None;
-                added.para.fmt_change = None;
-                added.chr.fmt_change = None;
-                remap_style_numbering(&mut s.doc, &revised.numbering, &mut added.para.numbering, maps);
-                result_styles.styles.push(added);
+                result_styles.styles.push(clone_revised_style_for_merge(&mut s.doc, &revised.numbering, new_st, maps));
             }
         }
         crate::cmd::fmt_revisions::recompute_inherited_numbering(&mut result_styles);
@@ -278,19 +273,32 @@ fn sync_style_definitions(
         let mut result_styles = (*s.doc.styles).clone();
         for new_st in &revised.styles.styles {
             if !result_styles.styles.iter().any(|st| st.id == new_st.id) {
-                let mut added = new_st.clone();
-                added.para_change = None;
-                added.chr_change = None;
-                added.para.fmt_change = None;
-                added.chr.fmt_change = None;
-                remap_style_numbering(&mut s.doc, &revised.numbering, &mut added.para.numbering, maps);
-                result_styles.styles.push(added);
+                result_styles.styles.push(clone_revised_style_for_merge(&mut s.doc, &revised.numbering, new_st, maps));
             }
         }
         crate::cmd::fmt_revisions::recompute_inherited_numbering(&mut result_styles);
         s.doc.styles = Arc::new(result_styles);
     }
     changes
+}
+
+/// Clone a revised-only style into the merged stylesheet, clearing any source revisions and
+/// remapping explicit list numbering without importing an orphan list for inheriting styles.
+fn clone_revised_style_for_merge(
+    doc: &mut Document,
+    revised_numbering: &wordcraft_doc::numbering::Numbering,
+    new_st: &wordcraft_doc::Style,
+    maps: &mut NumberingMaps,
+) -> wordcraft_doc::Style {
+    let mut added = new_st.clone();
+    added.para_change = None;
+    added.chr_change = None;
+    added.para.fmt_change = None;
+    added.chr.fmt_change = None;
+    if !added.numbering_from_base {
+        remap_style_numbering(doc, revised_numbering, &mut added.para.numbering, maps);
+    }
+    added
 }
 
 /// Whether numbering `id` names the same list in both documents: the instance and the abstract

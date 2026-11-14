@@ -1623,3 +1623,149 @@ fn compare_style_rejected_change_keeps_the_original_list_explicit() {
     let _ = std::fs::remove_file(orig_path);
     let _ = std::fs::remove_file(rev_path);
 }
+
+#[test]
+fn compare_word_diff_preserves_run_formatting_and_records_para_list_change() {
+    let mut original = Document::new();
+    let num1 = Arc::make_mut(&mut original.numbering).add_list(wordcraft_doc::numbering::ListKind::Numbered);
+    original.body = vec![Arc::new(wordcraft_doc::Block::Para(wordcraft_doc::Paragraph {
+        text: "Old cat.".into(),
+        runs: vec![
+            wordcraft_doc::Run { len: 4, props: wordcraft_doc::props::CharProps { bold: Some(true), ..Default::default() } },
+            wordcraft_doc::Run { len: 4, props: wordcraft_doc::props::CharProps { italic: Some(true), ..Default::default() } },
+        ],
+        props: wordcraft_doc::props::ParaProps { numbering: Some(wordcraft_doc::props::NumRef { num: num1, level: 0 }), ..Default::default() },
+        ..Default::default()
+    }))];
+    let orig_path = std::env::temp_dir().join(format!("wc-compare-wdiff-orig-{}.docx", std::process::id()));
+    std::fs::write(&orig_path, wordcraft_docx::write(&original).unwrap()).unwrap();
+
+    let mut revised = Document::new();
+    let num2 = Arc::make_mut(&mut revised.numbering).add_list(wordcraft_doc::numbering::ListKind::Bullet);
+    revised.body = vec![Arc::new(wordcraft_doc::Block::Para(wordcraft_doc::Paragraph {
+        text: "Old dog.".into(),
+        runs: vec![
+            wordcraft_doc::Run { len: 4, props: wordcraft_doc::props::CharProps { bold: Some(true), ..Default::default() } },
+            wordcraft_doc::Run { len: 4, props: wordcraft_doc::props::CharProps { italic: Some(true), ..Default::default() } },
+        ],
+        props: wordcraft_doc::props::ParaProps { numbering: Some(wordcraft_doc::props::NumRef { num: num2, level: 0 }), ..Default::default() },
+        ..Default::default()
+    }))];
+    let rev_path = std::env::temp_dir().join(format!("wc-compare-wdiff-rev-{}.docx", std::process::id()));
+    std::fs::write(&rev_path, wordcraft_docx::write(&revised).unwrap()).unwrap();
+
+    let mut s = Session::new(Document::new());
+    s.run("review.compare", &json!({"original": orig_path.to_string_lossy(), "path": rev_path.to_string_lossy()})).unwrap();
+    let p = s.doc.body[0].as_para().expect("diffed paragraph");
+    assert!(p.runs.iter().all(|r| r.props.fmt_change.is_none()), "word_diff must not record bogus offset-mismatched run fmt_change");
+    assert!(p.props.fmt_change.is_some(), "paragraph property difference recorded");
+
+    s.run("review.rejectAll", &json!({})).unwrap();
+    let p = s.doc.body[0].as_para().expect("rejected paragraph");
+    assert_eq!(p.plain_text(), "Old cat.");
+    assert_eq!(p.props.numbering, Some(wordcraft_doc::props::NumRef { num: num1, level: 0 }));
+
+    let _ = std::fs::remove_file(orig_path);
+    let _ = std::fs::remove_file(rev_path);
+}
+
+#[test]
+fn compare_matched_table_with_ignored_case_records_cell_para_list_change() {
+    let mut original = Document::new();
+    let num1 = Arc::make_mut(&mut original.numbering).add_list(wordcraft_doc::numbering::ListKind::Numbered);
+    let mut c1 = wordcraft_doc::table::Cell::with_text("Cell One");
+    if let wordcraft_doc::Block::Para(p) = Arc::make_mut(&mut c1.blocks[0]) {
+        p.props.numbering = Some(wordcraft_doc::props::NumRef { num: num1, level: 0 });
+    }
+    original.body = vec![Arc::new(wordcraft_doc::Block::Table(wordcraft_doc::table::Table {
+        rows: vec![wordcraft_doc::table::Row { cells: vec![c1], ..Default::default() }],
+        grid: vec![200.0],
+        ..Default::default()
+    }))];
+    let orig_path = std::env::temp_dir().join(format!("wc-compare-tbl-case-orig-{}.docx", std::process::id()));
+    std::fs::write(&orig_path, wordcraft_docx::write(&original).unwrap()).unwrap();
+
+    let mut revised = Document::new();
+    let num2 = Arc::make_mut(&mut revised.numbering).add_list(wordcraft_doc::numbering::ListKind::Bullet);
+    let mut c2 = wordcraft_doc::table::Cell::with_text("cell one");
+    if let wordcraft_doc::Block::Para(p) = Arc::make_mut(&mut c2.blocks[0]) {
+        p.props.numbering = Some(wordcraft_doc::props::NumRef { num: num2, level: 0 });
+    }
+    revised.body = vec![Arc::new(wordcraft_doc::Block::Table(wordcraft_doc::table::Table {
+        rows: vec![wordcraft_doc::table::Row { cells: vec![c2], ..Default::default() }],
+        grid: vec![200.0],
+        ..Default::default()
+    }))];
+    let rev_path = std::env::temp_dir().join(format!("wc-compare-tbl-case-rev-{}.docx", std::process::id()));
+    std::fs::write(&rev_path, wordcraft_docx::write(&revised).unwrap()).unwrap();
+
+    let mut s = Session::new(Document::new());
+    s.run("review.compare", &json!({"original": orig_path.to_string_lossy(), "path": rev_path.to_string_lossy(), "caseChanges": false})).unwrap();
+    let tbl = match &*s.doc.body[0] {
+        wordcraft_doc::Block::Table(t) => t,
+        _ => panic!("expected table"),
+    };
+    let cell_p = tbl.rows[0].cells[0].blocks[0].as_para().expect("cell paragraph");
+    assert!(cell_p.props.fmt_change.is_some(), "cell paragraph props change recorded despite ignored case difference");
+
+    s.run("review.rejectAll", &json!({})).unwrap();
+    let tbl = match &*s.doc.body[0] {
+        wordcraft_doc::Block::Table(t) => t,
+        _ => panic!("expected table after reject"),
+    };
+    let cell_p = tbl.rows[0].cells[0].blocks[0].as_para().expect("cell paragraph after reject");
+    assert_eq!(cell_p.props.numbering, Some(wordcraft_doc::props::NumRef { num: num1, level: 0 }));
+
+    let _ = std::fs::remove_file(orig_path);
+    let _ = std::fs::remove_file(rev_path);
+}
+
+#[test]
+fn compare_revised_only_inheriting_style_resolves_against_merged_base_without_orphan_list() {
+    let mut original = Document::from_text("Item");
+    let num_orig = Arc::make_mut(&mut original.numbering).add_list(wordcraft_doc::numbering::ListKind::Numbered);
+    Arc::make_mut(&mut original.styles).styles.push(wordcraft_doc::Style {
+        id: "Base".into(),
+        name: "Base".into(),
+        kind: wordcraft_doc::StyleKind::Paragraph,
+        para: wordcraft_doc::props::ParaProps { numbering: Some(wordcraft_doc::props::NumRef { num: num_orig, level: 0 }), ..Default::default() },
+        ..Default::default()
+    });
+    let orig_nums_before = original.numbering.nums.len();
+    let orig_path = std::env::temp_dir().join(format!("wc-compare-rev-inherit-orig-{}.docx", std::process::id()));
+    std::fs::write(&orig_path, wordcraft_docx::write(&original).unwrap()).unwrap();
+
+    let mut revised = Document::from_text("Item");
+    let num_rev = Arc::make_mut(&mut revised.numbering).add_list(wordcraft_doc::numbering::ListKind::Bullet);
+    {
+        let styles = Arc::make_mut(&mut revised.styles);
+        styles.styles.push(wordcraft_doc::Style {
+            id: "Base".into(),
+            name: "Base".into(),
+            kind: wordcraft_doc::StyleKind::Paragraph,
+            para: wordcraft_doc::props::ParaProps { numbering: Some(wordcraft_doc::props::NumRef { num: num_rev, level: 0 }), ..Default::default() },
+            ..Default::default()
+        });
+        styles.styles.push(wordcraft_doc::Style {
+            id: "Child".into(),
+            name: "Child".into(),
+            kind: wordcraft_doc::StyleKind::Paragraph,
+            based_on: Some("Base".into()),
+            para: wordcraft_doc::props::ParaProps { numbering: Some(wordcraft_doc::props::NumRef { num: num_rev, level: 1 }), ..Default::default() },
+            numbering_from_base: true,
+            ..Default::default()
+        });
+    }
+    let rev_path = std::env::temp_dir().join(format!("wc-compare-rev-inherit-rev-{}.docx", std::process::id()));
+    std::fs::write(&rev_path, wordcraft_docx::write(&revised).unwrap()).unwrap();
+
+    let mut s = Session::new(Document::new());
+    s.run("review.compare", &json!({"original": orig_path.to_string_lossy(), "path": rev_path.to_string_lossy(), "formatting": false})).unwrap();
+    let child = s.doc.styles.get("Child").expect("revised-only Child added");
+    assert!(child.numbering_from_base);
+    assert_eq!(child.para.numbering, Some(wordcraft_doc::props::NumRef { num: num_orig, level: 1 }));
+    assert_eq!(s.doc.numbering.nums.len(), orig_nums_before, "inheriting revised-only style must not import an orphan list");
+
+    let _ = std::fs::remove_file(orig_path);
+    let _ = std::fs::remove_file(rev_path);
+}

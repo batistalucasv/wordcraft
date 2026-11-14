@@ -139,12 +139,18 @@ fn navigated_style(s: &Session) -> Option<StyleTarget> {
 /// Accept or reject the navigated style change alone: that revision in that style. Returns whether
 /// it was still there.
 fn resolve_style_change(s: &mut Session, t: &StyleTarget, accept: bool) -> bool {
-    let revs = |st: &wordcraft_doc::styles::Style| [st.para_change.as_ref().map(|c| c.rev), st.chr_change.as_ref().map(|c| c.rev)];
+    let revs = |st: &wordcraft_doc::styles::Style| {
+        [st.para_change.as_ref().or(st.para.fmt_change.as_ref()).map(|c| c.rev), st.chr_change.as_ref().or(st.chr.fmt_change.as_ref()).map(|c| c.rev)]
+    };
     if !s.doc.styles.styles.iter().any(|st| st.id == t.style && revs(st).contains(&Some(t.rev))) {
         return false;
     }
-    for st in std::sync::Arc::make_mut(&mut s.doc.styles).styles.iter_mut().filter(|st| st.id == t.style) {
+    let sheet = std::sync::Arc::make_mut(&mut s.doc.styles);
+    for st in sheet.styles.iter_mut().filter(|st| st.id == t.style) {
         fmt_revisions::resolve_style_rev(st, t.rev, accept);
+    }
+    if !accept {
+        fmt_revisions::recompute_inherited_numbering(sheet);
     }
     true
 }

@@ -144,6 +144,10 @@ impl Recorder<'_> {
 
     /// Record formatting changes between matching blocks in `before` and `after`.
     fn blocks(&mut self, before: &Blocks, after: &mut Blocks, depth: usize) {
+        self.blocks_with(before, after, depth, false);
+    }
+
+    fn blocks_with(&mut self, before: &Blocks, after: &mut Blocks, depth: usize, compare_table: bool) {
         if before.len() != after.len() || depth > MAX_DEPTH {
             return;
         }
@@ -152,9 +156,14 @@ impl Recorder<'_> {
                 continue;
             }
             match (&**b, &**a) {
-                (Block::Para(pb), Block::Para(pa)) if pb.text == pa.text => {
+                (Block::Para(pb), Block::Para(pa)) if pb.text == pa.text || compare_table => {
+                    let same_text = pb.text == pa.text;
                     if let Block::Para(pa) = Arc::make_mut(a) {
-                        self.para(pb, pa);
+                        if same_text {
+                            self.para(pb, pa);
+                        } else if let Some(Replacement(w)) = self.change(&pb.props, &pa.props, ParaProps::formatting, |p| &p.fmt_change) {
+                            pa.props.fmt_change = w;
+                        }
                         // The section's properties on the paragraph (`w:sectPrChange`).
                         let (Some(b), Some(x)) = (pb.section.as_deref(), pa.section.as_deref_mut()) else { continue };
                         if let Some(Replacement(w)) = self.change(b, x, strip_section, |s| &s.fmt_change) {
@@ -164,7 +173,7 @@ impl Recorder<'_> {
                 }
                 (Block::Table(tb), Block::Table(ta)) if tb.rows.len() == ta.rows.len() && tb.grid == ta.grid => {
                     let Block::Table(ta) = Arc::make_mut(a) else { continue };
-                    self.table(tb, ta, depth);
+                    self.table_with(tb, ta, depth, compare_table);
                 }
                 _ => {}
             }
@@ -172,7 +181,7 @@ impl Recorder<'_> {
     }
 
     /// Record formatting changes between matching table rows, cells, and nested blocks.
-    fn table(&mut self, tb: &Table, ta: &mut Table, depth: usize) {
+    fn table_with(&mut self, tb: &Table, ta: &mut Table, depth: usize, compare_table: bool) {
         if tb.rows.len() != ta.rows.len() || tb.grid != ta.grid || depth > MAX_DEPTH {
             return;
         }
@@ -191,7 +200,7 @@ impl Recorder<'_> {
                 if let Some(Replacement(w)) = self.change(&cb.props, &ca.props, strip_cell, |c| &c.fmt_change) {
                     ca.props.fmt_change = w;
                 }
-                self.blocks(&cb.blocks, &mut ca.blocks, depth + 1);
+                self.blocks_with(&cb.blocks, &mut ca.blocks, depth + 1, compare_table);
             }
         }
     }
@@ -311,11 +320,20 @@ pub(crate) fn compare_formatting(old: &Paragraph, new: &mut Paragraph, revisions
     r.para(old, new);
 }
 
+/// Compare Documents: record paragraph-level property differences between `old` and `new` without
+/// touching run formatting (for paired paragraphs whose text was word-diffed).
+pub(crate) fn compare_para_props(old: &Paragraph, new: &mut Paragraph, revisions: &mut Vec<Revision>, author: &str, date: &str) {
+    let mut r = Recorder { author: author.to_string(), date: date.to_string(), before: &[], revisions, rid: None };
+    if let Some(Replacement(w)) = r.change(&old.props, &new.props, ParaProps::formatting, |p| &p.fmt_change) {
+        new.props.fmt_change = w;
+    }
+}
+
 /// Compare Documents: record formatting changes between `old` table and `new` table as
 /// tracked formatting changes by `author`.
 pub(crate) fn compare_table_formatting(old: &Table, new: &mut Table, revisions: &mut Vec<Revision>, author: &str, date: &str) {
     let mut r = Recorder { author: author.to_string(), date: date.to_string(), before: &[], revisions, rid: None };
-    r.table(old, new, 0);
+    r.table_with(old, new, 0, true);
 }
 
 /// Compare Documents: record how style `new` is formatted differently from `old` as

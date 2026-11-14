@@ -601,3 +601,45 @@ fn rejecting_an_explicit_old_list_survives_save_and_reload() {
     assert_eq!(child.para.numbering, Some(NumRef { num: 42, level: 1 }), "save and reload keep the rejected list");
     assert!(!child.numbering_from_base);
 }
+
+#[test]
+fn tracked_style_edit_preserves_old_numbering_from_base_and_individual_reject_recomputes_child() {
+    let mut doc = Document::from_text("Item");
+    {
+        let styles = Arc::make_mut(&mut doc.styles);
+        styles.styles.push(Style {
+            id: "Base".into(),
+            name: "Base".into(),
+            kind: StyleKind::Paragraph,
+            para: ParaProps { numbering: Some(NumRef { num: 42, level: 0 }), ..Default::default() },
+            ..Default::default()
+        });
+        styles.styles.push(Style {
+            id: "Child".into(),
+            name: "Child".into(),
+            kind: StyleKind::Paragraph,
+            based_on: Some("Base".into()),
+            para: ParaProps { numbering: Some(NumRef { num: 42, level: 1 }), ..Default::default() },
+            numbering_from_base: true,
+            ..Default::default()
+        });
+    }
+    let mut s = Session::new(doc);
+    s.doc.settings.track_changes = true;
+    // First tracked edit of Child's paragraph alignment should capture Child's numbering_from_base (true).
+    run(&mut s, "styles.modify", json!({"style": "Child", "para": {"align": "center"}}));
+    let child = s.doc.styles.get("Child").expect("Child");
+    assert!(child.old_numbering_from_base, "first edit captures current numbering_from_base");
+    // Same author modifies Child again: old_numbering_from_base stays true.
+    run(&mut s, "styles.modify", json!({"style": "Child", "para": {"align": "right"}}));
+    let child = s.doc.styles.get("Child").expect("Child");
+    assert!(child.old_numbering_from_base, "same-author follow-up preserves old_numbering_from_base");
+
+    // Individually reject Child's own change and confirm numbering_from_base stays true.
+    run(&mut s, "review.nextChange", json!({}));
+    run(&mut s, "review.reject", json!({}));
+    let child = s.doc.styles.get("Child").expect("Child after reject");
+    assert!(child.numbering_from_base);
+    assert_eq!(child.para.align, None);
+    assert_eq!(child.para.numbering, Some(NumRef { num: 42, level: 1 }));
+}
