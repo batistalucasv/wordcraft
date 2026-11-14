@@ -819,6 +819,83 @@ fn decode_zip_name<'a>(mut raw: &'a [u8], utf8: bool, extra: &'a [u8]) -> Option
     }
 }
 
+/// Reject records the reader cannot include in its central table. `by_index_raw`
+/// would parse local headers, initialize data-start caches and seek the archive;
+/// do not make directory identity depend on opening a part a second time.
+/// The walk already bounds these fields to their 16-bit lengths. Reader-rejected
+/// metadata leaves identity unknown rather than allowing a retry to invent duplicates.
+fn reader_accepts_central_record(header: &[u8], extra: &[u8], comment: &[u8], directory_start: u64) -> Option<()> {
+    let mut local = u64::from(u32_at(header, 42)?);
+    let mut compressed = u64::from(u32_at(header, 20)?);
+    let mut uncompressed = u64::from(u32_at(header, 24)?);
+    let mut method = u16_at(header, 10)?;
+    let mut aes = false;
+    let mut decoded_comment = None;
+    let mut offset = 0usize;
+    'extras: while offset < extra.len() {
+        let tag = u16_at(extra, offset)?;
+        let len = u16_at(extra, offset + 2)?;
+        offset = offset.checked_add(4)?;
+        let end = offset.checked_add(usize::from(len))?;
+        let field = extra.get(offset..end)?;
+        match tag {
+            0x0001 => {
+                // ZIP64 consumes each sentinel field, or all three for len >= 24.
+                let mut at = 0usize;
+                for value in [&mut uncompressed, &mut compressed, &mut local] {
+                    if len >= 24 || *value == u64::from(u32::MAX) {
+                        // The reader ignores extra-parser I/O errors, retaining
+                        // any ZIP64 values read before the short read.
+                        let Some(next) = u64_at(extra, offset.checked_add(at)?) else { break 'extras };
+                        *value = next;
+                        at = at.checked_add(8)?;
+                    }
+                }
+                field.get(at..)?;
+            }
+            0x000a => match zip::extra_fields::Ntfs::try_from_reader(&mut Cursor::new(extra.get(offset..)?), len) {
+                Ok(_) => {}
+                Err(zip::result::ZipError::Io(_)) => break,
+                Err(_) => return None,
+            },
+            0x9901 => {
+                if len != 7 || u16_at(field, 2)? != 0x4541 || !matches!(u16_at(field, 0)?, 1 | 2) || !matches!(*field.get(4)?, 1..=3) {
+                    return None;
+                }
+                aes = true;
+                method = u16_at(field, 5)?;
+            }
+            0x5455 => match zip::extra_fields::ExtendedTimestamp::try_from_reader(&mut Cursor::new(extra.get(offset..)?), len) {
+                Ok(_) => {}
+                Err(zip::result::ZipError::Io(_)) => break,
+                Err(_) => return None,
+            },
+            0x6375 => {
+                // Unicode Comment checks the current decoded comment, unlike Path,
+                // which checks raw name bytes in decode_zip_name.
+                // Its version and CRC are read before the length is validated;
+                // a short read ends extra parsing without rejecting the record.
+                if extra.get(offset..offset.checked_add(5)?).is_none() {
+                    break;
+                }
+                let current = match decoded_comment.take() {
+                    Some(current) => current,
+                    None => decode_zip_name(comment, u16_at(header, 8)? & 0x800 != 0, &[])?,
+                };
+                if u32_at(field, 1)? != name_crc32(current.as_bytes()) {
+                    return None;
+                }
+                decoded_comment = Some(std::str::from_utf8(field.get(5..)?).ok()?.to_string());
+            }
+            _ => {}
+        }
+        offset = end;
+    }
+    // The reader checks the final method after applying AES extra fields and the
+    // final ZIP64 local offset before accepting this record into its table.
+    if (method == 99 && !aes) || local >= directory_start { None } else { Some(()) }
+}
+
 /// CP437's upper half; ASCII/control bytes in the lower half keep their byte values.
 const CP437_HIGH: [char; 128] = [
     'Ç', 'ü', 'é', 'â', 'ä', 'à', 'å', 'ç', 'ê', 'ë', 'è', 'ï', 'î', 'ì', 'Ä', 'Å', 'É', 'æ', 'Æ', 'ô', 'ö', 'ò', 'û', 'ù', 'ÿ', 'Ö', 'Ü', '¢', '£',
@@ -938,7 +1015,7 @@ fn central_directory<'a>(bytes: &'a [u8], limit: usize, selected: &EocdSelection
         rules: "-";
         collections: "type.Vec*2";
         scope: "source-local bounded extraction; no implicit document owner";
-        loss: "source unavailable or malformed; XML event/depth budget; category allocation cap";
+        loss: "source unavailable or malformed; reader-rejected central record; XML event/depth budget; category allocation cap";
         fallback: "retain proven prefix presence and duplicates; return loss to the caller; no negative membership from an incomplete set";
         package_loss: "independent";
     }
@@ -964,6 +1041,8 @@ fn central_directory<'a>(bytes: &'a [u8], limit: usize, selected: &EocdSelection
         let comment_len = usize::from(u16_at(bytes, i + 32)?);
         let name = bytes.get(i + 46..i + 46 + name_len)?;
         let extra = bytes.get(i + 46 + name_len..i + 46 + name_len + extra_len)?;
+        let comment = bytes.get(i + 46 + name_len + extra_len..i + 46 + name_len + extra_len + comment_len)?;
+        reader_accepts_central_record(bytes.get(i..i + 46)?, extra, comment, cd_off)?;
         // Validate the name metadata against the reader before trusting this directory record.
         decoded_names.push(decode_zip_name(name, u16_at(bytes, i + 8)? & 0x800 != 0, extra)?);
         names.push(name);

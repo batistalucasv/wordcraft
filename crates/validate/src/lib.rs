@@ -2579,14 +2579,18 @@ fn check_owned_ids(
     let mut completion = JoinCompletion::vacuous();
     for (index, owner) in owners.iter().enumerate() {
         let index = OwnerId(index);
-        // An unknown main can leave a story-typed root outside the fallback scope.
-        // Its references were never joined, so vacuous success would overclaim coverage.
+        // An unknown main can leave a typed or conventional document root outside
+        // the fallback scope. Its references were never joined, so vacuous success
+        // would overclaim coverage even when its content type is absent.
         let unselected_root = matches!(owner, OwnerContext::Fallback)
             && matches!(&pkg.main, Resolution::Unknown(_))
-            && pkg
-                .entries
-                .iter()
-                .any(|e| !e.is_dir && (is_main_typed(pkg, &e.name) || pkg.content_types.of(&e.name) == Some(package::GLOSSARY_CONTENT_TYPE)));
+            && pkg.entries.iter().any(|e| {
+                !e.is_dir
+                    && (is_main_typed(pkg, &e.name)
+                        || pkg.content_types.of(&e.name) == Some(package::GLOSSARY_CONTENT_TYPE)
+                        || e.name.eq_ignore_ascii_case("word/document.xml")
+                        || e.name.to_ascii_lowercase().ends_with("/glossary/document.xml"))
+            });
         if owner_document_unreadable(pkg, owner) || unselected_root {
             completion.skipped = true;
             continue;
