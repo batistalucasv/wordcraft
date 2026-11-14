@@ -1986,6 +1986,9 @@ fn check_part_refs(pkg: &Package, xml: &XmlScan, acc: &mut Acc) -> JoinCompletio
     }
 
     let mut completion = JoinCompletion::vacuous();
+    // An unreadable selected document is absent from xml.parts, but still owes a reference
+    // observation. Seed its skipped scope; independently completed parts retain their credit.
+    completion.skipped = owner_scopes(pkg).iter().any(|owner| owner_document_unreadable(pkg, owner));
     // Empty reference sets are obligations too: they cannot launder a skipped active part.
     for facts in xml.parts.values() {
         let part = &facts.name;
@@ -2530,6 +2533,27 @@ impl JoinCompletion {
     }
 }
 
+/// Only a selected document root carries this owner-wide skipped reference obligation.
+/// Never-loaded supporting stories retain amendment 4's independent-category policy.
+fn owner_document_unreadable(pkg: &Package, owner: &OwnerContext) -> bool {
+    observation_contract! {
+        rules: "-";
+        collections: "lookup.entry_by_name*1";
+        scope: "the selected main or glossary document root for one owner";
+        loss: "present document root excluded from scanning by unreadable bytes or text";
+        fallback: "mark its reference joins skipped; supporting parts retain their existing policy";
+        package_loss: "independent";
+    }
+
+    let Some(root) = owner.root() else { return false };
+    match package::entry_by_name(pkg, root) {
+        Resolution::One(entry) => entry.content_unavailable,
+        Resolution::Absent => false,
+        Resolution::Unknown(_) => false,
+        Resolution::Ambiguous(_) => false,
+    }
+}
+
 /// Join each owner's references only to the definition part reached by its own relationships.
 /// Unavailable or truncated discovery/definition sources cannot establish missing IDs.
 fn check_owned_ids(
@@ -2555,6 +2579,10 @@ fn check_owned_ids(
     let mut completion = JoinCompletion::vacuous();
     for (index, owner) in owners.iter().enumerate() {
         let index = OwnerId(index);
+        if owner_document_unreadable(pkg, owner) {
+            completion.skipped = true;
+            continue;
+        }
         let source = supporting_part(pkg, owner.root(), kind, ct, acc);
         let observed = match source {
             Resolution::One(entry) => {
@@ -2581,8 +2609,8 @@ fn check_owned_ids(
         let mut refs = Observed::default();
         for (part, facts) in &xml.parts {
             if owner_map.owners(part.as_str()).contains(&index) {
-                // A mid-scan stop invalidates every contributed category. Never-loaded parts
-                // contribute nothing; they do not turn unrelated reference categories incomplete.
+                // A mid-scan stop invalidates every contributed category. Never-loaded supporting
+                // parts contribute nothing; selected unreadable document roots were skipped above.
                 refs.append(references(&facts.facts));
                 // The retained copy cannot establish all references from a competing record.
                 // Keep its positive facts, but decide join completeness from the duplicate group.
