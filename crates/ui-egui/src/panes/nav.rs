@@ -94,7 +94,7 @@ pub(super) fn nav(app: &mut WordApp, ui: &mut Ui) {
                         app.ui.nav_collapsed.insert(path);
                     }
                 } else if r.clicked() {
-                    let _ = app.run("caret.set", json!({"pos": Pos { story: StoryRef::Body, path, off: 0 }}));
+                    let _ = app.run("caret.set", json!({"pos": Pos::new(StoryRef::Body, path, 0)}));
                     // Align the chosen heading's page immediately against this pane, rather
                     // than the indeterminate minimum movement from scroll_to_rect.
                     app.canvas.nav_to_caret = true;
