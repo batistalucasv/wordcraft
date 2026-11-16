@@ -915,7 +915,7 @@ fn paint_end_drag(app: &WordApp, d: &ObjectDrag, painter: &Painter, t: &Tokens, 
     if glues && let Some(pg) = layout.pages.get(d.object.page) {
         for it in &pg.items {
             let wordcraft_layout::Placed::Object { rect, spin, story: StoryRef::Body, path, off, .. } = it else { continue };
-            let pos = Pos { story: StoryRef::Body, path: path.clone(), off: *off };
+            let pos = Pos::new(StoryRef::Body, path.clone(), *off);
             let Some(InlineObject::Shape { kind, .. }) = app.session.doc.para_at(&pos).and_then(|p| p.object_at(pos.off)) else { continue };
             if kind.is_connector() || pos == d.object.pos() {
                 continue;
