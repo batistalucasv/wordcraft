@@ -5,7 +5,7 @@ use super::{
 use wordcraft_doc::para::OBJ;
 
 /// Compare and Combine take the same settings.
-pub(super) const COMPARE_PARAMS: &str = r#"{"path"?: string (revised document), "text"?: string (revised text), "original"?: string (original document; default: this one), "author"?: string (label changes with), "caseChanges"?: bool, "whiteSpace"?: bool, "formatting"?: bool (default true: differences count), "level"?: "word|character" (character: paragraphs over 2000 characters fall back to word; see characterFallback/notHonoured), "showIn"?: "original|revised|new" (revised/new: an untitled document), "moves"|"comments"|"tables"|"headersFooters"|"footnotes"|"textBoxes"|"fields"?: bool (accepted; not honoured yet except tables, always compared)}"#;
+pub(super) const COMPARE_PARAMS: &str = r#"{"path"?: string (revised document), "text"?: string (revised text), "original"?: string (original document; default: this one), "author"?: string (label changes with), "caseChanges"?: bool, "whiteSpace"?: bool, "formatting"?: bool (default true: differences count), "level"?: "word|character" (character: paragraphs over 2000 characters fall back to word; see characterFallback/notHonoured), "showIn"?: "original|revised|new" (revised/new: an untitled document), "moves"|"comments"|"tables"|"headersFooters"|"textBoxes"|"fields"?: bool (accepted; not honoured yet except tables, always compared), "footnotes"?: bool (default true: compare footnotes and endnotes)}"#;
 
 /// What Compare / Combine compares (the More >> settings of Word's dialog).
 struct CompareOptions {
@@ -34,6 +34,9 @@ struct DiffCtx<'a> {
     opts: &'a CompareOptions,
     budget: &'a mut u64,
     char_fallbacks: &'a mut usize,
+    revisions: &'a mut Vec<wordcraft_doc::Revision>,
+    author: &'a str,
+    date: &'a str,
     plain_revised: bool,
 }
 
@@ -44,14 +47,16 @@ const MAX_CHAR_DIFF: usize = 2000;
 /// Compare the current document (original, or `original` from a file) with a revised one: the
 /// result shows the differences as tracked insertions, deletions and formatting changes, labelled
 /// with `author`. Options Word offers that the comparison can't honour yet (moves, comments,
-/// headers and footers, footnotes, text boxes, fields) are accepted and listed in the result.
+/// headers and footers, text boxes, fields) are accepted and listed in the result. Footnotes and
+/// endnotes are compared by default (`footnotes`: true), tracking edits, insertions, deletions,
+/// and paragraph formatting changes within note stories.
 /// When character-level comparison is requested (`"level": "character"`) but any paragraph exceeds
 /// [`MAX_CHAR_DIFF`] characters, it falls back to word-level diff for that paragraph, surfaces the
 /// fallback count in `"characterFallback"`, and includes `"level"` in `"notHonoured"`.
 pub(super) fn compare(s: &mut Session, v: &Value) -> CmdResult {
     // A revised side given as plain text carries no real runs or properties; one opened from a
     // path does. The diff takes the revised formatting only in the latter case.
-    let (revised, plain_revised) = if let Some(t) = p::str(v, "text") {
+    let (mut revised, plain_revised) = if let Some(t) = p::str(v, "text") {
         (Document::from_text(t), true)
     } else if let Some(path) = p::str(v, "path") {
         (crate::io::open_path(std::path::Path::new(path)).map_err(CmdError::Failed)?, false)
@@ -76,10 +81,67 @@ pub(super) fn compare(s: &mut Session, v: &Value) -> CmdResult {
         formatting: p::bool(v, "formatting").unwrap_or(true),
         characters: matches!(level, "character" | "char"),
     };
+    let compare_notes = p::bool(v, "footnotes").unwrap_or(true);
     let mut not_honoured: Vec<&str> =
-        ["moves", "comments", "headersFooters", "footnotes", "textBoxes", "fields"].into_iter().filter(|k| v.get(*k).is_some()).collect();
+        ["moves", "comments", "headersFooters", "textBoxes", "fields"].into_iter().filter(|k| v.get(*k).is_some()).collect();
     let author = p::str(v, "author").map(str::trim).filter(|a| !a.is_empty()).map(str::to_string).unwrap_or_else(|| s.author.clone());
     let date = crate::cmd::now_iso();
+    let mut budget = MAX_COMPARE_CELLS;
+    let mut note_budget = MAX_NOTE_ALIGN_BUDGET;
+
+    reconcile_media(&mut s.doc, &mut revised);
+
+    let mut note_map = std::collections::HashMap::new();
+    let mut paired_notes = Vec::new();
+    let mut inserted_notes = Vec::new();
+    let mut deleted_notes = Vec::new();
+
+    let mut next_orphan_id = s.doc.parts.keys().next_back().copied().unwrap_or(0).saturating_add(10_000);
+    for kind in [wordcraft_doc::PartKind::Footnote, wordcraft_doc::PartKind::Endnote] {
+        let orig_ids = document_note_ids(&s.doc, kind);
+        let rev_ids = document_note_ids(&revised, kind);
+        let (paired, inserted, deleted) = align_notes(&s.doc, &orig_ids, &revised, &rev_ids, kind, &opts, &mut note_budget);
+        for (o, r) in paired {
+            note_map.insert(r, o);
+            if compare_notes {
+                paired_notes.push((o, r));
+            }
+        }
+        if compare_notes {
+            for r in inserted {
+                let blocks = revised.parts.get(&r).map(|p| p.blocks.clone()).unwrap_or_default();
+                let frag_blocks: Vec<Block> = blocks.iter().map(|b| (**b).clone()).collect();
+                let frag = wordcraft_doc::edit::Fragment {
+                    parts: revised.parts.iter().filter(|(_, p)| p.kind == wordcraft_doc::PartKind::TextBox).map(|(k, p)| (*k, p.clone())).collect(),
+                    media: revised.media_of_blocks(&frag_blocks),
+                    blocks: frag_blocks,
+                };
+                let adopted = s.doc.adopt_fragment(&frag);
+                let new_id = s.doc.add_part(kind, adopted.into_iter().map(Arc::new).collect());
+                note_map.insert(r, new_id);
+                inserted_notes.push((new_id, r));
+            }
+            deleted_notes.extend(deleted);
+        } else {
+            for r in inserted {
+                let orphan_id = next_orphan_id;
+                next_orphan_id = next_orphan_id.saturating_add(1);
+                note_map.insert(r, orphan_id);
+            }
+        }
+    }
+    if !note_map.is_empty() {
+        revised.body = revised.body.iter().map(|b| Arc::new(remap_note_refs(b, &note_map, 0))).collect();
+        for part in revised.parts.values_mut() {
+            part.blocks = part.blocks.iter().map(|b| Arc::new(remap_note_refs(b, &note_map, 0))).collect();
+        }
+        for &(new_id, _) in &inserted_notes {
+            if let Some(p) = s.doc.parts.get_mut(&new_id) {
+                p.blocks = p.blocks.iter().map(|b| Arc::new(remap_note_refs(b, &note_map, 0))).collect();
+            }
+        }
+    }
+
     let old: Vec<Arc<Block>> = s.doc.body.clone();
     let new: Vec<Arc<Block>> = if revised.parts.values().any(|p| p.kind == wordcraft_doc::PartKind::TextBox) {
         // The revised document's text boxes get stories of their own in the result, so its
@@ -92,80 +154,46 @@ pub(super) fn compare(s: &mut Session, v: &Value) -> CmdResult {
     let ins = (s.doc.revisions.len() - 1) as u32;
     s.doc.revisions.push(wordcraft_doc::Revision { kind: RevisionKind::Delete, author: author.clone(), date: date.clone(), move_name: None });
     let del = (s.doc.revisions.len() - 1) as u32;
-    let key = |b: &Arc<Block>| match &**b {
-        Block::Para(p) => opts.key(&p.plain_text()),
-        // Tables match as a whole, by their text.
-        Block::Table(_) => format!("\u{0}table\u{0}{}", opts.key(&block_text(b, 0))),
-    };
-    let mut budget = MAX_COMPARE_CELLS;
+
     let mut char_fallbacks = 0usize;
-    let ops = lcs_ops(&old.iter().map(key).collect::<Vec<_>>(), &new.iter().map(key).collect::<Vec<_>>(), &mut budget);
-    let mut ctx = DiffCtx { ins, del, opts: &opts, budget: &mut budget, char_fallbacks: &mut char_fallbacks, plain_revised };
-    let mut out: Vec<Arc<Block>> = Vec::new();
-    let (mut i, mut j) = (0usize, 0usize);
-    let mut changes = 0usize;
-    let mut k = 0;
-    while k < ops.len() {
-        match ops.get(k) {
-            Some(Op::Same) => {
-                let (a, b) = (old.get(i), new.get(j));
-                // The revised block, with its formatting changes tracked.
-                if let (Some(Block::Para(pa)), Some(Block::Para(pb))) = (a.map(|x| &**x), b.map(|x| &**x)) {
-                    if !same_objects(&s.doc, pa, pb) {
-                        // Same text, but objects (text boxes, pictures…) differ: diffed, so the
-                        // original's objects aren't lost.
-                        out.push(para_block(word_diff(&s.doc, pa, pb, &mut ctx)));
-                        changes += 1;
-                        i += 1;
-                        j += 1;
-                        k += 1;
-                        continue;
-                    }
-                    let mut p = pb.clone();
-                    if opts.formatting && pa.text == pb.text {
-                        let before = s.doc.revisions.len();
-                        crate::cmd::fmt_revisions::compare_formatting(pa, &mut p, &mut s.doc.revisions, &author, &date);
-                        if s.doc.revisions.len() > before || p != *pb {
-                            changes += 1;
-                        }
-                    }
-                    out.push(para_block(p));
-                } else if let Some(x) = b.or(a) {
-                    out.push(x.clone());
-                }
-                i += 1;
-                j += 1;
-                k += 1;
+    let run = CompareRun { ins, del, opts: &opts, author: &author, date: &date, plain_revised };
+    let (out, body_changes) = compare_blocks(&s.doc.parts, &mut s.doc.revisions, &run, &old, &new, &mut budget, &mut char_fallbacks);
+    s.doc.body = out;
+    let mut changes = body_changes;
+
+    if compare_notes {
+        for (orig_id, rev_id) in paired_notes {
+            let orig_blocks = s.doc.parts.get(&orig_id).map(|p| p.blocks.clone()).unwrap_or_default();
+            let rev_blocks_raw = revised.parts.get(&rev_id).map(|p| p.blocks.clone()).unwrap_or_default();
+            let frag_blocks: Vec<Block> = rev_blocks_raw.iter().map(|b| (**b).clone()).collect();
+            let frag = wordcraft_doc::edit::Fragment {
+                parts: revised.parts.iter().filter(|(_, p)| p.kind == wordcraft_doc::PartKind::TextBox).map(|(k, p)| (*k, p.clone())).collect(),
+                media: revised.media_of_blocks(&frag_blocks),
+                blocks: frag_blocks,
+            };
+            let rev_blocks: Vec<Arc<Block>> = if revised.parts.values().any(|p| p.kind == wordcraft_doc::PartKind::TextBox) {
+                s.doc.adopt_fragment(&frag).into_iter().map(Arc::new).collect()
+            } else {
+                rev_blocks_raw
+            };
+            let (note_out, note_changes) =
+                compare_blocks(&s.doc.parts, &mut s.doc.revisions, &run, &orig_blocks, &rev_blocks, &mut budget, &mut char_fallbacks);
+            if let Some(part) = s.doc.parts.get_mut(&orig_id) {
+                part.blocks = note_out;
             }
-            Some(_) => {
-                // A run of deletions and insertions: changed paragraphs pair up and are diffed
-                // word by word (or by character); the rest are deleted or inserted whole.
-                let run = ops.get(k..).unwrap_or_default().iter().take_while(|o| **o != Op::Same).count();
-                let dels = ops.get(k..k + run).unwrap_or_default().iter().filter(|o| **o == Op::Del).count();
-                let inss = run - dels;
-                for x in 0..dels.max(inss) {
-                    let (a, b) = (if x < dels { old.get(i + x) } else { None }, if x < inss { new.get(j + x) } else { None });
-                    match (a.map(|x| &**x), b.map(|x| &**x)) {
-                        (Some(Block::Para(pa)), Some(Block::Para(pb))) => out.push(para_block(word_diff(&s.doc, pa, pb, &mut ctx))),
-                        _ => {
-                            if let Some(x) = a {
-                                out.push(Arc::new(mark_block(x, &|c| c.del = Some(del), 0)));
-                            }
-                            if let Some(x) = b {
-                                out.push(Arc::new(mark_block(x, &|c| c.ins = Some(ins), 0)));
-                            }
-                        }
-                    }
-                    changes += 1;
-                }
-                i += dels;
-                j += inss;
-                k += run.max(1);
+            changes += note_changes;
+        }
+        for &(new_id, _) in &inserted_notes {
+            if let Some(part) = s.doc.parts.get_mut(&new_id) {
+                part.blocks = part.blocks.iter().map(|b| Arc::new(mark_block(b, &|c| c.ins = Some(run.ins), 0))).collect();
             }
-            None => break,
+        }
+        for orig_id in deleted_notes {
+            if let Some(part) = s.doc.parts.get_mut(&orig_id) {
+                part.blocks = part.blocks.iter().map(|b| Arc::new(mark_block(b, &|c| c.del = Some(run.del), 0))).collect();
+            }
         }
     }
-    s.doc.body = out;
     s.doc.ensure_nonempty();
     s.note_body_replaced();
     s.math = None;
@@ -192,6 +220,1062 @@ pub(super) fn compare(s: &mut Session, v: &Value) -> CmdResult {
         "notHonoured": not_honoured,
         "characterFallback": char_fallbacks,
     }))
+}
+
+/// Context describing the author, date, options, and change IDs for compare emissions.
+struct CompareRun<'a> {
+    /// Revision ID for insertions.
+    ins: u32,
+    /// Revision ID for deletions.
+    del: u32,
+    /// Comparison options.
+    opts: &'a CompareOptions,
+    /// Author name for tracked changes.
+    author: &'a str,
+    /// ISO timestamp for tracked changes.
+    date: &'a str,
+    /// Whether the revised document was supplied as plain text.
+    plain_revised: bool,
+}
+
+/// Compares two slices of blocks (`old` and `new`) and returns the combined blocks with tracked
+/// revisions along with the count of changes.
+fn compare_blocks(
+    parts: &std::collections::BTreeMap<u32, wordcraft_doc::Part>,
+    revisions: &mut Vec<wordcraft_doc::Revision>,
+    run: &CompareRun<'_>,
+    old: &[Arc<Block>],
+    new: &[Arc<Block>],
+    budget: &mut u64,
+    char_fallbacks: &mut usize,
+) -> (Vec<Arc<Block>>, usize) {
+    let key = |b: &Arc<Block>| match &**b {
+        Block::Para(p) => run.opts.key(&p.plain_text()),
+        // Tables match as a whole, by their text.
+        Block::Table(_) => format!("\u{0}table\u{0}{}", run.opts.key(&block_text(b, 0))),
+    };
+    let ops = lcs_ops(&old.iter().map(key).collect::<Vec<_>>(), &new.iter().map(key).collect::<Vec<_>>(), budget);
+    let mut ctx = DiffCtx {
+        ins: run.ins,
+        del: run.del,
+        opts: run.opts,
+        budget,
+        char_fallbacks,
+        revisions,
+        author: run.author,
+        date: run.date,
+        plain_revised: run.plain_revised,
+    };
+    let mut out: Vec<Arc<Block>> = Vec::new();
+    let (mut i, mut j) = (0usize, 0usize);
+    let mut changes = 0usize;
+    let mut k = 0;
+    while k < ops.len() {
+        match ops.get(k) {
+            Some(Op::Same) => {
+                let (a, b) = (old.get(i), new.get(j));
+                // The revised block, with its formatting changes tracked.
+                if let (Some(Block::Para(pa)), Some(Block::Para(pb))) = (a.map(|x| &**x), b.map(|x| &**x)) {
+                    if !same_objects(parts, pa, pb) || !same_para_links(pa, pb) {
+                        // Same text, but objects (text boxes, pictures…) or hyperlink targets differ:
+                        // diffed, so the original's objects and links aren't lost.
+                        out.push(para_block(word_diff(parts, pa, pb, &mut ctx)));
+                        changes += 1;
+                        i += 1;
+                        j += 1;
+                        k += 1;
+                        continue;
+                    }
+                    let mut p = pb.clone();
+                    if run.opts.formatting && pa.text != pb.text {
+                        // Case or spacing differs only: track paragraph-level formatting.
+                        if crate::cmd::fmt_revisions::compare_para_formatting(&pa.props, &pa.mark, &mut p, ctx.revisions, run.author, run.date) {
+                            changes += 1;
+                        }
+                    } else if run.opts.formatting {
+                        let before = ctx.revisions.len();
+                        crate::cmd::fmt_revisions::compare_formatting(pa, &mut p, ctx.revisions, run.author, run.date);
+                        if ctx.revisions.len() > before || p != *pb {
+                            changes += 1;
+                        }
+                    }
+                    out.push(para_block(p));
+                } else if let (Some(Block::Table(ta)), Some(Block::Table(tb))) = (a.map(|x| &**x), b.map(|x| &**x)) {
+                    let mut table_matched = false;
+                    let mut table_changes = 0usize;
+                    let mut new_rows = Vec::with_capacity(tb.rows.len());
+                    if ta.rows.len() == tb.rows.len() && (!run.opts.formatting || ta.grid == tb.grid) {
+                        let mut rows_match = true;
+                        for (ra, rb) in ta.rows.iter().zip(&tb.rows) {
+                            if ra.cells.len() != rb.cells.len() {
+                                rows_match = false;
+                                break;
+                            }
+                            let mut new_cells = Vec::with_capacity(rb.cells.len());
+                            for (ca, cb) in ra.cells.iter().zip(&rb.cells) {
+                                if ca.props.span != cb.props.span || ca.props.vmerge != cb.props.vmerge {
+                                    rows_match = false;
+                                    break;
+                                }
+                                let (cell_blocks, cell_changes) =
+                                    compare_blocks(parts, ctx.revisions, run, &ca.blocks, &cb.blocks, ctx.budget, ctx.char_fallbacks);
+                                table_changes = table_changes.saturating_add(cell_changes);
+                                let mut cell_props = cb.props.clone();
+                                if run.opts.formatting
+                                    && crate::cmd::fmt_revisions::compare_cell_props(&ca.props, &mut cell_props, ctx.revisions, run.author, run.date)
+                                {
+                                    table_changes = table_changes.saturating_add(1);
+                                }
+                                new_cells.push(wordcraft_doc::Cell { props: cell_props, blocks: cell_blocks, controls: cb.controls.clone() });
+                            }
+                            if !rows_match {
+                                break;
+                            }
+                            let mut row_props = rb.props.clone();
+                            if run.opts.formatting
+                                && crate::cmd::fmt_revisions::compare_row_props(&ra.props, &mut row_props, ctx.revisions, run.author, run.date)
+                            {
+                                table_changes = table_changes.saturating_add(1);
+                            }
+                            new_rows.push(wordcraft_doc::Row { props: row_props, cells: new_cells, controls: rb.controls.clone() });
+                        }
+                        table_matched = rows_match;
+                    }
+                    if table_matched {
+                        let mut table_props = tb.props.clone();
+                        if run.opts.formatting
+                            && crate::cmd::fmt_revisions::compare_table_props(&ta.props, &mut table_props, ctx.revisions, run.author, run.date)
+                        {
+                            table_changes = table_changes.saturating_add(1);
+                        }
+                        changes = changes.saturating_add(table_changes);
+                        let final_grid = if run.opts.formatting { tb.grid.clone() } else { ta.grid.clone() };
+                        out.push(Arc::new(Block::Table(wordcraft_doc::Table {
+                            props: table_props,
+                            grid: final_grid,
+                            rows: new_rows,
+                            controls: tb.controls.clone(),
+                        })));
+                    } else {
+                        if let Some(x) = a {
+                            out.push(Arc::new(mark_block(x, &|c| c.del = Some(run.del), 0)));
+                        }
+                        if let Some(x) = b {
+                            out.push(Arc::new(mark_block(x, &|c| c.ins = Some(run.ins), 0)));
+                        }
+                        changes += 1;
+                    }
+                } else if let Some(x) = b.or(a) {
+                    out.push(x.clone());
+                }
+                i += 1;
+                j += 1;
+                k += 1;
+            }
+            Some(_) => {
+                // A run of deletions and insertions: changed paragraphs pair up and are diffed
+                // word by word (or by character); the rest are deleted or inserted whole.
+                let run_len = ops.get(k..).unwrap_or_default().iter().take_while(|o| **o != Op::Same).count();
+                let dels = ops.get(k..k + run_len).unwrap_or_default().iter().filter(|o| **o == Op::Del).count();
+                let inss = run_len - dels;
+                for x in 0..dels.max(inss) {
+                    let (a, b) = (if x < dels { old.get(i + x) } else { None }, if x < inss { new.get(j + x) } else { None });
+                    match (a.map(|x| &**x), b.map(|x| &**x)) {
+                        (Some(Block::Para(pa)), Some(Block::Para(pb))) => out.push(para_block(word_diff(parts, pa, pb, &mut ctx))),
+                        _ => {
+                            if let Some(x) = a {
+                                out.push(Arc::new(mark_block(x, &|c| c.del = Some(run.del), 0)));
+                            }
+                            if let Some(x) = b {
+                                out.push(Arc::new(mark_block(x, &|c| c.ins = Some(run.ins), 0)));
+                            }
+                        }
+                    }
+                    changes += 1;
+                }
+                i += dels;
+                j += inss;
+                k += run_len.max(1);
+            }
+            None => break,
+        }
+    }
+    (out, changes)
+}
+
+/// Collects the IDs of footnote or endnote parts in reading order: first walking all inline note
+/// references across the body and nested text boxes, then appending any unreferenced note parts.
+fn document_note_ids(doc: &Document, kind: wordcraft_doc::PartKind) -> Vec<u32> {
+    let note_kind = match kind {
+        wordcraft_doc::PartKind::Footnote => wordcraft_doc::para::NoteKind::Footnote,
+        wordcraft_doc::PartKind::Endnote => wordcraft_doc::para::NoteKind::Endnote,
+        _ => return Vec::new(),
+    };
+    let mut ids = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    doc.objects_in_reading_order(&mut |o| {
+        if let InlineObject::NoteRef { kind: k, id, .. } = o
+            && *k == note_kind
+            && doc.parts.get(id).is_some_and(|p| p.kind == kind)
+            && seen.insert(*id)
+        {
+            ids.push(*id);
+        }
+    });
+    for (&id, part) in &doc.parts {
+        if part.kind == kind && seen.insert(id) {
+            ids.push(id);
+        }
+    }
+    ids
+}
+
+/// Minimum similarity score (on 0..=1000 scale) to allow pairing between two notes.
+const NOTE_SIMILARITY_THRESHOLD: u32 = 400;
+
+/// Maximum number of tokens inspected per note when computing similarity.
+const MAX_SIMILARITY_TOKENS: usize = 200;
+
+/// Maximum comparison budget allocated specifically for aligning footnote and endnote sequences.
+const MAX_NOTE_ALIGN_BUDGET: u64 = 200_000;
+
+/// Maximum number of notes in a single run allowed for dynamic programming matrix allocation.
+pub(super) const MAX_NOTE_ALIGN_RUN: usize = 200;
+
+/// Maximum number of DP matrix cells allowed for note run alignment.
+const MAX_NOTE_ALIGN_CELLS: usize = 40_000;
+
+/// Maximum look-ahead, in tokens, for the greedy fallback match.
+const GREEDY_WINDOW: usize = 16;
+
+/// Maximum characters of normalized inline context captured on each side of a note reference.
+const MAX_REF_CONTEXT_CHARS: usize = 128;
+
+/// Location and inline surrounding context of a note reference in the document body.
+struct RefContext {
+    /// Top-level body block index containing the note reference (or its anchor).
+    block_idx: usize,
+    /// Normalized plain text of the paragraph containing the note reference.
+    para: String,
+    /// Normalized plain text immediately preceding the note reference.
+    before: String,
+    /// Normalized plain text immediately following the note reference.
+    after: String,
+}
+
+/// Metadata and content summary for aligning footnote and endnote parts.
+struct NoteInfo {
+    /// Note ID.
+    id: u32,
+    /// Normalized plain text key of the note content.
+    key: String,
+    /// Tokens for similarity comparison.
+    tokens: Vec<String>,
+    /// Location and inline context of the note reference.
+    ref_pos: Option<RefContext>,
+}
+
+/// Returns the trailing slice of `s` containing at most `max_chars` Unicode scalar values.
+fn suffix_chars(s: &str, max_chars: usize) -> &str {
+    if max_chars == 0 {
+        return "";
+    }
+    match s.char_indices().rev().nth(max_chars - 1) {
+        Some((idx, _)) => s.get(idx..).unwrap_or(s),
+        None => s,
+    }
+}
+
+/// Returns the leading slice of `s` containing at most `max_chars` Unicode scalar values.
+fn prefix_chars(s: &str, max_chars: usize) -> &str {
+    match s.char_indices().nth(max_chars) {
+        Some((idx, _)) => s.get(..idx).unwrap_or(s),
+        None => s,
+    }
+}
+
+/// Computes a map from note ID to its reference location and inline surrounding context.
+fn note_reference_map(doc: &Document, kind: wordcraft_doc::PartKind, opts: &CompareOptions) -> std::collections::HashMap<u32, RefContext> {
+    let note_kind = match kind {
+        wordcraft_doc::PartKind::Footnote => wordcraft_doc::para::NoteKind::Footnote,
+        wordcraft_doc::PartKind::Endnote => wordcraft_doc::para::NoteKind::Endnote,
+        _ => return std::collections::HashMap::new(),
+    };
+    let mut map = std::collections::HashMap::new();
+    doc.objects_in_reading_order_by_block(&mut |block_idx, para, obj_idx| {
+        if let Some(InlineObject::NoteRef { kind: k, id, .. }) = para.objects.get(obj_idx)
+            && *k == note_kind
+            && !map.contains_key(id)
+        {
+            let mut plain = String::with_capacity(para.text.len());
+            let mut k_obj = 0usize;
+            let mut ref_offsets: Vec<(u32, usize)> = Vec::new();
+            for c in para.text.chars() {
+                if c == OBJ {
+                    if let Some(o) = para.objects.get(k_obj) {
+                        if let InlineObject::NoteRef { kind: nk, id: nid, .. } = o
+                            && *nk == note_kind
+                        {
+                            ref_offsets.push((*nid, plain.len()));
+                        }
+                        plain.push_str(o.plain_text());
+                    }
+                    k_obj = k_obj.saturating_add(1);
+                } else {
+                    plain.push(c);
+                }
+            }
+            let para_key = opts.key(&plain);
+            for (nid, off) in ref_offsets {
+                let raw_before = plain.get(..off).unwrap_or_default();
+                let raw_after = plain.get(off..).unwrap_or_default();
+                let before = opts.key(suffix_chars(raw_before, MAX_REF_CONTEXT_CHARS));
+                let after = opts.key(prefix_chars(raw_after, MAX_REF_CONTEXT_CHARS));
+                map.entry(nid).or_insert_with(|| RefContext { block_idx, para: para_key.clone(), before, after });
+            }
+        }
+        true
+    });
+    map
+}
+
+/// Extracts [`NoteInfo`] for a list of note IDs in reading order.
+fn collect_note_info(doc: &Document, ids: &[u32], kind: wordcraft_doc::PartKind, opts: &CompareOptions) -> Vec<NoteInfo> {
+    let mut ref_map = note_reference_map(doc, kind, opts);
+    ids.iter()
+        .map(|&id| {
+            let text = doc.parts.get(&id).map(part_text).unwrap_or_default();
+            let key = opts.key(&text);
+            let tokens: Vec<String> = if opts.characters {
+                key.chars().filter(|c| !c.is_whitespace()).take(MAX_SIMILARITY_TOKENS).map(|c| c.to_string()).collect()
+            } else {
+                key.split_whitespace().take(MAX_SIMILARITY_TOKENS).map(str::to_string).collect()
+            };
+            let ref_pos = ref_map.remove(&id);
+            NoteInfo { id, key, tokens, ref_pos }
+        })
+        .collect()
+}
+
+/// Computes the length of the longest common subsequence between two slices,
+/// charging dynamic programming cells to `budget` and using a bounded greedy fallback
+/// when the comparison cell budget is exhausted.
+pub(super) fn lcs_len<T: PartialEq>(a: &[T], b: &[T], budget: &mut u64) -> usize {
+    if a.is_empty() || b.is_empty() {
+        return 0;
+    }
+    let pre = a.iter().zip(b).take_while(|(x, y)| x == y).count();
+    let a_mid = a.get(pre..).unwrap_or_default();
+    let b_mid = b.get(pre..).unwrap_or_default();
+    let suf = a_mid.iter().rev().zip(b_mid.iter().rev()).take_while(|(x, y)| x == y).count();
+    let a_core = a_mid.get(..a_mid.len().saturating_sub(suf)).unwrap_or_default();
+    let b_core = b_mid.get(..b_mid.len().saturating_sub(suf)).unwrap_or_default();
+    let n = a_core.len();
+    let m = b_core.len();
+    if n == 0 || m == 0 {
+        return pre.saturating_add(suf);
+    }
+    let cells = (n as u64).saturating_mul(m as u64);
+    if cells > *budget {
+        // Budget exhausted: use bounded forward and backward greedy subsequence matching
+        // (look-ahead of GREEDY_WINDOW tokens) to find a genuine in-order common subsequence
+        // in O(GREEDY_WINDOW * n) time without allocating DP tables.
+        let mut fwd = 0usize;
+        let mut b_idx = 0usize;
+        for x in a_core {
+            if let Some(pos) = b_core.get(b_idx..).and_then(|s| s.iter().take(GREEDY_WINDOW).position(|y| x == y)) {
+                fwd = fwd.saturating_add(1);
+                b_idx = b_idx.saturating_add(pos).saturating_add(1);
+                if b_idx >= b_core.len() {
+                    break;
+                }
+            }
+        }
+        let mut bwd = 0usize;
+        let mut b_rev_idx = 0usize;
+        for x in a_core.iter().rev() {
+            if let Some(pos) = b_core
+                .get(..b_core.len().saturating_sub(b_rev_idx))
+                .and_then(|s| s.iter().rev().take(GREEDY_WINDOW).position(|y| x == y).map(|off| s.len().saturating_sub(1).saturating_sub(off)))
+            {
+                bwd = bwd.saturating_add(1);
+                b_rev_idx = b_core.len().saturating_sub(pos);
+                if b_rev_idx >= b_core.len() {
+                    break;
+                }
+            }
+        }
+        pre.saturating_add(suf).saturating_add(fwd.max(bwd))
+    } else {
+        *budget = budget.saturating_sub(cells);
+        let mut prev = vec![0u32; m.saturating_add(1)];
+        let mut curr = vec![0u32; m.saturating_add(1)];
+        for x in a_core {
+            for (j, y) in b_core.iter().enumerate() {
+                let diag = prev.get(j).copied().unwrap_or(0).saturating_add(1);
+                let up = prev.get(j.saturating_add(1)).copied().unwrap_or(0);
+                let left = curr.get(j).copied().unwrap_or(0);
+                if let Some(c) = curr.get_mut(j.saturating_add(1)) {
+                    *c = if x == y { diag } else { up.max(left) };
+                }
+            }
+            std::mem::swap(&mut prev, &mut curr);
+        }
+        pre.saturating_add(suf).saturating_add(prev.get(m).copied().unwrap_or(0) as usize)
+    }
+}
+
+/// Scores similarity between an original note and a revised note on a 0..=1000 scale.
+///
+/// Combines text similarity of the note content with reference location in the body:
+/// - Exact text match: 1000.
+/// - Text LCS similarity: 0..=1000 (falls back to bounded greedy subsequence when budget is exhausted).
+/// - Reference paragraph match bonus: if the body paragraph containing the note reference
+///   matches between original and revised, gives a substantial bonus or pairs directly.
+fn note_score(a: &NoteInfo, b: &NoteInfo, budget: &mut u64) -> u32 {
+    if !a.key.is_empty() && a.key == b.key {
+        return 1000;
+    }
+    let same_ref_para = match (&a.ref_pos, &b.ref_pos) {
+        (Some(ra), Some(rb)) if !ra.para.is_empty() => ra.para == rb.para,
+        _ => false,
+    };
+    let same_ref_idx = match (&a.ref_pos, &b.ref_pos) {
+        (Some(ra), Some(rb)) => ra.block_idx == rb.block_idx,
+        _ => false,
+    };
+
+    let total_tokens = a.tokens.len().saturating_add(b.tokens.len());
+    let min_tokens = a.tokens.len().min(b.tokens.len());
+    let text_sim = if total_tokens == 0 {
+        1000
+    } else {
+        let max_possible = (2000u64 * min_tokens as u64) / total_tokens as u64;
+        if max_possible < NOTE_SIMILARITY_THRESHOLD as u64 && !same_ref_para && !same_ref_idx {
+            0
+        } else {
+            let lcs = lcs_len(&a.tokens, &b.tokens, budget);
+            ((2000u64 * lcs as u64) / total_tokens as u64) as u32
+        }
+    };
+
+    if same_ref_para {
+        text_sim.max(500).saturating_add(200).min(1000)
+    } else if same_ref_idx && text_sim >= 300 {
+        text_sim.saturating_add(100).min(1000)
+    } else {
+        text_sim
+    }
+}
+
+/// Pairs notes inside a run too large for the similarity matrix, using identity anchors only.
+///
+/// A note is paired when its text is identical, or when its reference sits at the same block and
+/// reference paragraph and that location holds exactly one unpaired note on each side. Notes
+/// without an anchor stay whole deletions or insertions: pairing them by position would attach
+/// individual accept/reject revisions to a different original note.
+fn align_note_run_by_anchors(old_notes: &[&NoteInfo], new_notes: &[&NoteInfo]) -> (Vec<(u32, u32)>, Vec<u32>, Vec<u32>) {
+    let mut anchors: Vec<(usize, usize)> = Vec::new();
+    let mut exact_old = vec![false; old_notes.len()];
+    let mut exact_new = vec![false; new_notes.len()];
+
+    // Same text, in document order: each revised note answers at most one original note.
+    let mut by_key: std::collections::HashMap<&str, std::collections::VecDeque<usize>> = std::collections::HashMap::new();
+    for (idx, note) in new_notes.iter().enumerate() {
+        if !note.key.is_empty() {
+            by_key.entry(note.key.as_str()).or_default().push_back(idx);
+        }
+    }
+    let mut next_new = 0usize;
+    for (old_idx, note) in old_notes.iter().enumerate() {
+        let Some(queue) = by_key.get_mut(note.key.as_str()) else { continue };
+        while queue.front().is_some_and(|&idx| idx < next_new) {
+            queue.pop_front();
+        }
+        if let Some(new_idx) = queue.pop_front() {
+            anchors.push((old_idx, new_idx));
+            if let Some(flag) = exact_old.get_mut(old_idx) {
+                *flag = true;
+            }
+            if let Some(flag) = exact_new.get_mut(new_idx) {
+                *flag = true;
+            }
+            next_new = new_idx.saturating_add(1);
+        }
+    }
+
+    // Same reference location, when it names a single unpaired note on each side.
+    let mut old_refs: std::collections::HashMap<(usize, &str), Vec<usize>> = std::collections::HashMap::new();
+    for (idx, note) in old_notes.iter().enumerate() {
+        if let Some(ctx) = &note.ref_pos
+            && !ctx.para.is_empty()
+            && !exact_old.get(idx).copied().unwrap_or(true)
+        {
+            old_refs.entry((ctx.block_idx, ctx.para.as_str())).or_default().push(idx);
+        }
+    }
+    let mut new_refs: std::collections::HashMap<(usize, &str), Vec<usize>> = std::collections::HashMap::new();
+    for (idx, note) in new_notes.iter().enumerate() {
+        if let Some(ctx) = &note.ref_pos
+            && !ctx.para.is_empty()
+            && !exact_new.get(idx).copied().unwrap_or(true)
+        {
+            new_refs.entry((ctx.block_idx, ctx.para.as_str())).or_default().push(idx);
+        }
+    }
+    for (key, olds) in old_refs {
+        let [old_idx] = olds.as_slice() else { continue };
+        let Some(news) = new_refs.get(&key) else { continue };
+        let [new_idx] = news.as_slice() else { continue };
+        anchors.push((*old_idx, *new_idx));
+    }
+
+    // Anchors must keep document order on both sides. A dropped anchor stays a whole
+    // deletion or insertion, never a silent loss.
+    anchors.sort_unstable();
+    let mut paired = Vec::new();
+    let mut old_paired = vec![false; old_notes.len()];
+    let mut new_paired = vec![false; new_notes.len()];
+    let mut last_new = 0usize;
+    for (old_idx, new_idx) in anchors {
+        if new_idx < last_new {
+            continue;
+        }
+        let (Some(o), Some(r)) = (old_notes.get(old_idx), new_notes.get(new_idx)) else { continue };
+        paired.push((o.id, r.id));
+        if let Some(flag) = old_paired.get_mut(old_idx) {
+            *flag = true;
+        }
+        if let Some(flag) = new_paired.get_mut(new_idx) {
+            *flag = true;
+        }
+        last_new = new_idx.saturating_add(1);
+    }
+
+    let deleted = old_notes.iter().zip(&old_paired).filter(|(_, p)| !**p).map(|(info, _)| info.id).collect();
+    let inserted = new_notes.iter().zip(&new_paired).filter(|(_, p)| !**p).map(|(info, _)| info.id).collect();
+    (paired, inserted, deleted)
+}
+
+/// Aligns a run of original notes and revised notes using dynamic programming over note similarity and reference context.
+fn align_note_run(old_notes: &[&NoteInfo], new_notes: &[&NoteInfo], budget: &mut u64) -> (Vec<(u32, u32)>, Vec<u32>, Vec<u32>) {
+    let n = old_notes.len();
+    let m = new_notes.len();
+    if n == 0 {
+        return (Vec::new(), new_notes.iter().map(|info| info.id).collect(), Vec::new());
+    }
+    if m == 0 {
+        return (Vec::new(), Vec::new(), old_notes.iter().map(|info| info.id).collect());
+    }
+    if n > MAX_NOTE_ALIGN_RUN || m > MAX_NOTE_ALIGN_RUN || n.saturating_mul(m) > MAX_NOTE_ALIGN_CELLS {
+        return align_note_run_by_anchors(old_notes, new_notes);
+    }
+
+    let mut scores = vec![vec![0u32; m]; n];
+    for (row, a) in scores.iter_mut().zip(old_notes.iter()) {
+        for (cell, b) in row.iter_mut().zip(new_notes.iter()) {
+            *cell = note_score(a, b, budget);
+        }
+    }
+
+    let mut dp = vec![vec![0u32; m + 1]; n + 1];
+    for u in 0..n {
+        for v in 0..m {
+            let skip_old = dp.get(u).and_then(|r| r.get(v + 1)).copied().unwrap_or(0);
+            let skip_new = dp.get(u + 1).and_then(|r| r.get(v)).copied().unwrap_or(0);
+            let mut best = skip_old.max(skip_new);
+            let s = scores.get(u).and_then(|r| r.get(v)).copied().unwrap_or(0);
+            if s >= NOTE_SIMILARITY_THRESHOLD {
+                let diag = dp.get(u).and_then(|r| r.get(v)).copied().unwrap_or(0);
+                best = best.max(diag.saturating_add(s));
+            }
+            if let Some(cell) = dp.get_mut(u + 1).and_then(|r| r.get_mut(v + 1)) {
+                *cell = best;
+            }
+        }
+    }
+
+    let mut u = n;
+    let mut v = m;
+    let mut pairs = Vec::new();
+    let mut dels = Vec::new();
+    let mut inss = Vec::new();
+
+    while u > 0 || v > 0 {
+        if u > 0 && v > 0 {
+            let s = scores.get(u - 1).and_then(|r| r.get(v - 1)).copied().unwrap_or(0);
+            let prev_diag = dp.get(u - 1).and_then(|r| r.get(v - 1)).copied().unwrap_or(0);
+            let curr = dp.get(u).and_then(|r| r.get(v)).copied().unwrap_or(0);
+            if s >= NOTE_SIMILARITY_THRESHOLD && curr == prev_diag.saturating_add(s) {
+                pairs.push((u - 1, v - 1));
+                u -= 1;
+                v -= 1;
+                continue;
+            }
+        }
+        let skip_old = if u > 0 { dp.get(u - 1).and_then(|r| r.get(v)).copied().unwrap_or(0) } else { 0 };
+        let curr = dp.get(u).and_then(|r| r.get(v)).copied().unwrap_or(0);
+        if u > 0 && (v == 0 || curr == skip_old) {
+            dels.push(u - 1);
+            u -= 1;
+        } else if v > 0 {
+            inss.push(v - 1);
+            v -= 1;
+        } else {
+            break;
+        }
+    }
+
+    pairs.reverse();
+    dels.reverse();
+    inss.reverse();
+
+    // No note met the similarity threshold: keep only identity anchors, never positional ones.
+    if pairs.is_empty() {
+        return align_note_run_by_anchors(old_notes, new_notes);
+    }
+
+    let mut paired_out = Vec::new();
+    for (u_idx, v_idx) in pairs {
+        if let (Some(o), Some(r)) = (old_notes.get(u_idx), new_notes.get(v_idx)) {
+            paired_out.push((o.id, r.id));
+        }
+    }
+    let deleted_out = dels.into_iter().filter_map(|idx| old_notes.get(idx).map(|info| info.id)).collect();
+    let inserted_out = inss.into_iter().filter_map(|idx| new_notes.get(idx).map(|info| info.id)).collect();
+
+    (paired_out, inserted_out, deleted_out)
+}
+
+/// Returns the trailing character count shared by `a` and `b` up to a word boundary,
+/// provided the shared suffix contains at least one alphanumeric character.
+fn common_suffix_context(a: &str, b: &str) -> usize {
+    let a_chars: Vec<char> = a.chars().collect();
+    let b_chars: Vec<char> = b.chars().collect();
+    let mut k = a_chars.iter().rev().zip(b_chars.iter().rev()).take_while(|(x, y)| x == y).count();
+    while k > 0 {
+        let a_ok = k == a_chars.len()
+            || !a_chars.get(a_chars.len().saturating_sub(k)).is_some_and(|c| c.is_alphanumeric())
+            || !a_chars.len().checked_sub(k + 1).and_then(|idx| a_chars.get(idx)).is_some_and(|c| c.is_alphanumeric());
+        let b_ok = k == b_chars.len()
+            || !b_chars.get(b_chars.len().saturating_sub(k)).is_some_and(|c| c.is_alphanumeric())
+            || !b_chars.len().checked_sub(k + 1).and_then(|idx| b_chars.get(idx)).is_some_and(|c| c.is_alphanumeric());
+        if a_ok && b_ok {
+            break;
+        }
+        k -= 1;
+    }
+    let matched = a_chars.get(a_chars.len().saturating_sub(k)..).unwrap_or_default();
+    if matched.iter().any(|c| c.is_alphanumeric()) { k } else { 0 }
+}
+
+/// Returns the leading character count shared by `a` and `b` up to a word boundary,
+/// provided the shared prefix contains at least one alphanumeric character.
+fn common_prefix_context(a: &str, b: &str) -> usize {
+    let a_chars: Vec<char> = a.chars().collect();
+    let b_chars: Vec<char> = b.chars().collect();
+    let mut k = a_chars.iter().zip(&b_chars).take_while(|(x, y)| x == y).count();
+    while k > 0 {
+        let a_ok = k == a_chars.len()
+            || !k.checked_sub(1).and_then(|idx| a_chars.get(idx)).is_some_and(|c| c.is_alphanumeric())
+            || !a_chars.get(k).is_some_and(|c| c.is_alphanumeric());
+        let b_ok = k == b_chars.len()
+            || !k.checked_sub(1).and_then(|idx| b_chars.get(idx)).is_some_and(|c| c.is_alphanumeric())
+            || !b_chars.get(k).is_some_and(|c| c.is_alphanumeric());
+        if a_ok && b_ok {
+            break;
+        }
+        k -= 1;
+    }
+    if a_chars.get(..k).is_some_and(|s| s.iter().any(|c| c.is_alphanumeric())) { k } else { 0 }
+}
+
+/// Scores how well two note references' immediate inline surrounding text matches.
+fn ref_context_score(a: Option<&RefContext>, b: Option<&RefContext>) -> usize {
+    let (Some(a), Some(b)) = (a, b) else { return 0 };
+    common_suffix_context(&a.before, &b.before).saturating_add(common_prefix_context(&a.after, &b.after))
+}
+
+/// Returns the unique strict-maximum `(row, col)` index for a slice of scores, or `None` on zero or ties.
+fn unique_strict_best<I>(scores: I) -> Option<(usize, usize)>
+where
+    I: Iterator<Item = (usize, usize)>,
+{
+    let mut best_idx = None;
+    let mut best_score = 0usize;
+    let mut tied = false;
+    for (idx, score) in scores {
+        if score == 0 {
+            continue;
+        }
+        if score > best_score {
+            best_score = score;
+            best_idx = Some(idx);
+            tied = false;
+        } else if score == best_score {
+            tied = true;
+        }
+    }
+    (!tied).then_some(best_idx.map(|idx| (idx, best_score))).flatten()
+}
+
+/// Pairs notes whose text repeats on either side by inline reference context, before the text LCS.
+///
+/// Identical text cannot tell two notes apart, and `lcs_ops` would commit a surviving note to the
+/// first duplicate. Notes with a unique inline `(before, after)` reference context pair directly;
+/// remaining duplicates within a paragraph or across edited paragraphs pair only when their
+/// immediate inline context forms a mutual strict-best match. Returns sorted `(old_idx, new_idx)`
+/// anchor pairs.
+fn pair_duplicate_note_texts(old_info: &[NoteInfo], new_info: &[NoteInfo]) -> Vec<(usize, usize)> {
+    let mut counts: std::collections::HashMap<&str, (usize, usize)> = std::collections::HashMap::new();
+    for note in old_info.iter().filter(|n| !n.key.is_empty()) {
+        counts.entry(note.key.as_str()).or_default().0 += 1;
+    }
+    for note in new_info.iter().filter(|n| !n.key.is_empty()) {
+        counts.entry(note.key.as_str()).or_default().1 += 1;
+    }
+    let duplicated = |key: &str| counts.get(key).is_some_and(|&(old, new)| old > 1 || new > 1);
+
+    let mut old_groups: std::collections::HashMap<&str, Vec<usize>> = std::collections::HashMap::new();
+    for (idx, note) in old_info.iter().enumerate() {
+        if !note.key.is_empty() && duplicated(note.key.as_str()) {
+            old_groups.entry(note.key.as_str()).or_default().push(idx);
+        }
+    }
+    let mut new_groups: std::collections::HashMap<&str, Vec<usize>> = std::collections::HashMap::new();
+    for (idx, note) in new_info.iter().enumerate() {
+        if !note.key.is_empty() && duplicated(note.key.as_str()) {
+            new_groups.entry(note.key.as_str()).or_default().push(idx);
+        }
+    }
+
+    let mut pairs = Vec::new();
+    for (key, olds) in old_groups {
+        let Some(news) = new_groups.get(key) else { continue };
+        let mut old_matched = vec![false; olds.len()];
+        let mut new_matched = vec![false; news.len()];
+
+        // 1. Unique exact inline reference context `(before, after)` on each side.
+        let mut old_at: std::collections::HashMap<(&str, &str), Vec<usize>> = std::collections::HashMap::new();
+        for (pos, &idx) in olds.iter().enumerate() {
+            if let Some(ctx) = old_info.get(idx).and_then(|n| n.ref_pos.as_ref())
+                && (!ctx.before.is_empty() || !ctx.after.is_empty())
+            {
+                old_at.entry((ctx.before.as_str(), ctx.after.as_str())).or_default().push(pos);
+            }
+        }
+        let mut new_at: std::collections::HashMap<(&str, &str), Vec<usize>> = std::collections::HashMap::new();
+        for (pos, &idx) in news.iter().enumerate() {
+            if let Some(ctx) = new_info.get(idx).and_then(|n| n.ref_pos.as_ref())
+                && (!ctx.before.is_empty() || !ctx.after.is_empty())
+            {
+                new_at.entry((ctx.before.as_str(), ctx.after.as_str())).or_default().push(pos);
+            }
+        }
+        for (loc, old_poss) in old_at {
+            let [old_pos] = old_poss.as_slice() else { continue };
+            let Some(new_poss) = new_at.get(&loc) else { continue };
+            let [new_pos] = new_poss.as_slice() else { continue };
+            if let (Some(&old_idx), Some(&new_idx)) = (olds.get(*old_pos), news.get(*new_pos)) {
+                pairs.push((old_idx, new_idx));
+                if let Some(flag) = old_matched.get_mut(*old_pos) {
+                    *flag = true;
+                }
+                if let Some(flag) = new_matched.get_mut(*new_pos) {
+                    *flag = true;
+                }
+            }
+        }
+
+        // 2. Remaining duplicates: pair mutual strict-best inline context matches (e.g. when a
+        //    clause and its note reference in the same paragraph were deleted together).
+        let rem_olds: Vec<usize> = olds.iter().zip(&old_matched).filter(|(_, m)| !**m).map(|(&idx, _)| idx).collect();
+        let rem_news: Vec<usize> = news.iter().zip(&new_matched).filter(|(_, m)| !**m).map(|(&idx, _)| idx).collect();
+        if rem_olds.is_empty() || rem_news.is_empty() || rem_olds.len() > MAX_NOTE_ALIGN_RUN || rem_news.len() > MAX_NOTE_ALIGN_RUN {
+            continue;
+        }
+        let scores: Vec<Vec<usize>> = rem_olds
+            .iter()
+            .map(|&oi| {
+                let o_ctx = old_info.get(oi).and_then(|n| n.ref_pos.as_ref());
+                rem_news.iter().map(|&ni| ref_context_score(o_ctx, new_info.get(ni).and_then(|n| n.ref_pos.as_ref()))).collect()
+            })
+            .collect();
+        for (u, row) in scores.iter().enumerate() {
+            let Some((v, _)) = unique_strict_best(row.iter().copied().enumerate()) else { continue };
+            let Some((best_u, _)) = unique_strict_best(scores.iter().enumerate().map(|(r, r_scores)| (r, r_scores.get(v).copied().unwrap_or(0))))
+            else {
+                continue;
+            };
+            if best_u == u
+                && let (Some(&old_idx), Some(&new_idx)) = (rem_olds.get(u), rem_news.get(v))
+            {
+                pairs.push((old_idx, new_idx));
+            }
+        }
+    }
+    pairs.sort_unstable();
+    pairs
+}
+
+/// Filters `anchors` (already sorted by `old_idx`) to the subset that respects strict document
+/// order on both sides, so every kept anchor safely partitions `old_info` and `new_info`.
+fn non_crossing_anchors(anchors: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    if anchors.is_empty() {
+        return Vec::new();
+    }
+    let mut prefix_max = Vec::with_capacity(anchors.len());
+    let mut cur_max = 0usize;
+    for &(_, new_idx) in anchors {
+        cur_max = cur_max.max(new_idx);
+        prefix_max.push(cur_max);
+    }
+    let mut suffix_min = vec![usize::MAX; anchors.len()];
+    let mut cur_min = usize::MAX;
+    for (i, &(_, new_idx)) in anchors.iter().enumerate().rev() {
+        cur_min = cur_min.min(new_idx);
+        if let Some(slot) = suffix_min.get_mut(i) {
+            *slot = cur_min;
+        }
+    }
+    anchors
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &(old_idx, new_idx))| {
+            let left_ok = i == 0 || prefix_max.get(i - 1).is_some_and(|&m| m < new_idx);
+            let right_ok = i + 1 == anchors.len() || suffix_min.get(i + 1).is_some_and(|&m| new_idx < m);
+            (left_ok && right_ok).then_some((old_idx, new_idx))
+        })
+        .collect()
+}
+
+/// Collects unused [`NoteInfo`] references within `info[start..end]`.
+fn collect_unused_segment<'a>(info: &'a [NoteInfo], used: &[bool], start: usize, end: usize) -> Vec<&'a NoteInfo> {
+    let slice = info.get(start..end).unwrap_or_default();
+    let flags = used.get(start..end).unwrap_or_default();
+    slice.iter().zip(flags).filter(|(_, is_used)| !**is_used).map(|(note, _)| note).collect()
+}
+
+/// Aligns one bounded segment of unused original and revised notes between prepaired anchors.
+fn align_note_segment(
+    old_seg: &[&NoteInfo],
+    new_seg: &[&NoteInfo],
+    budget: &mut u64,
+    paired: &mut Vec<(u32, u32)>,
+    inserted: &mut Vec<u32>,
+    deleted: &mut Vec<u32>,
+) {
+    if old_seg.is_empty() {
+        inserted.extend(new_seg.iter().map(|n| n.id));
+        return;
+    }
+    if new_seg.is_empty() {
+        deleted.extend(old_seg.iter().map(|n| n.id));
+        return;
+    }
+    let keys_orig: Vec<&str> = old_seg.iter().map(|n| n.key.as_str()).collect();
+    let keys_rev: Vec<&str> = new_seg.iter().map(|n| n.key.as_str()).collect();
+    let ops = lcs_ops(&keys_orig, &keys_rev, budget);
+    let (mut i, mut j, mut k) = (0, 0, 0);
+    while k < ops.len() {
+        match ops.get(k) {
+            Some(Op::Same) => {
+                if let (Some(o), Some(r)) = (old_seg.get(i), new_seg.get(j)) {
+                    paired.push((o.id, r.id));
+                }
+                i += 1;
+                j += 1;
+                k += 1;
+            }
+            Some(_) => {
+                let run = ops.get(k..).unwrap_or_default().iter().take_while(|o| **o != Op::Same).count();
+                let dels = ops.get(k..k + run).unwrap_or_default().iter().filter(|o| **o == Op::Del).count();
+                let inss = run - dels;
+                let old_slice = old_seg.get(i..i + dels).unwrap_or_default();
+                let new_slice = new_seg.get(j..j + inss).unwrap_or_default();
+                let (p, ins, del) = align_note_run(old_slice, new_slice, budget);
+                paired.extend(p);
+                inserted.extend(ins);
+                deleted.extend(del);
+                i += dels;
+                j += inss;
+                k += run.max(1);
+            }
+            None => break,
+        }
+    }
+}
+
+/// Pairs original and revised note IDs using sequence alignment over note plain text and body reference positions.
+///
+/// Returns `(paired, inserted, deleted)`:
+/// - `paired`: `(orig_id, rev_id)` pairs to be diffed against each other.
+/// - `inserted`: `rev_id`s that represent newly added notes.
+/// - `deleted`: `orig_id`s that have no revised counterpart.
+fn align_notes(
+    orig_doc: &Document,
+    orig_ids: &[u32],
+    rev_doc: &Document,
+    rev_ids: &[u32],
+    kind: wordcraft_doc::PartKind,
+    opts: &CompareOptions,
+    budget: &mut u64,
+) -> (Vec<(u32, u32)>, Vec<u32>, Vec<u32>) {
+    let old_info = collect_note_info(orig_doc, orig_ids, kind, opts);
+    let new_info = collect_note_info(rev_doc, rev_ids, kind, opts);
+
+    let prepaired = pair_duplicate_note_texts(&old_info, &new_info);
+    let mut paired = Vec::with_capacity(prepaired.len());
+    let mut old_used = vec![false; old_info.len()];
+    let mut new_used = vec![false; new_info.len()];
+    for &(old_idx, new_idx) in &prepaired {
+        if let (Some(o), Some(r)) = (old_info.get(old_idx), new_info.get(new_idx)) {
+            paired.push((o.id, r.id));
+            if let Some(flag) = old_used.get_mut(old_idx) {
+                *flag = true;
+            }
+            if let Some(flag) = new_used.get_mut(new_idx) {
+                *flag = true;
+            }
+        }
+    }
+
+    let boundaries = non_crossing_anchors(&prepaired);
+    let mut inserted = Vec::new();
+    let mut deleted = Vec::new();
+    let mut old_start = 0usize;
+    let mut new_start = 0usize;
+    for (old_anchor, new_anchor) in boundaries.into_iter().chain(std::iter::once((old_info.len(), new_info.len()))) {
+        let old_seg = collect_unused_segment(&old_info, &old_used, old_start, old_anchor);
+        let new_seg = collect_unused_segment(&new_info, &new_used, new_start, new_anchor);
+        align_note_segment(&old_seg, &new_seg, budget, &mut paired, &mut inserted, &mut deleted);
+        old_start = old_anchor.saturating_add(1);
+        new_start = new_anchor.saturating_add(1);
+    }
+    (paired, inserted, deleted)
+}
+
+/// Remaps note references within a block and any nested tables using `map`.
+fn remap_note_refs(b: &Block, map: &std::collections::HashMap<u32, u32>, depth: usize) -> Block {
+    match b {
+        Block::Para(p) => {
+            let mut p = p.clone();
+            for o in &mut p.objects {
+                if let InlineObject::NoteRef { id, .. } = o
+                    && let Some(&new_id) = map.get(id)
+                {
+                    *id = new_id;
+                }
+            }
+            Block::Para(p)
+        }
+        Block::Table(t) => {
+            let mut t = t.clone();
+            if depth < 16 {
+                for c in t.rows.iter_mut().flat_map(|r| r.cells.iter_mut()) {
+                    c.blocks = c.blocks.iter().map(|x| Arc::new(remap_note_refs(x, map, depth + 1))).collect();
+                }
+            }
+            Block::Table(t)
+        }
+    }
+}
+
+/// Remap media references in an inline object.
+fn remap_media_object(o: &mut InlineObject, map: &std::collections::BTreeMap<String, String>, depth: usize) {
+    match o {
+        InlineObject::Image { media, .. } => {
+            if let Some(k) = map.get(media.as_str()) {
+                *media = k.clone();
+            }
+        }
+        InlineObject::Graphic { graphic, .. } => {
+            let mapped = |m: &str| map.get(m).filter(|k| k.as_str() != m);
+            if graphic.items.iter().any(|i| matches!(i, wordcraft_doc::graphic::GraphicItem::Image { media, .. } if mapped(media).is_some())) {
+                for i in &mut Arc::make_mut(graphic).items {
+                    if let wordcraft_doc::graphic::GraphicItem::Image { media, .. } = i
+                        && let Some(k) = map.get(media.as_str())
+                    {
+                        *media = k.clone();
+                    }
+                }
+            }
+        }
+        InlineObject::Group { children, .. } if depth < 8 => {
+            for child in children {
+                remap_media_object(&mut child.obj, map, depth + 1);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Remap media references in a block and any nested tables up to depth 16.
+fn remap_media_block(b: &mut Block, map: &std::collections::BTreeMap<String, String>, depth: usize) {
+    match b {
+        Block::Para(p) => {
+            for o in &mut p.objects {
+                remap_media_object(o, map, 0);
+            }
+        }
+        Block::Table(t) => {
+            if depth < 16 {
+                for c in t.rows.iter_mut().flat_map(|r| r.cells.iter_mut()) {
+                    if let Some(ref mut pic) = c.props.picture
+                        && let Some(k) = map.get(&pic.media)
+                    {
+                        pic.media = k.clone();
+                    }
+                    for cb in &mut c.blocks {
+                        remap_media_block(Arc::make_mut(cb), map, depth + 1);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Reconciles media from `revised` into `target`, remapping colliding media keys
+/// that have different content to newly allocated keys in `target`.
+fn reconcile_media(target: &mut wordcraft_doc::Document, revised: &mut wordcraft_doc::Document) {
+    let mut media_remap = std::collections::BTreeMap::new();
+    for (k, v) in &revised.media {
+        if let Some(existing) = target.media.get(k) {
+            if existing.as_slice() != v.as_slice() {
+                let ext = k.rsplit_once('.').map_or("png", |(_, ext)| ext);
+                let mut i = target.media.len().saturating_add(revised.media.len()).saturating_add(1);
+                let mut new_key = format!("image{i}.{ext}");
+                while target.media.contains_key(&new_key) || revised.media.contains_key(&new_key) {
+                    i = i.saturating_add(1);
+                    new_key = format!("image{i}.{ext}");
+                }
+                target.media.insert(new_key.clone(), v.clone());
+                media_remap.insert(k.clone(), new_key);
+            }
+        } else {
+            target.media.insert(k.clone(), v.clone());
+        }
+    }
+    if !media_remap.is_empty() {
+        for b in &mut revised.body {
+            remap_media_block(Arc::make_mut(b), &media_remap, 0);
+        }
+        for part in revised.parts.values_mut() {
+            for b in &mut part.blocks {
+                remap_media_block(Arc::make_mut(b), &media_remap, 0);
+            }
+        }
+        for (old_key, new_key) in media_remap {
+            if let Some(data) = revised.media.remove(&old_key) {
+                revised.media.insert(new_key, data);
+            }
+        }
+    }
+}
+
+/// Returns the plain text of a part's blocks.
+fn part_text(p: &wordcraft_doc::Part) -> String {
+    p.blocks.iter().map(|b| block_text(b, 0)).collect::<Vec<_>>().join("\n")
 }
 
 /// A block's text (a table's cells in order), for matching blocks.
@@ -394,13 +1478,20 @@ fn flatten_region(out: &mut Vec<Op>, region: &[(Op, usize, Kind)]) {
     out.extend(std::iter::repeat_n(Op::Ins, inss));
 }
 
+/// A piece of text or an inline object with its character properties.
+#[derive(Clone)]
+enum TokPiece<'a> {
+    /// Text slice and its character properties.
+    Text(String, CharProps),
+    /// Inline object and its character properties.
+    Obj(&'a InlineObject, CharProps),
+}
+
 /// A token of a changed paragraph: a word (or character), or an inline object without text
 /// of its own (a text box anchor, a picture, a bookmark…), which is compared and kept whole.
-/// Each token also carries the byte range it came from in its source paragraph, so the output
-/// segment can take the formatting of the run it came from instead of the paragraph's first run.
-enum Tok<'a> {
-    Text(String, std::ops::Range<usize>),
-    Obj(&'a InlineObject, std::ops::Range<usize>),
+#[derive(Clone)]
+struct Tok<'a> {
+    pieces: Vec<TokPiece<'a>>,
 }
 
 /// What a comparison sees of a token: the text as the options say, an object with the text of
@@ -411,8 +1502,9 @@ enum Key {
     Obj(Box<InlineObject>, Vec<String>),
 }
 
-fn obj_key(doc: &Document, o: &InlineObject) -> Key {
-    let texts = o.text_boxes().into_iter().map(|id| doc.plain_text(StoryRef::Part(id))).collect();
+/// Computes a comparison key for an inline object, taking text box content from parts into account.
+fn obj_key(parts: &std::collections::BTreeMap<u32, wordcraft_doc::Part>, o: &InlineObject) -> Key {
+    let texts = o.text_boxes().into_iter().map(|id| parts.get(&id).map(part_text).unwrap_or_default()).collect();
     let mut o = o.clone();
     for story in o.text_box_slots() {
         *story = None;
@@ -421,139 +1513,122 @@ fn obj_key(doc: &Document, o: &InlineObject) -> Key {
 }
 
 /// Whether two paragraphs hold the same objects, as compared.
-fn same_objects(doc: &Document, a: &Paragraph, b: &Paragraph) -> bool {
-    a.objects.len() == b.objects.len() && a.objects.iter().zip(&b.objects).all(|(x, y)| x == y || obj_key(doc, x) == obj_key(doc, y))
+fn same_objects(parts: &std::collections::BTreeMap<u32, wordcraft_doc::Part>, a: &Paragraph, b: &Paragraph) -> bool {
+    a.objects.len() == b.objects.len() && a.objects.iter().zip(&b.objects).all(|(x, y)| x == y || obj_key(parts, x) == obj_key(parts, y))
 }
 
 /// Words with the spaces after them ("The ", "cat "), or single characters, and the objects
-/// between them. Objects with text (fields, equations…) count as their text. Each token records
-/// the byte range it came from in `p`, so its output segment can take that source run's
-/// formatting. An object's flattened text (or a broken marker's placeholder) maps to the marker's
-/// own range, which is the nearest formatting the object has.
+/// between them, tracking each portion's original character properties.
 fn tokens(p: &Paragraph, characters: bool) -> Vec<Tok<'_>> {
-    fn push(v: &mut Vec<Tok<'_>>, cur: &mut String, start: usize, end: usize, c: char, characters: bool) {
-        cur.push(c);
-        if characters || c == ' ' {
-            v.push(Tok::Text(std::mem::take(cur), start..end));
+    fn flush_text(cur_pieces: &mut Vec<TokPiece<'_>>, cur_text: &mut String, cur_props: &mut Option<CharProps>) {
+        if !cur_text.is_empty() {
+            let props = cur_props.take().unwrap_or_default();
+            cur_pieces.push(TokPiece::Text(std::mem::take(cur_text), props));
         }
     }
-    let mut v = Vec::new();
-    let mut cur = String::new();
-    let mut cur_start = 0usize;
+
+    fn flush_tok<'a>(out: &mut Vec<Tok<'a>>, cur_pieces: &mut Vec<TokPiece<'a>>, cur_text: &mut String, cur_props: &mut Option<CharProps>) {
+        flush_text(cur_pieces, cur_text, cur_props);
+        if !cur_pieces.is_empty() {
+            out.push(Tok { pieces: std::mem::take(cur_pieces) });
+        }
+    }
+
+    let mut out: Vec<Tok<'_>> = Vec::new();
+    let mut cur_pieces: Vec<TokPiece<'_>> = Vec::new();
+    let mut cur_text = String::new();
+    let mut cur_props: Option<CharProps> = None;
     let mut objects = p.objects.iter();
-    for (i, c) in p.text.char_indices() {
-        let marker = i..i + OBJ.len_utf8();
-        if c != OBJ {
-            if cur.is_empty() {
-                cur_start = i;
+
+    let mut runs = p.run_ranges().peekable();
+    let mut byte_off = 0;
+    for c in p.text.chars() {
+        let char_len = c.len_utf8();
+        while runs.peek().is_some_and(|(r, _)| r.end <= byte_off) {
+            runs.next();
+        }
+        let mut props = runs.peek().map_or_else(|| p.mark.clone(), |(_, pr)| (*pr).clone());
+        props.ins = None;
+        props.del = None;
+        props.fmt_change = None;
+        byte_off += char_len;
+
+        if c == OBJ {
+            flush_tok(&mut out, &mut cur_pieces, &mut cur_text, &mut cur_props);
+            match objects.next() {
+                Some(o) if o.plain_text().is_empty() => {
+                    out.push(Tok { pieces: vec![TokPiece::Obj(o, props)] });
+                }
+                Some(o) => {
+                    for ch in o.plain_text().chars() {
+                        if cur_props.as_ref() != Some(&props) {
+                            flush_text(&mut cur_pieces, &mut cur_text, &mut cur_props);
+                            cur_props = Some(props.clone());
+                        }
+                        cur_text.push(ch);
+                        if characters || ch == ' ' {
+                            flush_tok(&mut out, &mut cur_pieces, &mut cur_text, &mut cur_props);
+                        }
+                    }
+                }
+                None => {
+                    log::warn!("compare: an object marker without its object");
+                    if cur_props.as_ref() != Some(&props) {
+                        flush_text(&mut cur_pieces, &mut cur_text, &mut cur_props);
+                        cur_props = Some(props.clone());
+                    }
+                    cur_text.push(char::REPLACEMENT_CHARACTER);
+                    if characters {
+                        flush_tok(&mut out, &mut cur_pieces, &mut cur_text, &mut cur_props);
+                    }
+                }
             }
-            push(&mut v, &mut cur, cur_start, i + c.len_utf8(), c, characters);
             continue;
         }
-        match objects.next() {
-            Some(o) if o.plain_text().is_empty() => {
-                if !cur.is_empty() {
-                    v.push(Tok::Text(std::mem::take(&mut cur), cur_start..i));
-                }
-                v.push(Tok::Obj(o, marker));
-            }
-            Some(o) => {
-                for c in o.plain_text().chars() {
-                    if cur.is_empty() {
-                        cur_start = i;
+
+        if cur_props.as_ref() != Some(&props) {
+            flush_text(&mut cur_pieces, &mut cur_text, &mut cur_props);
+            cur_props = Some(props);
+        }
+        cur_text.push(c);
+        if characters || c == ' ' {
+            flush_tok(&mut out, &mut cur_pieces, &mut cur_text, &mut cur_props);
+        }
+    }
+
+    flush_tok(&mut out, &mut cur_pieces, &mut cur_text, &mut cur_props);
+    out
+}
+
+/// Add a token at the end of `p` with revisions applied if specified.
+fn put_tok(p: &mut Paragraph, t: Option<&Tok<'_>>, rev: Option<u32>, is_ins: bool) {
+    let Some(t) = t else { return };
+    for piece in &t.pieces {
+        let at = p.len();
+        match piece {
+            TokPiece::Text(text, props) => {
+                let mut props = props.clone();
+                if let Some(r) = rev {
+                    if is_ins {
+                        props.ins = Some(r);
+                    } else {
+                        props.del = Some(r);
                     }
-                    push(&mut v, &mut cur, cur_start, marker.end, c, characters);
                 }
+                let _ = p.insert_text(at, text, &props);
             }
-            None => {
-                // A marker without its object (a broken paragraph): kept as a visible
-                // placeholder, so the loss shows in the result instead of vanishing.
-                log::warn!("compare: an object marker without its object");
-                if cur.is_empty() {
-                    cur_start = i;
+            TokPiece::Obj(o, props) => {
+                let mut props = props.clone();
+                if let Some(r) = rev {
+                    if is_ins {
+                        props.ins = Some(r);
+                    } else {
+                        props.del = Some(r);
+                    }
                 }
-                push(&mut v, &mut cur, cur_start, marker.end, char::REPLACEMENT_CHARACTER, characters);
+                let _ = p.insert_object(at, (*o).clone(), &props);
             }
         }
-    }
-    if !cur.is_empty() {
-        v.push(Tok::Text(cur, cur_start..p.text.len()));
-    }
-    v
-}
-
-/// One side's run formatting for `word_diff`: the paragraph's run ranges (from
-/// [`Paragraph::run_ranges`]), walked with a forward cursor. `word_diff` consumes each side's
-/// tokens in increasing offset order, so the cursor makes a token's lookup amortised O(1)
-/// instead of rescanning the runs from the start for every token; an out-of-order offset falls
-/// back to a binary search, so the lookup stays correct for any offset.
-struct SideProps<'a> {
-    ranges: Vec<(std::ops::Range<usize>, &'a CharProps)>,
-    mark: &'a CharProps,
-    cursor: usize,
-}
-
-impl<'a> SideProps<'a> {
-    fn new(p: &'a Paragraph) -> Self {
-        SideProps { ranges: p.run_ranges().collect(), mark: &p.mark, cursor: 0 }
-    }
-
-    /// The props of the run holding byte `off`: that run's props, or the paragraph mark when
-    /// `off` is past the last run — the same answer `Paragraph::props_of_char` gives.
-    fn run_props(&mut self, off: usize) -> &'a CharProps {
-        while self.cursor < self.ranges.len() && self.ranges[self.cursor].0.end <= off {
-            self.cursor += 1;
-        }
-        if let Some((range, props)) = self.ranges.get(self.cursor)
-            && range.contains(&off)
-        {
-            return props;
-        }
-        let idx = self.ranges.partition_point(|(r, _)| r.start <= off);
-        match idx.checked_sub(1).and_then(|i| self.ranges.get(i)) {
-            Some((range, props)) if range.contains(&off) => props,
-            _ => self.mark,
-        }
-    }
-
-    /// The formatting of the source run a token came from: the run holding the token's first
-    /// byte, with the revision metadata stripped. `ins`, `del` and `fmt_change` are indices into
-    /// the *source* document's own revision table, and the rebuilt paragraph lives in the result
-    /// document, whose table is a different one, so a source mark can never be carried across;
-    /// `word_diff` stamps the compare's own `ins`/`del` on the segments it marks. The consequence
-    /// is plain: a pre-existing pending revision inside a changed paragraph (say another author's
-    /// deletion) is superseded by the compare result rather than preserved. The hyperlink is
-    /// kept, because Reject restores it on a deleted run (at token granularity: the link is taken
-    /// from the token's first byte, so a token that starts unlinked can lose a mid-token link).
-    fn props_of(&mut self, t: &Tok<'_>) -> CharProps {
-        let off = match t {
-            Tok::Text(_, range) | Tok::Obj(_, range) => range.start,
-        };
-        let c = self.run_props(off);
-        CharProps { ins: None, del: None, fmt_change: None, ..c.clone() }
-    }
-}
-
-/// The props of an output token: those of the source run it came from, or — never expected, since
-/// [`tokens`] and [`lcs_ops`] consume both sides in step — the given fallback. A miss is loud.
-fn output_props(side: &mut SideProps<'_>, t: Option<&Tok<'_>>, fallback: &CharProps) -> CharProps {
-    if t.is_none() {
-        log::warn!("compare: a token range lookup missed; `tokens` and `lcs_ops` are out of step");
-    }
-    t.map(|t| side.props_of(t)).unwrap_or_else(|| fallback.clone())
-}
-
-/// Add a token at the end of `p` with `props`.
-fn put(p: &mut Paragraph, t: Option<&Tok<'_>>, props: &CharProps) {
-    let at = p.len();
-    match t {
-        Some(Tok::Text(t, _)) => {
-            let _ = p.insert_text(at, t, props);
-        }
-        Some(Tok::Obj(o, _)) => {
-            let _ = p.insert_object(at, (*o).clone(), props);
-        }
-        None => {}
     }
 }
 
@@ -569,11 +1644,160 @@ fn para_exceeds_char_limit(p: &Paragraph, limit: usize) -> bool {
     }
 }
 
+/// Looks up character properties in token `tok` at character offset `off`.
+fn props_at_offset(tok: &Tok<'_>, off: usize) -> CharProps {
+    let mut cur = 0usize;
+    for piece in &tok.pieces {
+        let piece_len = match piece {
+            TokPiece::Text(t, _) => t.chars().count(),
+            TokPiece::Obj(o, _) => o.plain_text().chars().count().max(1),
+        };
+        if off < cur.saturating_add(piece_len) {
+            return match piece {
+                TokPiece::Text(_, p) => p.clone(),
+                TokPiece::Obj(_, p) => p.clone(),
+            };
+        }
+        cur = cur.saturating_add(piece_len);
+    }
+    tok.pieces
+        .last()
+        .map(|p| match p {
+            TokPiece::Text(_, pr) => pr.clone(),
+            TokPiece::Obj(_, pr) => pr.clone(),
+        })
+        .unwrap_or_default()
+}
+
+/// Splits revised text pieces in `b` at formatting boundaries of original token `a`.
+fn split_tok_at_boundaries<'a>(a: &Tok<'_>, b: &mut Tok<'a>) {
+    let mut a_cuts = Vec::new();
+    let mut a_off = 0usize;
+    for p in &a.pieces {
+        let len = match p {
+            TokPiece::Text(t, _) => t.chars().count(),
+            TokPiece::Obj(o, _) => o.plain_text().chars().count().max(1),
+        };
+        a_off = a_off.saturating_add(len);
+        a_cuts.push(a_off);
+    }
+
+    let mut new_pieces = Vec::new();
+    let mut cur_off = 0usize;
+
+    for piece in std::mem::take(&mut b.pieces) {
+        match piece {
+            TokPiece::Text(text, props) => {
+                let char_count = text.chars().count();
+                let piece_end = cur_off.saturating_add(char_count);
+                let cuts: Vec<usize> = a_cuts.iter().copied().filter(|&c| c > cur_off && c < piece_end).collect();
+
+                if cuts.is_empty() {
+                    new_pieces.push(TokPiece::Text(text, props));
+                } else {
+                    let chars: Vec<char> = text.chars().collect();
+                    let mut seg_start = 0usize;
+                    for cut in cuts {
+                        let seg_end = cut.saturating_sub(cur_off);
+                        if seg_end > seg_start && seg_end <= chars.len() {
+                            let seg: String = chars[seg_start..seg_end].iter().collect();
+                            new_pieces.push(TokPiece::Text(seg, props.clone()));
+                            seg_start = seg_end;
+                        }
+                    }
+                    if seg_start < chars.len() {
+                        let seg: String = chars[seg_start..].iter().collect();
+                        new_pieces.push(TokPiece::Text(seg, props));
+                    }
+                }
+                cur_off = piece_end;
+            }
+            TokPiece::Obj(o, props) => {
+                let len = o.plain_text().chars().count().max(1);
+                cur_off = cur_off.saturating_add(len);
+                new_pieces.push(TokPiece::Obj(o, props));
+            }
+        }
+    }
+    b.pieces = new_pieces;
+}
+
+/// Compares character formatting between original token `a` and revised token `b`, recording
+/// tracked formatting revisions on `b`'s pieces when character properties differ.
+fn apply_tok_formatting(a: &Tok<'_>, b: &mut Tok<'_>, ctx: &mut DiffCtx<'_>) {
+    split_tok_at_boundaries(a, b);
+    let mut off = 0;
+    for piece in &mut b.pieces {
+        let old_props = props_at_offset(a, off);
+        let piece_len = match piece {
+            TokPiece::Text(t, props) => {
+                crate::cmd::fmt_revisions::compare_char_props(&old_props, props, ctx.revisions, ctx.author, ctx.date);
+                t.chars().count()
+            }
+            TokPiece::Obj(o, props) => {
+                crate::cmd::fmt_revisions::compare_char_props(&old_props, props, ctx.revisions, ctx.author, ctx.date);
+                o.plain_text().chars().count().max(1)
+            }
+        };
+        off = off.saturating_add(piece_len);
+    }
+}
+
+/// Returns the hyperlink target for a token piece if one is defined.
+fn piece_link<'a>(p: &'a TokPiece<'_>) -> Option<&'a str> {
+    match p {
+        TokPiece::Text(_, pr) | TokPiece::Obj(_, pr) => pr.link.as_deref(),
+    }
+}
+
+/// Returns whether two tokens have the same hyperlink target over the same characters.
+///
+/// A link is a property of a character, not of the run pieces it arrives in: moving a link's end
+/// (`"ab"` linked vs `"abc"` linked) is a change even when the pieces' link targets line up.
+fn same_tok_links(a: &Tok<'_>, b: &Tok<'_>) -> bool {
+    fn links<'a>(t: &'a Tok<'_>) -> Vec<Option<&'a str>> {
+        let mut out = Vec::new();
+        for piece in &t.pieces {
+            let len = match piece {
+                TokPiece::Text(text, _) => text.chars().count(),
+                TokPiece::Obj(..) => 1,
+            };
+            out.extend(std::iter::repeat_n(piece_link(piece), len));
+        }
+        out
+    }
+    let (a_links, b_links) = (links(a), links(b));
+    let a_has = a_links.iter().any(|l| l.is_some());
+    let b_has = b_links.iter().any(|l| l.is_some());
+    if !a_has || !b_has {
+        return true;
+    }
+    if a_links.len() != b_links.len() {
+        return false;
+    }
+    a_links == b_links
+}
+
+/// Returns whether two paragraphs have identical hyperlink targets across their runs.
+fn same_para_links(a: &Paragraph, b: &Paragraph) -> bool {
+    let a_has = a.runs.iter().any(|r| r.props.link.is_some());
+    let b_has = b.runs.iter().any(|r| r.props.link.is_some());
+    if !a_has && !b_has {
+        return true;
+    }
+    if a_has != b_has {
+        return false;
+    }
+    let a_links: Vec<(&str, Option<&str>)> = a.run_ranges().map(|(r, p)| (&a.text[r], p.link.as_deref())).collect();
+    let b_links: Vec<(&str, Option<&str>)> = b.run_ranges().map(|(r, p)| (&b.text[r], p.link.as_deref())).collect();
+    a_links == b_links
+}
+
 /// Diffs two matched paragraphs either at word granularity or at character granularity according
 /// to `ctx.opts.characters`. When character-level diff is requested but either paragraph exceeds
 /// [`MAX_CHAR_DIFF`] characters, falls back to word-level diff and increments `ctx.char_fallbacks`
 /// so callers can discover the fallback.
-fn word_diff(doc: &Document, a: &Paragraph, b: &Paragraph, ctx: &mut DiffCtx<'_>) -> Paragraph {
+fn word_diff(parts: &std::collections::BTreeMap<u32, wordcraft_doc::Part>, a: &Paragraph, b: &Paragraph, ctx: &mut DiffCtx<'_>) -> Paragraph {
     let chars = if ctx.opts.characters {
         if para_exceeds_char_limit(a, MAX_CHAR_DIFF) || para_exceeds_char_limit(b, MAX_CHAR_DIFF) {
             *ctx.char_fallbacks = ctx.char_fallbacks.saturating_add(1);
@@ -586,10 +1810,20 @@ fn word_diff(doc: &Document, a: &Paragraph, b: &Paragraph, ctx: &mut DiffCtx<'_>
     };
     let plain_revised = ctx.plain_revised;
     let (ta, tb) = (tokens(a, chars), tokens(b, chars));
-    let (mut a_props, mut b_props) = (SideProps::new(a), SideProps::new(b));
-    let key = |t: &Tok<'_>| match t {
-        Tok::Text(t, _) => Key::Text(ctx.opts.key(t)),
-        Tok::Obj(o, _) => obj_key(doc, o),
+    let key = |t: &Tok<'_>| {
+        if let Some(TokPiece::Obj(o, _)) = t.pieces.first().filter(|_| t.pieces.len() == 1)
+            && o.plain_text().is_empty()
+        {
+            return obj_key(parts, o);
+        }
+        let mut s = String::new();
+        for piece in &t.pieces {
+            match piece {
+                TokPiece::Text(text, _) => s.push_str(text),
+                TokPiece::Obj(o, _) => s.push_str(o.plain_text()),
+            }
+        }
+        Key::Text(ctx.opts.key(&s))
     };
     let ops = lcs_ops(&ta.iter().map(key).collect::<Vec<_>>(), &tb.iter().map(key).collect::<Vec<_>>(), ctx.budget);
     // Only at character granularity: a matched whole word almost never happens by coincidence,
@@ -598,7 +1832,7 @@ fn word_diff(doc: &Document, a: &Paragraph, b: &Paragraph, ctx: &mut DiffCtx<'_>
     let ops = if chars { collapse_noise_matches(&ops) } else { ops };
     let mut p = Paragraph::new();
     // The revised paragraph's properties are used with its revision bookkeeping stripped, like runs
-    // (`SideProps::props_of`) and the mark, because `fmt_change`/`num_change` are indices into the revised
+    // and the mark, because `fmt_change`/`num_change` are indices into the revised
     // document's own revision table and are meaningless in the result document. A plain-text
     // revised side, which carries no paragraph properties of its own, falls back to the original's,
     // stripped the same way, so pre-existing revision state never leaks into the rebuilt paragraph.
@@ -612,34 +1846,63 @@ fn word_diff(doc: &Document, a: &Paragraph, b: &Paragraph, ctx: &mut DiffCtx<'_>
     } else {
         CharProps { ins: None, del: None, fmt_change: None, ..b.mark.clone() }
     };
-    let fallback = a.runs.first().map(|r| CharProps { ins: None, del: None, fmt_change: None, ..r.props.clone() }).unwrap_or_default();
-    let fallback_b = b.runs.first().map(|r| CharProps { ins: None, del: None, fmt_change: None, ..r.props.clone() }).unwrap_or_default();
+    // The section break belongs to the paragraph, not its text: a diffed paragraph must keep it.
+    p.section = b.section.clone();
     let (mut i, mut j) = (0, 0);
     for op in ops {
         match op {
             Op::Same => {
-                // Equal as compared (perhaps up to case or spacing): the revised text, but the
-                // formatting of the run it stands for. For a document revised side that is the
-                // revised run, as issue #3749 prescribes ("Copy unchanged tokens from the revised
-                // paragraph with their own properties"); a plain-text revised side has no runs to
-                // speak of, so the original run's formatting is kept instead.
-                let props =
-                    if plain_revised { output_props(&mut a_props, ta.get(i), &fallback) } else { output_props(&mut b_props, tb.get(j), &fallback_b) };
-                put(&mut p, tb.get(j), &props);
+                // Equal as compared (perhaps up to case or spacing): the revised text.
+                let ta_tok = ta.get(i);
+                let tb_tok = tb.get(j);
+                if let (Some(a_tok), Some(b_tok)) = (ta_tok, tb_tok)
+                    && !same_tok_links(a_tok, b_tok)
+                {
+                    put_tok(&mut p, Some(a_tok), Some(ctx.del), false);
+                    put_tok(&mut p, Some(b_tok), Some(ctx.ins), true);
+                } else {
+                    let mut tb_mut = tb_tok.cloned();
+                    if plain_revised {
+                        if let (Some(ta_tok), Some(tb_mut)) = (ta.get(i), tb_mut.as_mut()) {
+                            split_tok_at_boundaries(ta_tok, tb_mut);
+                            let mut off = 0;
+                            for piece in &mut tb_mut.pieces {
+                                let old_props = props_at_offset(ta_tok, off);
+                                let piece_len = match piece {
+                                    TokPiece::Text(t, props) => {
+                                        *props = old_props;
+                                        t.chars().count()
+                                    }
+                                    TokPiece::Obj(o, props) => {
+                                        *props = old_props;
+                                        o.plain_text().chars().count().max(1)
+                                    }
+                                };
+                                off = off.saturating_add(piece_len);
+                            }
+                        }
+                    } else if ctx.opts.formatting
+                        && let (Some(ta_tok), Some(tb_mut)) = (ta.get(i), tb_mut.as_mut())
+                    {
+                        apply_tok_formatting(ta_tok, tb_mut, ctx);
+                    }
+                    put_tok(&mut p, tb_mut.as_ref(), None, false);
+                }
                 i += 1;
                 j += 1;
             }
             Op::Del => {
-                let props = output_props(&mut a_props, ta.get(i), &fallback);
-                put(&mut p, ta.get(i), &CharProps { del: Some(ctx.del), ..props });
+                put_tok(&mut p, ta.get(i), Some(ctx.del), false);
                 i += 1;
             }
             Op::Ins => {
-                let props = tb.get(j).map(|t| b_props.props_of(t)).unwrap_or_else(|| fallback.clone());
-                put(&mut p, tb.get(j), &CharProps { ins: Some(ctx.ins), ..props });
+                put_tok(&mut p, tb.get(j), Some(ctx.ins), true);
                 j += 1;
             }
         }
+    }
+    if ctx.opts.formatting {
+        crate::cmd::fmt_revisions::compare_para_formatting(&a.props, &a.mark, &mut p, ctx.revisions, ctx.author, ctx.date);
     }
     p
 }
