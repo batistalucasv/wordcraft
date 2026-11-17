@@ -35,7 +35,7 @@ use serde_json::{Value, json};
 use wordcraft_engine::WindowView;
 use wordcraft_engine::cmd::view::OtherWindow;
 
-use crate::{WordApp, documents, window_ui::WindowUi};
+use crate::{WordApp, documents, window_geometry, window_ui::WindowUi};
 
 pub(crate) mod arrange;
 
@@ -95,6 +95,8 @@ pub struct Windows {
     driven: bool,
     /// View › Window: Side by Side and Synchronous Scrolling (#322).
     arranged: arrange::State,
+    /// The newest window, when the driver was last told where new windows go.
+    newest: Option<WindowId>,
 }
 
 impl Windows {
@@ -119,6 +121,7 @@ impl Windows {
             input_plugin: false,
             driven: false,
             arranged: arrange::State::default(),
+            newest: None,
         }
     }
 
@@ -335,6 +338,30 @@ impl WordApp {
         let doc_id = root_win.doc;
         let title = self.session.documents().iter().find(|d| d.id == doc_id).map(documents::display_title).unwrap_or_default();
         Some((root_win.key, doc_id, title))
+    }
+
+    /// A window opened since the last frame cascades on the monitor of the window before it.
+    /// The driver, left to itself, guesses that monitor from the window's top-left corner, which
+    /// on Windows is a few pixels outside a maximized window's monitor: it took the monitor up
+    /// and to the left, one that needn't exist, and the new window opened off screen.
+    ///
+    /// Each window's rectangle is in points of its own scale, so the monitor is picked in physical
+    /// pixels, and the bounds go back to the points of the window the cascade starts from.
+    fn bound_new_window(&self, ctx: &egui::Context, list: &WindowList<u64>, viewports: &mut Viewports) -> Option<WindowId> {
+        let newest = list.ids().last();
+        if newest != self.windows.newest {
+            let origin = list.recent().filter(|id| Some(*id) != newest).find_map(|id| Some((id, list.outer_rect(id)?)));
+            let monitor = origin.and_then(|(id, rect)| {
+                let scale = ctx.input_for(viewports.viewport_id(id), |i| i.pixels_per_point());
+                if !scale.is_finite() || scale <= 0.0 {
+                    return None;
+                }
+                let ask = self.services.monitors.as_ref()?;
+                Some(window_geometry::monitor_of(egui::Rect::from(rect) * scale, &ask())? / scale)
+            });
+            viewports.set_bounds(monitor.map(Into::into));
+        }
+        newest
     }
 
     /// The viewport new windows start from: the host's size, icon and app id. Their title and
@@ -636,6 +663,7 @@ impl WordApp {
         }
         let Some(mut viewports) = self.windows.viewports.take() else { return };
         let mut list = std::mem::take(&mut self.windows.list);
+        self.windows.newest = self.bound_new_window(&ctx, &list, &mut viewports);
         self.windows.recent = list.recent().filter_map(|id| list.get(id).copied()).collect();
         let titles: HashMap<u64, String> = self.windows.open.iter().map(|w| (w.key, w.title.clone())).collect();
         let target_monitor = list
