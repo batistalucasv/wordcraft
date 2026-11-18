@@ -2121,3 +2121,45 @@ fn shape_outline_no_line_dash_and_cap_round_trip_docx() {
     assert_eq!(extra.dash, wordcraft_doc::line_dash::LineDash::SystemDot);
     assert_eq!(extra.cap, wordcraft_doc::connector::LineCap::Square);
 }
+
+/// Issue #5896: mixed multi-selections enable `shape.fill`, `shape.outline`, `shape.effects`,
+/// `shape.alignText`, and `shape.textDirection` whenever at least one selected target matches.
+#[test]
+fn mixed_object_multi_selection_enables_shape_and_text_box_commands() {
+    // Picture selected first + rectangle added via select.addObject.
+    let mut s = Session::new(wordcraft_doc::Document::new());
+    let data = super::super::insert::base64_encode(&png(12, 12));
+    s.run("insert.picture", &json!({"data": data, "width": 60})).unwrap();
+    s.sel = Selection::caret(s.doc.end_of(StoryRef::Body));
+    s.run("insert.shape", &json!({"kind": "rectangle"})).unwrap();
+    s.run("select.objects", &json!({"index": 0})).unwrap();
+    s.run("select.addObject", &json!({"index": 1})).unwrap();
+
+    s.run("shape.fill", &json!({"color": "00AA00"})).unwrap();
+    s.run("shape.outline", &json!({"color": "FF0000", "dash": "dash"})).unwrap();
+    s.run("shape.effects", &json!({"shadow": "offsetBottomRight"})).unwrap();
+    assert!(matches!(s.run("shape.alignText", &json!({"anchor": "b"})), Err(CmdError::Disabled(_))));
+    assert!(matches!(s.run("shape.textDirection", &json!({"dir": "vert"})), Err(CmdError::Disabled(_))));
+
+    let objs = all_objects(&s);
+    assert!(matches!(&objs[0].1, InlineObject::Image { .. }));
+    let InlineObject::Shape { fill, stroke, effects, extra, .. } = &objs[1].1 else { panic!("{:?}", objs[1]) };
+    assert_eq!(*fill, Rgb::parse("00AA00").map(wordcraft_doc::fill::Fill::solid));
+    assert_eq!(*stroke, Rgb::parse("FF0000"));
+    assert_eq!(extra.dash, wordcraft_doc::line_dash::LineDash::Dash);
+    assert!(effects.shadow.is_some());
+
+    // Plain shape selected first + text box added via select.addObject.
+    let mut s2 = Session::new(wordcraft_doc::Document::new());
+    s2.run("insert.shape", &json!({"kind": "rectangle"})).unwrap();
+    s2.sel = Selection::caret(s2.doc.end_of(StoryRef::Body));
+    let tb_id = s2.run("insert.textBox", &json!({"text": "Mixed box"})).unwrap()["story"].as_u64().unwrap() as u32;
+    s2.run("select.objects", &json!({"index": 0})).unwrap();
+    s2.run("select.addObject", &json!({"index": 1})).unwrap();
+
+    s2.run("shape.alignText", &json!({"anchor": "b"})).unwrap();
+    s2.run("shape.textDirection", &json!({"dir": "vert270"})).unwrap();
+    let body = s2.doc.parts.get(&tb_id).unwrap().body;
+    assert_eq!(body.anchor, VAlign::Bottom);
+    assert_eq!(body.vert, TextVert::Vert270);
+}

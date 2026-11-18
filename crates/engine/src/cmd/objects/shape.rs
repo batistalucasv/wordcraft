@@ -1,14 +1,35 @@
-use super::select::{all_objects, edit_obj, selected, target_objects};
+use super::select::{all_objects, edit_obj, picked_objects, selected, target_objects};
 use super::{CmdError, CmdResult, InlineObject, Pos, Rgb, Session, StoryRef, TextBody, Value, json, p};
 
 pub(super) const NO_TEXT_BOX: &str = "select a text box first";
 
 pub(super) fn has_text_box(s: &Session) -> Option<&'static str> {
-    if text_box_target(s).is_some() { None } else { Some(NO_TEXT_BOX) }
+    if text_box_targets(s).is_empty() { Some(NO_TEXT_BOX) } else { None }
 }
 
 fn is_text_box(s: &Session, id: u32) -> bool {
     s.doc.parts.get(&id).is_some_and(|p| p.kind == wordcraft_doc::PartKind::TextBox)
+}
+
+/// Target text boxes for Shape Format › Text commands: all selected text boxes (including
+/// those added with `select.addObject` or the active canvas text box member), falling back
+/// to the text box containing the caret when no object is selected.
+pub fn text_box_targets(s: &Session) -> Vec<(Pos, u32)> {
+    let mut targets: Vec<(Pos, u32)> = target_objects(s, |o| matches!(o, InlineObject::Shape { story: Some(id), .. } if is_text_box(s, *id)))
+        .into_iter()
+        .filter_map(|(pos, o)| match o {
+            InlineObject::Shape { story: Some(id), .. } => Some((pos, id)),
+            _ => None,
+        })
+        .collect();
+    if targets.is_empty()
+        && selected(s).is_none()
+        && picked_objects(s).is_empty()
+        && let Some(t) = text_box_target(s)
+    {
+        targets.push(t);
+    }
+    targets
 }
 
 /// The text box the Shape Format › Text commands work on: the selected one, or the one whose
@@ -30,18 +51,7 @@ pub fn text_box_target(s: &Session) -> Option<(Pos, u32)> {
 
 /// Change the target text boxes' text direction, alignment or link.
 pub(crate) fn set_text_body(s: &mut Session, f: impl Fn(&mut TextBody)) -> CmdResult {
-    let mut targets: Vec<(Pos, u32)> = target_objects(s, |o| matches!(o, InlineObject::Shape { story: Some(id), .. } if is_text_box(s, *id)))
-        .into_iter()
-        .filter_map(|(pos, o)| match o {
-            InlineObject::Shape { story: Some(id), .. } => Some((pos, id)),
-            _ => None,
-        })
-        .collect();
-    if targets.is_empty()
-        && let Some(t) = text_box_target(s)
-    {
-        targets.push(t);
-    }
+    let targets = text_box_targets(s);
     if targets.is_empty() {
         return Err(CmdError::Disabled(NO_TEXT_BOX.into()));
     }

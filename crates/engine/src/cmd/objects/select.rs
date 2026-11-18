@@ -84,12 +84,9 @@ pub(super) fn has_group(s: &Session) -> Option<&'static str> {
     }
 }
 
-/// Shape Fill and Shape Outline: a shape, or a Drawing Canvas's background and border.
+/// Shape Fill and Shape Outline: any selected shape or Drawing Canvas, or the active text box.
 pub(crate) fn has_shape_or_canvas(s: &Session) -> Option<&'static str> {
-    match selected(s) {
-        Some((_, o)) if o.is_canvas() => None,
-        _ => has_shape(s),
-    }
+    if target_objects(s, |o| matches!(o, InlineObject::Shape { .. }) || o.is_canvas()).is_empty() { Some("select a shape first") } else { None }
 }
 
 pub(super) fn can_group(s: &Session) -> Option<&'static str> {
@@ -102,6 +99,11 @@ pub(super) fn has_shape(s: &Session) -> Option<&'static str> {
         Some((_, InlineObject::Shape { .. })) => None,
         _ => Some("select a shape first"),
     }
+}
+
+/// Guard returning `None` when any selected object (or the active text box) is a shape.
+pub(super) fn has_any_shape(s: &Session) -> Option<&'static str> {
+    if target_objects(s, |o| matches!(o, InlineObject::Shape { .. })).is_empty() { Some("select a shape first") } else { None }
 }
 
 /// The selection when it is exactly one picture, shape or text box (its U+FFFC), rather than
@@ -209,7 +211,7 @@ pub(crate) const MAX_TARGET_OBJECTS: usize = 10_000;
 
 /// Selected objects matching `pred` (in the selection range or added with `select.addObject`),
 /// or — when nothing is selected — the active text box containing the caret if it matches `pred`.
-pub(crate) fn target_objects(s: &Session, pred: impl Fn(&InlineObject) -> bool) -> Vec<(Pos, InlineObject)> {
+pub fn target_objects(s: &Session, pred: impl Fn(&InlineObject) -> bool) -> Vec<(Pos, InlineObject)> {
     if let Some((pos, _, member)) = crate::cmd::canvas::active_member(s) {
         return if pred(member) { vec![(pos, member.clone())] } else { Vec::new() };
     }

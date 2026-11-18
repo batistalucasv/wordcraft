@@ -2,8 +2,9 @@ use super::arrange::{MAX_OFFSET, bounds, copy_to, move_with_text, unalign};
 use super::group::{add_object, group, ungroup};
 use super::picture::{adjust, adjust_media, clear_lum, crop, original_media, recolor, relook, remove_background, reset, size};
 use super::select::{
-    all_objects, alt_text, can_group, edit_obj, has_floating, has_group, has_movable, has_object, has_picture, has_placeable, has_shape,
-    has_shape_or_canvas, has_sizable, obj_size, objects_list, selected_or_text_box, target_objects, with_float, with_movable_floats, with_obj,
+    all_objects, alt_text, can_group, edit_obj, has_any_shape, has_floating, has_group, has_movable, has_object, has_picture, has_placeable,
+    has_shape, has_shape_or_canvas, has_sizable, obj_size, objects_list, selected_or_text_box, target_objects, with_float, with_movable_floats,
+    with_obj,
 };
 use super::shape::{NO_TEXT_BOX, can_link, has_text_box, link_text_box, set_text_body, shape_effects, text_box_target};
 use super::{CmdError, CommandSpec, InlineObject, Pos, Rgb, Selection, Spin, TextVert, VAlign, Wrap, WrapText, json, p, sel_result};
@@ -376,7 +377,7 @@ pub fn specs() -> Vec<CommandSpec> {
             .params(
                 r#"{"shadow"?: preset|{"preset"?, "color"?: "RRGGBB", "transparency"?: %, "blur"?: pt, "distance"?: pt, "angle"?: deg}|null, "glow"?: pt|{"color"?: "RRGGBB", "size"?: pt, "transparency"?: %}|null, "softEdge"?: pt|null}  (shadow presets: offsetBottomRight, offsetBottom, offsetBottomLeft, offsetRight, offsetCenter, offsetLeft, offsetTopRight, offsetTop, offsetTopLeft; an omitted key is left as it is; applies to every shape in the selection)"#,
             )
-            .when(has_shape),
+            .when(has_any_shape),
         CommandSpec::new("shape.change", "Change Shape", "Shape Format › Insert Shapes", |s, v| {
             let kind: wordcraft_doc::para::ShapeKind = serde_json::from_value(v.get("kind").cloned().unwrap_or(json!("rectangle"))).map_err(|e| CmdError::Params(e.to_string()))?;
             with_obj(s, |o| {
