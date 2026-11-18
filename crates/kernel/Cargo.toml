@@ -1,0 +1,16 @@
+[package]
+name = "wordcraft-kernel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "WordCraft execution runner for interactive code chunks (R and Python)"
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

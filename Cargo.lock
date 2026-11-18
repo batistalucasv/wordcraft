@@ -7532,6 +7532,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "wordcraft-kernel"
+version = "0.18.1"
+dependencies = [
+ "proptest",
+ "serde",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "wordcraft-layout"
 version = "0.18.1"
 dependencies = [

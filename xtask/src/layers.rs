@@ -37,6 +37,7 @@ pub const TABLE: &[(&str, Class)] = &[
     ("control-key", Class::Standalone),
     ("doc", Class::Layer(1)),
     ("fonts", Class::Layer(1)),
+    ("kernel", Class::Layer(1)),
     ("layout", Class::Layer(2)),
     ("docx", Class::Layer(2)),
     ("docbin", Class::Layer(2)),
