@@ -1,7 +1,7 @@
 use super::doc_state::{ColumnBlock, Selection};
 use super::ime_state::ImeCaretState;
 use super::snapshot_types::RunSnapshot;
-use super::{CharProps, CmdError, Document, Fragment, ImeEditOutcome, Pos, Session, StoryRef, Value, document_id_mark};
+use super::{CharProps, CmdError, Document, Fragment, ImeEditOutcome, Session, StoryRef, Value, document_id_mark};
 use crate::CommandSpec;
 
 struct SuccessContext<'a> {
@@ -36,7 +36,7 @@ impl Session {
             && let Some(m) = self.math.take()
         {
             let off = m.at.off + wordcraft_doc::para::OBJ.len_utf8();
-            self.sel = Selection::caret(Pos { off, ..m.at });
+            self.sel = Selection::caret(m.at.at(off));
         }
     }
 
@@ -376,6 +376,10 @@ impl Session {
                     self.join_anchor = false;
                 }
             }
+        }
+        if spec.mutates && !no_op && !matches!(id, "edit.undo" | "edit.undoTo" | "edit.redo") {
+            self.sel.anchor.affinity = None;
+            self.sel.focus.affinity = None;
         }
         self.clamp_selection();
         let mut ime_outcome = self.ime_edit_outcome;
