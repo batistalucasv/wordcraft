@@ -112,12 +112,10 @@ fn conservative_span_bound(env: &ParaEnv, styles: &[StyleRun], rp: &ResolvedPara
     let est_h = (font_h * if let LineSpacing::Multiple(m) = rp.line_spacing { m } else { 1.0 }).max(1.0);
     let table_h = if let LineSpacing::Exactly(h) = rp.line_spacing { h } else { est_h };
     let settings = &env.doc.settings;
-    let may_tight = settings.do_not_suppress_indentation
-        && settings.compat_mode < wordcraft_doc::COMPAT_MODE_CURRENT
-        && env.label.is_none();
+    let may_tight = settings.do_not_suppress_indentation && settings.compat_mode < wordcraft_doc::COMPAT_MODE_CURRENT && env.label.is_none();
 
     for w in y_points.windows(2) {
-        let (y0, y1) = (w[0], w[1]);
+        let &[y0, y1] = w else { continue };
         if y1 <= y0 {
             continue;
         }
@@ -668,7 +666,7 @@ impl<'a> Builder<'a> {
     /// - All emitted clusters share the field slot's `start..end` in the document paragraph text.
     /// - Word and space groupings are determined by `break_positions` (UAX #14) and whitespace transitions.
     /// - Embedding levels for bidi reordering are resolved via [`isolate_base_level`] and internal `lv`.
-    /// - Unbroken words wider than `max_line_w` (derived conservatively via [`conservative_span_bound`]
+    /// - Unbroken words wider than `span_bound` (derived conservatively via [`conservative_span_bound`]
     ///   from the narrowest valid line-breaker span beside floating exclusions and indents) are chunked
     ///   into smaller clusters so that line breaking can emergency-split without overflowing margins or
     ///   extending into floating exclusions, where each emitted cluster allocates its displayed string
@@ -730,20 +728,22 @@ impl<'a> Builder<'a> {
         let n_added = added.len();
 
         while group_start < n_added {
-            let is_space = added[group_start].kind == ClKind::Space;
+            let Some(head) = added.get(group_start) else { break };
+            let is_space = head.kind == ClKind::Space;
             let mut group_end = group_start + 1;
-            while group_end < n_added {
-                if (added[group_end].kind == ClKind::Space) != is_space {
+            while let Some(next_cl) = added.get(group_end) {
+                if (next_cl.kind == ClKind::Space) != is_space {
                     break;
                 }
-                let t_end = added[group_end - 1].end.saturating_sub(start);
+                let Some(prev_cl) = added.get(group_end - 1) else { break };
+                let t_end = prev_cl.end.saturating_sub(start);
                 if opps.binary_search(&t_end).is_ok() {
                     break;
                 }
                 group_end += 1;
             }
-            let group = &added[group_start..group_end];
-            let last = &group[group.len() - 1];
+            let Some(group) = added.get(group_start..group_end) else { break };
+            let Some(last) = group.last() else { break };
             let w_end = last.end.saturating_sub(start);
 
             let group_adv: f32 = group.iter().map(|c| c.adv).sum();
@@ -765,16 +765,15 @@ impl<'a> Builder<'a> {
             // across lines with exact plain-text parity.
             if exceeds_bound {
                 let mut ci = 0;
-                while ci < group.len() {
+                while let Some(head_cl) = group.get(ci) {
                     let mut c_end = ci + 1;
                     // Keep glyphless followers (such as ligature tails) grouped with their head cluster
                     // so emergency line breaking never splits a ligature across lines.
-                    while c_end < group.len() && group[c_end].g1 <= group[c_end].g0 && group[c_end].style == group[ci].style {
+                    while group.get(c_end).is_some_and(|c| c.g1 <= c.g0 && c.style == head_cl.style) {
                         c_end += 1;
                     }
-                    let sub = &group[ci..c_end];
-                    let first = &sub[0];
-                    let last = &sub[sub.len() - 1];
+                    let Some(sub) = group.get(ci..c_end) else { break };
+                    let (Some(first), Some(last)) = (sub.first(), sub.last()) else { break };
                     let is_last = c_end == group.len();
                     let cs = first.start.saturating_sub(start);
                     let ce = last.end.saturating_sub(start);
@@ -807,15 +806,14 @@ impl<'a> Builder<'a> {
                 // Keep glyphs grouped in style runs within the word so style changes retain
                 // their respective fonts without introducing unwanted line breaks.
                 let mut run_start = 0;
-                while run_start < group.len() {
-                    let run_style = group[run_start].style;
+                while let Some(run_head) = group.get(run_start) {
+                    let run_style = run_head.style;
                     let mut run_end = run_start + 1;
-                    while run_end < group.len() && group[run_end].style == run_style {
+                    while group.get(run_end).is_some_and(|c| c.style == run_style) {
                         run_end += 1;
                     }
-                    let sub_run = &group[run_start..run_end];
-                    let first_c = &sub_run[0];
-                    let last_c = &sub_run[sub_run.len() - 1];
+                    let Some(sub_run) = group.get(run_start..run_end) else { break };
+                    let (Some(first_c), Some(last_c)) = (sub_run.first(), sub_run.last()) else { break };
                     let sub_w_start = first_c.start.saturating_sub(start);
                     let sub_w_end = last_c.end.saturating_sub(start);
                     let sub_text = text.get(sub_w_start..sub_w_end).unwrap_or("");
