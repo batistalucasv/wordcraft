@@ -67,23 +67,75 @@ fn owns_clipboard(v: &Value) -> bool {
     p::bool(v, "privateClipboard").unwrap_or(true)
 }
 
+/// Whether the HTML payload matches WordCraft's session clipboard HTML, accounting for the
+/// `<html><head>...</head><body>...</body></html>` wrapper arboard adds on macOS.
+fn html_matches_session(html: &str, session_html: &str) -> bool {
+    if html == session_html || html.trim() == session_html.trim() {
+        return true;
+    }
+    if let Some(body_start) = html.find("<body")
+        && let Some(gt) = html[body_start..].find('>')
+    {
+        let inner = &html[body_start + gt + 1..];
+        if let Some(end) = inner.rfind("</body>") {
+            let body_content = inner[..end].trim();
+            let stripped = body_content.trim_start_matches("<!--StartFragment-->").trim_end_matches("<!--EndFragment-->").trim();
+            let target = session_html.trim();
+            if body_content == target || stripped == target {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Whether the clipboard payload matches WordCraft's session clipboard copy, so the session's
 /// formatted fragment can be used.
+///
+/// **Normal path (text present and non-empty):** text match is the primary identity, like
+/// `main`. `privateClipboard` already guards against "someone else copied since", so HTML/RTF
+/// comparison is not required here.
+///
+/// **Empty-text branch (#5785, text boxes or shapes with no body text):** rich formats identify
+/// our copy. On macOS arboard wraps the HTML fragment in `<html>…<body>…</body></html>`, so RTF
+/// (written raw on all platforms) or unwrapped HTML confirms ownership.
+///
+/// **No clipboard data at all:** internal-only call (agent, CLI, tests) — use the session copy.
 pub(crate) fn matches_session_clipboard(s: &Session, v: &Value) -> bool {
     let text = p::str(v, "text").map(|t| t.replace("\r\n", "\n"));
     let html = p::str(v, "html");
     let rtf = p::str(v, "rtf");
-    let has_rich = html.is_some_and(|h| !h.is_empty()) || rtf.is_some_and(|r| !r.is_empty());
-    let html_matches = html.is_none_or(|h| h == s.clipboard_html);
-    let rtf_matches = rtf.is_none_or(|r| r == s.clipboard_rtf);
 
-    owns_clipboard(v)
-        && s.clipboard.as_ref().is_some_and(|f| {
-            text.as_ref().is_none_or(|t| f.clipboard_text() == *t || (t.is_empty() && has_rich))
-                && html_matches
-                && rtf_matches
-                && (text.is_some() || has_rich || (html.is_none() && rtf.is_none()))
-        })
+    if !owns_clipboard(v) {
+        return false;
+    }
+
+    let Some(f) = &s.clipboard else {
+        return false;
+    };
+
+    match text.as_deref() {
+        // Main's rule: when non-empty text matches, the session copy is used.
+        // `privateClipboard` already covers "someone else copied since".
+        Some(t) if !t.is_empty() => f.clipboard_text() == *t,
+
+        // Empty-text branch (#5785: custom text boxes or shapes with no body text):
+        // `text` is empty or omitted because the clipboard holds no plain text.
+        _ => {
+            let has_rich = html.is_some_and(|h| !h.is_empty()) || rtf.is_some_and(|r| !r.is_empty());
+            if !has_rich {
+                // Internal-only call with no rich clipboard data: use session copy.
+                text.as_deref().is_none_or(|t| t.is_empty() && f.clipboard_text().is_empty()) && (text.is_some() || (html.is_none() && rtf.is_none()))
+            } else {
+                let rtf_matches = rtf.is_some_and(|r| r == s.clipboard_rtf && !r.is_empty());
+                let html_matches = html.is_some_and(|h| html_matches_session(h, &s.clipboard_html) && !h.is_empty());
+                let rtf_ok = rtf.is_none_or(|r| r == s.clipboard_rtf);
+                let html_ok = html.is_none_or(|h| html_matches_session(h, &s.clipboard_html));
+
+                (rtf_matches || html_matches) && rtf_ok && html_ok
+            }
+        }
+    }
 }
 
 /// The source for a format, if the clipboard has it.
