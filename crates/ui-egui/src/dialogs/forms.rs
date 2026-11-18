@@ -304,10 +304,10 @@ impl TableForm {
         if self.align != basis.align {
             v.insert("align".into(), json!(self.align));
         }
-        if moved(self.indent, basis.indent) {
+        if self.wrapping != "around" && moved(self.indent, basis.indent) {
             v.insert("indent".into(), json!(self.indent * k));
         }
-        if self.wrapping != basis.wrapping && self.can_wrap {
+        if self.wrapping != basis.wrapping && (self.wrapping == "none" || self.can_wrap) {
             v.insert("wrapping".into(), json!(self.wrapping));
         }
         if self.rtl != basis.rtl {
@@ -414,7 +414,7 @@ pub(super) fn table_properties(ui: &mut Ui, f: &mut TableForm) {
                 r.cell(|ui| ui.label(tl!("Indent from left:")));
                 r.cell(|ui| {
                     ui.add_enabled(
-                        f.align == "left",
+                        f.align == "left" && f.wrapping != "around",
                         egui::DragValue::new(&mut f.indent).speed(0.01).range(-11.0..=22.0).measure(unit).max_decimals(2),
                     )
                 });
