@@ -987,6 +987,35 @@ mod tests {
         let line = super::current_line(h.state()).expect("shape has line");
         assert!(matches!(line.dash, wordcraft_doc::line_dash::LineDash::Custom(_)), "custom dash is preserved");
     }
+
+    /// Issue #5896 P2: when typing inside a text box inside a drawing canvas, Format Shape shows
+    /// the member's controls and "No line" removes the member's border without clearing the canvas's.
+    #[test]
+    fn format_shape_pane_targets_canvas_text_box_member_while_typing() {
+        let mut a = WordApp::new(wordcraft_engine::Session::new(wordcraft_doc::Document::new()), Default::default());
+        a.run("insert.canvas", json!({"width": 300, "height": 200, "outline": "1F4E79"})).unwrap();
+        a.run("insert.textBox", json!({"text": "Canvas text"})).unwrap();
+        a.run("view.formatShapePane", json!({"value": true})).unwrap();
+        let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1440.0, 900.0)).build_ui_state(
+            |ui, app: &mut WordApp| {
+                let ctx = ui.ctx().clone();
+                app.logic(&ctx);
+                app.ui(ui);
+            },
+            a,
+        );
+        h.run_steps(4);
+        assert!(h.query_by_label("Dash type").is_some(), "member text box shows Dash type");
+        assert!(h.query_by_label("Cap type").is_some(), "member text box shows Cap type");
+        assert!(h.query_by_label("Text Box").is_some(), "member text box shows Text Box section");
+
+        h.get_by_label("No line").click();
+        h.run_steps(3);
+        let canvas = h.state().session.doc.body.first().and_then(|b| b.as_para()).and_then(|p| p.objects.first()).unwrap();
+        assert_eq!(canvas.canvas_style().and_then(|st| st.stroke), Some(wordcraft_doc::Rgb(0x1F, 0x4E, 0x79)));
+        let InlineObject::Group { children, .. } = canvas else { panic!("{canvas:?}") };
+        assert!(matches!(&children[0].obj, InlineObject::Shape { stroke: None, .. }));
+    }
 }
 
 #[cfg(test)]

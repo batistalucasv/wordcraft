@@ -29,7 +29,7 @@ pub use picture::{OriginalSize, PictureLook, cropped_original_size, fit_size, or
 use picture::{clear_background, grown, picture_style};
 #[cfg(test)]
 pub(crate) use select::all_objects;
-pub(crate) use select::{edit_obj, has_shape_or_canvas};
+pub(crate) use select::{edit_obj, has_shape_or_canvas, target_objects};
 #[cfg(test)]
 use select::{has_group, holds_ink, obj_size, with_obj};
 pub use select::{min_size, object_selection, picked_objects, selected, selected_all, selected_or_text_box};
