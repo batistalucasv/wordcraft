@@ -9,6 +9,8 @@ impl Session {
         let replaced = self.document_id;
         self.md_source = None;
         self.md_file = Default::default();
+        // Chunk outputs name controls by id, which mean nothing in the document replacing this one.
+        self.chunks.clear_all();
         self.document_id = next_document_id();
         if let Some(at) = self.order.iter_mut().find(|d| **d == replaced) {
             *at = self.document_id;
@@ -174,6 +176,8 @@ impl Session {
             // Go Back's places, like the caret history: not part of the document.
             edit_marks: _,
             go_back_step: _,
+            // Kernel output is not part of the document.
+            chunks: _,
         } = self;
         let head = if history.len() + SNAPSHOT_HEAD > MAX_UNDO { history.iter().take(SNAPSHOT_HEAD).cloned().collect() } else { Vec::new() };
         EditSnapshot {
@@ -231,6 +235,7 @@ impl Session {
         self.ime_text_join = ime_text_join;
         self.ime_body_epoch = ime_body_epoch;
         self.join_anchor = join_anchor;
+        self.chunks.invalidate_for_document(&self.doc);
         self.touch();
         self.dirty = dirty;
     }

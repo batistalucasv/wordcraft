@@ -200,6 +200,7 @@ impl Session {
         // Undo swaps the whole body back: a composition belongs to the text it showed.
         self.note_body_replaced();
         self.refresh_math_session();
+        self.chunks.invalidate_for_document(&self.doc);
         self.touch();
         true
     }
@@ -225,6 +226,7 @@ impl Session {
         self.history.push(Arc::new(cur));
         self.note_body_replaced();
         self.refresh_math_session();
+        self.chunks.invalidate_for_document(&self.doc);
         self.touch();
         true
     }
