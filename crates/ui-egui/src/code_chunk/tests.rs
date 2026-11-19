@@ -30,7 +30,15 @@ fn result(stdout: &str, plot: Option<Vec<u8>>) -> ExecutionResult {
         timed_out: false,
         plot_png: plot,
         plot_svg: None,
+        tables: Vec::new(),
         duration_ms: 120,
+    }
+}
+
+fn table(headers: &[&str], rows: &[&[&str]]) -> TabularOutput {
+    TabularOutput {
+        headers: headers.iter().map(|header| (*header).to_owned()).collect(),
+        rows: rows.iter().map(|row| row.iter().map(|cell| (*cell).to_owned()).collect()).collect(),
     }
 }
 
@@ -223,4 +231,118 @@ fn the_plot_tab_offers_insertion_into_the_document() {
         Some(CodeChunkAction::InsertPlot { png: Some(png), .. }) => assert!(!png.is_empty(), "the PNG reaches the host"),
         other => panic!("expected an insert action, got {other:?}"),
     }
+}
+
+#[test]
+fn a_result_with_tables_opens_the_table_tab() {
+    let ctx = egui::Context::default();
+    let mut chunk = python();
+    let (tx, rx) = mpsc::channel();
+    chunk.pending = Some(rx);
+    chunk.started = Some(Instant::now());
+    tx.send(Ok(ExecutionResult { tables: vec![table(&["n"], &[&["1"]])], ..result("", None) })).unwrap();
+    chunk.poll(&ctx);
+
+    assert_eq!(chunk.tab, OutputTab::Table, "a run that captured a table opens on its tab");
+    assert!(chunk.output().expect("the run's output").has_tables());
+}
+
+#[test]
+fn a_plot_still_wins_the_initial_tab_when_a_run_produced_both() {
+    let mut chunk = python();
+    chunk.set_output(ChunkOutput { plot_png: Some(plot_png()), tables: vec![table(&["n"], &[&["1"]])], success: true, ..ChunkOutput::default() });
+
+    assert_eq!(chunk.tab, OutputTab::Plot);
+}
+
+#[test]
+fn the_table_tab_shows_the_captured_frame() {
+    let mut chunk = python();
+    chunk.set_output(ChunkOutput {
+        tables: vec![table(&["species", "n"], &[&["setosa", "50"], &["virginica", "50"]])],
+        success: true,
+        ..ChunkOutput::default()
+    });
+    let mut harness = harness(chunk);
+    steps(&mut harness, 3);
+
+    assert_eq!(harness.state().chunk.tab, OutputTab::Table);
+    assert!(harness.query_by_label_contains("species").is_some(), "the header is drawn");
+    assert!(harness.query_by_label_contains("virginica").is_some(), "the cells are drawn");
+}
+
+#[test]
+fn the_table_tab_offers_insertion_and_carries_every_row() {
+    let rows: Vec<Vec<String>> = (0..250).map(|index| vec![index.to_string()]).collect();
+    let mut chunk = python();
+    chunk.set_output(ChunkOutput { tables: vec![TabularOutput { headers: vec!["n".to_owned()], rows }], success: true, ..ChunkOutput::default() });
+    let mut harness = harness(chunk);
+    steps(&mut harness, 3);
+
+    assert!(harness.query_by_label_contains("Showing the first").is_some(), "the drawer says the grid is a preview");
+    harness.get_by_label("Insert into document").click();
+    steps(&mut harness, 2);
+    match harness.state().actions.last() {
+        Some(CodeChunkAction::InsertTable { headers, rows }) => {
+            assert_eq!(headers, &vec!["n".to_owned()]);
+            assert_eq!(rows.len(), 250, "the action carries the table, not the bounded preview");
+        }
+        other => panic!("expected a table insert action, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_run_with_two_tables_lets_the_drawer_pick_one() {
+    let mut chunk = python();
+    chunk.set_output(ChunkOutput {
+        tables: vec![table(&["first"], &[&["one"]]), table(&["second"], &[&["two"]])],
+        success: true,
+        ..ChunkOutput::default()
+    });
+    let mut harness = harness(chunk);
+    steps(&mut harness, 3);
+
+    assert!(harness.query_by_label_contains("Table 2").is_some(), "both tables are offered");
+    harness.get_by_label("Table 2").click();
+    steps(&mut harness, 2);
+    assert_eq!(harness.state().chunk.table_index, 1);
+    assert!(harness.query_by_label_contains("second").is_some(), "the second table is drawn");
+}
+
+#[test]
+fn numeric_cells_are_recognised_for_right_alignment() {
+    assert!(is_numeric("1.5"));
+    assert!(is_numeric("-2"));
+    assert!(is_numeric("1e6"));
+    assert!(!is_numeric("NA"));
+    assert!(!is_numeric(""));
+    assert!(!is_numeric("setosa"));
+}
+
+#[test]
+fn a_table_without_columns_does_not_reach_the_grid() {
+    let mut chunk = python();
+    chunk.set_output(ChunkOutput {
+        tables: vec![TabularOutput { headers: Vec::new(), rows: vec![vec!["1".to_owned()]] }],
+        success: true,
+        ..ChunkOutput::default()
+    });
+    let mut harness = harness(chunk);
+    steps(&mut harness, 3);
+
+    assert!(harness.query_by_label_contains("This run captured no table.").is_some());
+    assert!(harness.query_by_label("Insert into document").is_none(), "nothing to insert");
+}
+
+#[test]
+fn a_wide_table_previews_fifty_columns_and_says_so() {
+    let headers: Vec<String> = (0..60).map(|index| format!("c{index}")).collect();
+    let row: Vec<String> = (0..60).map(|index| index.to_string()).collect();
+    let mut chunk = python();
+    chunk.set_output(ChunkOutput { tables: vec![TabularOutput { headers, rows: vec![row] }], success: true, ..ChunkOutput::default() });
+    let mut harness = harness(chunk);
+    steps(&mut harness, 3);
+
+    assert!(harness.query_by_label_contains("Showing the first").is_some(), "the drawer says the grid is a preview");
+    assert!(harness.query_by_label_contains("c49").is_some(), "the last previewed column is drawn");
 }
