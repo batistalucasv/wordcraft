@@ -2,14 +2,7 @@
 //!
 //! Provides isolated, safe subprocess execution with timeout enforcement,
 //! output capture (stdout, stderr, exit status), and plot interception (PNG and vector SVG).
-#![deny(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::unimplemented,
-    clippy::todo,
-    clippy::unreachable
-)]
+#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 use std::fmt;
 use std::fs;
@@ -121,14 +114,7 @@ pub struct ExecutionRequest {
 impl ExecutionRequest {
     /// Create a new execution request with reasonable defaults (30s timeout, plot capture enabled, PNG format).
     pub fn new(language: CodeLanguage, code: impl Into<String>) -> Self {
-        Self {
-            language,
-            code: code.into(),
-            timeout_ms: 30_000,
-            capture_plots: true,
-            plot_format: PlotFormat::Png,
-            working_dir: None,
-        }
+        Self { language, code: code.into(), timeout_ms: 30_000, capture_plots: true, plot_format: PlotFormat::Png, working_dir: None }
     }
 
     /// Set a custom timeout in milliseconds.
@@ -184,10 +170,7 @@ pub enum KernelError {
     UnsupportedLanguage(String),
 
     #[error("Interpreter for {language} ('{binary}') was not found in PATH")]
-    InterpreterNotFound {
-        language: CodeLanguage,
-        binary: &'static str,
-    },
+    InterpreterNotFound { language: CodeLanguage, binary: &'static str },
 
     #[error("I/O error during execution: {0}")]
     Io(String),
@@ -223,36 +206,20 @@ pub fn which_binary(language: CodeLanguage) -> Option<PathBuf> {
 
 /// Execute a code chunk and collect outputs.
 pub fn execute(request: &ExecutionRequest) -> Result<ExecutionResult, KernelError> {
-    let binary =
-        which_binary(request.language).ok_or_else(|| KernelError::InterpreterNotFound {
-            language: request.language,
-            binary: request.language.binary_name(),
-        })?;
+    let binary = which_binary(request.language)
+        .ok_or_else(|| KernelError::InterpreterNotFound { language: request.language, binary: request.language.binary_name() })?;
 
     let unique_id = SCRIPT_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let temp_dir = std::env::temp_dir().join(format!(
-        "wordcraft-chunk-{}-{}",
-        std::process::id(),
-        unique_id
-    ));
-    fs::create_dir_all(&temp_dir)
-        .map_err(|e| KernelError::Io(format!("create temp dir {}: {e}", temp_dir.display())))?;
+    let temp_dir = std::env::temp_dir().join(format!("wordcraft-chunk-{}-{}", std::process::id(), unique_id));
+    fs::create_dir_all(&temp_dir).map_err(|e| KernelError::Io(format!("create temp dir {}: {e}", temp_dir.display())))?;
 
     let plot_png_path = temp_dir.join("__wordcraft_plot__.png");
     let plot_svg_path = temp_dir.join("__wordcraft_plot__.svg");
     let script_file = temp_dir.join(format!("script.{}", request.language.extension()));
 
-    let wrapped_code = prepare_wrapped_code(
-        request.language,
-        &request.code,
-        request.capture_plots,
-        request.plot_format,
-        &plot_png_path,
-        &plot_svg_path,
-    );
-    fs::write(&script_file, wrapped_code.as_bytes()).map_err(|e| {
-        KernelError::ScriptPreparation(format!("write {}: {e}", script_file.display()))
-    })?;
+    let wrapped_code =
+        prepare_wrapped_code(request.language, &request.code, request.capture_plots, request.plot_format, &plot_png_path, &plot_svg_path);
+    fs::write(&script_file, wrapped_code.as_bytes()).map_err(|e| KernelError::ScriptPreparation(format!("write {}: {e}", script_file.display())))?;
 
     let mut cmd = Command::new(&binary);
     cmd.arg(&script_file);
@@ -267,12 +234,9 @@ pub fn execute(request: &ExecutionRequest) -> Result<ExecutionResult, KernelErro
     }
 
     let start_time = Instant::now();
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| KernelError::Io(format!("spawn {}: {e}", binary.display())))?;
+    let mut child = cmd.spawn().map_err(|e| KernelError::Io(format!("spawn {}: {e}", binary.display())))?;
 
-    let (exit_status, timed_out) =
-        wait_with_timeout(&mut child, Duration::from_millis(request.timeout_ms));
+    let (exit_status, timed_out) = wait_with_timeout(&mut child, Duration::from_millis(request.timeout_ms));
     let duration_ms = start_time.elapsed().as_millis().min(u64::MAX as u128) as u64;
 
     let mut stdout = String::new();
@@ -291,16 +255,13 @@ pub fn execute(request: &ExecutionRequest) -> Result<ExecutionResult, KernelErro
 
     let mut plot_png = None;
     if request.capture_plots && request.plot_format.captures_png() && plot_png_path.is_file() {
-        plot_png = fs::read(&plot_png_path).ok().filter(|bytes| {
-            bytes.len() > 64 && bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A])
-        });
+        plot_png =
+            fs::read(&plot_png_path).ok().filter(|bytes| bytes.len() > 64 && bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]));
     }
 
     let mut plot_svg = None;
     if request.capture_plots && request.plot_format.captures_svg() && plot_svg_path.is_file() {
-        plot_svg = fs::read_to_string(&plot_svg_path)
-            .ok()
-            .filter(|content| content.len() > 64 && content.contains("<svg"));
+        plot_svg = fs::read_to_string(&plot_svg_path).ok().filter(|content| content.len() > 64 && content.contains("<svg"));
     }
 
     // Best-effort cleanup of temporary files
@@ -312,23 +273,11 @@ pub fn execute(request: &ExecutionRequest) -> Result<ExecutionResult, KernelErro
     let exit_code = exit_status.and_then(|s| s.code());
     let success = exit_status.map(|s| s.success()).unwrap_or(false) && !timed_out;
 
-    Ok(ExecutionResult {
-        stdout,
-        stderr,
-        exit_code,
-        success,
-        timed_out,
-        plot_png,
-        plot_svg,
-        duration_ms,
-    })
+    Ok(ExecutionResult { stdout, stderr, exit_code, success, timed_out, plot_png, plot_svg, duration_ms })
 }
 
 /// Wait for child process with timeout. Kills the child if timeout is reached.
-fn wait_with_timeout(
-    child: &mut Child,
-    timeout: Duration,
-) -> (Option<std::process::ExitStatus>, bool) {
+fn wait_with_timeout(child: &mut Child, timeout: Duration) -> (Option<std::process::ExitStatus>, bool) {
     let start = Instant::now();
     let step = Duration::from_millis(20);
 
@@ -424,16 +373,9 @@ tryCatch({{
             ),
         },
         CodeLanguage::Python => {
-            let save_png = if format.captures_png() {
-                format!(r#"plt.savefig("{png_str}", dpi=200, bbox_inches='tight')"#)
-            } else {
-                String::new()
-            };
-            let save_svg = if format.captures_svg() {
-                format!(r#"plt.savefig("{svg_str}", format='svg', bbox_inches='tight')"#)
-            } else {
-                String::new()
-            };
+            let save_png = if format.captures_png() { format!(r#"plt.savefig("{png_str}", dpi=200, bbox_inches='tight')"#) } else { String::new() };
+            let save_svg =
+                if format.captures_svg() { format!(r#"plt.savefig("{svg_str}", format='svg', bbox_inches='tight')"#) } else { String::new() };
 
             format!(
                 r#"import sys
