@@ -5154,6 +5154,44 @@ fn web_downloads_that_drop_content_leave_the_document_unsaved() {
     }
 }
 
+#[test]
+fn web_save_copy_with_password_encrypts_download_without_changing_session_password() {
+    let mut a = typed();
+    let downloaded_bytes = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let captured = downloaded_bytes.clone();
+    a.services.download = Some(Box::new(move |_, bytes| {
+        *captured.borrow_mut() = bytes.to_vec();
+        Ok(())
+    }));
+
+    let res = a
+        .execute(
+            "file.saveAs",
+            json!({
+                "path": "copy.docx",
+                "password": "Password123!",
+                "copy": true,
+            }),
+        )
+        .unwrap();
+    assert_eq!(res["downloaded"], "copy.docx");
+    assert!(a.session.password.is_none(), "session password must remain None for a copy");
+
+    let bytes = downloaded_bytes.borrow().clone();
+    assert!(!bytes.is_empty());
+    assert!(wordcraft_engine::io::open_bytes_with("copy.docx", &bytes, None).is_err());
+    let (doc, encrypted) = wordcraft_engine::io::open_bytes_with("copy.docx", &bytes, Some("Password123!")).unwrap();
+    assert!(encrypted);
+    assert_eq!(doc.plain_text(wordcraft_doc::StoryRef::Body), a.session.doc.plain_text(wordcraft_doc::StoryRef::Body));
+
+    downloaded_bytes.borrow_mut().clear();
+    a.execute("file.saveAs", json!({"path": "normal.docx"})).unwrap();
+    assert!(a.session.password.is_none());
+    let normal_bytes = downloaded_bytes.borrow().clone();
+    let (_, normal_encrypted) = wordcraft_engine::io::open_bytes_with("normal.docx", &normal_bytes, None).unwrap();
+    assert!(!normal_encrypted);
+}
+
 /// Web inside a page that keeps the files: the app with `host_save` recording each file it
 /// is handed (name, Save As, size).
 fn host_app(fail: bool) -> (WordApp, std::rc::Rc<std::cell::RefCell<Vec<(String, bool, usize)>>>) {
