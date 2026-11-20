@@ -1194,3 +1194,15 @@ fn a_valid_empty_snapshot_wins_over_the_backup() {
     assert!(read_tables(&path).is_empty(), "an empty primary is valid and is not replaced by an older snapshot");
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn python_registers_the_chunk_as_main_for_pickling() {
+    if !is_language_available(CodeLanguage::Python) {
+        return;
+    }
+    let code = "import pickle\n\n\nclass C:\n    pass\n\n\npickle.dumps(C())\nprint('pickled')\n";
+    let result = execute(&ExecutionRequest::new(CodeLanguage::Python, code)).expect("execution failed");
+
+    assert!(result.success, "stderr: {}", result.stderr);
+    assert!(result.stdout.contains("pickled"));
+}

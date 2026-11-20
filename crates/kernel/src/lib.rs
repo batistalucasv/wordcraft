@@ -882,6 +882,7 @@ const PY_TABLES_PRELUDE: &str = r##"import json as _wc_json
 import os as _wc_os
 import sys as _wc_sys
 import threading as _wc_threading
+import types as _wc_types
 
 _wc_tables = []
 _wc_tables_path = "__WC_TABLES_PATH__"
@@ -1210,11 +1211,15 @@ with open(_wc_user_path, "rb") as _wc_user_file:
     _wc_user_source = _wc_user_file.read()
 if _wc_sys.argv:
     _wc_sys.argv[0] = _wc_user_path
-# The chunk runs in its own namespace so a name it assigns (open, len, _wc_tables) cannot shadow
-# the capture driver's state or builtins. Only wc_table crosses the boundary.
-_wc_namespace = {{"__name__": "__main__", "__file__": _wc_user_path, "__builtins__": __builtins__, "wc_table": wc_table, "_wc_capture_limits": _wc_capture_limits}}
+# The chunk runs as a module registered as __main__: a name it assigns cannot shadow the capture
+# driver, while classes and functions it defines are still findable by pickle and inspect.
+_wc_module = _wc_types.ModuleType("__main__")
+_wc_module.__file__ = _wc_user_path
+_wc_module.wc_table = wc_table
+_wc_module._wc_capture_limits = _wc_capture_limits
+_wc_sys.modules["__main__"] = _wc_module
 try:
-    exec(compile(_wc_user_source, _wc_user_path, "exec"), _wc_namespace)
+    exec(compile(_wc_user_source, _wc_user_path, "exec"), _wc_module.__dict__)
 finally:
     # A write that failed during the run is retried once on ordinary exit; the immediate write
     # still covers a timeout kill.
