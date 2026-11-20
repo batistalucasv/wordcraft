@@ -2,27 +2,38 @@
 //!
 //! Provides isolated, safe subprocess execution with timeout enforcement,
 //! output capture (stdout, stderr, exit status), and plot interception (PNG and vector SVG).
-#![deny(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::unimplemented,
-    clippy::todo,
-    clippy::unreachable
-)]
+#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 use std::fmt;
 use std::fs;
-use std::io::Read;
+use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+#[cfg(target_family = "wasm")]
+mod process_group;
+
+#[cfg(target_family = "wasm")]
+use crate::process_group::{CommandGroup, GroupChild};
+#[cfg(not(target_family = "wasm"))]
+use command_group::{CommandGroup, GroupChild};
 use serde::{Deserialize, Serialize};
 
 static SCRIPT_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+/// Attempts to create a unique scratch directory before giving up.
+const MAX_SCRATCH_DIR_ATTEMPTS: u64 = 10;
+/// How long to wait for a killed process group to be reaped.
+const PROCESS_GROUP_REAP_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long to wait for output readers after the process group is gone.
+const READER_JOIN_TIMEOUT: Duration = Duration::from_secs(1);
+/// A complete PNG ends with the empty IEND chunk.
+const PNG_HEADER: &[u8] = &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+const PNG_IEND: &[u8] = &[0x00, 0x00, 0x00, 0x00, b'I', b'E', b'N', b'D', 0xAE, 0x42, 0x60, 0x82];
 
 /// Programming language for a code chunk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -121,14 +132,7 @@ pub struct ExecutionRequest {
 impl ExecutionRequest {
     /// Create a new execution request with reasonable defaults (30s timeout, plot capture enabled, PNG format).
     pub fn new(language: CodeLanguage, code: impl Into<String>) -> Self {
-        Self {
-            language,
-            code: code.into(),
-            timeout_ms: 30_000,
-            capture_plots: true,
-            plot_format: PlotFormat::Png,
-            working_dir: None,
-        }
+        Self { language, code: code.into(), timeout_ms: 30_000, capture_plots: true, plot_format: PlotFormat::Png, working_dir: None }
     }
 
     /// Set a custom timeout in milliseconds.
@@ -184,10 +188,7 @@ pub enum KernelError {
     UnsupportedLanguage(String),
 
     #[error("Interpreter for {language} ('{binary}') was not found in PATH")]
-    InterpreterNotFound {
-        language: CodeLanguage,
-        binary: &'static str,
-    },
+    InterpreterNotFound { language: CodeLanguage, binary: &'static str },
 
     #[error("I/O error during execution: {0}")]
     Io(String),
@@ -223,36 +224,33 @@ pub fn which_binary(language: CodeLanguage) -> Option<PathBuf> {
 
 /// Execute a code chunk and collect outputs.
 pub fn execute(request: &ExecutionRequest) -> Result<ExecutionResult, KernelError> {
-    let binary =
-        which_binary(request.language).ok_or_else(|| KernelError::InterpreterNotFound {
-            language: request.language,
-            binary: request.language.binary_name(),
-        })?;
+    let binary = which_binary(request.language)
+        .ok_or_else(|| KernelError::InterpreterNotFound { language: request.language, binary: request.language.binary_name() })?;
 
-    let unique_id = SCRIPT_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let temp_dir = std::env::temp_dir().join(format!(
-        "wordcraft-chunk-{}-{}",
-        std::process::id(),
-        unique_id
-    ));
-    fs::create_dir_all(&temp_dir)
-        .map_err(|e| KernelError::Io(format!("create temp dir {}: {e}", temp_dir.display())))?;
+    let mut created_dir = None;
+    for _ in 0..MAX_SCRATCH_DIR_ATTEMPTS {
+        let unique_id = SCRIPT_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let candidate = std::env::temp_dir().join(format!("wordcraft-chunk-{}-{}", std::process::id(), unique_id));
+        match create_scratch_dir(&candidate) {
+            Ok(()) => {
+                created_dir = Some(candidate);
+                break;
+            }
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(KernelError::Io(format!("create temp dir {}: {error}", candidate.display()))),
+        }
+    }
+    let temp_dir =
+        created_dir.ok_or_else(|| KernelError::Io(format!("failed to create an exclusive temp dir after {MAX_SCRATCH_DIR_ATTEMPTS} attempts")))?;
+    let _guard = TempDirGuard(temp_dir.clone());
 
     let plot_png_path = temp_dir.join("__wordcraft_plot__.png");
     let plot_svg_path = temp_dir.join("__wordcraft_plot__.svg");
     let script_file = temp_dir.join(format!("script.{}", request.language.extension()));
 
-    let wrapped_code = prepare_wrapped_code(
-        request.language,
-        &request.code,
-        request.capture_plots,
-        request.plot_format,
-        &plot_png_path,
-        &plot_svg_path,
-    );
-    fs::write(&script_file, wrapped_code.as_bytes()).map_err(|e| {
-        KernelError::ScriptPreparation(format!("write {}: {e}", script_file.display()))
-    })?;
+    let wrapped_code =
+        prepare_wrapped_code(request.language, &request.code, request.capture_plots, request.plot_format, &plot_png_path, &plot_svg_path);
+    fs::write(&script_file, wrapped_code.as_bytes()).map_err(|e| KernelError::ScriptPreparation(format!("write {}: {e}", script_file.display())))?;
 
     let mut cmd = Command::new(&binary);
     cmd.arg(&script_file);
@@ -267,89 +265,147 @@ pub fn execute(request: &ExecutionRequest) -> Result<ExecutionResult, KernelErro
     }
 
     let start_time = Instant::now();
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| KernelError::Io(format!("spawn {}: {e}", binary.display())))?;
+    let mut child = cmd.group_spawn().map_err(|e| KernelError::Io(format!("spawn {}: {e}", binary.display())))?;
 
-    let (exit_status, timed_out) =
-        wait_with_timeout(&mut child, Duration::from_millis(request.timeout_ms));
+    let stdout_reader = child.inner().stdout.take().map(spawn_reader);
+    let stderr_reader = child.inner().stderr.take().map(spawn_reader);
+
+    let (exit_status, timed_out) = wait_with_timeout(&mut child, Duration::from_millis(request.timeout_ms));
     let duration_ms = start_time.elapsed().as_millis().min(u64::MAX as u128) as u64;
 
-    let mut stdout = String::new();
-    if let Some(mut out) = child.stdout.take() {
-        let mut buf = Vec::new();
-        let _ = out.read_to_end(&mut buf);
-        stdout = String::from_utf8_lossy(&buf).into_owned();
-    }
-
-    let mut stderr = String::new();
-    if let Some(mut err) = child.stderr.take() {
-        let mut buf = Vec::new();
-        let _ = err.read_to_end(&mut buf);
-        stderr = String::from_utf8_lossy(&buf).into_owned();
-    }
+    // Descendants may outlive the interpreter and keep the pipes open. Kill the
+    // whole group before joining the readers, and bound the join as a last resort.
+    terminate_process_group(&mut child);
+    let stdout = join_reader(stdout_reader, Instant::now() + READER_JOIN_TIMEOUT)
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        .unwrap_or_default();
+    let stderr = join_reader(stderr_reader, Instant::now() + READER_JOIN_TIMEOUT)
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        .unwrap_or_default();
 
     let mut plot_png = None;
     if request.capture_plots && request.plot_format.captures_png() && plot_png_path.is_file() {
-        plot_png = fs::read(&plot_png_path).ok().filter(|bytes| {
-            bytes.len() > 64 && bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A])
-        });
+        plot_png = fs::read(&plot_png_path).ok().filter(|bytes| is_complete_png(bytes));
     }
 
     let mut plot_svg = None;
     if request.capture_plots && request.plot_format.captures_svg() && plot_svg_path.is_file() {
-        plot_svg = fs::read_to_string(&plot_svg_path)
-            .ok()
-            .filter(|content| content.len() > 64 && content.contains("<svg"));
+        plot_svg = fs::read_to_string(&plot_svg_path).ok().filter(|content| is_complete_svg(content));
     }
-
-    // Best-effort cleanup of temporary files
-    let _ = fs::remove_file(&script_file);
-    let _ = fs::remove_file(&plot_png_path);
-    let _ = fs::remove_file(&plot_svg_path);
-    let _ = fs::remove_dir(&temp_dir);
 
     let exit_code = exit_status.and_then(|s| s.code());
     let success = exit_status.map(|s| s.success()).unwrap_or(false) && !timed_out;
 
-    Ok(ExecutionResult {
-        stdout,
-        stderr,
-        exit_code,
-        success,
-        timed_out,
-        plot_png,
-        plot_svg,
-        duration_ms,
+    Ok(ExecutionResult { stdout, stderr, exit_code, success, timed_out, plot_png, plot_svg, duration_ms })
+}
+
+/// Create the per-run scratch directory exclusively, with owner-only permissions.
+fn create_scratch_dir(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    let builder = {
+        use std::os::unix::fs::DirBuilderExt;
+        let mut builder = fs::DirBuilder::new();
+        builder.mode(0o700);
+        builder
+    };
+    #[cfg(not(unix))]
+    let builder = fs::DirBuilder::new();
+    builder.create(path)
+}
+
+/// Removes the scratch directory recursively on every exit path.
+struct TempDirGuard(PathBuf);
+
+impl Drop for TempDirGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Read one piped stream on its own thread so a full pipe never blocks the child.
+fn spawn_reader<R: Read + Send + 'static>(mut reader: R) -> JoinHandle<Vec<u8>> {
+    thread::spawn(move || {
+        let mut buffer = Vec::new();
+        let _ = reader.read_to_end(&mut buffer);
+        buffer
     })
 }
 
-/// Wait for child process with timeout. Kills the child if timeout is reached.
-fn wait_with_timeout(
-    child: &mut Child,
-    timeout: Duration,
-) -> (Option<std::process::ExitStatus>, bool) {
+/// Join a reader without letting an escaped descendant block the caller forever.
+fn join_reader(handle: Option<JoinHandle<Vec<u8>>>, deadline: Instant) -> Option<Vec<u8>> {
+    let handle = handle?;
+    while !handle.is_finished() {
+        if Instant::now() >= deadline {
+            return None;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    handle.join().ok()
+}
+
+/// Kill the whole process group and reap it, so no descendant outlives the chunk.
+fn terminate_process_group(child: &mut GroupChild) {
+    let _ = child.kill();
+    let deadline = Instant::now() + PROCESS_GROUP_REAP_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) | Err(_) => return,
+            Ok(None) if Instant::now() >= deadline => return,
+            Ok(None) => thread::sleep(Duration::from_millis(10)),
+        }
+    }
+}
+
+/// Wait for the interpreter with a timeout. The caller terminates the group afterwards.
+fn wait_with_timeout(child: &mut GroupChild, timeout: Duration) -> (Option<ExitStatus>, bool) {
     let start = Instant::now();
     let step = Duration::from_millis(20);
 
     loop {
-        match child.try_wait() {
+        // Wait for the direct child only: descendants are cleaned up afterwards.
+        match child.inner().try_wait() {
             Ok(Some(status)) => return (Some(status), false),
             Ok(None) => {
                 if start.elapsed() >= timeout {
-                    let _ = child.kill();
-                    let _ = child.wait();
                     return (None, true);
                 }
-                std::thread::sleep(step);
+                thread::sleep(step);
             }
-            Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return (None, false);
-            }
+            Err(_) => return (None, false),
         }
     }
+}
+
+/// A PNG is complete only when both its signature and its IEND chunk are present.
+fn is_complete_png(bytes: &[u8]) -> bool {
+    bytes.len() > PNG_HEADER.len() + PNG_IEND.len() && bytes.starts_with(PNG_HEADER) && bytes.ends_with(PNG_IEND)
+}
+
+/// An SVG is complete only when the document is closed, not merely started.
+fn is_complete_svg(content: &str) -> bool {
+    let trimmed = content.trim_end();
+    trimmed.len() > 64 && (trimmed.starts_with("<?xml") || trimmed.starts_with("<svg")) && trimmed.ends_with("</svg>")
+}
+
+/// Escape a path for a double-quoted R or Python string literal.
+fn escape_path_literal(path: &Path) -> String {
+    let mut escaped = String::with_capacity(path.as_os_str().len());
+    for character in path.to_string_lossy().chars() {
+        match character {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            '\u{08}' => escaped.push_str("\\b"),
+            '\u{0c}' => escaped.push_str("\\f"),
+            control if control.is_ascii_control() => {
+                escaped.push_str(&format!("\\x{:02x}", u32::from(control)));
+            }
+            other => escaped.push(other),
+        }
+    }
+    escaped
 }
 
 /// Wrap user code to intercept plots in PNG, SVG, or both.
@@ -365,8 +421,8 @@ fn prepare_wrapped_code(
         return code.to_string();
     }
 
-    let png_str = plot_png_path.to_string_lossy();
-    let svg_str = plot_svg_path.to_string_lossy();
+    let png_str = escape_path_literal(plot_png_path);
+    let svg_str = escape_path_literal(plot_svg_path);
 
     match lang {
         CodeLanguage::R => match format {
@@ -374,6 +430,7 @@ fn prepare_wrapped_code(
                 r#"options(warn = 1)
 .wc_plot_png <- "{png_str}"
 setHook("plot.new", function() assign(".wc_has_plot", TRUE, envir = .GlobalEnv))
+setHook("grid.newpage", function() assign(".wc_has_plot", TRUE, envir = .GlobalEnv))
 png(.wc_plot_png, width = 1600, height = 1200, res = 200)
 tryCatch({{
 {code}
@@ -389,6 +446,7 @@ tryCatch({{
                 r#"options(warn = 1)
 .wc_plot_svg <- "{svg_str}"
 setHook("plot.new", function() assign(".wc_has_plot", TRUE, envir = .GlobalEnv))
+setHook("grid.newpage", function() assign(".wc_has_plot", TRUE, envir = .GlobalEnv))
 svg(.wc_plot_svg, width = 8, height = 6)
 tryCatch({{
 {code}
@@ -405,6 +463,7 @@ tryCatch({{
 .wc_plot_png <- "{png_str}"
 .wc_plot_svg <- "{svg_str}"
 setHook("plot.new", function() assign(".wc_has_plot", TRUE, envir = .GlobalEnv))
+setHook("grid.newpage", function() assign(".wc_has_plot", TRUE, envir = .GlobalEnv))
 png(.wc_plot_png, width = 1600, height = 1200, res = 200)
 dev.control("enable")
 tryCatch({{
@@ -424,16 +483,9 @@ tryCatch({{
             ),
         },
         CodeLanguage::Python => {
-            let save_png = if format.captures_png() {
-                format!(r#"plt.savefig("{png_str}", dpi=200, bbox_inches='tight')"#)
-            } else {
-                String::new()
-            };
-            let save_svg = if format.captures_svg() {
-                format!(r#"plt.savefig("{svg_str}", format='svg', bbox_inches='tight')"#)
-            } else {
-                String::new()
-            };
+            let save_png = if format.captures_png() { format!(r#"plt.savefig("{png_str}", dpi=200, bbox_inches='tight')"#) } else { String::new() };
+            let save_svg =
+                if format.captures_svg() { format!(r#"plt.savefig("{svg_str}", format='svg', bbox_inches='tight')"#) } else { String::new() };
 
             format!(
                 r#"import sys

@@ -61,7 +61,10 @@ fn main() {
             image.save(&out).expect("save png");
             println!("{out}");
         }
-        Err(error) => eprintln!("render failed: {error}"),
+        Err(error) => {
+            eprintln!("render failed: {error}");
+            std::process::exit(1);
+        }
     }
 }
 

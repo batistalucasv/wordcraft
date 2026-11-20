@@ -12,5 +12,8 @@ workspace = true
 serde = { workspace = true }
 thiserror = { workspace = true }
 
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+command-group = { workspace = true }
+
 [dev-dependencies]
 proptest = { workspace = true }
