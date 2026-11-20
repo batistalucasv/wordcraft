@@ -750,7 +750,15 @@ const R_TABLES_PRELUDE: &str = r##"local({
     for (index in seq_len(count)) {
       cells <- character(0)
       for (column in seq_len(cols_count)) {
-        cells <- c(cells, cell(df[[column]][index]))
+        value <- df[[column]]
+        if (is.matrix(value)) {
+          # A data frame can hold a matrix column; the row is one cell instead of only its first
+          # element, which linear indexing would otherwise keep.
+          rendered <- paste(as.character(value[index, , drop = TRUE]), collapse = ", ")
+          cells <- c(cells, substr(rendered, 1L, 4096L))
+        } else {
+          cells <- c(cells, cell(value[index]))
+        }
       }
       if (has_labels) cells <- c(cell(labels[index]), cells)
       escaped <- vapply(cells, json_escape, character(1), USE.NAMES = FALSE)
@@ -803,10 +811,13 @@ const R_TABLES_PRELUDE: &str = r##"local({
     # capture must not lose the rows that capture already accepted.
     budget <- 65011712
     tmp <- paste0(drv$path, ".tmp")
-    con <- tryCatch(base::file(tmp, open = "wt", encoding = "UTF-8"), error = function(e) NULL)
+    # A binary connection keeps the already escaped UTF-8 bytes from being re-encoded through the
+    # native locale; `cat()` would mangle them under a C locale.
+    con <- tryCatch(base::file(tmp, open = "wb"), error = function(e) NULL)
     if (is.null(con)) return(invisible(NULL))
-    written <- tryCatch({
-      cat("{\"tables\":[", file = con, sep = "")
+    write_fragment <- function(text) base::writeBin(base::charToRaw(base::enc2utf8(text)), con)
+    written <- tryCatch(withCallingHandlers({
+      write_fragment("{\"tables\":[")
       bytes_written <- 11L
       table_written <- 0L
       closing_reserve <- 4L
@@ -816,7 +827,7 @@ const R_TABLES_PRELUDE: &str = r##"local({
         prefix <- paste0(if (table_written > 0L) "," else "", "{\"headers\":", h_json, ",\"rows\":[")
         prefix_bytes <- nchar(prefix, type = "bytes")
         if (bytes_written + prefix_bytes + closing_reserve > budget) break
-        cat(prefix, file = con, sep = "")
+        write_fragment(prefix)
         bytes_written <- bytes_written + prefix_bytes
         table_written <- table_written + 1L
         row_written <- 0L
@@ -825,20 +836,26 @@ const R_TABLES_PRELUDE: &str = r##"local({
           r_str <- paste0(if (row_written > 0L) "," else "", r_json)
           r_bytes <- nchar(r_str, type = "bytes")
           if (bytes_written + r_bytes + closing_reserve > budget) break
-          cat(r_str, file = con, sep = "")
+          write_fragment(r_str)
           bytes_written <- bytes_written + r_bytes
           row_written <- row_written + 1L
         }
-        cat("]}", file = con, sep = "")
+        write_fragment("]}")
         bytes_written <- bytes_written + 2L
         if (bytes_written + 2L > budget) break
       }
-      cat("]}\n", file = con, sep = "")
+      write_fragment("]}\n")
       TRUE
-    }, error = function(e) FALSE)
-    # A failed flush on close leaves an incomplete file: publish only after both steps succeed.
-    closed <- isTRUE(tryCatch({ base::close(con); TRUE }, error = function(e) FALSE))
-    if (!written || !closed) {
+    }, warning = function(w) stop(w)), error = function(e) FALSE)
+    if (!written) {
+      suppressWarnings(try(base::close(con), silent = TRUE))
+      suppressWarnings(base::file.remove(tmp))
+      return(invisible(NULL))
+    }
+    # A failed flush on close leaves an incomplete file: publish only after both steps succeed,
+    # and treat a warning from either step as a failure.
+    closed <- isTRUE(tryCatch(withCallingHandlers({ base::close(con); TRUE }, warning = function(w) stop(w)), error = function(e) FALSE))
+    if (!closed) {
       suppressWarnings(base::file.remove(tmp))
       return(invisible(NULL))
     }
@@ -875,6 +892,16 @@ _wc_bytes = 0
 _wc_cells_budget = 250000
 _wc_bytes_budget = 62 * 1024 * 1024
 _wc_lock = _wc_threading.Lock()
+_wc_pending = False
+
+
+def _wc_capture_limits(cells=None, bytes_=None):
+    """Lower the hard capture caps. A test hook: it can never raise them."""
+    global _wc_cells_budget, _wc_bytes_budget
+    if cells is not None:
+        _wc_cells_budget = max(0, min(int(cells), 250000))
+    if bytes_ is not None:
+        _wc_bytes_budget = max(0, min(int(bytes_), 62 * 1024 * 1024))
 
 
 def _wc_cell(value):
@@ -970,7 +997,9 @@ def _wc_capture(value):
 
 
 def _wc_write_tables():
+    global _wc_pending
     if not _wc_tables:
+        _wc_pending = False
         return
     budget = 62 * 1024 * 1024
     tmp_path = _wc_tables_path + ".tmp"
@@ -1009,6 +1038,7 @@ def _wc_write_tables():
         # Replacing the target only after the rewrite finishes keeps the previous complete snapshot
         # if the interpreter is killed mid-write.
         _wc_os.replace(tmp_path, _wc_tables_path)
+        _wc_pending = False
     except Exception:
         try:
             _wc_os.remove(tmp_path)
@@ -1017,7 +1047,7 @@ def _wc_write_tables():
 
 
 def wc_table(value):
-    global _wc_pandas
+    global _wc_pandas, _wc_pending
     if _wc_pandas is None:
         try:
             import pandas as _pandas
@@ -1029,6 +1059,7 @@ def wc_table(value):
     # Only publication takes the lock: capture commits under it too, and conversion stays outside
     # so a nested call from a cell formatter cannot deadlock the chunk.
     if _wc_capture(value):
+        _wc_pending = True
         with _wc_lock:
             _wc_write_tables()
     return None
@@ -1177,11 +1208,19 @@ except Exception:
 _wc_user_path = "{user_str}"
 with open(_wc_user_path, "rb") as _wc_user_file:
     _wc_user_source = _wc_user_file.read()
-_wc_globals = globals()
-_wc_globals["__file__"] = _wc_user_path
 if _wc_sys.argv:
     _wc_sys.argv[0] = _wc_user_path
-exec(compile(_wc_user_source, _wc_user_path, "exec"), _wc_globals)
+# The chunk runs in its own namespace so a name it assigns (open, len, _wc_tables) cannot shadow
+# the capture driver's state or builtins. Only wc_table crosses the boundary.
+_wc_namespace = {{"__name__": "__main__", "__file__": _wc_user_path, "__builtins__": __builtins__, "wc_table": wc_table, "_wc_capture_limits": _wc_capture_limits}}
+try:
+    exec(compile(_wc_user_source, _wc_user_path, "exec"), _wc_namespace)
+finally:
+    # A write that failed during the run is retried once on ordinary exit; the immediate write
+    # still covers a timeout kill.
+    if _wc_pending:
+        with _wc_lock:
+            _wc_write_tables()
 
 {cleanup}"#
             )
@@ -1189,20 +1228,26 @@ exec(compile(_wc_user_source, _wc_user_path, "exec"), _wc_globals)
     }
 }
 
-/// Anything unreadable, oversized or malformed yields no tables instead of an error.
+/// Anything unreadable, oversized or malformed yields no tables instead of an error. When the
+/// primary snapshot cannot be read, the previous complete one beside it is tried under the same
+/// limits: a failed replacement leaves `<path>.bak` behind.
 fn read_tables(path: &Path) -> Vec<TabularOutput> {
-    let metadata = match fs::metadata(path) {
-        Ok(metadata) => metadata,
-        Err(_) => return Vec::new(),
-    };
-    if !metadata.is_file() || metadata.len() > MAX_TABLES_FILE_BYTES {
-        return Vec::new();
+    if let Some(tables) = read_tables_file(path) {
+        return tables;
     }
-    let file = match fs::File::open(path) {
-        Ok(file) => file,
-        Err(_) => return Vec::new(),
-    };
-    read_tables_from_reader(file, MAX_TABLES_FILE_BYTES, MAX_TOTAL_CELLS)
+    let mut backup = path.as_os_str().to_owned();
+    backup.push(".bak");
+    read_tables_file(Path::new(&backup)).unwrap_or_default()
+}
+
+/// `None` means the file was missing, oversized or malformed; `Some` may still be empty.
+fn read_tables_file(path: &Path) -> Option<Vec<TabularOutput>> {
+    let metadata = fs::metadata(path).ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_TABLES_FILE_BYTES {
+        return None;
+    }
+    let file = fs::File::open(path).ok()?;
+    read_tables_payload(file, MAX_TABLES_FILE_BYTES, MAX_TOTAL_CELLS)
 }
 
 #[derive(Deserialize)]
@@ -1220,30 +1265,30 @@ struct RawTable {
 }
 
 /// Read and validate tabular data from a reader under strict byte and cell budgets.
+#[cfg(test)]
 fn read_tables_from_reader<R: Read>(reader: R, max_bytes: u64, max_cells: usize) -> Vec<TabularOutput> {
+    read_tables_payload(reader, max_bytes, max_cells).unwrap_or_default()
+}
+
+/// `None` covers an unreadable, oversized or malformed payload; `Some` may still be empty.
+fn read_tables_payload<R: Read>(reader: R, max_bytes: u64, max_cells: usize) -> Option<Vec<TabularOutput>> {
     let mut raw = Vec::new();
     let mut limited = reader.take(max_bytes.saturating_add(1));
     if limited.read_to_end(&mut raw).is_err() || raw.len() > max_bytes as usize {
-        return Vec::new();
+        return None;
     }
-    let payload: RawTables = match serde_json::from_slice(&raw) {
-        Ok(payload) => payload,
-        Err(_) => return Vec::new(),
-    };
+    let payload: RawTables = serde_json::from_slice(&raw).ok()?;
     let tables: Vec<RawTable> = payload.tables.into_iter().take(MAX_TABLES).collect();
     let mut projected: usize = 0;
     for table in &tables {
         let width = table.headers.len().min(MAX_TABLE_COLUMNS);
         let rows = table.rows.len().min(MAX_TABLE_ROWS);
-        match width.checked_mul(rows).and_then(|cells| projected.checked_add(cells)) {
-            Some(total) => projected = total,
-            None => return Vec::new(),
-        }
+        projected = width.checked_mul(rows).and_then(|cells| projected.checked_add(cells))?;
     }
     if projected > max_cells {
-        return Vec::new();
+        return None;
     }
-    tables.into_iter().filter_map(normalize_table).collect()
+    Some(tables.into_iter().filter_map(normalize_table).collect())
 }
 
 /// Clamp a table to the documented limits and make every row as wide as the headers.

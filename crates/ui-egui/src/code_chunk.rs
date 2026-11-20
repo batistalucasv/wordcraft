@@ -741,12 +741,19 @@ impl CodeChunk {
         });
 
         // A column opens at the width of its longest previewed cell, so numeric columns stay
-        // readable without measuring every one of the kernel's rows each frame.
+        // readable without measuring every one of the kernel's rows each frame. Only the first 32
+        // characters can affect the width, since the result is capped below that.
         let widths: Vec<f32> = (0..preview_cols)
             .map(|column| {
-                let header = table.headers.get(column).map_or(0, |cell| cell.chars().count());
-                let body = table.rows.iter().take(preview_rows).map(|row| row.get(column).map_or(0, |cell| cell.chars().count())).max().unwrap_or(0);
-                (header.max(body).min(32) as f32 * 7.0).clamp(48.0, 240.0)
+                let header = table.headers.get(column).map_or(0, |cell| cell.chars().take(32).count());
+                let body = table
+                    .rows
+                    .iter()
+                    .take(preview_rows)
+                    .map(|row| row.get(column).map_or(0, |cell| cell.chars().take(32).count()))
+                    .max()
+                    .unwrap_or(0);
+                (header.max(body) as f32 * 7.0).clamp(48.0, 240.0)
             })
             .collect();
         // A wide frame gets a horizontal scrollbar rather than clipped columns that cannot be

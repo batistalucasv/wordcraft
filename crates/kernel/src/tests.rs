@@ -616,9 +616,10 @@ fn rows_are_padded_and_extra_cells_are_dropped() {
 
 #[test]
 fn padding_may_not_exceed_the_aggregate_cell_budget() {
-    let payload = br#"{"tables":[{"headers":["a","b"],"rows":[["1","2"],["3","4"]]}]}"#;
+    // Two empty rows carry no cells themselves; padding them to two headers projects four cells.
+    let payload = br#"{"tables":[{"headers":["a","b"],"rows":[[],[]]}]}"#;
     let tables = read_tables_from_reader(&payload[..], MAX_TABLES_FILE_BYTES, 3);
-    assert!(tables.is_empty(), "two rows of two columns project four cells, over a budget of three");
+    assert!(tables.is_empty(), "padding two empty rows to two headers projects four cells, over a budget of three");
 }
 
 #[test]
@@ -806,7 +807,7 @@ fn python_keeps_earlier_tables_when_the_cell_budget_runs_out() {
     }
     let code = format!(
         r#"{PY_FAKE_PANDAS}
-_wc_cells_budget = 7
+_wc_capture_limits(cells=7)
 wc_table(_DataFrame(["a", "b"], [[1, 3], [2, 4]]))
 wc_table(_DataFrame(["c", "d"], [[1, 4], [2, 5], [3, 6]]))
 wc_table(_DataFrame(["e", "f"], [[1, 3], [2, 4]]))
@@ -838,7 +839,7 @@ class _Counting:
         return self.text
 
 
-_wc_bytes_budget = 100
+_wc_capture_limits(bytes_=100)
 rows = [[_Counting("aaaaaaaaaa"), _Counting("bbbbbbbbbb")] for _ in range(20)]
 wc_table(_DataFrame(["a", "b"], rows))
 print("converted", _Counting.calls)
@@ -848,7 +849,11 @@ print("converted", _Counting.calls)
 
     assert!(result.success, "stderr: {}", result.stderr);
     assert_eq!(result.tables[0].rows.len(), 1, "one row of 27 encoded bytes fits a 100-byte budget");
-    assert!(result.stdout.contains("converted 4"), "only the kept row and the one that did not fit are converted: {}", result.stdout);
+    assert!(
+        result.stdout.lines().any(|line| line.trim() == "converted 4"),
+        "only the kept row and the one that did not fit are converted: {}",
+        result.stdout
+    );
 }
 
 #[test]
@@ -869,7 +874,7 @@ class _Counting:
         return self.text
 
 
-_wc_bytes_budget = 150
+_wc_capture_limits(bytes_=150)
 rows = [[_Counting(chr(1) * 10)] for _ in range(20)]
 wc_table(_DataFrame(["a"], rows))
 print("converted", _Counting.calls)
@@ -1016,7 +1021,7 @@ fn python_clamps_a_raised_cell_budget() {
     }
     let code = format!(
         r#"{PY_FAKE_PANDAS}
-_wc_cells_budget = 250001
+_wc_capture_limits(cells=250001)
 wc_table(_DataFrame(["a"], [[1]]))
 rows = [[1] * 250 for _ in range(1000)]
 wc_table(_DataFrame(["c" + str(i) for i in range(250)], rows))
@@ -1049,10 +1054,9 @@ class _Nested:
         return "outer"
 
 
-_wc_cells_budget = 2
+_wc_capture_limits(cells=2)
 wc_table(_DataFrame(["a"], [[1]]))
 wc_table(_DataFrame(["b"], [[_Nested(_DataFrame(["c"], [[2]]))]]))
-print("tables", len(_wc_tables), "cells", _wc_cells)
 "#
     );
     let result = execute(&ExecutionRequest::new(CodeLanguage::Python, code).with_timeout(3_000)).expect("execution failed");
@@ -1063,7 +1067,6 @@ print("tables", len(_wc_tables), "cells", _wc_cells)
     assert_eq!(headers, vec!["a", "c"], "the outer table is the one that did not fit");
     let cells: usize = result.tables.iter().map(|table| table.headers.len() * table.rows.len()).sum();
     assert_eq!(cells, 2, "the outer capture rechecked the remaining budget before committing");
-    assert!(result.stdout.lines().any(|line| line.trim() == "tables 2 cells 2"), "{}", result.stdout);
 }
 
 #[test]
@@ -1131,4 +1134,63 @@ fn python_publishes_a_table_with_columns_but_no_rows() {
     assert_eq!(result.tables.len(), 1);
     assert_eq!(result.tables[0].headers, vec!["x".to_owned()]);
     assert!(result.tables[0].rows.is_empty());
+}
+
+#[test]
+fn r_keeps_every_value_of_a_matrix_column() {
+    if !is_language_available(CodeLanguage::R) {
+        return;
+    }
+    let code = "wc_table(data.frame(x = I(matrix(1:4, nrow = 2))))";
+    let result = execute(&ExecutionRequest::new(CodeLanguage::R, code)).expect("execution failed");
+
+    assert!(result.success, "stderr: {}", result.stderr);
+    assert_eq!(result.tables[0].headers, vec!["x".to_owned()]);
+    assert_eq!(
+        result.tables[0].rows,
+        vec![vec!["1, 3".to_owned()], vec!["2, 4".to_owned()]],
+        "a matrix column keeps every value of the row instead of only the first"
+    );
+}
+
+#[test]
+fn python_chunk_names_do_not_shadow_the_capture_driver() {
+    if !is_language_available(CodeLanguage::Python) {
+        return;
+    }
+    let code = format!("{PY_FAKE_PANDAS}\nopen = lambda *args, **kwargs: None\n_wc_json = None\nwc_table(_DataFrame([\"a\"], [[1]]))\n");
+    let result = execute(&ExecutionRequest::new(CodeLanguage::Python, code)).expect("execution failed");
+
+    assert!(result.success, "stderr: {}", result.stderr);
+    assert_eq!(result.tables.len(), 1, "the driver keeps its own builtins and state");
+    assert_eq!(result.tables[0].rows, vec![vec!["1".to_owned()]]);
+}
+
+#[test]
+fn a_missing_snapshot_falls_back_to_the_backup() {
+    let dir = std::env::temp_dir().join(format!("wc-tables-bak-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).expect("scratch dir");
+    let path = dir.join("tables.json");
+    let backup = dir.join("tables.json.bak");
+    fs::write(&backup, br#"{"tables":[{"headers":["x"],"rows":[["1"]]}]}"#).expect("backup");
+
+    let tables = read_tables(&path);
+    assert_eq!(tables.len(), 1, "the previous complete snapshot is used");
+    assert_eq!(tables[0].rows, vec![vec!["1".to_owned()]]);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_valid_empty_snapshot_wins_over_the_backup() {
+    let dir = std::env::temp_dir().join(format!("wc-tables-empty-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).expect("scratch dir");
+    let path = dir.join("tables.json");
+    let backup = dir.join("tables.json.bak");
+    fs::write(&path, br#"{"tables":[]}"#).expect("primary");
+    fs::write(&backup, br#"{"tables":[{"headers":["x"],"rows":[["1"]]}]}"#).expect("backup");
+
+    assert!(read_tables(&path).is_empty(), "an empty primary is valid and is not replaced by an older snapshot");
+    let _ = fs::remove_dir_all(&dir);
 }
