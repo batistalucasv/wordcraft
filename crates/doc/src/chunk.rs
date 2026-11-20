@@ -5,10 +5,12 @@
 //! code box). Word understands the control without knowing the tag, so a document with chunks
 //! opens and saves like any other: the code stays ordinary, editable text.
 //!
-//! The control's options (`eval`, `echo`, `fig-cap`…) are Quarto chunk options, kept in a custom
-//! document property named `wordcraft.chunk.<id>`, where `<id>` is the control's `w:id`. Custom
-//! properties are part of the package Word itself writes and preserves, so the metadata survives
-//! a round trip through Word without putting anything non-standard in the markup.
+//! The control's options (`eval`, `echo`, `fig-cap`…) are Quarto chunk options. They travel with
+//! the control in its `w:tag` (`wordcraft:chunk:<language>?…`, bounded to [`MAX_CONTROL_TEXT`]
+//! characters with `eval` prioritized first) so copying a chunk inside Word preserves its options
+//! even when Word assigns a fresh `w:id`. The full options JSON is also written to the custom
+//! document property `wordcraft.chunk.<id>` so documents with many or long options keep full
+//! fidelity on normal round trips.
 //!
 //! The kernel crate executes the code; this model only stores it, which keeps the document model
 //! free of process handling and lets `.qmd` files be read and written without R or Python.
@@ -18,7 +20,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use crate::control::{ContentControl, ControlKind, walk_controls};
+use crate::control::{ContentControl, ControlKind, MAX_CONTROL_TEXT, walk_controls};
 use crate::para::OBJ;
 use crate::props::{Border, BorderStyle, Borders, CharProps, ParaProps, Rgb};
 use crate::{Block, Blocks, DocError, Document, InlineObject, Paragraph, Pos, Result, StoryRef, Style, StyleKind, para_block};
@@ -239,6 +241,11 @@ impl CodeChunk {
         format!("{CHUNK_TAG}{}", if self.language.is_empty() { "text" } else { self.language.as_str() })
     }
 
+    /// The `w:tag` value written onto `w:sdtPr`, carrying bounded options after `?`.
+    pub fn control_tag(&self) -> String {
+        encode_control_tag(&normalize_language(&self.language), &self.options)
+    }
+
     /// The control's title, as Word's Tags pane shows it.
     pub fn alias(&self) -> String {
         let name = match self.language.as_str() {
@@ -278,11 +285,180 @@ pub fn chunk_prop_name(id: i64) -> String {
 
 /// The language a chunk tag names, `None` when the tag isn't a chunk's.
 pub fn tag_language(tag: &str) -> Option<String> {
-    let rest = tag.strip_prefix(CHUNK_TAG)?.trim();
-    if rest.is_empty() {
+    let rest = tag.strip_prefix(CHUNK_TAG)?;
+    let lang = rest.split_once('?').map_or(rest, |(l, _)| l).trim();
+    if lang.is_empty() {
         return None;
     }
-    Some(normalize_language(rest))
+    let normalized = normalize_language(lang);
+    if normalized.is_empty() {
+        return None;
+    }
+    Some(normalized)
+}
+
+/// Priority order for encoding options into `w:tag` so execution-safety flags fit first.
+const PRIORITY_TAG_OPTIONS: &[&str] = &["eval", "echo", "include", "label"];
+
+fn is_tag_unreserved(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~')
+}
+
+fn encoded_len(s: &str) -> usize {
+    s.bytes().map(|b| if is_tag_unreserved(b) { 1 } else { 3 }).sum()
+}
+
+fn push_percent_encoded(out: &mut String, s: &str) {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    for b in s.bytes() {
+        if is_tag_unreserved(b) {
+            out.push(b as char);
+        } else {
+            out.push('%');
+            out.push(HEX[(b >> 4) as usize] as char);
+            out.push(HEX[(b & 0x0F) as usize] as char);
+        }
+    }
+}
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(hi), Some(lo)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2]))
+        {
+            out.push((hi << 4) | lo);
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn encode_tag_pairs(ordered: &[(&str, &str)], max_body: usize, options: &ChunkOptions) -> (String, bool) {
+    let mut body = String::new();
+    let mut truncated = false;
+
+    for &(key, val) in ordered {
+        let sep = usize::from(!body.is_empty());
+        let key_len = encoded_len(key);
+        let val_len = encoded_len(val);
+        let needed = sep.saturating_add(key_len).saturating_add(1).saturating_add(val_len);
+        if body.len().saturating_add(needed) <= max_body {
+            if sep == 1 {
+                body.push('&');
+            }
+            push_percent_encoded(&mut body, key);
+            body.push('=');
+            push_percent_encoded(&mut body, val);
+            continue;
+        }
+
+        truncated = true;
+        // If `eval` had a long comment that didn't fit verbatim, keep its boolean flag so
+        // `eval: false` still survives a copy in Word.
+        if key == "eval"
+            && let Some(flag) = options.flag("eval")
+        {
+            let compact = if flag { "true" } else { "false" };
+            let compact_needed = sep.saturating_add(key_len).saturating_add(1).saturating_add(compact.len());
+            if body.len().saturating_add(compact_needed) <= max_body {
+                if sep == 1 {
+                    body.push('&');
+                }
+                push_percent_encoded(&mut body, key);
+                body.push('=');
+                body.push_str(compact);
+            }
+        }
+    }
+
+    (body, truncated)
+}
+
+/// Encode `language` and `options` into a `w:tag` string within [`MAX_CONTROL_TEXT`] chars.
+fn encode_control_tag(language: &str, options: &ChunkOptions) -> String {
+    let lang = if language.is_empty() { "text" } else { language };
+    let mut prefix = String::with_capacity(CHUNK_TAG.len() + lang.len() + 2);
+    prefix.push_str(CHUNK_TAG);
+    prefix.push_str(lang);
+    prefix.push('?');
+    if options.is_empty() {
+        return prefix;
+    }
+
+    let max_body = MAX_CONTROL_TEXT.saturating_sub(prefix.len());
+    let mut ordered: Vec<(&str, &str)> = Vec::with_capacity(options.len());
+    for &key in PRIORITY_TAG_OPTIONS {
+        if let Some(val) = options.get(key) {
+            ordered.push((key, val));
+        }
+    }
+    for (key, val) in options.iter() {
+        if !PRIORITY_TAG_OPTIONS.contains(&key) {
+            ordered.push((key, val));
+        }
+    }
+
+    let (body, truncated) = encode_tag_pairs(&ordered, max_body, options);
+    if truncated {
+        // Reserve 1 byte for `!` before encoding so an exact-budget `eval` compacts rather than
+        // getting popped after filling `max_body`.
+        let (truncated_body, _) = encode_tag_pairs(&ordered, max_body.saturating_sub(1), options);
+        prefix.push('!');
+        prefix.push_str(&truncated_body);
+    } else {
+        prefix.push_str(&body);
+    }
+    prefix
+}
+
+enum TagOptions {
+    /// Legacy or hand-written `wordcraft:chunk:<lang>` tag with no `?` query: options are missing.
+    Missing,
+    /// Tag carried the complete option set (`wordcraft:chunk:<lang>?...`).
+    Complete(ChunkOptions),
+    /// Tag carried partial options (`wordcraft:chunk:<lang>?!...`) after hitting [`MAX_CONTROL_TEXT`].
+    Truncated(ChunkOptions),
+}
+
+fn decode_tag_options(tag: &str) -> TagOptions {
+    let Some(rest) = tag.strip_prefix(CHUNK_TAG) else {
+        return TagOptions::Missing;
+    };
+    let Some((_, query)) = rest.split_once('?') else {
+        return TagOptions::Missing;
+    };
+    let (truncated, pairs) = match query.strip_prefix('!') {
+        Some(tail) => (true, tail),
+        None => (false, query),
+    };
+    let mut opts = ChunkOptions::new();
+    if !pairs.is_empty() {
+        for pair in pairs.split('&') {
+            let Some((raw_k, raw_v)) = pair.split_once('=') else {
+                continue;
+            };
+            let k = percent_decode(raw_k);
+            let v = percent_decode(raw_v);
+            opts.set(k, v);
+        }
+    }
+    if truncated { TagOptions::Truncated(opts) } else { TagOptions::Complete(opts) }
 }
 
 /// A language name as a tag carries it: lower-case ASCII letters, digits, `-`, `_`, `+` and `.`,
@@ -310,10 +486,24 @@ fn code_of(doc: &Document, start: &Pos, end: &Pos) -> Option<String> {
     Some(lines.join("\n"))
 }
 
-/// The options stored beside control `id`, or none when the property is missing or unreadable.
-fn options_of(doc: &Document, id: Option<i64>) -> ChunkOptions {
-    let Some(json) = id.and_then(|id| doc.custom_prop(&chunk_prop_name(id))) else { return ChunkOptions::default() };
-    serde_json::from_str(json).unwrap_or_default()
+/// The options for `control`, along with whether the options are missing/incomplete.
+///
+/// Prefers the custom property `wordcraft.chunk.<id>` when present and valid JSON (since it has
+/// no 1024-char tag limit), and falls back to options encoded on `control.tag`.
+fn options_of(doc: &Document, control: &ContentControl) -> (ChunkOptions, bool) {
+    if let Some(json) = control.id.and_then(|id| doc.custom_prop(&chunk_prop_name(id)))
+        && let Ok(opts) = serde_json::from_str::<ChunkOptions>(json)
+    {
+        return (opts, false);
+    }
+    match decode_tag_options(&control.tag) {
+        TagOptions::Complete(opts) => (opts, false),
+        TagOptions::Truncated(opts) => {
+            let missing_eval = opts.get("eval").is_none();
+            (opts, missing_eval)
+        }
+        TagOptions::Missing => (ChunkOptions::default(), true),
+    }
 }
 
 fn chunk_from_range(doc: &Document, range: &crate::ControlRange) -> Option<CodeChunk> {
@@ -322,7 +512,8 @@ fn chunk_from_range(doc: &Document, range: &crate::ControlRange) -> Option<CodeC
     }
     let language = tag_language(&range.control.tag)?;
     let code = code_of(doc, &range.start, &range.end)?;
-    Some(CodeChunk { id: range.control.id, language, code, options: options_of(doc, range.control.id) })
+    let (options, _) = options_of(doc, &range.control);
+    Some(CodeChunk { id: range.control.id, language, code, options })
 }
 
 impl Document {
@@ -344,6 +535,18 @@ impl Document {
             .collect();
         out.sort_by(|a, b| (&a.start.path, a.start.off).cmp(&(&b.start.path, b.start.off)));
         out
+    }
+
+    /// Whether `range`'s chunk options could not be recovered (no valid `wordcraft.chunk.<id>`
+    /// property and the tag carried neither complete options nor an `eval` flag).
+    pub fn chunk_options_missing(&self, range: &ChunkRef) -> bool {
+        let Some(para) = self.para(range.start.story, &range.start.path) else {
+            return true;
+        };
+        let Some(InlineObject::ControlStart { control }) = para.object_at(range.start.off) else {
+            return true;
+        };
+        options_of(self, control).1
     }
 
     /// `w:id`s in use anywhere in the document (including reserved chunk properties).
@@ -412,7 +615,7 @@ impl Document {
         let language = normalize_language(&chunk.language);
         let mut control = ContentControl::new(ControlKind::RichText);
         control.id = Some(id);
-        control.tag = format!("{CHUNK_TAG}{}", if language.is_empty() { "text" } else { language.as_str() });
+        control.tag = encode_control_tag(&language, &chunk.options);
         control.title = chunk.alias();
         control.block = true;
         if self.styles.get(CHUNK_STYLE).is_none() {
@@ -500,7 +703,7 @@ mod tests {
         assert!(!found[0].options.echo());
         assert_eq!(found[0].options.fig_caption().as_deref(), Some("A plot"));
         let range = &doc.control_ranges(StoryRef::Body)[0];
-        assert_eq!(range.control.tag, "wordcraft:chunk:r");
+        assert!(range.control.tag.starts_with("wordcraft:chunk:r?"), "{}", range.control.tag);
         assert!(range.control.block);
         assert_eq!(range.control.title, "R code chunk (fig-plot)");
     }
@@ -708,5 +911,126 @@ mod tests {
         Arc::make_mut(&mut doc.styles).upsert(custom_style);
         let _ = doc.chunk_blocks(&CodeChunk::new("r", "1 + 1")).unwrap();
         assert_eq!(doc.styles.get(CHUNK_STYLE).map(|s| s.name.as_str()), Some("Custom Box Style"));
+    }
+
+    #[test]
+    fn copied_chunk_with_fresh_id_and_no_property_keeps_options_from_tag() {
+        let mut doc = Document::new();
+        let mut c = CodeChunk::new("r", "unlink('important')");
+        c.options.set("eval", "false");
+        c.options.set("echo", "FALSE");
+        c.options.set("fig-cap", "\"A & B = 100%\"");
+        c.options.set("label", "fig-safe");
+        let old_id = doc.push_chunk(&c).unwrap();
+
+        // Simulate Word copy/paste: fresh control id and no matching `wordcraft.chunk.<new_id>`.
+        let start = doc.control_ranges(StoryRef::Body)[0].start.clone();
+        doc.control_mut(&start).unwrap().id = Some(old_id + 99);
+        doc.remove_custom_prop(&chunk_prop_name(old_id));
+
+        let refs = doc.chunk_refs(StoryRef::Body);
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].chunk.id, Some(old_id + 99));
+        assert_eq!(refs[0].chunk.language, "r");
+        assert!(!refs[0].chunk.options.eval());
+        assert!(!refs[0].chunk.options.echo());
+        assert_eq!(refs[0].chunk.options.fig_caption().as_deref(), Some("A & B = 100%"));
+        assert_eq!(refs[0].chunk.options.label(), Some("fig-safe"));
+        assert!(!doc.chunk_options_missing(&refs[0]));
+    }
+
+    #[test]
+    fn empty_options_chunk_with_fresh_id_and_no_property_is_not_missing() {
+        let mut doc = Document::new();
+        let old_id = doc.push_chunk(&CodeChunk::new("python", "print(1)")).unwrap();
+        let start = doc.control_ranges(StoryRef::Body)[0].start.clone();
+        doc.control_mut(&start).unwrap().id = Some(old_id + 50);
+        doc.remove_custom_prop(&chunk_prop_name(old_id));
+
+        let refs = doc.chunk_refs(StoryRef::Body);
+        assert_eq!(refs.len(), 1);
+        assert!(refs[0].chunk.options.is_empty());
+        assert!(refs[0].chunk.options.eval());
+        assert!(!doc.chunk_options_missing(&refs[0]));
+    }
+
+    #[test]
+    fn legacy_tag_without_query_and_no_property_reports_missing_options() {
+        let mut doc = Document::new();
+        let old_id = doc.push_chunk(&CodeChunk::new("r", "1 + 1")).unwrap();
+        let start = doc.control_ranges(StoryRef::Body)[0].start.clone();
+        let control = doc.control_mut(&start).unwrap();
+        control.tag = "wordcraft:chunk:r".to_string();
+        control.id = Some(old_id + 10);
+        doc.remove_custom_prop(&chunk_prop_name(old_id));
+
+        let refs = doc.chunk_refs(StoryRef::Body);
+        assert_eq!(refs.len(), 1);
+        assert!(doc.chunk_options_missing(&refs[0]));
+    }
+
+    #[test]
+    fn huge_options_stay_bounded_in_tag_and_preserve_eval_false_on_copy() {
+        let mut doc = Document::new();
+        let mut c = CodeChunk::new("r", "stop('boom')");
+        c.options.set("fig-cap", format!("\"{}\"", "a".repeat(2_000)));
+        c.options.set("eval", "false # very long trailing explanation that would exceed tag limit ".to_owned() + &"x".repeat(1_200));
+        c.options.set("warning", "false");
+        let old_id = doc.push_chunk(&c).unwrap();
+
+        let range = &doc.control_ranges(StoryRef::Body)[0];
+        assert!(range.control.tag.chars().count() <= MAX_CONTROL_TEXT);
+        assert!(range.control.tag.starts_with("wordcraft:chunk:r?!"), "{}", range.control.tag);
+
+        // With the custom property intact, the full 2000-char caption is preserved.
+        assert_eq!(doc.chunks()[0].options.fig_caption().as_deref().map(str::len), Some(2_000));
+
+        // After copying in Word (fresh id, no property), eval: false and warning: false survive.
+        let start = range.start.clone();
+        doc.control_mut(&start).unwrap().id = Some(old_id + 100);
+        doc.remove_custom_prop(&chunk_prop_name(old_id));
+
+        let refs = doc.chunk_refs(StoryRef::Body);
+        assert!(!refs[0].chunk.options.eval());
+        assert_eq!(refs[0].chunk.options.flag("warning"), Some(false));
+        assert!(!doc.chunk_options_missing(&refs[0]));
+    }
+
+    #[test]
+    fn exact_budget_eval_with_overflow_option_keeps_eval_false_on_copy() {
+        let mut doc = Document::new();
+        let mut c = CodeChunk::new("r", "stop('boom')");
+        // `wordcraft:chunk:r?` (18) + `eval=` (5) + `false%20%23` (11) + 990 `'x'` = 1024 == MAX_CONTROL_TEXT.
+        c.options.set("eval", format!("false #{}", "x".repeat(990)));
+        c.options.set("echo", "false");
+        let old_id = doc.push_chunk(&c).unwrap();
+
+        let range = &doc.control_ranges(StoryRef::Body)[0];
+        assert!(range.control.tag.chars().count() <= MAX_CONTROL_TEXT);
+        assert!(range.control.tag.starts_with("wordcraft:chunk:r?!"), "{}", range.control.tag);
+
+        let start = range.start.clone();
+        doc.control_mut(&start).unwrap().id = Some(old_id + 200);
+        doc.remove_custom_prop(&chunk_prop_name(old_id));
+
+        let refs = doc.chunk_refs(StoryRef::Body);
+        assert!(!refs[0].chunk.options.eval());
+        assert!(!refs[0].chunk.options.echo());
+        assert!(!doc.chunk_options_missing(&refs[0]));
+    }
+
+    #[test]
+    fn tag_language_and_malformed_percent_escapes_never_panic() {
+        assert_eq!(tag_language("wordcraft:chunk:r?eval=false"), Some("r".into()));
+        assert_eq!(tag_language("wordcraft:chunk:python?"), Some("python".into()));
+        assert_eq!(tag_language("wordcraft:chunk:r?!eval=false"), Some("r".into()));
+        assert_eq!(tag_language("wordcraft:chunk:?eval=false"), None);
+        assert_eq!(tag_language("wordcraft:chunk:???"), None);
+
+        assert_eq!(percent_decode("abc%ZZ%2%FF%20def"), "abc%ZZ%2\u{FFFD} def");
+        let TagOptions::Complete(opts) = decode_tag_options("wordcraft:chunk:r?badpair&k=%FF%20v") else {
+            panic!("expected Complete");
+        };
+        assert_eq!(opts.get("k"), Some("\u{FFFD} v"));
     }
 }
