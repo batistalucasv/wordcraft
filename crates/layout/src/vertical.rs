@@ -89,7 +89,9 @@ pub(crate) fn turn_page(page: &mut Page, turn: TextDirection, phys: &SectionProp
         if matches!(it, Placed::Object { .. }) {
             continue;
         }
-        if let Some((dx, dy)) = in_box(it) {
+        if !matches!(it, Placed::Chunk { .. })
+            && let Some((dx, dy)) = in_box(it)
+        {
             it.translate(dx, dy);
             continue;
         }

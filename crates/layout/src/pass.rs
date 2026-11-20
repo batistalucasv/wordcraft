@@ -383,6 +383,9 @@ fn mounted_chunks(doc: &Document, heights: &std::collections::BTreeMap<i64, u32>
     for r in doc.chunk_refs(StoryRef::Body) {
         let Some(id) = r.chunk.id else { continue };
         let Some(&centipts) = heights.get(&id) else { continue };
+        if r.start.path.0.len() != 1 || r.end.path.0.len() != 1 {
+            continue;
+        }
         let first = r.start.path.last();
         let last = r.end.path.last();
         if last >= first && last < doc.body.len() {
@@ -393,13 +396,15 @@ fn mounted_chunks(doc: &Document, heights: &std::collections::BTreeMap<i64, u32>
     map
 }
 
-fn place_chunk(ctx: &Ctx, pb: &mut PageBuilder, id: i64, first: usize, last: usize, h: f32, body_top: f32) {
-    if ctx.doc.body.get(first).and_then(|b| b.as_para()).is_some_and(|p| p.props.page_break_before == Some(true)) && !pb.at_top() {
+fn place_chunk(ctx: &mut Ctx, pb: &mut PageBuilder, id: i64, first: usize, last: usize, h: f32, body_top: f32) {
+    if ctx.doc.body.get(first).and_then(|b| b.as_para()).is_some_and(|p| ctx.doc.styles.resolve_para(&p.props).page_break_before) && !pb.at_top() {
         pb.new_page(first, body_top);
+        ctx.fields.page = pb.number;
     }
     let mut top_gap = if pb.at_top() { 0.0 } else { 4.0 };
-    if !pb.at_top() && pb.y + top_gap + h > pb.bottom + 0.5 {
+    if !pb.fresh() && pb.y + top_gap + h > pb.bottom + 0.5 {
         pb.advance(first, body_top);
+        ctx.fields.page = pb.number;
         top_gap = 0.0;
     }
     let y = pb.y + top_gap;

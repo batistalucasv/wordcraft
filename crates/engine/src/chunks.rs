@@ -166,6 +166,7 @@ impl ChunkFingerprint {
 struct StoredOutput {
     output: ChunkOutput,
     fingerprint: Option<ChunkFingerprint>,
+    rev: u64,
 }
 
 /// Per-document chunk outputs, mounted heights, and kernel generation, swapped with [`DocState`].
@@ -175,6 +176,7 @@ pub(crate) struct DocChunkOutputs {
     heights: BTreeMap<i64, u32>,
     generation: u64,
     rev: u64,
+    heights_rev: u64,
 }
 
 /// The kernel's transient state in a session: the active document's last chunk outputs and
@@ -198,19 +200,29 @@ impl ChunkState {
 
     /// Keep `output` as the last output of chunk `id`.
     pub fn store(&mut self, id: i64, output: ChunkOutput) {
-        self.doc.outputs.insert(id, StoredOutput { output, fingerprint: None });
         self.doc.rev = self.doc.rev.wrapping_add(1);
+        self.doc.outputs.insert(id, StoredOutput { output, fingerprint: None, rev: self.doc.rev });
     }
 
     /// Keep `output` as the last output of chunk `id`, bound to its `language` and `code`.
     pub fn store_for(&mut self, id: i64, language: &str, code: &str, output: ChunkOutput) {
-        self.doc.outputs.insert(id, StoredOutput { output, fingerprint: Some(ChunkFingerprint::new(language, code)) });
         self.doc.rev = self.doc.rev.wrapping_add(1);
+        self.doc.outputs.insert(id, StoredOutput { output, fingerprint: Some(ChunkFingerprint::new(language, code)), rev: self.doc.rev });
     }
 
     /// The last output of chunk `id`, if it ran since the last clear.
     pub fn output(&self, id: i64) -> Option<&ChunkOutput> {
         self.doc.outputs.get(&id).map(|entry| &entry.output)
+    }
+
+    /// The last output of chunk `id` together with the revision at which it was stored.
+    pub fn output_with_rev(&self, id: i64) -> Option<(&ChunkOutput, u64)> {
+        self.doc.outputs.get(&id).map(|entry| (&entry.output, entry.rev))
+    }
+
+    /// Whether chunk `id`'s stored output matches `language` and `code`.
+    pub fn output_matches(&self, id: i64, language: &str, code: &str) -> bool {
+        self.doc.outputs.get(&id).is_some_and(|entry| entry.fingerprint.as_ref().is_none_or(|fp| fp.matches(language, code)))
     }
 
     /// UI-measured height map (`control_id -> round(pt * 100)`) passed into [`wordcraft_layout::LayoutOptions`].
@@ -224,15 +236,24 @@ impl ChunkState {
             return false;
         }
         self.doc.heights = heights;
+        self.doc.heights_rev = self.doc.heights_rev.wrapping_add(1);
         true
+    }
+
+    /// Monotonically bumped whenever the mounted chunk heights map changes.
+    pub fn heights_rev(&self) -> u64 {
+        self.doc.heights_rev
     }
 
     /// Forget chunk `id`'s last output; whether it had one.
     pub fn clear(&mut self, id: i64) -> bool {
         let removed = self.doc.outputs.remove(&id).is_some();
         let height_removed = self.doc.heights.remove(&id).is_some();
-        if removed || height_removed {
+        if removed {
             self.doc.rev = self.doc.rev.wrapping_add(1);
+        }
+        if height_removed {
+            self.doc.heights_rev = self.doc.heights_rev.wrapping_add(1);
         }
         removed
     }
@@ -255,11 +276,16 @@ impl ChunkState {
     /// Drop outputs whose chunk id no longer exists in `doc` or whose language/code changed
     /// (for Undo, Redo, and transaction rollback).
     pub(crate) fn invalidate_for_document(&mut self, doc: &Document) {
+        if self.doc.outputs.is_empty() && self.doc.heights.is_empty() {
+            return;
+        }
         let live: BTreeMap<i64, (String, String)> = doc.chunks().into_iter().filter_map(|c| c.id.map(|id| (id, (c.language, c.code)))).collect();
         let h_before = self.doc.heights.len();
         self.doc.heights.retain(|id, _| live.contains_key(id));
+        if self.doc.heights.len() != h_before {
+            self.doc.heights_rev = self.doc.heights_rev.wrapping_add(1);
+        }
         if self.doc.outputs.is_empty() {
-            let _ = h_before;
             return;
         }
         let o_before = self.doc.outputs.len();

@@ -165,7 +165,8 @@ impl WordApp {
     pub(crate) fn document_unsaved_by_id(&self, id: u64) -> bool {
         let dirty = self.session.document_dirty(id);
         let unconfirmed = self.saves_in_flight.iter().any(|s| s.marked_saved && s.document == id);
-        dirty || unconfirmed
+        let dirty_chunks = id == self.session.document_id() && crate::canvas::code_chunks::has_dirty_chunks(self);
+        dirty || unconfirmed || dirty_chunks
     }
 
     /// Whether the open document `id` has comment or reply text typed but not yet written to

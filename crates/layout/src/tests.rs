@@ -16292,15 +16292,22 @@ fn header_text_covers_the_whole_band_of_centred_and_right_lines() {
 
 #[test]
 fn chunk_heights_reserve_vertical_space_and_push_following_blocks() {
-    use wordcraft_doc::{CodeChunk, Document};
+    use wordcraft_doc::{CodeChunk, Document, InlineObject, Table};
 
     let mut d = Document::from_text("before");
+    d.last_section.page_h = 792.0;
+    d.last_section.margin_top = 72.0;
+    d.last_section.margin_bottom = 72.0;
     let id = d.push_chunk(&CodeChunk::new("r", "x <- 1")).unwrap();
     d.body.push(wordcraft_doc::para_block(wordcraft_doc::Paragraph::with_text("after", Default::default())));
 
-    // Without UI chunk heights, headless/PDF layout emits ordinary Placed::Lines.
+    // Without UI chunk heights, headless/PDF layout emits ordinary Placed::Lines for the chunk.
     let headless = lay(&d);
     assert!(!headless.pages[0].items.iter().any(|it| matches!(it, Placed::Chunk { .. })));
+    assert!(
+        headless.pages[0].items.iter().any(|it| matches!(it, Placed::Lines { path, .. } if path.0 == [1])),
+        "headless layout must render the chunk source block as Placed::Lines"
+    );
 
     // With chunk_heights populated, layout emits Placed::Chunk and pushes "after" down.
     let mut small_opts = LayoutOptions::default();
@@ -16326,9 +16333,44 @@ fn chunk_heights_reserve_vertical_space_and_push_following_blocks() {
         .expect("after paragraph line");
     assert!(after_y_small >= chunk_rect_small.bottom());
 
-    // Growing chunk height reflows "after" downward (and onto page 2 if it overflows).
+    // Growing chunk height pushes "after" onto a later page.
     let mut big_opts = LayoutOptions::default();
-    big_opts.chunk_heights.insert(id, 62_000); // 620.0 pt
+    big_opts.chunk_heights.insert(id, 64_000); // 640.0 pt of 648.0 pt printable height
     let big = layout(&d, &mut LayoutCache::new(), &big_opts);
-    assert!(big.pages.len() >= 2, "tall chunk should push following paragraph onto page 2");
+    let chunk_page = big
+        .pages
+        .iter()
+        .position(|p| p.items.iter().any(|it| matches!(it, Placed::Chunk { id: cid, .. } if *cid == id)))
+        .expect("tall chunk should be placed");
+    let after_page = big
+        .pages
+        .iter()
+        .position(|p| p.items.iter().any(|it| matches!(it, Placed::Lines { path, .. } if path.0 == [2])))
+        .expect("after paragraph should be placed");
+    assert!(after_page > chunk_page, "tall chunk on page {chunk_page} must push after paragraph to a later page (got {after_page})");
+
+    // Nested table-cell chunks must not be mounted into top-level body blocks.
+    let mut td = Document::from_text("body intro");
+    let cell_blocks = td.chunk_blocks(&CodeChunk::new("r", "nested <- 1")).unwrap();
+    let nested_id = match &*cell_blocks[0] {
+        wordcraft_doc::Block::Para(p) => match &p.objects[0] {
+            InlineObject::ControlStart { control } => control.id.unwrap(),
+            _ => panic!("expected control start"),
+        },
+        _ => panic!("expected para"),
+    };
+    let mut tbl = Table::new(1, 1, 200.0);
+    tbl.rows[0].cells[0].blocks = cell_blocks;
+    td.body.push(std::sync::Arc::new(wordcraft_doc::Block::Table(tbl)));
+    let mut nested_opts = LayoutOptions::default();
+    nested_opts.chunk_heights.insert(nested_id, 10_000);
+    let nested_layout = layout(&td, &mut LayoutCache::new(), &nested_opts);
+    assert!(
+        !nested_layout.pages.iter().flat_map(|p| &p.items).any(|it| matches!(it, Placed::Chunk { .. })),
+        "table-cell chunk must never mount as a top-level Placed::Chunk"
+    );
+    assert!(
+        nested_layout.pages[0].items.iter().any(|it| matches!(it, Placed::Lines { path, .. } if path.0 == [0])),
+        "top-level block 0 must stay intact"
+    );
 }

@@ -342,25 +342,48 @@ fn validate_code_text(code: &str) -> Result<(), CmdError> {
     Ok(())
 }
 
-fn remap_pos_after_chunk_resize(pos: &mut Pos, old_first: usize, old_last: usize, new_last: usize, doc: &wordcraft_doc::Document) {
-    if pos.story != StoryRef::Body || pos.path.0.is_empty() {
+fn ensure_top_level_body_chunk(range: &ChunkRef) -> Result<(usize, usize), CmdError> {
+    if range.start.story != StoryRef::Body || range.end.story != StoryRef::Body || range.start.path.0.len() != 1 || range.end.path.0.len() != 1 {
+        return Err(CmdError::Disabled("code chunks must be top-level blocks in the document body".into()));
+    }
+    let first = range.start.path.last();
+    let last = range.end.path.last();
+    if last < first {
+        return Err(CmdError::Failed("chunk block range is out of bounds".into()));
+    }
+    Ok((first, last))
+}
+
+fn remap_pos_after_chunk_resize(
+    pos: &mut Pos,
+    story: StoryRef,
+    parent: &[u32],
+    old_first: usize,
+    old_last: usize,
+    new_last: usize,
+    doc: &wordcraft_doc::Document,
+) {
+    if pos.story != story || !pos.path.0.starts_with(parent) {
         return;
     }
-    let Some(block) = pos.path.0.first().copied().map(|b| b as usize) else { return };
+    let depth = parent.len();
+    let Some(block) = pos.path.0.get(depth).copied().map(|b| b as usize) else { return };
     if block < old_first {
         return;
     }
     if block <= old_last {
-        let clamped_block = block.min(new_last);
-        if clamped_block != block {
-            pos.path.0[0] = clamped_block as u32;
+        if pos.path.0.len() == depth + 1 {
+            let clamped_block = block.min(new_last);
+            if clamped_block != block {
+                pos.path.0[depth] = clamped_block as u32;
+            }
+            let off = pos.off;
+            pos.off = doc.para(pos.story, &pos.path).map_or(0, |p| p.clamp(off));
         }
-        let max_off = doc.para(StoryRef::Body, &pos.path).map_or(0, |p| p.len());
-        pos.off = pos.off.min(max_off);
     } else {
         let delta = new_last as isize - old_last as isize;
         let shifted = (block as isize + delta).max(0) as usize;
-        pos.path.0[0] = shifted as u32;
+        pos.path.0[depth] = shifted as u32;
     }
 }
 
@@ -382,13 +405,15 @@ fn update_chunk(s: &mut Session, v: &Value) -> CmdResult {
     let id = chunk_id(s, &range);
     let old_first = range.start.path.last();
     let old_last = range.end.path.last();
+    let story = range.start.story;
+    let parent = range.start.path.parent().to_vec();
     let changed = s.doc.update_chunk(id, &lang_str, code)?;
     let updated = find_chunk(s, id)?;
     let new_last = updated.end.path.last();
 
     if changed {
-        remap_pos_after_chunk_resize(&mut s.sel.anchor, old_first, old_last, new_last, &s.doc);
-        remap_pos_after_chunk_resize(&mut s.sel.focus, old_first, old_last, new_last, &s.doc);
+        remap_pos_after_chunk_resize(&mut s.sel.anchor, story, &parent, old_first, old_last, new_last, &s.doc);
+        remap_pos_after_chunk_resize(&mut s.sel.focus, story, &parent, old_first, old_last, new_last, &s.doc);
         s.goal_x = None;
         s.touch();
     }
@@ -406,9 +431,8 @@ fn update_chunk(s: &mut Session, v: &Value) -> CmdResult {
 
 fn delete_chunk(s: &mut Session, v: &Value) -> CmdResult {
     let range = resolve_target_chunk(s, v)?;
-    let first = range.start.path.last();
-    let last = range.end.path.last();
-    if last < first || last >= s.doc.body.len() {
+    let (first, last) = ensure_top_level_body_chunk(&range)?;
+    if last >= s.doc.body.len() {
         return Err(CmdError::Failed("chunk block range is out of bounds".into()));
     }
     let span = last - first + 1;
@@ -419,15 +443,24 @@ fn delete_chunk(s: &mut Session, v: &Value) -> CmdResult {
         blank.section = trailing_section;
         s.doc.body = vec![para_block(blank)];
     } else {
-        if let Some(sect) = trailing_section
-            && first > 0
-            && let Ok(prev) = s.doc.para_mut(StoryRef::Body, &Path::top(first - 1))
-            && prev.section.is_none()
-        {
-            prev.section = Some(sect);
+        let mut kept_break = trailing_section;
+        if let Some(sect) = kept_break.take() {
+            if first > 0
+                && let Ok(prev) = s.doc.para_mut(StoryRef::Body, &Path::top(first - 1))
+                && prev.section.is_none()
+            {
+                prev.section = Some(sect);
+            } else {
+                kept_break = Some(sect);
+            }
         }
         for _ in 0..span {
             let _ = s.doc.remove_block(StoryRef::Body, &Path::top(first));
+        }
+        if let Some(sect) = kept_break {
+            let mut blank = Paragraph::new();
+            blank.section = Some(sect);
+            let _ = s.doc.insert_block(StoryRef::Body, &Path::top(first), Block::Para(blank));
         }
     }
 
@@ -437,7 +470,16 @@ fn delete_chunk(s: &mut Session, v: &Value) -> CmdResult {
     }
 
     let next_idx = first.min(s.doc.body.len().saturating_sub(1));
-    s.sel = Selection::caret(Pos::new(StoryRef::Body, Path::top(next_idx), 0));
+    let mut caret_path = Path::top(next_idx);
+    while matches!(s.doc.block(StoryRef::Body, &caret_path), Some(Block::Table(_))) {
+        caret_path.0.extend([0, 0, 0]);
+    }
+    let pos = if s.doc.para(StoryRef::Body, &caret_path).is_some() {
+        Pos::new(StoryRef::Body, caret_path, 0)
+    } else {
+        s.doc.clamp(&Pos::new(StoryRef::Body, Path::top(next_idx), 0))
+    };
+    s.sel = Selection::caret(pos);
     s.goal_x = None;
     s.touch();
 
@@ -465,12 +507,23 @@ fn insert_plot(s: &mut Session, v: &Value) -> CmdResult {
         Some(id) => Some(find_chunk(s, id)?),
         None => chunks::chunk_at(&s.doc, &s.sel.focus),
     };
+    if let Some(ref range) = target_chunk {
+        let _ = ensure_top_level_body_chunk(range)?;
+    }
 
     let explicit_png = p::str(v, "png").or_else(|| p::str(v, "data"));
+    let mut cached_matches = false;
     let png_bytes = if let Some(b64) = explicit_png {
         insert::base64_decode(b64).ok_or_else(|| CmdError::Params("bad base64 PNG plot data".into()))?
-    } else if let Some(cached) = target_chunk.as_ref().and_then(|r| r.chunk.id).and_then(|id| s.chunks.output(id)).and_then(|o| o.plot_png.clone()) {
-        cached
+    } else if let Some(ref range) = target_chunk
+        && let Some(id) = range.chunk.id
+        && let Some(output) = s.chunks.output(id)
+    {
+        if !s.chunks.output_matches(id, &range.chunk.language, &range.chunk.code) {
+            return Err(CmdError::Failed("the code chunk changed since its last run; run the chunk again before inserting its plot".into()));
+        }
+        cached_matches = true;
+        output.plot_png.clone().ok_or_else(|| CmdError::Params("insert_plot requires PNG base64 data or a chunk with a cached PNG plot".into()))?
     } else {
         return Err(CmdError::Params("insert_plot requires PNG base64 data or a chunk with a cached PNG plot".into()));
     };
@@ -489,7 +542,7 @@ fn insert_plot(s: &mut Session, v: &Value) -> CmdResult {
     }
 
     let svg_opt: Option<&str> = match v.get("svg") {
-        None | Some(Value::Null) if explicit_png.is_none() => {
+        None | Some(Value::Null) if explicit_png.is_none() && cached_matches => {
             target_chunk.as_ref().and_then(|r| r.chunk.id).and_then(|id| s.chunks.output(id)).and_then(|o| o.plot_svg.as_deref())
         }
         None | Some(Value::Null) => None,
@@ -543,6 +596,9 @@ fn insert_table(s: &mut Session, v: &Value) -> CmdResult {
         Some(id) => Some(find_chunk(s, id)?),
         None => chunks::chunk_at(&s.doc, &s.sel.focus),
     };
+    if let Some(ref range) = target_chunk {
+        let _ = ensure_top_level_body_chunk(range)?;
+    }
 
     let raw_headers = v.get("headers").and_then(Value::as_array).ok_or_else(|| CmdError::Params("headers: required array of strings".into()))?;
     let mut text_budget = 0usize;
@@ -552,6 +608,10 @@ fn insert_table(s: &mut Session, v: &Value) -> CmdResult {
         Some(Value::Array(arr)) => arr.as_slice(),
         Some(_) => return Err(CmdError::Params("rows: expected array of rows".into())),
     };
+    let total_rows = 1usize.saturating_add(raw_rows.len());
+    if total_rows > MAX_ROWS {
+        return Err(CmdError::Params(format!("rows: at most {MAX_ROWS} rows")));
+    }
 
     let mut rows = Vec::with_capacity(raw_rows.len());
     let mut cols = headers.len();
@@ -564,10 +624,6 @@ fn insert_table(s: &mut Session, v: &Value) -> CmdResult {
 
     if cols == 0 || cols > MAX_COLS {
         return Err(CmdError::Params(format!("headers/rows: expected 1..={MAX_COLS} columns")));
-    }
-    let total_rows = 1usize.saturating_add(rows.len());
-    if total_rows > MAX_ROWS {
-        return Err(CmdError::Params(format!("rows: at most {MAX_ROWS} rows")));
     }
     if total_rows.checked_mul(cols).is_none_or(|cells| cells > MAX_INSERT_TABLE_CELLS) {
         return Err(CmdError::Params(format!("table exceeds {MAX_INSERT_TABLE_CELLS} total cells")));
@@ -592,21 +648,22 @@ fn insert_table(s: &mut Session, v: &Value) -> CmdResult {
         }
     }
 
-    let insert_at = if let Some(ref range) = target_chunk {
-        Path::top(range.end.path.last().saturating_add(1))
+    let (story, insert_at) = if let Some(ref range) = target_chunk {
+        (StoryRef::Body, Path::top(range.end.path.last().saturating_add(1)))
     } else {
         let at = delete_selection(s)?;
-        if s.doc.para_at(&at).is_some_and(|p| p.is_empty()) { at.path } else { at.path.with_last(at.path.last().saturating_add(1)) }
+        let path = if s.doc.para_at(&at).is_some_and(|p| p.is_empty()) { at.path } else { at.path.with_last(at.path.last().saturating_add(1)) };
+        (at.story, path)
     };
 
-    s.doc.insert_block(StoryRef::Body, &insert_at, Block::Table(table))?;
+    s.doc.insert_block(story, &insert_at, Block::Table(table))?;
     let next = insert_at.with_last(insert_at.last().saturating_add(1));
-    if s.doc.block(StoryRef::Body, &next).is_none() {
-        s.doc.insert_block(StoryRef::Body, &next, Block::Para(Paragraph::new()))?;
+    if s.doc.block(story, &next).is_none() {
+        s.doc.insert_block(story, &next, Block::Para(Paragraph::new()))?;
     }
     let mut first_cell = insert_at.0.clone();
     first_cell.extend([0, 0, 0]);
-    s.sel = Selection::caret(Pos::new(StoryRef::Body, Path(first_cell), 0));
+    s.sel = Selection::caret(Pos::new(story, Path(first_cell), 0));
     s.goal_x = None;
     s.touch();
 

@@ -630,3 +630,114 @@ fn insert_table_and_plot_validate_before_mutating_on_bad_input() {
     assert!(matches!(s.run("code.insert_plot", &json!({"chunkId": id, "png": "not-valid-base64!!!"})), Err(CmdError::Params(_))));
     assert_eq!(s.doc, before, "rejected plot/table must leave document untouched");
 }
+
+#[test]
+fn delete_chunk_followed_by_table_moves_caret_to_first_cell_paragraph() {
+    let mut s = s();
+    let id = chunk_id(&run(&mut s, "code.insert_chunk", json!({"language": "python", "code": "x = 1"})));
+    run(&mut s, "code.insert_table", json!({"chunkId": id, "headers": ["a", "b"], "rows": [["1", "2"]]}));
+    assert!(matches!(&*s.doc.body[1], wordcraft_doc::Block::Table(_)));
+
+    run(&mut s, "code.delete_chunk", json!({"chunkId": id}));
+    assert!(matches!(&*s.doc.body[0], wordcraft_doc::Block::Table(_)));
+    assert_eq!(s.sel.focus, wordcraft_doc::Pos::new(StoryRef::Body, wordcraft_doc::Path(vec![0, 0, 0, 0]), 0));
+}
+
+#[test]
+fn delete_chunk_after_table_preserves_trailing_section_break() {
+    let mut s = s();
+    s.doc.body = vec![
+        std::sync::Arc::new(wordcraft_doc::Block::Table(wordcraft_doc::Table::new(1, 1, 468.0))),
+        wordcraft_doc::para_block(wordcraft_doc::Paragraph::new()),
+    ];
+    s.sel = Selection::caret(wordcraft_doc::Pos::body(1, 0));
+    let id = chunk_id(&run(&mut s, "code.insert_chunk", json!({"language": "python", "code": "b = 2"})));
+    let range = chunks::chunks_in(&s.doc, StoryRef::Body).into_iter().find(|r| r.chunk.id == Some(id)).expect("chunk");
+    let first = range.start.path.last();
+    let end_block = range.end.path.last();
+    if let Some(wordcraft_doc::Block::Para(p)) = s.doc.body.get_mut(end_block).map(std::sync::Arc::make_mut) {
+        p.section = Some(Box::new(wordcraft_doc::SectionProps::default()));
+    }
+
+    run(&mut s, "code.delete_chunk", json!({"chunkId": id}));
+    let Some(wordcraft_doc::Block::Para(retained)) = s.doc.body.get(first).map(|b| &**b) else {
+        panic!("expected a blank paragraph carrying the preserved section break at index {first} after the table");
+    };
+    assert!(retained.section.is_some(), "trailing section break must not be lost when preceded by a table");
+}
+
+#[test]
+fn chunk_commands_refuse_nested_table_cell_chunks() {
+    let mut s = s();
+    let cell_blocks = s.doc.chunk_blocks(&CodeChunk::new("python", "nested = True")).unwrap();
+    let nested_id = match &*cell_blocks[0] {
+        wordcraft_doc::Block::Para(p) => match &p.objects[0] {
+            wordcraft_doc::InlineObject::ControlStart { control } => control.id.unwrap(),
+            _ => panic!("expected control start"),
+        },
+        _ => panic!("expected para"),
+    };
+    let mut tbl = wordcraft_doc::Table::new(1, 1, 468.0);
+    tbl.rows[0].cells[0].blocks = cell_blocks;
+    s.doc.body.push(std::sync::Arc::new(wordcraft_doc::Block::Table(tbl)));
+    let before = s.doc.clone();
+
+    assert!(matches!(s.run("code.delete_chunk", &json!({"chunkId": nested_id})), Err(CmdError::Disabled(_))));
+    assert!(matches!(
+        s.run("code.insert_plot", &json!({"chunkId": nested_id, "png": crate::cmd::insert::base64_encode(b"\x89PNG\r\n\x1a\n")})),
+        Err(CmdError::Disabled(_))
+    ));
+    assert!(matches!(s.run("code.insert_table", &json!({"chunkId": nested_id, "headers": ["h"], "rows": [["v"]]})), Err(CmdError::Disabled(_))));
+    assert_eq!(s.doc, before, "nested table-cell chunks must not mutate body blocks");
+}
+
+#[test]
+fn insert_plot_without_explicit_png_rejects_stale_cached_plot() {
+    let mut s = s();
+    let id = chunk_id(&run(&mut s, "code.insert_chunk", json!({"language": "python", "code": "plot(1)"})));
+    let png = vec![
+        0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1A, b'\n', 0, 0, 0, 13, b'I', b'H', b'D', b'R', 0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0, 0, 0, 0x1F, 0x15,
+        0xC4, 0x89, 0, 0, 0, 10, b'I', b'D', b'A', b'T', 0x78, 0x9C, 0x63, 0, 1, 0, 0, 5, 0, 1, 0x0D, 0x0A, 0x2D, 0xB4, 0, 0, 0, 0, b'I', b'E', b'N',
+        b'D', 0xAE, 0x42, 0x60, 0x82,
+    ];
+    s.chunks.store_for(id, "python", "plot(1)", chunks::ChunkOutput { plot_png: Some(png), success: true, ..chunks::ChunkOutput::default() });
+    run(&mut s, "code.update_chunk", json!({"chunkId": id, "language": "python", "code": "plot(2)"}));
+
+    assert!(
+        matches!(s.run("code.insert_plot", &json!({"chunkId": id})), Err(CmdError::Failed(_))),
+        "unpinned insert_plot must reject cached output when chunk source changed since last run"
+    );
+}
+
+#[test]
+fn untargeted_insert_table_uses_caret_story_and_rejects_excessive_rows() {
+    let mut s = s();
+    let pid = s.doc.add_part(
+        wordcraft_doc::PartKind::Header,
+        vec![wordcraft_doc::para_block(wordcraft_doc::Paragraph::with_text("Header", Default::default()))],
+    );
+    s.sel = Selection::caret(wordcraft_doc::Pos::new(StoryRef::Part(pid), wordcraft_doc::Path::top(0), 0));
+    run(&mut s, "code.insert_table", json!({"headers": ["a", "b"], "rows": [["1", "2"]]}));
+
+    assert!(
+        s.doc.para(StoryRef::Part(pid), &wordcraft_doc::Path(vec![1, 0, 0, 0])).is_some_and(|p| p.text == "a"),
+        "table must be inserted into the active header story"
+    );
+    assert_eq!(s.doc.body.len(), 1, "document body must stay untouched when caret is in a header");
+
+    let oversized_rows: Vec<Vec<&str>> = vec![vec!["1"]; wordcraft_doc::table::MAX_ROWS];
+    assert!(matches!(s.run("code.insert_table", &json!({"headers": ["a"], "rows": oversized_rows})), Err(CmdError::Params(_))));
+}
+
+#[test]
+fn update_chunk_clamps_caret_on_utf8_boundary() {
+    let mut s = s();
+    let id = chunk_id(&run(&mut s, "code.insert_chunk", json!({"language": "python", "code": "abcdef"})));
+    let range = chunks::chunks_in(&s.doc, StoryRef::Body).into_iter().find(|r| r.chunk.id == Some(id)).expect("chunk");
+    let code_block = range.start.path.last() + 1;
+    // Byte offset 3 sits strictly inside the 4-byte emoji '😀' once updated to "z😀".
+    s.sel = Selection::caret(wordcraft_doc::Pos::body(code_block, 3));
+    run(&mut s, "code.update_chunk", json!({"chunkId": id, "language": "python", "code": "z😀"}));
+    let p = s.doc.para(StoryRef::Body, &wordcraft_doc::Path::top(s.sel.focus.path.last())).expect("caret paragraph");
+    assert!(p.text.is_char_boundary(s.sel.focus.off), "remapped caret offset {} must land on a UTF-8 boundary of {:?}", s.sel.focus.off, p.text);
+}

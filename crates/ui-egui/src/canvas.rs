@@ -1466,9 +1466,13 @@ fn finish_canvas_frame(finish: CanvasFinish<'_>, out: egui::scroll_area::ScrollA
         crate::content_controls::clicks(app, &resp);
     }
     let secondary_clicked = resp.secondary_clicked() && !middle_gesture;
+    // Shift+F10 opens the same menu below the caret, for the selection or the word there (#821).
+    let from_keys = std::mem::take(&mut app.canvas.context_menu_from_keys);
     let chunk_context_click = app.canvas.code_chunks.take_context_click();
     if let Some((cid, _)) = chunk_context_click {
         app.canvas.code_chunks.context_chunk = Some(cid);
+    } else if from_keys {
+        app.canvas.code_chunks.context_chunk = None;
     } else if secondary_clicked {
         app.canvas.code_chunks.context_chunk = resp.interact_pointer_pos().and_then(|p| app.canvas.code_chunks.hit(p));
     }
@@ -1478,8 +1482,6 @@ fn finish_canvas_frame(finish: CanvasFinish<'_>, out: egui::scroll_area::ScrollA
         app.canvas.context_issue = None;
         app.canvas.context_synonyms = None;
     }
-    // Shift+F10 opens the same menu below the caret, for the selection or the word there (#821).
-    let from_keys = std::mem::take(&mut app.canvas.context_menu_from_keys);
     // A click on the equation frame's options strip opens the equation's menu below the strip.
     let eq_strip = app.canvas.eq_options.map(|f| f.strip).filter(|r| resp.clicked() && resp.interact_pointer_pos().is_some_and(|p| r.contains(p)));
     if let Some((_, pos)) = chunk_context_click {

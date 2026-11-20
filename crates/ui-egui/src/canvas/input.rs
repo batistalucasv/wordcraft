@@ -119,12 +119,6 @@ fn route_pointer_targets(app: &mut WordApp, ui: &Ui, resp: &egui::Response, rect
         return None;
     }
     let pointer = resp.interact_pointer_pos().or_else(|| resp.hover_pos());
-    if !app.canvas.dragging
-        && let Some(at) = pointer
-        && app.canvas.code_chunks.hit(at).is_some()
-    {
-        return None;
-    }
     // An object (or crop handle) drag follows the pointer anywhere until it's released.
     let dragging = app.canvas.obj_drag.is_some() || app.canvas.crop_drag.is_some();
     let object_pointer = pointer.or_else(|| dragging.then(|| ui.input(|i| i.pointer.latest_pos())).flatten());
@@ -139,6 +133,12 @@ fn route_pointer_targets(app: &mut WordApp, ui: &Ui, resp: &egui::Response, rect
     }
     // A press on a table's selection area, insert button or move handle.
     if crate::table_mouse::pointer(app, ui, resp, rects, layout, scale) {
+        return None;
+    }
+    if !app.canvas.dragging
+        && let Some(at) = pointer
+        && app.canvas.code_chunks.hit(at).is_some()
+    {
         return None;
     }
     pointer

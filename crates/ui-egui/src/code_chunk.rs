@@ -171,8 +171,8 @@ pub struct EmbeddedFrame {
     pub editor_lost_focus: bool,
     /// Up (`-1`) or Down (`1`) arrow pressed on the first or last source line to leave the chunk.
     pub arrow_exit: Option<i32>,
-    /// True when an asynchronous run finished (succeeded, failed, or errored) on this frame.
-    pub run_completed: bool,
+    /// Source `(language, code)` of an asynchronous widget-initiated run that finished this frame.
+    pub completed_run: Option<(CodeLanguage, String)>,
     /// Screen position of a secondary click inside the chunk card, if any.
     pub context_click_pos: Option<egui::Pos2>,
 }
@@ -212,6 +212,10 @@ pub struct CodeChunk {
     plot_texture: Option<egui::TextureHandle>,
     /// Pending cursor placement when entering the editor (`Some(false)` = start, `Some(true)` = end).
     pending_cursor_edge: Option<bool>,
+    /// Read-only view (e.g. Read Mode): blocks editing source, language, and run/insert actions.
+    pub read_only: bool,
+    /// Snapshot of `(language, code)` at the moment a widget-initiated run started.
+    pending_source: Option<(CodeLanguage, String)>,
 }
 
 impl CodeChunk {
@@ -236,6 +240,8 @@ impl CodeChunk {
             started: None,
             plot_texture: None,
             pending_cursor_edge: None,
+            read_only: false,
+            pending_source: None,
         }
     }
 
@@ -257,12 +263,13 @@ impl CodeChunk {
     /// Switch language. The last output belonged to the other interpreter, so it is dropped, and
     /// a run in flight is abandoned.
     pub fn set_language(&mut self, language: CodeLanguage) {
-        if self.language == language {
+        if self.read_only || self.language == language {
             return;
         }
         self.language = language;
         self.available = interpreter_available(language);
         self.pending = None;
+        self.pending_source = None;
         self.started = None;
         self.output = None;
         self.plot_texture = None;
@@ -301,7 +308,7 @@ impl CodeChunk {
 
     /// Run the chunk now on a worker thread. Does nothing while another run is in flight.
     pub fn run(&mut self, ctx: &egui::Context) {
-        if self.is_running() {
+        if self.read_only || self.is_running() {
             return;
         }
         #[cfg(target_arch = "wasm32")]
@@ -320,7 +327,8 @@ impl CodeChunk {
                 ));
                 return;
             }
-            let request = ExecutionRequest::new(self.language, self.code.clone()).with_plot_format(PlotFormat::Both);
+            let launched_source = (self.language, self.code.clone());
+            let request = ExecutionRequest::new(self.language, launched_source.1.clone()).with_plot_format(PlotFormat::Both);
             let (tx, rx) = std::sync::mpsc::channel();
             let spawned = std::thread::Builder::new().name("wordcraft-code-chunk".to_owned()).spawn(move || {
                 let _ = tx.send(wordcraft_kernel::execute(&request));
@@ -332,6 +340,7 @@ impl CodeChunk {
                     self.output_open = true;
                     self.tab = OutputTab::Console;
                     self.pending = Some(rx);
+                    self.pending_source = Some(launched_source);
                     self.started = Some(Instant::now());
                     ctx.request_repaint_after(Duration::from_millis(50));
                 }
@@ -349,6 +358,7 @@ impl CodeChunk {
         self.output_open = true;
         self.tab = OutputTab::Console;
         self.pending = Some(rx);
+        self.pending_source = None;
         self.started = Some(Instant::now());
     }
 
@@ -357,11 +367,15 @@ impl CodeChunk {
         self.output = None;
         self.plot_texture = None;
         self.pending = None;
+        self.pending_source = None;
         self.started = None;
     }
 
     /// Show the code editor if hidden, focus it next frame, and place its cursor at the start or end.
     pub fn focus_edge(&mut self, at_end: bool) {
+        if self.read_only {
+            return;
+        }
         self.show_code = true;
         self.pending_cursor_edge = Some(at_end);
     }
@@ -374,10 +388,10 @@ impl CodeChunk {
     /// Draw the chunk mounted inside the document canvas and report UI, focus, and edit status.
     pub fn show_embedded(&mut self, ui: &mut Ui) -> EmbeddedFrame {
         let prev_lang = self.language;
-        let run_completed = self.poll(ui.ctx());
+        let completed_run = self.poll(ui.ctx());
         let t = Tokens::get(ui.ctx());
         let editor = self.editor_id();
-        if shortcut_pressed(ui, editor) {
+        if !self.read_only && shortcut_pressed(ui, editor) {
             self.run(ui.ctx());
         }
         let focus = if ui.memory(|m| m.has_focus(editor)) { t.accent } else { t.border_strong };
@@ -404,11 +418,11 @@ impl CodeChunk {
         });
         EmbeddedFrame {
             action,
-            dirty: editor_outcome.changed || self.language != prev_lang,
+            dirty: !self.read_only && (editor_outcome.changed || self.language != prev_lang),
             editor_has_focus: editor_outcome.has_focus,
             editor_lost_focus: editor_outcome.lost_focus,
             arrow_exit: editor_outcome.arrow_exit,
-            run_completed,
+            completed_run,
             context_click_pos,
         }
     }
@@ -418,36 +432,36 @@ impl CodeChunk {
         Id::unique(("wordcraft-code-chunk-editor", self.id))
     }
 
-    /// Apply a result that arrived from a host or a worker thread. Returns `true` when finished.
-    fn poll(&mut self, ctx: &egui::Context) -> bool {
-        let received = match self.pending.as_ref() {
-            None => return false,
-            Some(rx) => match rx.try_recv() {
-                Ok(result) => Some(Some(result)),
-                Err(TryRecvError::Empty) => None,
-                Err(TryRecvError::Disconnected) => Some(None),
-            },
+    /// Apply a result that arrived from a host or a worker thread. Returns the widget-initiated
+    /// `(language, code)` snapshot when one finishes.
+    fn poll(&mut self, ctx: &egui::Context) -> Option<(CodeLanguage, String)> {
+        let received = match self.pending.as_ref()?.try_recv() {
+            Ok(result) => Some(Some(result)),
+            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Disconnected) => Some(None),
         };
         match received {
             None => {
                 ctx.request_repaint_after(Duration::from_millis(50));
-                false
+                None
             }
             Some(Some(result)) => {
                 self.pending = None;
                 self.started = None;
+                let source = self.pending_source.take();
                 self.plot_texture = None;
                 match result {
                     Ok(result) => self.set_output(ChunkOutput::from_result(&result)),
                     Err(e) => self.fail(e.to_string()),
                 }
-                true
+                source
             }
             Some(None) => {
                 self.pending = None;
                 self.started = None;
+                let source = self.pending_source.take();
                 self.fail("The code runner stopped before it reported a result.");
-                true
+                source
             }
         }
     }
@@ -470,21 +484,24 @@ impl CodeChunk {
             ui,
             |ui| {
                 ui.horizontal(|ui| {
-                    let badge = ui.add(
+                    let badge = ui.add_enabled(
+                        !self.read_only,
                         egui::Button::new(RichText::new(format!("[ {} ]", language_name(current))).monospace().color(t.on_accent))
                             .fill(t.accent)
                             .corner_radius(CornerRadius::same(4))
                             .min_size(vec2(0.0, 21.0)),
                     );
-                    badge.clone().on_hover_text(crate::tl!("Choose the chunk's language"));
-                    crate::rtl::menu(&badge).show(|ui| {
-                        for language in [CodeLanguage::R, CodeLanguage::Python] {
-                            if ui.selectable_label(current == language, language_name(language)).clicked() {
-                                picked = Some(language);
-                                ui.close();
+                    if !self.read_only {
+                        badge.clone().on_hover_text(crate::tl!("Choose the chunk's language"));
+                        crate::rtl::menu(&badge).show(|ui| {
+                            for language in [CodeLanguage::R, CodeLanguage::Python] {
+                                if ui.selectable_label(current == language, language_name(language)).clicked() {
+                                    picked = Some(language);
+                                    ui.close();
+                                }
                             }
-                        }
-                    });
+                        });
+                    }
 
                     let arrow = if self.show_code { "▾" } else { "▸" };
                     if ui.add(egui::Button::new(RichText::new(arrow).color(t.text_dim)).frame(false)).clicked() {
@@ -502,7 +519,7 @@ impl CodeChunk {
                                 toggle_code = true;
                                 ui.close();
                             }
-                            if ui.add_enabled(self.output.is_some(), egui::Button::new(crate::tl!("Clear output"))).clicked() {
+                            if ui.add_enabled(!self.read_only && self.output.is_some(), egui::Button::new(crate::tl!("Clear output"))).clicked() {
                                 clear = true;
                                 ui.close();
                             }
@@ -510,7 +527,7 @@ impl CodeChunk {
                         options.response.on_hover_text(crate::tl!("Chunk options"));
 
                         let run_button = ui.add_enabled(
-                            !self.is_running() && self.available,
+                            !self.read_only && !self.is_running() && self.available,
                             egui::Button::new(RichText::new(format!("▶ {}", crate::tl!("Run"))).color(t.on_accent))
                                 .fill(t.accent)
                                 .corner_radius(CornerRadius::same(4)),
@@ -524,7 +541,7 @@ impl CodeChunk {
                                 current.binary_name(),
                                 language_name(current)
                             ));
-                        } else {
+                        } else if !self.read_only {
                             run_button.on_hover_text(crate::tl!("Run the chunk (Ctrl+Enter)"));
                         }
 
@@ -546,19 +563,21 @@ impl CodeChunk {
                 });
             },
         );
-        if let Some(language) = picked {
+        if !self.read_only
+            && let Some(language) = picked
+        {
             self.set_language(language);
         }
         if toggle_code {
             self.show_code = !self.show_code;
         }
-        if clear {
+        if !self.read_only && clear {
             self.clear_output();
         }
         if copy {
             ui.ctx().copy_text(self.code.clone());
         }
-        if run {
+        if !self.read_only && run {
             self.run(ui.ctx());
         }
     }
@@ -566,7 +585,9 @@ impl CodeChunk {
     fn editor(&mut self, ui: &mut Ui, t: &Tokens) -> EditorOutcome {
         let editor_id = self.editor_id();
         let mut arrow_exit = None;
-        if let Some(at_end) = self.pending_cursor_edge.take() {
+        if self.read_only {
+            self.pending_cursor_edge = None;
+        } else if let Some(at_end) = self.pending_cursor_edge.take() {
             ui.memory_mut(|m| m.request_focus(editor_id));
             let mut state = TextEdit::load_state(ui.ctx(), editor_id).unwrap_or_default();
             let idx = if at_end { self.code.chars().count() } else { 0 };
@@ -598,7 +619,14 @@ impl CodeChunk {
             job.wrap.max_width = f32::INFINITY;
             job.keep_trailing_whitespace = true;
             for token in highlight(buffer.as_str(), language) {
-                job.append(token.text, 0.0, egui::TextFormat { font_id: code_font.clone(), color: colours.of(token.kind), ..Default::default() });
+                let format = egui::TextFormat { font_id: code_font.clone(), color: colours.of(token.kind), ..Default::default() };
+                if token.text.contains('\u{FFFC}') {
+                    // Display-only replacement (both are 1 char / 3 UTF-8 bytes) avoids missing-glyph panics while keeping U+FFFC in `self.code`.
+                    let display = token.text.replace('\u{FFFC}', "\u{FFFD}");
+                    job.append(&display, 0.0, format);
+                } else {
+                    job.append(token.text, 0.0, format);
+                }
             }
             ui.fonts_mut(|fonts| fonts.layout_job(job))
         };
@@ -612,6 +640,7 @@ impl CodeChunk {
         let gutter = digits as f32 * char_w + 14.0;
 
         let mut outcome = EditorOutcome { arrow_exit, ..Default::default() };
+        let read_only = self.read_only;
         egui::Frame::NONE.inner_margin(Margin::symmetric(0, 6)).show(ui, |ui| {
             egui::ScrollArea::horizontal().id_salt(("wordcraft-code-chunk-scroll", self.id)).auto_shrink([false, true]).show(ui, |ui| {
                 // The child's width is the source's, so long lines scroll instead of being cut.
@@ -619,18 +648,26 @@ impl CodeChunk {
                 ui.allocate_ui_with_layout(size, Layout::left_to_right(Align::Min), |ui| {
                     ui.spacing_mut().item_spacing.x = 0.0;
                     ui.add_space(gutter);
-                    let out = TextEdit::multiline(&mut self.code)
-                        .id(editor_id)
-                        .code_editor()
-                        .frame(egui::Frame::NONE)
-                        .margin(Margin::ZERO)
-                        .desired_width(text_w)
-                        .desired_rows(lines)
-                        .hint_text(crate::tl!("Code"))
-                        .char_limit(MAX_CODE_CHARS)
-                        .layouter(&mut layouter)
-                        .show(ui);
-                    outcome.changed = out.response.changed();
+                    let mut show_box = |ui: &mut Ui, buffer: &mut dyn egui::TextBuffer| {
+                        TextEdit::multiline(buffer)
+                            .id(editor_id)
+                            .code_editor()
+                            .frame(egui::Frame::NONE)
+                            .margin(Margin::ZERO)
+                            .desired_width(text_w)
+                            .desired_rows(lines)
+                            .hint_text(crate::tl!("Code"))
+                            .char_limit(MAX_CODE_CHARS)
+                            .layouter(&mut layouter)
+                            .show(ui)
+                    };
+                    let out = if read_only {
+                        let mut ro = self.code.as_str();
+                        show_box(ui, &mut ro)
+                    } else {
+                        show_box(ui, &mut self.code)
+                    };
+                    outcome.changed = !read_only && out.response.changed();
                     outcome.has_focus = out.response.has_focus();
                     outcome.lost_focus = out.response.lost_focus();
                     let top = out.galley_pos;
@@ -756,7 +793,7 @@ impl CodeChunk {
                 self.zoom = (room / natural.x.max(1.0)).clamp(MIN_ZOOM, MAX_ZOOM);
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let response = ui.add_enabled(output.has_plot(), egui::Button::new(crate::tl!("Insert into document")));
+                let response = ui.add_enabled(!self.read_only && output.plot_png.is_some(), egui::Button::new(crate::tl!("Insert into document")));
                 if response.clicked() {
                     insert = true;
                 }
@@ -825,7 +862,7 @@ impl CodeChunk {
             ui.label(RichText::new(format!("{} × {}", table.rows.len(), table.headers.len())).color(t.text_dim).size(11.0))
                 .on_hover_text(crate::tl!("Rows × columns"));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let response = ui.button(crate::tl!("Insert into document"));
+                let response = ui.add_enabled(!self.read_only, egui::Button::new(crate::tl!("Insert into document")));
                 if response.clicked() {
                     insert = true;
                 }

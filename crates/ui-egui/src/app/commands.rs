@@ -36,9 +36,7 @@ impl WordApp {
         // close, New or Open counts it as a change (#1348). A draft the document refuses is not
         // part of it: saving and exporting go on without it (the refusal stays on the status
         // line), and replacing the document asks Save / Don't Save / Cancel about it.
-        if flushes_comment_drafts(id, &params) {
-            crate::canvas::code_chunks::flush_dirty(self);
-        }
+        let chunk_refused = if flushes_comment_drafts(id, &params) { crate::canvas::code_chunks::flush_dirty(self).err() } else { None };
         let refused = if flushes_comment_drafts(id, &params) { panes::flush_comment_drafts(self).err() } else { None };
         if id == "file.recover" && params.as_object().is_none_or(|p| p.is_empty()) {
             self.ui.backstage = true;
@@ -53,7 +51,10 @@ impl WordApp {
         }
         // The same unsaved work the control channel's refusal covers, so the prompt and the
         // refusal can't drift apart (#3274).
-        if (self.document_unsaved() || refused.is_some()) && discards_document(id, &params) && !self.closes_only_its_window(id, &params) {
+        if (self.document_unsaved() || refused.is_some() || chunk_refused.is_some())
+            && discards_document(id, &params)
+            && !self.closes_only_its_window(id, &params)
+        {
             let name = self.prompt_name();
             self.dialog = Some(dialogs::Dialog::SaveChanges {
                 name,
@@ -63,6 +64,12 @@ impl WordApp {
                 message: String::new(),
             });
             return Ok(json!({"pending": "saveChanges"}));
+        }
+        if !discards_document(id, &params)
+            && let Some(err) = chunk_refused
+        {
+            self.status(err.clone());
+            return Err(err);
         }
         // The ribbon and context-menu Paste commands send no text: read the system clipboard's, as
         // Ctrl+V's paste event carries it (#584), and its HTML and RTF, which egui's paste event
@@ -126,8 +133,10 @@ impl WordApp {
                 | "code.run_chunk"
                 | "code.run_all"
                 | "code.delete_chunk"
-        ) {
-            crate::canvas::code_chunks::flush_dirty(self);
+        ) && let Err(err) = crate::canvas::code_chunks::flush_dirty(self)
+        {
+            self.status(err.clone());
+            return Err(err);
         }
         self.clear_command_targets(id);
         if let Some(error) = self.document_required_error(id) {
@@ -397,11 +406,19 @@ impl WordApp {
         let retry = matches!(id, "file.open" | "file.newFromTemplate").then(|| params.clone());
         let retry_path = retry.clone();
         let r = if id == "code.run_chunk" {
-            crate::canvas::code_chunks::flush_dirty(self);
-            crate::canvas::code_chunks::run_chunk_async(self, &params, self.ctx.clone().as_ref())
+            if let Err(err) = crate::canvas::code_chunks::flush_dirty(self) {
+                self.status(err.clone());
+                Err(err)
+            } else {
+                crate::canvas::code_chunks::run_chunk_async(self, &params, self.ctx.clone().as_ref())
+            }
         } else if id == "code.run_all" {
-            crate::canvas::code_chunks::flush_dirty(self);
-            crate::canvas::code_chunks::run_all_async(self, &params, self.ctx.clone().as_ref())
+            if let Err(err) = crate::canvas::code_chunks::flush_dirty(self) {
+                self.status(err.clone());
+                Err(err)
+            } else {
+                crate::canvas::code_chunks::run_all_async(self, &params, self.ctx.clone().as_ref())
+            }
         } else {
             self.execute(id, params)
         };

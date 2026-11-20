@@ -5991,18 +5991,32 @@ fn mounted_code_chunk_reserves_canvas_space_reflows_text_and_syncs_edits_with_un
         .expect("below paragraph line");
     assert!(below_y >= chunk_rect.bottom() - 1.0, "below paragraph ({below_y}) must reflow below chunk ({})", chunk_rect.bottom());
 
-    // Simulate editing inside the widget and flushing via code.update_chunk, then Undo/Redo.
-    {
-        let entry = h.state_mut().canvas.code_chunks.widgets.get_mut(&chunk_id).unwrap();
-        entry.widget.set_code("x = 1\ny = 2\nz = 3\nw = 4");
-    }
-    h.state_mut().run("code.update_chunk", json!({"chunkId": chunk_id, "language": "python", "code": "x = 1\ny = 2\nz = 3\nw = 4"})).unwrap();
-    steps(&mut h, 4);
-    assert_eq!(h.state().canvas.code_chunks.widgets[&chunk_id].widget.code(), "x = 1\ny = 2\nz = 3\nw = 4");
+    // Simulate typing directly inside the mounted widget, let debounce flush cleanly to the doc, then Undo/Redo.
+    let editor_id = h.state().canvas.code_chunks.widgets[&chunk_id].widget.editor_id();
+    h.state_mut().canvas.code_chunks.request_focus(chunk_id, true);
+    steps(&mut h, 2);
+    assert!(h.ctx.memory(|m| m.has_focus(editor_id)), "mounted chunk editor should acquire focus");
+    h.input_mut().events.extend([
+        egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE },
+        egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed: false, repeat: false, modifiers: egui::Modifiers::NONE },
+        egui::Event::Text("y = 2".into()),
+    ]);
+    h.step();
+    assert!(crate::canvas::code_chunks::has_dirty_chunks(h.state()), "widget edit should mark draft dirty before debounce expires");
+    assert_eq!(wordcraft_engine::chunks::chunks_in(&h.state().session.doc, StoryRef::Body)[0].chunk.code, "x = 1");
+    let next_time = h.ctx.input(|i| i.time) + 0.7;
+    h.input_mut().time = Some(next_time);
+    h.step();
+    assert!(!crate::canvas::code_chunks::has_dirty_chunks(h.state()), "expired debounce should flush draft cleanly");
+    assert_eq!(wordcraft_engine::chunks::chunks_in(&h.state().session.doc, StoryRef::Body)[0].chunk.code, "x = 1\ny = 2");
 
     h.state_mut().run("edit.undo", json!({})).unwrap();
     steps(&mut h, 4);
     assert_eq!(h.state().canvas.code_chunks.widgets[&chunk_id].widget.code(), "x = 1");
+
+    h.state_mut().run("edit.redo", json!({})).unwrap();
+    steps(&mut h, 4);
+    assert_eq!(h.state().canvas.code_chunks.widgets[&chunk_id].widget.code(), "x = 1\ny = 2");
 
     // Delete removes the chunk from document and widget cache cleanly.
     h.state_mut().run("code.delete_chunk", json!({"chunkId": chunk_id})).unwrap();
@@ -6085,4 +6099,126 @@ fn mounted_chunk_teaching_mode_toggle_reflows_and_arrow_keys_cross_boundary() {
     h.state_mut().run("code.insert_table", json!({"chunkId": chunk_id, "headers": ["k", "v"], "rows": [["1", "2"]]})).unwrap();
     steps(&mut h, 4);
     assert!(h.state().session.doc.body.iter().any(|b| matches!(&**b, wordcraft_doc::Block::Table(_))));
+}
+
+#[test]
+fn refused_chunk_draft_blocks_save_and_run_and_keeps_document_unsaved() {
+    let mut a = WordApp::new(wordcraft_engine::Session::new(wordcraft_doc::Document::new()), Default::default());
+    a.run("code.insert_chunk", json!({"language": "python", "code": "x = 1"})).unwrap();
+    let chunk_id = wordcraft_engine::chunks::chunks_in(&a.session.doc, StoryRef::Body)[0].chunk.id.unwrap();
+
+    let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1280.0, 860.0)).build_ui_state(
+        |ui, app: &mut WordApp| {
+            let ctx = ui.ctx().clone();
+            app.logic(&ctx);
+            app.ui(ui);
+        },
+        a,
+    );
+    steps(&mut h, 4);
+    h.state_mut().session.dirty = false;
+    let doc_id = h.state().session.document_id();
+    assert!(!h.state().document_unsaved_by_id(doc_id));
+
+    h.state_mut().canvas.code_chunks.request_focus(chunk_id, true);
+    steps(&mut h, 2);
+    // U+FFFC passes TextEdit's char limit but is rejected by `code.update_chunk`.
+    h.input_mut().events.push(egui::Event::Text("\u{FFFC}".into()));
+    h.step();
+
+    assert!(crate::canvas::code_chunks::has_dirty_chunks(h.state()));
+    assert!(h.state().document_unsaved(), "refused chunk draft must keep document unsaved");
+    assert!(h.state().document_unsaved_by_id(doc_id));
+
+    let next_time = h.ctx.input(|i| i.time) + 0.7;
+    h.input_mut().time = Some(next_time);
+    steps(&mut h, 2);
+    assert!(crate::canvas::code_chunks::has_dirty_chunks(h.state()), "rejected debounce flush must preserve dirty flag");
+
+    let target = std::env::temp_dir().join(format!("wc-refused-draft-{}.docx", std::process::id()));
+    let _ = std::fs::remove_file(&target);
+    let save_res = h.state_mut().run("file.save", json!({"path": target.to_string_lossy()}));
+    assert!(save_res.is_err(), "save must stop when a dirty chunk draft is refused: {save_res:?}");
+    assert!(!target.exists(), "refused save must not write stale chunk contents to disk");
+
+    let run_res = h.state_mut().run("code.run_chunk", json!({"chunkId": chunk_id}));
+    assert!(run_res.is_err(), "running a chunk with an unflushable draft must fail instead of running stale code");
+    assert!(h.state().document_unsaved(), "document must stay unsaved until draft is resolved");
+}
+
+#[test]
+fn mounted_chunk_in_read_mode_blocks_edits_and_arrow_entry() {
+    let mut a = WordApp::new(wordcraft_engine::Session::new(wordcraft_doc::Document::new()), Default::default());
+    a.run("text.insert", json!({"text": "Above"})).unwrap();
+    a.run("text.newParagraph", json!({})).unwrap();
+    a.run("code.insert_chunk", json!({"language": "python", "code": "x = 1"})).unwrap();
+    let chunk_id = wordcraft_engine::chunks::chunks_in(&a.session.doc, StoryRef::Body)[0].chunk.id.unwrap();
+    a.session.view.read_mode = true;
+
+    let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1280.0, 860.0)).build_ui_state(
+        |ui, app: &mut WordApp| {
+            let ctx = ui.ctx().clone();
+            app.logic(&ctx);
+            app.ui(ui);
+        },
+        a,
+    );
+    steps(&mut h, 4);
+    assert!(h.state().canvas.code_chunks.is_mounted(chunk_id));
+    assert!(h.state().canvas.code_chunks.widgets[&chunk_id].widget.read_only);
+
+    let editor_id = h.state().canvas.code_chunks.widgets[&chunk_id].widget.editor_id();
+    h.ctx.memory_mut(|m| m.request_focus(editor_id));
+    steps(&mut h, 1);
+    h.input_mut().events.push(egui::Event::Text(" + 99".into()));
+    steps(&mut h, 2);
+    assert_eq!(h.state().canvas.code_chunks.widgets[&chunk_id].widget.code(), "x = 1", "Read Mode must keep chunk source immutable");
+    assert!(!crate::canvas::code_chunks::has_dirty_chunks(h.state()));
+
+    h.state_mut().session.sel = wordcraft_engine::Selection::caret(Pos::body(0, 0));
+    assert!(!crate::canvas::code_chunks::maybe_enter_from_canvas_arrow(h.state_mut(), egui::Key::ArrowDown, egui::Modifiers::NONE));
+    assert_eq!(h.state().canvas.code_chunks.pending_focus, None);
+}
+
+#[test]
+fn arrow_navigation_enters_chunk_from_table_cell_and_picks_nearest_chunk_on_arrow_up() {
+    let mut a = WordApp::new(wordcraft_engine::Session::new(wordcraft_doc::Document::new()), Default::default());
+    let temp = a.run("code.insert_chunk", json!({"language": "python", "code": "tmp = 0"})).unwrap()["chunk"]["id"].as_i64().unwrap();
+    a.run("code.insert_table", json!({"chunkId": temp, "headers": ["Col"], "rows": [["Cell"]]})).unwrap();
+    a.run("code.delete_chunk", json!({"chunkId": temp})).unwrap();
+    // `insert_table` + `delete_chunk` leave `[Table(0), Para(1)]`. Insert chunk A at block 1.
+    a.session.sel = wordcraft_engine::Selection::caret(Pos::body(1, 0));
+    let chunk_a = a.run("code.insert_chunk", json!({"language": "python", "code": "a = 1"})).unwrap()["chunk"]["id"].as_i64().unwrap();
+    let end_a = wordcraft_engine::chunks::chunks_in(&a.session.doc, StoryRef::Body)[0].end.path.last();
+    a.session.doc.body.truncate(end_a + 1);
+    a.session.doc.body.push(wordcraft_doc::para_block(wordcraft_doc::Paragraph::new()));
+    a.session.sel = wordcraft_engine::Selection::caret(Pos::body(end_a + 1, 0));
+    let chunk_b = a.run("code.insert_chunk", json!({"language": "python", "code": "b = 2"})).unwrap()["chunk"]["id"].as_i64().unwrap();
+    let end_b = wordcraft_engine::chunks::chunks_in(&a.session.doc, StoryRef::Body)[1].end.path.last();
+    a.session.doc.body.truncate(end_b + 1);
+    let below_idx = a.session.doc.body.len();
+    a.session.doc.body.push(wordcraft_doc::para_block(wordcraft_doc::Paragraph::with_text("Below", Default::default())));
+
+    let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1280.0, 860.0)).build_ui_state(
+        |ui, app: &mut WordApp| {
+            let ctx = ui.ctx().clone();
+            app.logic(&ctx);
+            app.ui(ui);
+        },
+        a,
+    );
+    steps(&mut h, 6);
+
+    // ArrowDown from row 0 stays inside row 1 of the table; ArrowDown from row 1 enters chunk A.
+    h.state_mut().session.sel = wordcraft_engine::Selection::caret(Pos::new(StoryRef::Body, wordcraft_doc::Path(vec![0, 0, 0, 0]), 0));
+    assert!(!crate::canvas::code_chunks::maybe_enter_from_canvas_arrow(h.state_mut(), egui::Key::ArrowDown, egui::Modifiers::NONE));
+    h.state_mut().session.sel = wordcraft_engine::Selection::caret(Pos::new(StoryRef::Body, wordcraft_doc::Path(vec![0, 1, 0, 0]), 0));
+    assert!(crate::canvas::code_chunks::maybe_enter_from_canvas_arrow(h.state_mut(), egui::Key::ArrowDown, egui::Modifiers::NONE));
+    assert_eq!(h.state().canvas.code_chunks.pending_focus, Some((chunk_a, false)));
+
+    // ArrowUp from paragraph below two adjacent chunks must enter the closest chunk (chunk B), not chunk A.
+    h.state_mut().canvas.code_chunks.pending_focus = None;
+    h.state_mut().session.sel = wordcraft_engine::Selection::caret(Pos::body(below_idx, 0));
+    assert!(crate::canvas::code_chunks::maybe_enter_from_canvas_arrow(h.state_mut(), egui::Key::ArrowUp, egui::Modifiers::NONE));
+    assert_eq!(h.state().canvas.code_chunks.pending_focus, Some((chunk_b, true)));
 }

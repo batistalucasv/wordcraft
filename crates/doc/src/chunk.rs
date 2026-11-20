@@ -471,18 +471,25 @@ impl Document {
             return Ok(false);
         };
         let norm_lang = normalize_language(language);
-        let new_tag = format!("{CHUNK_TAG}{}", if norm_lang.is_empty() { "text" } else { norm_lang.as_str() });
-        if found.chunk.language == norm_lang && found.chunk.code == code {
+        let effective_lang = if norm_lang.is_empty() { "text" } else { norm_lang.as_str() };
+        if found.chunk.language == effective_lang && found.chunk.code == code {
             return Ok(false);
         }
+        let new_tag = format!("{CHUNK_TAG}{effective_lang}");
 
+        if found.start.story != found.end.story || found.start.path.parent() != found.end.path.parent() {
+            return Ok(false);
+        }
+        let Some(container) = self.container(found.start.story, &found.start.path) else {
+            return Ok(false);
+        };
         let first = found.start.path.last();
         let last = found.end.path.last();
-        if last < first || last >= self.body.len() {
+        if last < first || last >= container.len() {
             return Ok(false);
         }
 
-        let Some(first_para) = self.body.get(first).and_then(|b| b.as_para()) else {
+        let Some(first_para) = container.get(first).and_then(|b| b.as_para()) else {
             return Ok(false);
         };
         let Some(mut control) = first_para.objects.iter().find_map(|o| match o {
@@ -493,11 +500,11 @@ impl Document {
         };
 
         control.tag = new_tag;
-        let mut updated = CodeChunk::new(&norm_lang, code);
+        let mut updated = CodeChunk::new(effective_lang, code);
         updated.options = found.chunk.options.clone();
         control.title = updated.alias();
 
-        let trailing_section = self.body.get(last).and_then(|b| b.as_para()).and_then(|p| p.section.clone());
+        let trailing_section = container.get(last).and_then(|b| b.as_para()).and_then(|p| p.section.clone());
         let first_ppr = first_para.props.clone();
 
         if self.styles.get(CHUNK_STYLE).is_none() {
@@ -525,7 +532,8 @@ impl Document {
             blocks.push(para_block(p));
         }
 
-        self.body.splice(first..=last, blocks);
+        let container = self.container_mut(found.start.story, &found.start.path)?;
+        container.splice(first..=last, blocks);
         Ok(true)
     }
 }
@@ -814,5 +822,37 @@ mod tests {
         let too_many_lines = "\n".repeat(MAX_CHUNK_LINES + 1);
         assert!(matches!(doc.update_chunk(id, "python", &too_many_lines), Err(DocError::Invalid(_))));
         assert_eq!(doc.chunks()[0].code, "x = 1");
+    }
+
+    #[test]
+    fn update_chunk_updates_nested_table_cell_chunk_without_touching_body_block_zero() {
+        use crate::{Block, Path, Table};
+
+        let mut doc = Document::from_text("body intro");
+        let cell_blocks = doc.chunk_blocks(&CodeChunk::new("r", "a <- 1")).unwrap();
+        let id = doc.chunk_refs(StoryRef::Body).first().and_then(|r| r.chunk.id).unwrap_or_else(|| match &*cell_blocks[0] {
+            Block::Para(p) => match &p.objects[0] {
+                InlineObject::ControlStart { control } => control.id.unwrap(),
+                _ => panic!("expected control start"),
+            },
+            _ => panic!("expected para"),
+        });
+        let mut table = Table::new(1, 1, 200.0);
+        table.rows[0].cells[0].blocks = cell_blocks;
+        doc.body.push(Arc::new(Block::Table(table)));
+
+        assert!(doc.update_chunk(id, "python", "x = 99").unwrap());
+        assert_eq!(doc.para(StoryRef::Body, &Path::top(0)).unwrap().plain_text(), "body intro");
+        let updated = doc.chunk_refs(StoryRef::Body).into_iter().find(|r| r.chunk.id == Some(id)).unwrap();
+        assert_eq!(updated.chunk.language, "python");
+        assert_eq!(updated.chunk.code, "x = 99");
+        assert_eq!(updated.start.path.0, vec![1, 0, 0, 0]);
+    }
+
+    #[test]
+    fn update_chunk_treats_empty_language_on_text_chunk_as_noop() {
+        let mut doc = Document::new();
+        let id = doc.push_chunk(&CodeChunk::new("", "plain")).unwrap();
+        assert!(!doc.update_chunk(id, "", "plain").unwrap());
     }
 }
