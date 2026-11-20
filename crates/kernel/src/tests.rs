@@ -1320,7 +1320,7 @@ fn which_binary_skips_non_executable_candidates() {
         fs::write(&non_exec, b"#!/bin/sh\n").expect("write non-exec");
         fs::set_permissions(&non_exec, fs::Permissions::from_mode(0o644)).expect("chmod 0644");
 
-        // Owner permissions (rw-) take precedence over the other-execute bit (--x).
+        // Mode 0o641 sets only the other-execute bit while leaving the owner bits rw-.
         let other_exec_only = other_exec_only_dir.join(name);
         fs::write(&other_exec_only, b"#!/bin/sh\n").expect("write other-exec-only");
         fs::set_permissions(&other_exec_only, fs::Permissions::from_mode(0o641)).expect("chmod 0641");
@@ -1329,17 +1329,31 @@ fn which_binary_skips_non_executable_candidates() {
         symlink(dir.join("missing-target"), broken_link_dir.join(name)).expect("create broken symlink");
         symlink(&non_exec, link_to_non_exec_dir.join(name)).expect("create symlink to non-exec");
 
-        let only_bad_paths = std::env::join_paths([&non_exec_dir, &other_exec_only_dir, &dir_named_bin, &broken_link_dir, &link_to_non_exec_dir])
-            .expect("join bad paths");
-        assert_eq!(which_binary_in(language, &only_bad_paths), None, "{name}: non-executable candidates must be ignored");
-
         let exec_bin = exec_dir.join(name);
         fs::write(&exec_bin, b"#!/bin/sh\n").expect("write exec");
         fs::set_permissions(&exec_bin, fs::Permissions::from_mode(0o755)).expect("chmod 0755");
 
-        let all_paths =
-            std::env::join_paths([&non_exec_dir, &other_exec_only_dir, &dir_named_bin, &broken_link_dir, &link_to_non_exec_dir, &exec_dir])
-                .expect("join all paths");
+        // For unprivileged callers on an executable filesystem, owner permissions (rw-) reject
+        // mode 0o641 even though its other-execute bit (--x) is set. Privileged callers (root or
+        // CAP_DAC_OVERRIDE) can execute 0o641 directly, so include it only when execve denies it.
+        let other_exec_denied = matches!(
+            Command::new(&other_exec_only).stdout(Stdio::null()).stderr(Stdio::null()).status(),
+            Err(ref err) if err.kind() == ErrorKind::PermissionDenied
+        ) && !matches!(
+            Command::new(&exec_bin).stdout(Stdio::null()).stderr(Stdio::null()).status(),
+            Err(ref err) if err.kind() == ErrorKind::PermissionDenied
+        );
+
+        let mut bad_dirs = vec![&non_exec_dir, &dir_named_bin, &broken_link_dir, &link_to_non_exec_dir];
+        if other_exec_denied {
+            bad_dirs.insert(1, &other_exec_only_dir);
+        }
+
+        let only_bad_paths = std::env::join_paths(&bad_dirs).expect("join bad paths");
+        assert_eq!(which_binary_in(language, &only_bad_paths), None, "{name}: non-executable candidates must be ignored");
+
+        bad_dirs.push(&exec_dir);
+        let all_paths = std::env::join_paths(&bad_dirs).expect("join all paths");
         assert_eq!(which_binary_in(language, &all_paths), Some(exec_bin), "{name}: search must fall through to the executable candidate");
     }
 }
