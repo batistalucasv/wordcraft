@@ -266,6 +266,7 @@ fn python_large_output_is_drained_while_running() {
 
     assert!(!result.timed_out, "large output must not cause a false timeout");
     assert!(result.success);
+    assert!(!result.output_truncated);
     assert_eq!(result.stdout.trim_end().len(), 200_000);
 }
 
@@ -282,11 +283,108 @@ subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
 print("chunk finished")
 "#;
     let req = ExecutionRequest::new(CodeLanguage::Python, code).with_plot_capture(false).with_timeout(10_000);
+    let started = Instant::now();
     let result = execute(&req).expect("execution failed");
 
+    assert!(started.elapsed() < Duration::from_secs(5), "a background descendant must not delay the chunk");
     assert!(!result.timed_out, "a background descendant must not extend the chunk");
     assert!(result.success);
     assert!(result.stdout.contains("chunk finished"));
+}
+
+#[test]
+fn capture_retains_at_most_the_limit() {
+    let sink = CaptureSink::new();
+    let chunk = [b'x'; 128];
+    for _ in 0..8 {
+        sink.retain(&chunk, 256);
+    }
+    assert_eq!(sink.snapshot().len(), 256);
+    assert!(sink.is_truncated());
+}
+
+#[cfg(unix)]
+#[test]
+fn capture_keeps_draining_after_the_limit() {
+    use std::io::Write;
+
+    let (reader, mut writer) = std::io::pipe().expect("create pipe");
+    set_pipe_nonblocking(&reader).expect("set pipe nonblocking");
+    let capture = spawn_capture(reader, 256).expect("spawn capture");
+    let payload = vec![b'x'; 200_000];
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let writer_thread = thread::spawn(move || {
+        let result = writer.write_all(&payload);
+        let _ = done_tx.send(result);
+    });
+    let written = done_rx.recv_timeout(Duration::from_secs(5)).expect("reader must keep draining");
+    written.expect("write payload");
+    writer_thread.join().expect("writer thread");
+
+    let captured = capture.stop();
+    assert_eq!(captured.bytes.len(), 256);
+    assert!(captured.truncated);
+}
+
+#[cfg(unix)]
+#[test]
+fn python_timeout_kills_same_group_descendant() {
+    if !is_language_available(CodeLanguage::Python) {
+        return;
+    }
+
+    let code = r#"
+import subprocess
+import sys
+import time
+child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+print(child.pid, flush=True)
+time.sleep(30)
+"#;
+    let started = Instant::now();
+    let result = execute(&ExecutionRequest::new(CodeLanguage::Python, code).with_plot_capture(false).with_timeout(2_000)).expect("execution failed");
+
+    assert!(result.timed_out);
+    assert!(started.elapsed() < Duration::from_secs(8), "timeout must not wait for the descendant");
+    let pid: i32 = result.stdout.trim().parse().expect("descendant pid");
+    use nix::sys::signal::kill;
+    use nix::unistd::Pid;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if kill(Pid::from_raw(pid), None).is_err() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the timed-out group must not leave a descendant");
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn python_escaped_descendant_does_not_block_capture() {
+    if !is_language_available(CodeLanguage::Python) {
+        return;
+    }
+
+    let code = r#"
+import subprocess
+import sys
+import time
+child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], start_new_session=True)
+print(f"{child.pid} started", flush=True)
+time.sleep(30)
+"#;
+    let started = Instant::now();
+    let result = execute(&ExecutionRequest::new(CodeLanguage::Python, code).with_plot_capture(false).with_timeout(2_000)).expect("execution failed");
+
+    assert!(result.timed_out);
+    assert!(result.stdout.contains("started"), "captured output must survive reader cancellation");
+    assert!(started.elapsed() < Duration::from_secs(8), "an escaped descendant must not delay the chunk");
+
+    let pid: i32 = result.stdout.split_whitespace().next().and_then(|value| value.parse().ok()).expect("escaped pid");
+    use nix::sys::signal::{Signal, kill};
+    use nix::unistd::Pid;
+    let _ = kill(Pid::from_raw(pid), Signal::SIGKILL);
 }
 
 #[test]

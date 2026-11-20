@@ -7579,6 +7579,7 @@ name = "wordcraft-kernel"
 version = "0.18.1"
 dependencies = [
  "command-group",
+ "nix 0.27.1",
  "proptest",
  "serde",
  "thiserror 2.0.21",

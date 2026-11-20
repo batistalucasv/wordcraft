@@ -10,7 +10,8 @@ use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -29,8 +30,15 @@ static SCRIPT_COUNTER: AtomicU64 = AtomicU64::new(1);
 const MAX_SCRATCH_DIR_ATTEMPTS: u64 = 10;
 /// How long to wait for a killed process group to be reaped.
 const PROCESS_GROUP_REAP_TIMEOUT: Duration = Duration::from_secs(2);
-/// How long to wait for output readers after the process group is gone.
-const READER_JOIN_TIMEOUT: Duration = Duration::from_secs(1);
+/// Most bytes retained from each stream; the rest is drained and discarded.
+const MAX_CAPTURED_BYTES: usize = 10 * 1024 * 1024;
+/// Size of each read from a child pipe.
+const CAPTURE_CHUNK_BYTES: usize = 8 * 1024;
+/// How long a cancellable reader sleeps between non-blocking reads.
+const CAPTURE_POLL_INTERVAL: Duration = Duration::from_millis(5);
+/// Grace for a blocking reader to see EOF after its group is killed.
+#[cfg(not(unix))]
+const CAPTURE_STOP_TIMEOUT: Duration = Duration::from_secs(1);
 /// A complete PNG ends with the empty IEND chunk.
 const PNG_HEADER: &[u8] = &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
 const PNG_IEND: &[u8] = &[0x00, 0x00, 0x00, 0x00, b'I', b'E', b'N', b'D', 0xAE, 0x42, 0x60, 0x82];
@@ -173,6 +181,9 @@ pub struct ExecutionResult {
     pub success: bool,
     /// True if execution was halted due to timeout limit.
     pub timed_out: bool,
+    /// True when stdout or stderr was cut at the capture limit.
+    #[serde(default)]
+    pub output_truncated: bool,
     /// PNG bytes of plot/chart if generated and captured.
     pub plot_png: Option<Vec<u8>>,
     /// Vector SVG XML string of plot/chart if generated and captured.
@@ -267,21 +278,25 @@ pub fn execute(request: &ExecutionRequest) -> Result<ExecutionResult, KernelErro
     let start_time = Instant::now();
     let mut child = cmd.group_spawn().map_err(|e| KernelError::Io(format!("spawn {}: {e}", binary.display())))?;
 
-    let stdout_reader = child.inner().stdout.take().map(spawn_reader);
-    let stderr_reader = child.inner().stderr.take().map(spawn_reader);
+    let (stdout_reader, stderr_reader) = match spawn_capture_pair(&mut child, MAX_CAPTURED_BYTES) {
+        Ok(readers) => readers,
+        Err(error) => {
+            terminate_process_group(&mut child);
+            return Err(KernelError::Io(format!("start output capture: {error}")));
+        }
+    };
 
     let (exit_status, timed_out) = wait_with_timeout(&mut child, Duration::from_millis(request.timeout_ms));
     let duration_ms = start_time.elapsed().as_millis().min(u64::MAX as u128) as u64;
 
-    // Descendants may outlive the interpreter and keep the pipes open. Kill the
-    // whole group before joining the readers, and bound the join as a last resort.
+    // Kill the whole group first: descendants may outlive the interpreter and
+    // keep the pipes open. The readers are then stopped without losing bytes.
     terminate_process_group(&mut child);
-    let stdout = join_reader(stdout_reader, Instant::now() + READER_JOIN_TIMEOUT)
-        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-        .unwrap_or_default();
-    let stderr = join_reader(stderr_reader, Instant::now() + READER_JOIN_TIMEOUT)
-        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-        .unwrap_or_default();
+    let stdout = stdout_reader.map(CaptureReader::stop).unwrap_or_default();
+    let stderr = stderr_reader.map(CaptureReader::stop).unwrap_or_default();
+    let output_truncated = stdout.truncated || stderr.truncated;
+    let stdout = String::from_utf8_lossy(&stdout.bytes).into_owned();
+    let stderr = String::from_utf8_lossy(&stderr.bytes).into_owned();
 
     let mut plot_png = None;
     if request.capture_plots && request.plot_format.captures_png() && plot_png_path.is_file() {
@@ -296,7 +311,7 @@ pub fn execute(request: &ExecutionRequest) -> Result<ExecutionResult, KernelErro
     let exit_code = exit_status.and_then(|s| s.code());
     let success = exit_status.map(|s| s.success()).unwrap_or(false) && !timed_out;
 
-    Ok(ExecutionResult { stdout, stderr, exit_code, success, timed_out, plot_png, plot_svg, duration_ms })
+    Ok(ExecutionResult { stdout, stderr, exit_code, success, timed_out, output_truncated, plot_png, plot_svg, duration_ms })
 }
 
 /// Create the per-run scratch directory exclusively, with owner-only permissions.
@@ -322,25 +337,147 @@ impl Drop for TempDirGuard {
     }
 }
 
-/// Read one piped stream on its own thread so a full pipe never blocks the child.
-fn spawn_reader<R: Read + Send + 'static>(mut reader: R) -> JoinHandle<Vec<u8>> {
-    thread::spawn(move || {
-        let mut buffer = Vec::new();
-        let _ = reader.read_to_end(&mut buffer);
-        buffer
-    })
+/// Bytes captured from one stream, plus whether the limit was reached.
+#[derive(Default)]
+struct Captured {
+    bytes: Vec<u8>,
+    truncated: bool,
 }
 
-/// Join a reader without letting an escaped descendant block the caller forever.
-fn join_reader(handle: Option<JoinHandle<Vec<u8>>>, deadline: Instant) -> Option<Vec<u8>> {
-    let handle = handle?;
-    while !handle.is_finished() {
-        if Instant::now() >= deadline {
-            return None;
-        }
-        thread::sleep(Duration::from_millis(10));
+/// Shared sink: the reader appends under the lock, and the caller can still
+/// snapshot it if the reader has to be detached.
+#[derive(Clone)]
+struct CaptureSink {
+    bytes: Arc<Mutex<Vec<u8>>>,
+    truncated: Arc<AtomicBool>,
+}
+
+impl CaptureSink {
+    fn new() -> Self {
+        Self { bytes: Arc::new(Mutex::new(Vec::new())), truncated: Arc::new(AtomicBool::new(false)) }
     }
-    handle.join().ok()
+
+    fn retain(&self, chunk: &[u8], limit: usize) {
+        let mut bytes = self.bytes.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let remaining = limit.saturating_sub(bytes.len());
+        if chunk.len() > remaining {
+            bytes.extend_from_slice(&chunk[..remaining]);
+            drop(bytes);
+            self.truncated.store(true, Ordering::Release);
+        } else {
+            bytes.extend_from_slice(chunk);
+        }
+    }
+
+    fn snapshot(&self) -> Vec<u8> {
+        self.bytes.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone()
+    }
+
+    fn is_truncated(&self) -> bool {
+        self.truncated.load(Ordering::Acquire)
+    }
+}
+
+/// A running reader plus the handles needed to stop it.
+struct CaptureReader {
+    sink: CaptureSink,
+    cancel: Arc<AtomicBool>,
+    handle: JoinHandle<()>,
+}
+
+impl CaptureReader {
+    /// Stop the reader, close its pipe, and return everything captured so far.
+    fn stop(self) -> Captured {
+        self.cancel.store(true, Ordering::Release);
+        #[cfg(unix)]
+        {
+            // Non-blocking reads observe the flag within one poll interval.
+            let _ = self.handle.join();
+        }
+        #[cfg(not(unix))]
+        {
+            // A killed job closes the pipe, so the blocking reader sees EOF.
+            // A breakaway process outside the job can keep it open: bound the
+            // wait and detach, keeping the bytes already captured.
+            let deadline = Instant::now() + CAPTURE_STOP_TIMEOUT;
+            while !self.handle.is_finished() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(10));
+            }
+            if self.handle.is_finished() {
+                let _ = self.handle.join();
+            }
+        }
+        Captured { bytes: self.sink.snapshot(), truncated: self.sink.is_truncated() }
+    }
+}
+
+/// Start draining one pipe, retaining at most `limit` bytes.
+fn spawn_capture<R: Read + Send + 'static>(pipe: R, limit: usize) -> std::io::Result<CaptureReader> {
+    let sink = CaptureSink::new();
+    let thread_sink = sink.clone();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let thread_cancel = Arc::clone(&cancel);
+    let handle =
+        thread::Builder::new().name("wordcraft-output-capture".to_string()).spawn(move || capture_into(pipe, &thread_sink, &thread_cancel, limit))?;
+    Ok(CaptureReader { sink, cancel, handle })
+}
+
+fn capture_into<R: Read>(mut pipe: R, sink: &CaptureSink, cancel: &AtomicBool, limit: usize) {
+    let mut chunk = [0_u8; CAPTURE_CHUNK_BYTES];
+    loop {
+        if cancel.load(Ordering::Acquire) {
+            return;
+        }
+        match pipe.read(&mut chunk) {
+            Ok(0) => return,
+            Ok(read) => sink.retain(&chunk[..read], limit),
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                thread::sleep(CAPTURE_POLL_INTERVAL);
+            }
+            Err(_) => return,
+        }
+    }
+}
+
+/// Take both pipes and start their readers.
+fn spawn_capture_pair(child: &mut GroupChild, limit: usize) -> std::io::Result<(Option<CaptureReader>, Option<CaptureReader>)> {
+    let stdout = child.inner().stdout.take();
+    let stderr = child.inner().stderr.take();
+    #[cfg(unix)]
+    {
+        if let Some(pipe) = &stdout {
+            set_pipe_nonblocking(pipe)?;
+        }
+        if let Some(pipe) = &stderr {
+            set_pipe_nonblocking(pipe)?;
+        }
+    }
+    let stdout_reader = match stdout {
+        Some(pipe) => Some(spawn_capture(pipe, limit)?),
+        None => None,
+    };
+    let stderr_reader = match stderr {
+        Some(pipe) => match spawn_capture(pipe, limit) {
+            Ok(reader) => Some(reader),
+            Err(error) => {
+                if let Some(reader) = stdout_reader {
+                    let _ = reader.stop();
+                }
+                return Err(error);
+            }
+        },
+        None => None,
+    };
+    Ok((stdout_reader, stderr_reader))
+}
+
+#[cfg(unix)]
+fn set_pipe_nonblocking(pipe: &impl std::os::fd::AsRawFd) -> std::io::Result<()> {
+    use nix::fcntl::{FcntlArg, OFlag, fcntl};
+    let flags = fcntl(pipe.as_raw_fd(), FcntlArg::F_GETFL).map_err(std::io::Error::other)?;
+    let flags = OFlag::from_bits_truncate(flags) | OFlag::O_NONBLOCK;
+    fcntl(pipe.as_raw_fd(), FcntlArg::F_SETFL(flags)).map(|_| ()).map_err(std::io::Error::other)
 }
 
 /// Kill the whole process group and reap it, so no descendant outlives the chunk.
