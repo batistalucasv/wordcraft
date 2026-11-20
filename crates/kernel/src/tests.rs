@@ -1206,3 +1206,154 @@ fn python_registers_the_chunk_as_main_for_pickling() {
     assert!(result.success, "stderr: {}", result.stderr);
     assert!(result.stdout.contains("pickled"));
 }
+
+fn test_scratch_dir(prefix: &str) -> (PathBuf, TempDirGuard) {
+    let path = std::env::temp_dir().join(format!("{prefix}-{}-{}", std::process::id(), SCRIPT_COUNTER.fetch_add(1, Ordering::Relaxed)));
+    create_scratch_dir(&path).expect("create scratch dir");
+    (path.clone(), TempDirGuard(path))
+}
+
+#[test]
+fn bounded_plot_reads_reject_oversized_streams() {
+    let limit = 256_u64;
+
+    let mut exact_png = Vec::new();
+    exact_png.extend_from_slice(PNG_HEADER);
+    exact_png.resize(limit as usize - PNG_IEND.len(), 0);
+    exact_png.extend_from_slice(PNG_IEND);
+    assert_eq!(read_plot_png_from_reader(&exact_png[..], limit).as_deref(), Some(exact_png.as_slice()));
+
+    let mut oversized_png = Vec::new();
+    oversized_png.extend_from_slice(PNG_HEADER);
+    oversized_png.resize(limit as usize + 1 - PNG_IEND.len(), 0);
+    oversized_png.extend_from_slice(PNG_IEND);
+    assert!(read_plot_png_from_reader(&oversized_png[..], limit).is_none());
+    assert!(read_plot_png_from_reader(EndlessReader, limit).is_none());
+
+    let svg_prefix = "<?xml version=\"1.0\"?><svg xmlns=\"http://www.w3.org/2000/svg\">";
+    let svg_suffix = "</svg>";
+    let mut exact_svg = String::from(svg_prefix);
+    exact_svg.push_str(&" ".repeat(limit as usize - svg_prefix.len() - svg_suffix.len()));
+    exact_svg.push_str(svg_suffix);
+    assert_eq!(read_plot_svg_from_reader(exact_svg.as_bytes(), limit).as_deref(), Some(exact_svg.as_str()));
+
+    let mut oversized_svg = String::from(svg_prefix);
+    oversized_svg.push_str(&" ".repeat(limit as usize + 1 - svg_prefix.len() - svg_suffix.len()));
+    oversized_svg.push_str(svg_suffix);
+    assert!(read_plot_svg_from_reader(oversized_svg.as_bytes(), limit).is_none());
+    assert!(read_plot_svg_from_reader(EndlessReader, limit).is_none());
+}
+
+#[test]
+fn read_plot_files_reject_oversized_png_and_svg() {
+    use std::io::{Seek, SeekFrom, Write};
+
+    let (dir, _guard) = test_scratch_dir("wc-plot-cap-file");
+    let png_path = dir.join("oversized.png");
+    {
+        let mut file = fs::File::create(&png_path).expect("create png");
+        file.write_all(PNG_HEADER).expect("write png header");
+        file.seek(SeekFrom::Start(MAX_PLOT_BYTES + 1 - PNG_IEND.len() as u64)).expect("seek png");
+        file.write_all(PNG_IEND).expect("write png iend");
+    }
+    assert!(read_plot_png(&png_path, MAX_PLOT_BYTES).is_none(), "oversized PNG must be rejected");
+
+    let svg_path = dir.join("oversized.svg");
+    {
+        let mut file = fs::File::create(&svg_path).expect("create svg");
+        let prefix = b"<?xml version=\"1.0\"?><svg xmlns=\"http://www.w3.org/2000/svg\">";
+        file.write_all(prefix).expect("write svg prefix");
+        file.write_all(&[b' '; 32]).expect("write svg padding");
+        file.seek(SeekFrom::Start(MAX_PLOT_BYTES + 1 - b"</svg>".len() as u64)).expect("seek svg");
+        file.write_all(b"</svg>").expect("write svg close");
+    }
+    assert!(read_plot_svg(&svg_path, MAX_PLOT_BYTES).is_none(), "oversized SVG must be rejected");
+}
+
+#[test]
+fn execute_rejects_oversized_plot_files() {
+    if !is_language_available(CodeLanguage::Python) {
+        return;
+    }
+
+    let code = format!(
+        r#"with open("__wordcraft_plot__.png", "wb") as f:
+    f.write(b"\x89PNG\r\n\x1a\n")
+    f.seek({max_bytes} + 1 - 12)
+    f.write(b"\x00\x00\x00\x00IEND\xaeB`\x82")
+
+with open("__wordcraft_plot__.svg", "wb") as f:
+    f.write(b'<?xml version="1.0"?><svg xmlns="http://www.w3.org/2000/svg">')
+    f.write(b" " * 32)
+    f.seek({max_bytes} + 1 - 6)
+    f.write(b"</svg>")
+"#,
+        max_bytes = MAX_PLOT_BYTES
+    );
+    let result = execute(&ExecutionRequest::new(CodeLanguage::Python, code).with_plot_format(PlotFormat::Both)).expect("execution failed");
+
+    assert!(result.success, "stderr: {}", result.stderr);
+    assert!(result.plot_png.is_none(), "oversized PNG must be rejected by execute");
+    assert!(result.plot_svg.is_none(), "oversized SVG must be rejected by execute");
+}
+
+#[cfg(unix)]
+#[test]
+fn which_binary_skips_non_executable_candidates() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    let (dir, _guard) = test_scratch_dir("wc-which-binary");
+    let non_exec_dir = dir.join("01-non-exec");
+    let other_exec_only_dir = dir.join("02-other-exec-only");
+    let dir_named_bin = dir.join("03-directory");
+    let broken_link_dir = dir.join("04-broken-link");
+    let link_to_non_exec_dir = dir.join("05-link-non-exec");
+    let exec_dir = dir.join("06-exec");
+    for sub in [&non_exec_dir, &other_exec_only_dir, &dir_named_bin, &broken_link_dir, &link_to_non_exec_dir, &exec_dir] {
+        fs::create_dir(sub).expect("create path dir");
+    }
+
+    for language in [CodeLanguage::Python, CodeLanguage::R] {
+        let name = language.binary_name();
+
+        let non_exec = non_exec_dir.join(name);
+        fs::write(&non_exec, b"#!/bin/sh\n").expect("write non-exec");
+        fs::set_permissions(&non_exec, fs::Permissions::from_mode(0o644)).expect("chmod 0644");
+
+        // Mode 0o641 sets only the other-execute bit while leaving the owner bits rw-.
+        let other_exec_only = other_exec_only_dir.join(name);
+        fs::write(&other_exec_only, b"#!/bin/sh\n").expect("write other-exec-only");
+        fs::set_permissions(&other_exec_only, fs::Permissions::from_mode(0o641)).expect("chmod 0641");
+
+        fs::create_dir(dir_named_bin.join(name)).expect("create dir named like binary");
+        symlink(dir.join("missing-target"), broken_link_dir.join(name)).expect("create broken symlink");
+        symlink(&non_exec, link_to_non_exec_dir.join(name)).expect("create symlink to non-exec");
+
+        let exec_bin = exec_dir.join(name);
+        fs::write(&exec_bin, b"#!/bin/sh\n").expect("write exec");
+        fs::set_permissions(&exec_bin, fs::Permissions::from_mode(0o755)).expect("chmod 0755");
+
+        // For unprivileged callers on an executable filesystem, owner permissions (rw-) reject
+        // mode 0o641 even though its other-execute bit (--x) is set. Privileged callers (root or
+        // CAP_DAC_OVERRIDE) can execute 0o641 directly, so include it only when execve denies it.
+        let other_exec_denied = matches!(
+            Command::new(&other_exec_only).stdout(Stdio::null()).stderr(Stdio::null()).status(),
+            Err(ref err) if err.kind() == ErrorKind::PermissionDenied
+        ) && !matches!(
+            Command::new(&exec_bin).stdout(Stdio::null()).stderr(Stdio::null()).status(),
+            Err(ref err) if err.kind() == ErrorKind::PermissionDenied
+        );
+
+        let mut bad_dirs = vec![&non_exec_dir, &dir_named_bin, &broken_link_dir, &link_to_non_exec_dir];
+        if other_exec_denied {
+            bad_dirs.insert(1, &other_exec_only_dir);
+        }
+
+        let only_bad_paths = std::env::join_paths(&bad_dirs).expect("join bad paths");
+        assert_eq!(which_binary_in(language, &only_bad_paths), None, "{name}: non-executable candidates must be ignored");
+
+        bad_dirs.push(&exec_dir);
+        let all_paths = std::env::join_paths(&bad_dirs).expect("join all paths");
+        assert_eq!(which_binary_in(language, &all_paths), Some(exec_bin), "{name}: search must fall through to the executable candidate");
+    }
+}

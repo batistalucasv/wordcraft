@@ -112,9 +112,7 @@ fn a_result_on_the_channel_becomes_the_output() {
     let ctx = egui::Context::default();
     let mut chunk = python();
     let (tx, rx) = mpsc::channel();
-    chunk.pending = Some(rx);
-    chunk.started = Some(Instant::now());
-    chunk.output_open = true;
+    chunk.attach_run(rx);
     tx.send(Ok(result("hello", Some(plot_png())))).unwrap();
     chunk.poll(&ctx);
     assert!(!chunk.is_running());
@@ -239,8 +237,7 @@ fn a_result_with_tables_opens_the_table_tab() {
     let ctx = egui::Context::default();
     let mut chunk = python();
     let (tx, rx) = mpsc::channel();
-    chunk.pending = Some(rx);
-    chunk.started = Some(Instant::now());
+    chunk.attach_run(rx);
     tx.send(Ok(ExecutionResult { tables: vec![table(&["n"], &[&["1"]])], ..result("", None) })).unwrap();
     chunk.poll(&ctx);
 
@@ -359,7 +356,7 @@ fn set_language_updates_in_read_mode_and_poll_carries_completed_output() {
     let (tx, rx) = mpsc::channel();
     chunk.pending = Some(rx);
     chunk.pending_source = Some((CodeLanguage::R, "1 + 1".into()));
-    chunk.started = Some(Instant::now());
+    chunk.started_ms = Some(crate::clock::now_ms());
     tx.send(Ok(result("[1] 2", None))).unwrap();
 
     let completed = chunk.poll(&ctx).expect("completed run record");
@@ -408,4 +405,108 @@ fn embedded_chunk_emits_run_and_clear_requests_and_explains_svg_only_plot() {
     h.get_by_label("Clear output").click();
     h.step();
     assert!(h.state().2, "embedded header Clear output must emit clear_requested");
+}
+
+#[test]
+fn new_and_set_code_cap_source_at_max_code_chars() {
+    let over_ascii = "a".repeat(MAX_CODE_CHARS + 32);
+    let over_utf8 = "λ".repeat(MAX_CODE_CHARS + 17);
+
+    let mut chunk = CodeChunk::new(CodeLanguage::Python, over_ascii);
+    assert_eq!(chunk.code().chars().count(), MAX_CODE_CHARS);
+
+    chunk.set_code(over_utf8);
+    assert_eq!(chunk.code().chars().count(), MAX_CODE_CHARS);
+    assert!(chunk.code().chars().all(|c| c == 'λ'));
+}
+
+#[test]
+fn attach_run_uses_monotonic_clock_and_renders_elapsed_time() {
+    let (_tx, rx) = mpsc::channel();
+    let mut chunk = python();
+    chunk.attach_run(rx);
+    assert!(chunk.started_ms.is_some());
+    chunk.started_ms = Some(crate::clock::now_ms() - 1500.0);
+
+    let mut harness = harness(chunk);
+    steps(&mut harness, 2);
+    assert!(harness.query_by_label_contains("Running…").is_some(), "running spinner and elapsed time are shown");
+
+    harness.state_mut().chunk.started_ms = Some(crate::clock::now_ms() + 5000.0);
+    steps(&mut harness, 1);
+    assert!(harness.query_by_label_contains("0.0 s").is_some(), "clock skew clamps elapsed time cleanly");
+}
+
+#[test]
+fn failed_plot_decode_is_cached_until_output_changes() {
+    let mut chunk = python();
+    chunk.set_output(ChunkOutput { plot_png: Some(b"not a valid png".to_vec()), success: true, ..ChunkOutput::default() });
+    let mut harness = harness(chunk);
+    steps(&mut harness, 5);
+
+    assert_eq!(harness.state().chunk.plot_decode_attempts, 1, "corrupt PNG is decoded only once");
+    assert!(harness.state().chunk.plot_decode_failed);
+    assert!(harness.state().chunk.plot_texture.is_none());
+
+    harness.state_mut().chunk.set_output(ChunkOutput { plot_png: Some(plot_png()), success: true, ..ChunkOutput::default() });
+    steps(&mut harness, 4);
+
+    assert_eq!(harness.state().chunk.plot_decode_attempts, 2, "replacing output retries decode once");
+    assert!(!harness.state().chunk.plot_decode_failed);
+    assert!(harness.state().chunk.plot_texture.is_some());
+}
+
+#[test]
+fn active_run_gates_run_set_language_and_attach_run() {
+    let ctx = egui::Context::default();
+    let (tx1, rx1) = mpsc::channel();
+    let (tx2, rx2) = mpsc::channel();
+    let mut chunk = python();
+
+    chunk.attach_run(rx1);
+    assert!(chunk.is_running());
+
+    chunk.set_language(CodeLanguage::R);
+    assert_eq!(chunk.language(), CodeLanguage::Python, "cannot switch language while a run is active");
+    assert!(chunk.is_running());
+
+    chunk.run(&ctx);
+    assert!(chunk.output().is_none(), "run is ignored while another run is active");
+
+    chunk.attach_run(rx2);
+    assert!(tx2.send(Ok(result("second", None))).is_err(), "second receiver must not replace the active run");
+
+    let mut harness = harness(chunk);
+    steps(&mut harness, 2);
+    harness.get_by_label("[ Python ]").click();
+    steps(&mut harness, 2);
+    assert!(harness.query_by_label("R").is_none(), "language menu is disabled while running");
+
+    tx1.send(Ok(result("first", None))).unwrap();
+    steps(&mut harness, 2);
+    assert!(!harness.state().chunk.is_running());
+    assert_eq!(harness.state().chunk.output().expect("first result").stdout, "first");
+
+    harness.state_mut().chunk.set_language(CodeLanguage::R);
+    assert_eq!(harness.state().chunk.language(), CodeLanguage::R);
+}
+
+#[test]
+fn browser_mode_reports_desktop_only_message() {
+    let mut chunk = python();
+    chunk.run_browser();
+    let output = chunk.output().expect("browser run records an explanatory error");
+    assert_eq!(output.error.as_deref(), Some(BROWSER_NO_INTERPRETER_MESSAGE));
+    assert_eq!(chunk.tab, OutputTab::Console);
+    assert!(chunk.output_open);
+
+    let mut harness = harness(chunk);
+    steps(&mut harness, 3);
+    assert!(harness.query_by_label_contains(BROWSER_NO_INTERPRETER_MESSAGE).is_some());
+    assert!(harness.query_by_label_contains("Did not run").is_some());
+
+    let (_tx, rx) = mpsc::channel();
+    harness.state_mut().chunk.attach_run(rx);
+    harness.state_mut().chunk.run_browser();
+    assert!(harness.state().chunk.is_running(), "browser run gate also respects active run");
 }

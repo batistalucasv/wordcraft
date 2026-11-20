@@ -1121,6 +1121,9 @@ pub(crate) fn run_all_async(app: &mut WordApp, params: &Value, ctx: Option<&egui
         if !r.chunk.options.eval() {
             continue;
         }
+        if app.session.doc.chunk_options_missing(&r) {
+            return Err("code chunk options are missing; refusing to assume eval: true".into());
+        }
         let Some(id) = r.chunk.id else { continue };
         if r.chunk.code.trim().is_empty() {
             continue;

@@ -543,7 +543,83 @@ fn a_chunk_and_its_options_survive_a_docx_round_trip() {
     assert_eq!(refs[0].chunk.code, "print('hi')\nprint('bye')");
     assert_eq!(refs[0].chunk.options.flag("eval"), Some(false));
     assert_eq!(refs[0].chunk.options.fig_caption().as_deref(), Some("A plot"));
-    assert_eq!(reopened.control_ranges(StoryRef::Body)[0].control.tag, "wordcraft:chunk:python");
+    assert!(reopened.control_ranges(StoryRef::Body)[0].control.tag.starts_with("wordcraft:chunk:python?"));
+}
+
+#[test]
+fn run_all_skips_copied_eval_false_chunk_with_fresh_id_and_no_property() {
+    let mut s = s();
+    let old_id =
+        chunk_id(&run(&mut s, "code.insert_chunk", json!({"language": "r", "code": "danger()", "options": {"eval": false, "fig-cap": "Kept"}})));
+
+    // Simulate Word copying the chunk control: fresh w:id, no custom property for the new id.
+    let start = s.doc.control_ranges(StoryRef::Body)[0].start.clone();
+    s.doc.control_mut(&start).unwrap().id = Some(old_id + 42);
+    s.doc.remove_custom_prop(&wordcraft_doc::chunk::chunk_prop_name(old_id));
+
+    let bytes = crate::io::save_bytes("copied.docx", &s.doc).unwrap();
+    let reopened = crate::io::open_bytes("copied.docx", &bytes).unwrap();
+    let mut s2 = Session::new(reopened);
+    let fake = fake(&mut s2);
+    let out = run(&mut s2, "code.run_all", json!({}));
+    assert!(fake.seen.lock().unwrap().is_empty(), "copied eval: false chunk must never execute");
+    assert_eq!(out["chunks"][0]["chunk"]["skipped"], "eval: false");
+    assert_eq!(out["success"], true);
+}
+
+#[test]
+fn run_all_refuses_tagged_chunk_whose_options_are_missing() {
+    let mut s = s();
+    let old_id = chunk_id(&run(&mut s, "code.insert_chunk", json!({"language": "r", "code": "danger()", "options": {"eval": false}})));
+    run(&mut s, "code.insert_chunk", json!({"language": "r", "code": "safe()"}));
+
+    // Simulate copying a legacy chunk whose tag lacks `?options` and whose property is missing.
+    let start = s.doc.control_ranges(StoryRef::Body)[0].start.clone();
+    let control = s.doc.control_mut(&start).unwrap();
+    control.tag = "wordcraft:chunk:r".to_string();
+    control.id = Some(old_id + 100);
+    s.doc.remove_custom_prop(&wordcraft_doc::chunk::chunk_prop_name(old_id));
+
+    let fake = fake(&mut s);
+    let out = run(&mut s, "code.run_all", json!({}));
+    assert!(fake.seen.lock().unwrap().is_empty(), "chunk with missing options must never execute");
+    assert_eq!(out["success"], false);
+    assert_eq!(out["stopped"], true);
+    assert_eq!(out["chunks"][0]["chunk"]["success"], false);
+    assert!(out["chunks"][0]["error"].as_str().is_some_and(|e| e.contains("options are missing")));
+}
+
+#[test]
+fn run_all_runs_copied_empty_options_chunk_with_fresh_id() {
+    let mut s = s();
+    let old_id = chunk_id(&run(&mut s, "code.insert_chunk", json!({"language": "python", "code": "print(1)"})));
+    let start = s.doc.control_ranges(StoryRef::Body)[0].start.clone();
+    s.doc.control_mut(&start).unwrap().id = Some(old_id + 25);
+    s.doc.remove_custom_prop(&wordcraft_doc::chunk::chunk_prop_name(old_id));
+
+    let fake = fake(&mut s);
+    let out = run(&mut s, "code.run_all", json!({}));
+    assert_eq!(fake.seen.lock().unwrap().len(), 1);
+    assert_eq!(out["success"], true);
+    assert_eq!(out["chunks"][0]["output"]["stdout"], "ran print(1)");
+}
+
+#[test]
+fn run_all_skips_copied_exact_budget_eval_false_chunk_with_echo() {
+    let mut s = s();
+    let eval_exact = format!("false #{}", "x".repeat(990));
+    let old_id =
+        chunk_id(&run(&mut s, "code.insert_chunk", json!({"language": "r", "code": "danger()", "options": {"eval": eval_exact, "echo": false}})));
+
+    let start = s.doc.control_ranges(StoryRef::Body)[0].start.clone();
+    s.doc.control_mut(&start).unwrap().id = Some(old_id + 77);
+    s.doc.remove_custom_prop(&wordcraft_doc::chunk::chunk_prop_name(old_id));
+
+    let fake = fake(&mut s);
+    let out = run(&mut s, "code.run_all", json!({}));
+    assert!(fake.seen.lock().unwrap().is_empty(), "exact-budget copied eval: false chunk must never execute");
+    assert_eq!(out["chunks"][0]["chunk"]["skipped"], "eval: false");
+    assert_eq!(out["success"], true);
 }
 
 #[test]
