@@ -77,6 +77,7 @@ impl Session {
             // The editor shows a body page reference as stored until fields are updated.
             output_page_refs: false,
             bookmark_error: None,
+            chunk_heights: self.chunks.chunk_heights().clone(),
         };
         let l = Arc::new(wordcraft_layout::layout(&self.doc, &mut self.cache, &opts));
         let [newest, _] = std::mem::take(&mut self.layout);
@@ -192,6 +193,16 @@ impl Session {
     pub fn relayout(&mut self) {
         self.layout = Default::default();
         self.cache.clear();
+    }
+
+    /// Update mounted code-chunk widget heights (`control_id -> round(pt * 100)`) and invalidate
+    /// cached layouts if anything changed so the next [`Session::layout`] reflows around them.
+    pub fn set_chunk_heights(&mut self, heights: std::collections::BTreeMap<i64, u32>) -> bool {
+        if !self.chunks.set_chunk_heights(heights) {
+            return false;
+        }
+        self.layout = Default::default();
+        true
     }
 
     /// Set the language new documents are written in ([`Session::editing_lang`]; `None` or a

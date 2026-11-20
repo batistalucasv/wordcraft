@@ -15,7 +15,8 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use web_time::Instant;
 
 use egui::text::LayoutJob;
 use egui::{Align, Align2, Color32, CornerRadius, FontId, Id, Key, Layout, Margin, RichText, Stroke, TextEdit, Ui, pos2, vec2};
@@ -148,14 +149,41 @@ pub enum CodeChunkAction {
         /// The lossless vector, if one was captured.
         svg: Option<String>,
     },
-    /// Add a captured table to the document as a native Word table. The whole table is carried,
-    /// not the bounded preview the drawer draws.
+    /// Insert a table below the chunk.
     InsertTable {
         /// Column names in display order.
         headers: Vec<String>,
         /// Body rows, each with one cell per header.
         rows: Vec<Vec<String>>,
     },
+}
+
+/// Outcome from drawing a code chunk mounted inside the document canvas.
+#[derive(Debug, Default)]
+pub struct EmbeddedFrame {
+    /// Action requested from the output drawer (Insert Plot / Insert Table).
+    pub action: Option<CodeChunkAction>,
+    /// True if the source text or language changed this frame.
+    pub dirty: bool,
+    /// True if the inline editor currently holds keyboard focus.
+    pub editor_has_focus: bool,
+    /// True if the inline editor lost keyboard focus this frame.
+    pub editor_lost_focus: bool,
+    /// Up (`-1`) or Down (`1`) arrow pressed on the first or last source line to leave the chunk.
+    pub arrow_exit: Option<i32>,
+    /// True when an asynchronous run finished (succeeded, failed, or errored) on this frame.
+    pub run_completed: bool,
+    /// Screen position of a secondary click inside the chunk card, if any.
+    pub context_click_pos: Option<egui::Pos2>,
+}
+
+/// Outcome of [`CodeChunk::editor`] on a single frame.
+#[derive(Debug, Default)]
+struct EditorOutcome {
+    changed: bool,
+    has_focus: bool,
+    lost_focus: bool,
+    arrow_exit: Option<i32>,
 }
 
 /// The interactive code chunk's state, drawn with [`CodeChunk::show`].
@@ -182,6 +210,8 @@ pub struct CodeChunk {
     started: Option<Instant>,
     /// The plot's texture, decoded on first sight of its bytes.
     plot_texture: Option<egui::TextureHandle>,
+    /// Pending cursor placement when entering the editor (`Some(false)` = start, `Some(true)` = end).
+    pending_cursor_edge: Option<bool>,
 }
 
 impl CodeChunk {
@@ -205,6 +235,7 @@ impl CodeChunk {
             pending: None,
             started: None,
             plot_texture: None,
+            pending_cursor_edge: None,
         }
     }
 
@@ -321,9 +352,29 @@ impl CodeChunk {
         self.started = Some(Instant::now());
     }
 
+    /// Clear any displayed output, plot texture, or in-flight status.
+    pub fn clear_output(&mut self) {
+        self.output = None;
+        self.plot_texture = None;
+        self.pending = None;
+        self.started = None;
+    }
+
+    /// Show the code editor if hidden, focus it next frame, and place its cursor at the start or end.
+    pub fn focus_edge(&mut self, at_end: bool) {
+        self.show_code = true;
+        self.pending_cursor_edge = Some(at_end);
+    }
+
     /// Draw the chunk, returning the action the host must take, if any.
     pub fn show(&mut self, ui: &mut Ui) -> Option<CodeChunkAction> {
-        self.poll(ui.ctx());
+        self.show_embedded(ui).action
+    }
+
+    /// Draw the chunk mounted inside the document canvas and report UI, focus, and edit status.
+    pub fn show_embedded(&mut self, ui: &mut Ui) -> EmbeddedFrame {
+        let prev_lang = self.language;
+        let run_completed = self.poll(ui.ctx());
         let t = Tokens::get(ui.ctx());
         let editor = self.editor_id();
         if shortcut_pressed(ui, editor) {
@@ -332,13 +383,14 @@ impl CodeChunk {
         let focus = if ui.memory(|m| m.has_focus(editor)) { t.accent } else { t.border_strong };
         let width = ui.available_width();
         let mut action = None;
-        egui::Frame::NONE.fill(t.panel).stroke(Stroke::new(1.0, focus)).corner_radius(CornerRadius::same(8)).show(ui, |ui| {
+        let mut editor_outcome = EditorOutcome::default();
+        let frame_resp = egui::Frame::NONE.fill(t.panel).stroke(Stroke::new(1.0, focus)).corner_radius(CornerRadius::same(8)).show(ui, |ui| {
             if width.is_finite() {
                 ui.set_width((width - 2.0).max(0.0));
             }
             self.header(ui, &t);
             if self.show_code {
-                self.editor(ui, &t);
+                editor_outcome = self.editor(ui, &t);
             } else {
                 ui.add_space(2.0);
             }
@@ -347,7 +399,18 @@ impl CodeChunk {
                 self.drawer(ui, &t, &mut action);
             });
         });
-        action
+        let context_click_pos = ui.input(|i| {
+            if i.pointer.secondary_clicked() { i.pointer.interact_pos().filter(|pos| frame_resp.response.rect.contains(*pos)) } else { None }
+        });
+        EmbeddedFrame {
+            action,
+            dirty: editor_outcome.changed || self.language != prev_lang,
+            editor_has_focus: editor_outcome.has_focus,
+            editor_lost_focus: editor_outcome.lost_focus,
+            arrow_exit: editor_outcome.arrow_exit,
+            run_completed,
+            context_click_pos,
+        }
     }
 
     /// The id of the source editor, for focus checks and tests.
@@ -355,10 +418,10 @@ impl CodeChunk {
         Id::unique(("wordcraft-code-chunk-editor", self.id))
     }
 
-    /// Apply a result that arrived from a host or a worker thread.
-    fn poll(&mut self, ctx: &egui::Context) {
+    /// Apply a result that arrived from a host or a worker thread. Returns `true` when finished.
+    fn poll(&mut self, ctx: &egui::Context) -> bool {
         let received = match self.pending.as_ref() {
-            None => return,
+            None => return false,
             Some(rx) => match rx.try_recv() {
                 Ok(result) => Some(Some(result)),
                 Err(TryRecvError::Empty) => None,
@@ -366,7 +429,10 @@ impl CodeChunk {
             },
         };
         match received {
-            None => ctx.request_repaint_after(Duration::from_millis(50)),
+            None => {
+                ctx.request_repaint_after(Duration::from_millis(50));
+                false
+            }
             Some(Some(result)) => {
                 self.pending = None;
                 self.started = None;
@@ -375,11 +441,13 @@ impl CodeChunk {
                     Ok(result) => self.set_output(ChunkOutput::from_result(&result)),
                     Err(e) => self.fail(e.to_string()),
                 }
+                true
             }
             Some(None) => {
                 self.pending = None;
                 self.started = None;
                 self.fail("The code runner stopped before it reported a result.");
+                true
             }
         }
     }
@@ -485,10 +553,7 @@ impl CodeChunk {
             self.show_code = !self.show_code;
         }
         if clear {
-            self.output = None;
-            self.plot_texture = None;
-            self.pending = None;
-            self.started = None;
+            self.clear_output();
         }
         if copy {
             ui.ctx().copy_text(self.code.clone());
@@ -498,7 +563,31 @@ impl CodeChunk {
         }
     }
 
-    fn editor(&mut self, ui: &mut Ui, t: &Tokens) {
+    fn editor(&mut self, ui: &mut Ui, t: &Tokens) -> EditorOutcome {
+        let editor_id = self.editor_id();
+        let mut arrow_exit = None;
+        if let Some(at_end) = self.pending_cursor_edge.take() {
+            ui.memory_mut(|m| m.request_focus(editor_id));
+            let mut state = TextEdit::load_state(ui.ctx(), editor_id).unwrap_or_default();
+            let idx = if at_end { self.code.chars().count() } else { 0 };
+            state.cursor.set_char_range(Some(egui::text::CCursorRange::one(egui::text::CCursor::new(idx))));
+            state.store(ui.ctx(), editor_id);
+        } else if ui.memory(|m| m.has_focus(editor_id))
+            && let Some(range) = TextEdit::load_state(ui.ctx(), editor_id).and_then(|s| s.cursor.char_range())
+            && range.primary == range.secondary
+        {
+            let b = self.code.char_indices().nth(range.primary.index.into()).map_or(self.code.len(), |(i, _)| i);
+            let on_first_line = self.code.get(..b).is_some_and(|s| !s.contains('\n'));
+            let on_last_line = self.code.get(b..).is_some_and(|s| !s.contains('\n'));
+            if on_first_line && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::ArrowUp)) {
+                arrow_exit = Some(-1);
+                ui.memory_mut(|m| m.surrender_focus(editor_id));
+            } else if on_last_line && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::ArrowDown)) {
+                arrow_exit = Some(1);
+                ui.memory_mut(|m| m.surrender_focus(editor_id));
+            }
+        }
+
         let font = FontId::monospace(CODE_SIZE);
         let code_font = font.clone();
         let language = self.language;
@@ -522,6 +611,7 @@ impl CodeChunk {
         let digits = lines.to_string().len().max(2);
         let gutter = digits as f32 * char_w + 14.0;
 
+        let mut outcome = EditorOutcome { arrow_exit, ..Default::default() };
         egui::Frame::NONE.inner_margin(Margin::symmetric(0, 6)).show(ui, |ui| {
             egui::ScrollArea::horizontal().id_salt(("wordcraft-code-chunk-scroll", self.id)).auto_shrink([false, true]).show(ui, |ui| {
                 // The child's width is the source's, so long lines scroll instead of being cut.
@@ -529,7 +619,6 @@ impl CodeChunk {
                 ui.allocate_ui_with_layout(size, Layout::left_to_right(Align::Min), |ui| {
                     ui.spacing_mut().item_spacing.x = 0.0;
                     ui.add_space(gutter);
-                    let editor_id = self.editor_id();
                     let out = TextEdit::multiline(&mut self.code)
                         .id(editor_id)
                         .code_editor()
@@ -541,6 +630,9 @@ impl CodeChunk {
                         .char_limit(MAX_CODE_CHARS)
                         .layouter(&mut layouter)
                         .show(ui);
+                    outcome.changed = out.response.changed();
+                    outcome.has_focus = out.response.has_focus();
+                    outcome.lost_focus = out.response.lost_focus();
                     let top = out.galley_pos;
                     let painter = ui.painter();
                     let height = out.galley.rect.height();
@@ -559,6 +651,7 @@ impl CodeChunk {
                 });
             });
         });
+        outcome
     }
 
     fn drawer(&mut self, ui: &mut Ui, t: &Tokens, action: &mut Option<CodeChunkAction>) {

@@ -545,3 +545,88 @@ fn a_chunk_and_its_options_survive_a_docx_round_trip() {
     assert_eq!(refs[0].chunk.options.fig_caption().as_deref(), Some("A plot"));
     assert_eq!(reopened.control_ranges(StoryRef::Body)[0].control.tag, "wordcraft:chunk:python");
 }
+
+#[test]
+fn update_chunk_modifies_code_and_language_and_supports_undo_redo() {
+    let mut s = s();
+    let id = chunk_id(&run(&mut s, "code.insert_chunk", json!({"language": "r", "code": "a <- 1\nb <- 2"})));
+    let v = run(&mut s, "code.update_chunk", json!({"chunkId": id, "language": "python", "code": "x = 10"}));
+    assert_eq!(v["changed"], true);
+    assert_eq!(v["chunk"]["language"], "python");
+    assert_eq!(chunks::chunks_in(&s.doc, StoryRef::Body)[0].chunk.code, "x = 10");
+
+    // Undo restores previous code and language cleanly.
+    run(&mut s, "edit.undo", json!({}));
+    let restored = &chunks::chunks_in(&s.doc, StoryRef::Body)[0].chunk;
+    assert_eq!(restored.language, "r");
+    assert_eq!(restored.code, "a <- 1\nb <- 2");
+
+    // Redo re-applies the updated code.
+    run(&mut s, "edit.redo", json!({}));
+    assert_eq!(chunks::chunks_in(&s.doc, StoryRef::Body)[0].chunk.code, "x = 10");
+}
+
+#[test]
+fn delete_chunk_removes_control_and_clears_cached_output() {
+    let mut s = s();
+    let id = chunk_id(&run(&mut s, "code.insert_chunk", json!({"language": "python", "code": "print(1)"})));
+    s.chunks.store_for(id, "python", "print(1)", chunks::ChunkOutput { stdout: "1\n".into(), success: true, ..Default::default() });
+    let v = run(&mut s, "code.delete_chunk", json!({"chunkId": id}));
+    assert_eq!(v["deleted"], true);
+    assert!(chunks::chunks_in(&s.doc, StoryRef::Body).is_empty());
+    assert!(s.chunks.output(id).is_none());
+    assert!(!s.doc.body.is_empty(), "document body must keep at least one paragraph");
+
+    run(&mut s, "edit.undo", json!({}));
+    assert_eq!(chunks::chunks_in(&s.doc, StoryRef::Body).len(), 1);
+}
+
+#[test]
+fn insert_plot_and_insert_table_place_content_below_chunk() {
+    let mut s = s();
+    let id = chunk_id(&run(&mut s, "code.insert_chunk", json!({"language": "r", "code": "plot(1:3)"})));
+    run(
+        &mut s,
+        "code.insert_table",
+        json!({
+            "chunkId": id,
+            "headers": ["x", "y"],
+            "rows": [["1", "2"], ["3", "4"]],
+        }),
+    );
+    // Chunk is block 0; table sits immediately below it at block 1.
+    let wordcraft_doc::Block::Table(tbl) = &*s.doc.body[1] else { panic!("expected table at block 1") };
+    assert_eq!(tbl.rows.len(), 3);
+    assert!(tbl.rows[0].props.header);
+
+    // Valid 1x1 PNG encoded as base64 + optional SVG archive.
+    let png = [
+        0x89u8, b'P', b'N', b'G', b'\r', b'\n', 0x1A, b'\n', 0, 0, 0, 13, b'I', b'H', b'D', b'R', 0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0, 0, 0, 0x1F, 0x15,
+        0xC4, 0x89, 0, 0, 0, 10, b'I', b'D', b'A', b'T', 0x78, 0x9C, 0x63, 0, 1, 0, 0, 5, 0, 1, 0x0D, 0x0A, 0x2D, 0xB4, 0, 0, 0, 0, b'I', b'E', b'N',
+        b'D', 0xAE, 0x42, 0x60, 0x82,
+    ];
+    let b64 = crate::cmd::insert::base64_encode(&png);
+    let res = run(
+        &mut s,
+        "code.insert_plot",
+        json!({
+            "chunkId": id,
+            "png": b64,
+            "svg": "<svg xmlns=\"http://www.w3.org/2000/svg\"></svg>",
+        }),
+    );
+    assert!(res["media"].as_str().is_some());
+    assert!(res["svgMedia"].as_str().is_some());
+    let has_img = s.doc.para(StoryRef::Body, &wordcraft_doc::Path::top(1)).is_some_and(|p| !p.objects.is_empty());
+    assert!(has_img, "inserted plot paragraph should sit directly below chunk at block 1");
+}
+
+#[test]
+fn insert_table_and_plot_validate_before_mutating_on_bad_input() {
+    let mut s = s();
+    let id = chunk_id(&run(&mut s, "code.insert_chunk", json!({"language": "python", "code": "pass"})));
+    let before = s.doc.clone();
+    assert!(matches!(s.run("code.insert_table", &json!({"chunkId": id, "headers": []})), Err(CmdError::Params(_))));
+    assert!(matches!(s.run("code.insert_plot", &json!({"chunkId": id, "png": "not-valid-base64!!!"})), Err(CmdError::Params(_))));
+    assert_eq!(s.doc, before, "rejected plot/table must leave document untouched");
+}

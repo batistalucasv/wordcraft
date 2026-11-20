@@ -451,6 +451,83 @@ impl Document {
         self.body.extend(blocks);
         Ok(id.unwrap_or(before))
     }
+
+    /// Replace the language and code of chunk `id` in the body, keeping its control properties,
+    /// custom options, existing `CodeChunk` style, and any section break on its last paragraph.
+    /// Returns `Ok(true)` if the chunk changed, `Ok(false)` if unchanged or not found.
+    pub fn update_chunk(&mut self, id: i64, language: &str, code: &str) -> Result<bool> {
+        if code.len() > MAX_CHUNK_CODE_BYTES {
+            return Err(DocError::Invalid(format!("code chunk is larger than {MAX_CHUNK_CODE_BYTES} bytes")));
+        }
+        let line_count = code.bytes().filter(|b| *b == b'\n').count() + 1;
+        if line_count > MAX_CHUNK_LINES {
+            return Err(DocError::Invalid(format!("code chunk has more than {MAX_CHUNK_LINES} lines")));
+        }
+        if code.contains(OBJ) {
+            return Err(DocError::Invalid("code chunk contains U+FFFC, which is reserved for inline objects".to_string()));
+        }
+
+        let Some(found) = self.chunk_refs(StoryRef::Body).into_iter().find(|r| r.chunk.id == Some(id)) else {
+            return Ok(false);
+        };
+        let norm_lang = normalize_language(language);
+        let new_tag = format!("{CHUNK_TAG}{}", if norm_lang.is_empty() { "text" } else { norm_lang.as_str() });
+        if found.chunk.language == norm_lang && found.chunk.code == code {
+            return Ok(false);
+        }
+
+        let first = found.start.path.last();
+        let last = found.end.path.last();
+        if last < first || last >= self.body.len() {
+            return Ok(false);
+        }
+
+        let Some(first_para) = self.body.get(first).and_then(|b| b.as_para()) else {
+            return Ok(false);
+        };
+        let Some(mut control) = first_para.objects.iter().find_map(|o| match o {
+            InlineObject::ControlStart { control } if control.id == Some(id) => Some((**control).clone()),
+            _ => None,
+        }) else {
+            return Ok(false);
+        };
+
+        control.tag = new_tag;
+        let mut updated = CodeChunk::new(&norm_lang, code);
+        updated.options = found.chunk.options.clone();
+        control.title = updated.alias();
+
+        let trailing_section = self.body.get(last).and_then(|b| b.as_para()).and_then(|p| p.section.clone());
+        let first_ppr = first_para.props.clone();
+
+        if self.styles.get(CHUNK_STYLE).is_none() {
+            Arc::make_mut(&mut self.styles).upsert(chunk_style());
+        }
+
+        let lines: Vec<&str> = code.split('\n').collect();
+        let last_line = lines.len().saturating_sub(1);
+        let mut blocks = Vec::with_capacity(lines.len());
+        let mark = CharProps::default();
+        for (i, line) in lines.iter().enumerate() {
+            let mut p = Paragraph::with_text(line, CharProps::default()).styled(CHUNK_STYLE);
+            if i == 0 {
+                p.props.page_break_before = first_ppr.page_break_before;
+                p.props.keep_next = first_ppr.keep_next;
+                p.props.keep_lines = first_ppr.keep_lines;
+                p.insert_object(0, InlineObject::ControlStart { control: Box::new(control.clone()) }, &mark)?;
+            }
+            if i == last_line {
+                if let Some(sect) = &trailing_section {
+                    p.section = Some(sect.clone());
+                }
+                p.insert_object(p.len(), InlineObject::ControlEnd, &mark)?;
+            }
+            blocks.push(para_block(p));
+        }
+
+        self.body.splice(first..=last, blocks);
+        Ok(true)
+    }
 }
 
 /// The style a chunk's code is set in: a light code box, readable in Word without anything else.
@@ -708,5 +785,34 @@ mod tests {
         Arc::make_mut(&mut doc.styles).upsert(custom_style);
         let _ = doc.chunk_blocks(&CodeChunk::new("r", "1 + 1")).unwrap();
         assert_eq!(doc.styles.get(CHUNK_STYLE).map(|s| s.name.as_str()), Some("Custom Box Style"));
+    }
+
+    #[test]
+    fn update_chunk_replaces_code_and_language_without_losing_options() {
+        let mut doc = Document::new();
+        let mut opts = ChunkOptions::new();
+        opts.set("eval", "false");
+        let mut chunk = CodeChunk::new("r", "a <- 1\nb <- 2");
+        chunk.options = opts.clone();
+        let id = doc.push_chunk(&chunk).unwrap();
+        assert!(!doc.update_chunk(id, "r", "a <- 1\nb <- 2").unwrap());
+        assert!(doc.update_chunk(id, "python", "x = 42").unwrap());
+        let chunks = doc.chunks();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].id, Some(id));
+        assert_eq!(chunks[0].language, "python");
+        assert_eq!(chunks[0].code, "x = 42");
+        assert_eq!(chunks[0].options, opts);
+    }
+
+    #[test]
+    fn update_chunk_rejects_invalid_input_without_mutating() {
+        let mut doc = Document::new();
+        let id = doc.push_chunk(&CodeChunk::new("python", "x = 1")).unwrap();
+        let err = doc.update_chunk(id, "python", &format!("a{OBJ}b"));
+        assert!(matches!(err, Err(DocError::Invalid(_))));
+        let too_many_lines = "\n".repeat(MAX_CHUNK_LINES + 1);
+        assert!(matches!(doc.update_chunk(id, "python", &too_many_lines), Err(DocError::Invalid(_))));
+        assert_eq!(doc.chunks()[0].code, "x = 1");
     }
 }

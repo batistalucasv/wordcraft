@@ -5947,3 +5947,142 @@ fn a_linked_text_box_shows_and_follows_its_link_from_inside() {
     let (start, _) = wordcraft_engine::cmd::insert::bookmark_range(&s.doc, "Spot").unwrap();
     assert!(s.sel.is_collapsed() && s.sel.focus == start, "the caret went to the bookmark: {:?}", s.sel);
 }
+
+#[test]
+fn mounted_code_chunk_reserves_canvas_space_reflows_text_and_syncs_edits_with_undo() {
+    let mut a = WordApp::new(wordcraft_engine::Session::new(wordcraft_doc::Document::new()), Default::default());
+    a.run("text.insert", json!({"text": "Above paragraph"})).unwrap();
+    a.run("text.newParagraph", json!({})).unwrap();
+    a.run("text.insert", json!({"text": "Below paragraph"})).unwrap();
+    a.session.sel = wordcraft_engine::Selection::caret(Pos::body(0, 0));
+    a.run("code.insert_chunk", json!({"language": "python", "code": "x = 1"})).unwrap();
+
+    let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1280.0, 860.0)).build_ui_state(
+        |ui, app: &mut WordApp| {
+            let ctx = ui.ctx().clone();
+            app.logic(&ctx);
+            app.ui(ui);
+        },
+        a,
+    );
+    steps(&mut h, 6);
+
+    let chunk_id = wordcraft_engine::chunks::chunks_in(&h.state().session.doc, StoryRef::Body)[0].chunk.id.expect("chunk id");
+    assert!(h.state().canvas.code_chunks.is_mounted(chunk_id), "code chunk should be mounted on canvas");
+    assert!(h.state().canvas.code_chunks.screen_rects.contains_key(&chunk_id), "chunk screen rect should be tracked");
+
+    let layout = h.state_mut().session.layout();
+    let chunk_rect = layout.pages[0]
+        .items
+        .iter()
+        .find_map(|it| match it {
+            wordcraft_layout::Placed::Chunk { id, rect, .. } if *id == chunk_id => Some(*rect),
+            _ => None,
+        })
+        .expect("layout must allocate Placed::Chunk");
+    let below_y = layout.pages[0]
+        .items
+        .iter()
+        .filter_map(|it| match it {
+            wordcraft_layout::Placed::Lines { y, .. } => Some(*y),
+            _ => None,
+        })
+        .max_by(|a, b| a.total_cmp(b))
+        .expect("below paragraph line");
+    assert!(below_y >= chunk_rect.bottom() - 1.0, "below paragraph ({below_y}) must reflow below chunk ({})", chunk_rect.bottom());
+
+    // Simulate editing inside the widget and flushing via code.update_chunk, then Undo/Redo.
+    {
+        let entry = h.state_mut().canvas.code_chunks.widgets.get_mut(&chunk_id).unwrap();
+        entry.widget.set_code("x = 1\ny = 2\nz = 3\nw = 4");
+    }
+    h.state_mut().run("code.update_chunk", json!({"chunkId": chunk_id, "language": "python", "code": "x = 1\ny = 2\nz = 3\nw = 4"})).unwrap();
+    steps(&mut h, 4);
+    assert_eq!(h.state().canvas.code_chunks.widgets[&chunk_id].widget.code(), "x = 1\ny = 2\nz = 3\nw = 4");
+
+    h.state_mut().run("edit.undo", json!({})).unwrap();
+    steps(&mut h, 4);
+    assert_eq!(h.state().canvas.code_chunks.widgets[&chunk_id].widget.code(), "x = 1");
+
+    // Delete removes the chunk from document and widget cache cleanly.
+    h.state_mut().run("code.delete_chunk", json!({"chunkId": chunk_id})).unwrap();
+    steps(&mut h, 4);
+    assert!(!h.state().canvas.code_chunks.is_mounted(chunk_id));
+}
+
+#[test]
+fn code_chunk_insert_tab_ribbon_and_context_menu_are_wired() {
+    use egui_kittest::kittest::Queryable;
+    let mut a = WordApp::new(wordcraft_engine::Session::new(wordcraft_doc::Document::new()), Default::default());
+    a.run("code.insert_chunk", json!({"language": "r", "code": "1 + 1"})).unwrap();
+    let chunk_id = wordcraft_engine::chunks::chunks_in(&a.session.doc, StoryRef::Body)[0].chunk.id.unwrap();
+
+    let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1440.0, 900.0)).build_ui_state(
+        |ui, app: &mut WordApp| {
+            let ctx = ui.ctx().clone();
+            app.logic(&ctx);
+            app.ui(ui);
+        },
+        a,
+    );
+    // Switch to Insert ribbon tab and verify the Code Chunk button exists.
+    steps(&mut h, 2);
+    h.get_by_label("Insert").click();
+    steps(&mut h, 4);
+    assert!(h.query_by_label("Code Chunk").is_some(), "Insert tab should show Code Chunk control");
+
+    // Right-click the mounted chunk, verify the context menu entries, and delete via menu.
+    let rect = h.state().canvas.code_chunks.screen_rects[&chunk_id];
+    right_click(&mut h, rect.center());
+    assert_menu(&h, &["Run Chunk", "Hide Code (Teaching Mode)", "Clear Output", "Restart Kernel", "Delete Code Chunk"], true);
+    pick(&mut h, &["Delete Code Chunk"]);
+    steps(&mut h, 3);
+    assert!(wordcraft_engine::chunks::chunks_in(&h.state().session.doc, StoryRef::Body).is_empty());
+}
+
+#[test]
+fn mounted_chunk_teaching_mode_toggle_reflows_and_arrow_keys_cross_boundary() {
+    let mut a = WordApp::new(wordcraft_engine::Session::new(wordcraft_doc::Document::new()), Default::default());
+    a.run("text.insert", json!({"text": "Line above"})).unwrap();
+    a.run("text.newParagraph", json!({})).unwrap();
+    a.run("text.insert", json!({"text": "Line below"})).unwrap();
+    a.session.sel = wordcraft_engine::Selection::caret(Pos::body(0, 0));
+    a.run("code.insert_chunk", json!({"language": "python", "code": "a = 1\nb = 2\nc = 3\nd = 4\ne = 5\nf = 6"})).unwrap();
+    let chunk_id = wordcraft_engine::chunks::chunks_in(&a.session.doc, StoryRef::Body)[0].chunk.id.unwrap();
+
+    let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1280.0, 860.0)).build_ui_state(
+        |ui, app: &mut WordApp| {
+            let ctx = ui.ctx().clone();
+            app.logic(&ctx);
+            app.ui(ui);
+        },
+        a,
+    );
+    steps(&mut h, 6);
+
+    let full_h = h.state().canvas.code_chunks.screen_rects[&chunk_id].height();
+    h.state_mut().canvas.code_chunks.widgets.get_mut(&chunk_id).unwrap().widget.show_code = false;
+    steps(&mut h, 6);
+    let hidden_h = h.state().canvas.code_chunks.screen_rects[&chunk_id].height();
+    assert!(hidden_h < full_h - 20.0, "hiding code ({hidden_h}) must shrink chunk height below full ({full_h})");
+
+    // Canvas caret right above chunk + ArrowDown enters chunk editor smoothly.
+    h.state_mut().session.sel = wordcraft_engine::Selection::caret(Pos::body(0, 0));
+    h.state_mut().canvas.focused = true;
+    h.state_mut().canvas.code_chunks.active_chunk = None;
+    let entered = crate::canvas::code_chunks::maybe_enter_from_canvas_arrow(h.state_mut(), egui::Key::ArrowDown, egui::Modifiers::NONE);
+    assert!(entered, "ArrowDown on paragraph above chunk should enter the chunk editor");
+    assert_eq!(h.state().canvas.code_chunks.pending_focus, Some((chunk_id, false)));
+
+    // Execute plot and table insertion actions from output drawer below the chunk.
+    let png = [
+        0x89u8, b'P', b'N', b'G', b'\r', b'\n', 0x1A, b'\n', 0, 0, 0, 13, b'I', b'H', b'D', b'R', 0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0, 0, 0, 0x1F, 0x15,
+        0xC4, 0x89, 0, 0, 0, 10, b'I', b'D', b'A', b'T', 0x78, 0x9C, 0x63, 0, 1, 0, 0, 5, 0, 1, 0x0D, 0x0A, 0x2D, 0xB4, 0, 0, 0, 0, b'I', b'E', b'N',
+        b'D', 0xAE, 0x42, 0x60, 0x82,
+    ];
+    let b64 = wordcraft_engine::cmd::insert::base64_encode(&png);
+    h.state_mut().run("code.insert_plot", json!({"chunkId": chunk_id, "png": b64})).unwrap();
+    h.state_mut().run("code.insert_table", json!({"chunkId": chunk_id, "headers": ["k", "v"], "rows": [["1", "2"]]})).unwrap();
+    steps(&mut h, 4);
+    assert!(h.state().session.doc.body.iter().any(|b| matches!(&**b, wordcraft_doc::Block::Table(_))));
+}

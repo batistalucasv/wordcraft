@@ -16289,3 +16289,46 @@ fn header_text_covers_the_whole_band_of_centred_and_right_lines() {
         assert!(hit(x + left - 60.0), "{align:?}: beyond 40pt left of the band the picture is hit");
     }
 }
+
+#[test]
+fn chunk_heights_reserve_vertical_space_and_push_following_blocks() {
+    use wordcraft_doc::{CodeChunk, Document};
+
+    let mut d = Document::from_text("before");
+    let id = d.push_chunk(&CodeChunk::new("r", "x <- 1")).unwrap();
+    d.body.push(wordcraft_doc::para_block(wordcraft_doc::Paragraph::with_text("after", Default::default())));
+
+    // Without UI chunk heights, headless/PDF layout emits ordinary Placed::Lines.
+    let headless = lay(&d);
+    assert!(!headless.pages[0].items.iter().any(|it| matches!(it, Placed::Chunk { .. })));
+
+    // With chunk_heights populated, layout emits Placed::Chunk and pushes "after" down.
+    let mut small_opts = LayoutOptions::default();
+    small_opts.chunk_heights.insert(id, 10_000); // 100.0 pt
+    let small = layout(&d, &mut LayoutCache::new(), &small_opts);
+    let chunk_rect_small = small.pages[0]
+        .items
+        .iter()
+        .find_map(|it| match it {
+            Placed::Chunk { id: cid, rect, .. } if *cid == id => Some(*rect),
+            _ => None,
+        })
+        .expect("mounted chunk item");
+    assert!((chunk_rect_small.h - 100.0).abs() < 0.01);
+
+    let after_y_small = small.pages[0]
+        .items
+        .iter()
+        .find_map(|it| match it {
+            Placed::Lines { path, y, .. } if path.0 == [2] => Some(*y),
+            _ => None,
+        })
+        .expect("after paragraph line");
+    assert!(after_y_small >= chunk_rect_small.bottom());
+
+    // Growing chunk height reflows "after" downward (and onto page 2 if it overflows).
+    let mut big_opts = LayoutOptions::default();
+    big_opts.chunk_heights.insert(id, 62_000); // 620.0 pt
+    let big = layout(&d, &mut LayoutCache::new(), &big_opts);
+    assert!(big.pages.len() >= 2, "tall chunk should push following paragraph onto page 2");
+}

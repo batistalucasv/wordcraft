@@ -168,11 +168,13 @@ struct StoredOutput {
     fingerprint: Option<ChunkFingerprint>,
 }
 
-/// Per-document chunk outputs and kernel generation, swapped with [`DocState`].
+/// Per-document chunk outputs, mounted heights, and kernel generation, swapped with [`DocState`].
 #[derive(Debug, Default)]
 pub(crate) struct DocChunkOutputs {
     outputs: BTreeMap<i64, StoredOutput>,
+    heights: BTreeMap<i64, u32>,
     generation: u64,
+    rev: u64,
 }
 
 /// The kernel's transient state in a session: the active document's last chunk outputs and
@@ -197,11 +199,13 @@ impl ChunkState {
     /// Keep `output` as the last output of chunk `id`.
     pub fn store(&mut self, id: i64, output: ChunkOutput) {
         self.doc.outputs.insert(id, StoredOutput { output, fingerprint: None });
+        self.doc.rev = self.doc.rev.wrapping_add(1);
     }
 
     /// Keep `output` as the last output of chunk `id`, bound to its `language` and `code`.
-    pub(crate) fn store_for(&mut self, id: i64, language: &str, code: &str, output: ChunkOutput) {
+    pub fn store_for(&mut self, id: i64, language: &str, code: &str, output: ChunkOutput) {
         self.doc.outputs.insert(id, StoredOutput { output, fingerprint: Some(ChunkFingerprint::new(language, code)) });
+        self.doc.rev = self.doc.rev.wrapping_add(1);
     }
 
     /// The last output of chunk `id`, if it ran since the last clear.
@@ -209,29 +213,63 @@ impl ChunkState {
         self.doc.outputs.get(&id).map(|entry| &entry.output)
     }
 
+    /// UI-measured height map (`control_id -> round(pt * 100)`) passed into [`wordcraft_layout::LayoutOptions`].
+    pub fn chunk_heights(&self) -> &BTreeMap<i64, u32> {
+        &self.doc.heights
+    }
+
+    /// Update mounted chunk heights; returns `true` when the map changed.
+    pub fn set_chunk_heights(&mut self, heights: BTreeMap<i64, u32>) -> bool {
+        if self.doc.heights == heights {
+            return false;
+        }
+        self.doc.heights = heights;
+        true
+    }
+
     /// Forget chunk `id`'s last output; whether it had one.
     pub fn clear(&mut self, id: i64) -> bool {
-        self.doc.outputs.remove(&id).is_some()
+        let removed = self.doc.outputs.remove(&id).is_some();
+        let height_removed = self.doc.heights.remove(&id).is_some();
+        if removed || height_removed {
+            self.doc.rev = self.doc.rev.wrapping_add(1);
+        }
+        removed
     }
 
     /// Forget every output; how many there were.
     pub fn clear_all(&mut self) -> usize {
         let n = self.doc.outputs.len();
         self.doc.outputs.clear();
+        if n > 0 {
+            self.doc.rev = self.doc.rev.wrapping_add(1);
+        }
         n
+    }
+
+    /// Monotonically bumped on every store, clear, or invalidation affecting chunk outputs.
+    pub fn rev(&self) -> u64 {
+        self.doc.rev
     }
 
     /// Drop outputs whose chunk id no longer exists in `doc` or whose language/code changed
     /// (for Undo, Redo, and transaction rollback).
     pub(crate) fn invalidate_for_document(&mut self, doc: &Document) {
+        let live: BTreeMap<i64, (String, String)> = doc.chunks().into_iter().filter_map(|c| c.id.map(|id| (id, (c.language, c.code)))).collect();
+        let h_before = self.doc.heights.len();
+        self.doc.heights.retain(|id, _| live.contains_key(id));
         if self.doc.outputs.is_empty() {
+            let _ = h_before;
             return;
         }
-        let live: BTreeMap<i64, (String, String)> = doc.chunks().into_iter().filter_map(|c| c.id.map(|id| (id, (c.language, c.code)))).collect();
+        let o_before = self.doc.outputs.len();
         self.doc.outputs.retain(|id, entry| {
             let Some((language, code)) = live.get(id) else { return false };
             entry.fingerprint.as_ref().is_none_or(|fp| fp.matches(language, code))
         });
+        if self.doc.outputs.len() != o_before {
+            self.doc.rev = self.doc.rev.wrapping_add(1);
+        }
     }
 
     pub(crate) fn doc_outputs_mut(&mut self) -> &mut DocChunkOutputs {

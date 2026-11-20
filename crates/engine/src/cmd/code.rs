@@ -11,10 +11,11 @@ use std::str::FromStr;
 use serde_json::{Map, Value, json};
 use wordcraft_doc::chunk::MAX_CHUNK_LINES;
 use wordcraft_doc::para::OBJ;
-use wordcraft_doc::{ChunkOptions, ChunkRef, CodeChunk, StoryRef};
+use wordcraft_doc::table::{Cell, MAX_COLS, MAX_ROWS, Table};
+use wordcraft_doc::{Block, CharProps, ChunkOptions, ChunkRef, CodeChunk, Paragraph, Path, Pos, StoryRef, para_block};
 use wordcraft_kernel::{CodeLanguage, ExecutionRequest, PlotFormat};
 
-use super::{delete_selection, pos_json, sel_result};
+use super::{delete_selection, insert, pos_json, sel_result};
 use crate::chunks::{self, ChunkOutput};
 use crate::{CmdError, CmdResult, CommandSpec, Selection, Session, p};
 
@@ -43,7 +44,21 @@ pub fn specs() -> Vec<CommandSpec> {
         CommandSpec::new("code.clear_output", "Clear Code Output", LOC, clear_output)
             .params(r#"{"chunkId"?: n (control id; default: chunk at cursor), "all"?: bool}"#)
             .pure(),
+        CommandSpec::new("code.update_chunk", "Update Code Chunk", LOC, update_chunk)
+            .params(r#"{"chunkId"?: n (control id; default: chunk at cursor), "code": string (at most 4 MiB), "language"?: "r"|"python"}"#)
+            .when(has_any_chunks),
+        CommandSpec::new("code.delete_chunk", "Delete Code Chunk", LOC, delete_chunk)
+            .params(r#"{"chunkId"?: n (control id; default: chunk at cursor)}"#)
+            .when(has_any_chunks),
+        CommandSpec::new("code.insert_plot", "Insert Chunk Plot", LOC, insert_plot)
+            .params(r#"{"chunkId"?: n (control id; default: chunk at cursor), "png"?: string (base64 PNG), "svg"?: string (SVG XML to archive), "width"?: n (points), "alt"?: string}"#),
+        CommandSpec::new("code.insert_table", "Insert Chunk Table", LOC, insert_table)
+            .params(r#"{"chunkId"?: n (control id; default: chunk at cursor), "headers": [string], "rows"?: [[string]]}"#),
     ]
+}
+
+fn has_any_chunks(s: &Session) -> Option<&'static str> {
+    if chunks::chunks_in(&s.doc, StoryRef::Body).is_empty() { Some("the document has no code chunks") } else { None }
 }
 
 fn has_chunks(s: &Session) -> Option<&'static str> {
@@ -304,4 +319,300 @@ fn clear_output(s: &mut Session, v: &Value) -> CmdResult {
     let Some(id) = range.chunk.id else { return Ok(json!({"cleared": 0})) };
     let cleared = usize::from(s.chunks.clear(id));
     Ok(json!({"cleared": cleared, "chunk": id, "start": pos_json(&range.start)}))
+}
+
+fn resolve_target_chunk(s: &Session, v: &Value) -> Result<ChunkRef, CmdError> {
+    match optional_chunk_id(v)? {
+        Some(id) => find_chunk(s, id),
+        None => chunks::chunk_at(&s.doc, &s.sel.focus).ok_or_else(|| CmdError::Disabled("the cursor is not inside a code chunk".into())),
+    }
+}
+
+fn validate_code_text(code: &str) -> Result<(), CmdError> {
+    if code.len() > chunks::MAX_CHUNK_BYTES {
+        return Err(CmdError::Params(format!("code: at most {} bytes", chunks::MAX_CHUNK_BYTES)));
+    }
+    let line_count = code.bytes().filter(|b| *b == b'\n').count() + 1;
+    if line_count > MAX_CHUNK_LINES {
+        return Err(CmdError::Params(format!("code: at most {MAX_CHUNK_LINES} lines")));
+    }
+    if code.contains(OBJ) {
+        return Err(CmdError::Params("code: cannot contain U+FFFC".into()));
+    }
+    Ok(())
+}
+
+fn remap_pos_after_chunk_resize(pos: &mut Pos, old_first: usize, old_last: usize, new_last: usize, doc: &wordcraft_doc::Document) {
+    if pos.story != StoryRef::Body || pos.path.0.is_empty() {
+        return;
+    }
+    let Some(block) = pos.path.0.first().copied().map(|b| b as usize) else { return };
+    if block < old_first {
+        return;
+    }
+    if block <= old_last {
+        let clamped_block = block.min(new_last);
+        if clamped_block != block {
+            pos.path.0[0] = clamped_block as u32;
+        }
+        let max_off = doc.para(StoryRef::Body, &pos.path).map_or(0, |p| p.len());
+        pos.off = pos.off.min(max_off);
+    } else {
+        let delta = new_last as isize - old_last as isize;
+        let shifted = (block as isize + delta).max(0) as usize;
+        pos.path.0[0] = shifted as u32;
+    }
+}
+
+fn update_chunk(s: &mut Session, v: &Value) -> CmdResult {
+    let range = resolve_target_chunk(s, v)?;
+    let code = p::str(v, "code").ok_or_else(|| CmdError::Params("code: required string".into()))?;
+    validate_code_text(code)?;
+    let lang_str = match v.get("language") {
+        None | Some(Value::Null) => range.chunk.language.clone(),
+        Some(Value::String(name)) => {
+            if name.len() > 16 {
+                return Err(CmdError::Params("language: expected \"r\" or \"python\"".into()));
+            }
+            CodeLanguage::from_str(name).map_err(|e| CmdError::Params(e.to_string()))?.as_str().to_owned()
+        }
+        Some(_) => return Err(CmdError::Params("language: expected \"r\" or \"python\"".into())),
+    };
+
+    let id = chunk_id(s, &range);
+    let old_first = range.start.path.last();
+    let old_last = range.end.path.last();
+    let changed = s.doc.update_chunk(id, &lang_str, code)?;
+    let updated = find_chunk(s, id)?;
+    let new_last = updated.end.path.last();
+
+    if changed {
+        remap_pos_after_chunk_resize(&mut s.sel.anchor, old_first, old_last, new_last, &s.doc);
+        remap_pos_after_chunk_resize(&mut s.sel.focus, old_first, old_last, new_last, &s.doc);
+        s.goal_x = None;
+        s.touch();
+    }
+
+    let mut out = sel_result(s)?;
+    out["changed"] = json!(changed);
+    out["chunk"] = json!({
+        "id": id,
+        "language": updated.chunk.language,
+        "tag": updated.chunk.tag(),
+        "lines": updated.chunk.code.split('\n').count(),
+    });
+    Ok(out)
+}
+
+fn delete_chunk(s: &mut Session, v: &Value) -> CmdResult {
+    let range = resolve_target_chunk(s, v)?;
+    let first = range.start.path.last();
+    let last = range.end.path.last();
+    if last < first || last >= s.doc.body.len() {
+        return Err(CmdError::Failed("chunk block range is out of bounds".into()));
+    }
+    let span = last - first + 1;
+    let trailing_section = s.doc.body.get(last).and_then(|b| b.as_para()).and_then(|p| p.section.clone());
+
+    if s.doc.body.len() <= span {
+        let mut blank = Paragraph::new();
+        blank.section = trailing_section;
+        s.doc.body = vec![para_block(blank)];
+    } else {
+        if let Some(sect) = trailing_section
+            && first > 0
+            && let Ok(prev) = s.doc.para_mut(StoryRef::Body, &Path::top(first - 1))
+            && prev.section.is_none()
+        {
+            prev.section = Some(sect);
+        }
+        for _ in 0..span {
+            let _ = s.doc.remove_block(StoryRef::Body, &Path::top(first));
+        }
+    }
+
+    if let Some(id) = range.chunk.id {
+        s.doc.remove_custom_prop(&wordcraft_doc::chunk::chunk_prop_name(id));
+        s.chunks.clear(id);
+    }
+
+    let next_idx = first.min(s.doc.body.len().saturating_sub(1));
+    s.sel = Selection::caret(Pos::new(StoryRef::Body, Path::top(next_idx), 0));
+    s.goal_x = None;
+    s.touch();
+
+    let mut out = sel_result(s)?;
+    out["deleted"] = json!(true);
+    out["chunkId"] = json!(range.chunk.id);
+    Ok(out)
+}
+
+const MAX_ARCHIVED_SVG_BYTES: usize = 16 * 1024 * 1024;
+const MAX_INSERT_TABLE_CELLS: usize = 250_000;
+const MAX_INSERT_TABLE_TEXT_BYTES: usize = 8 * 1024 * 1024;
+
+fn move_caret_below_chunk(s: &mut Session, range: &ChunkRef) -> Result<(), CmdError> {
+    let after = range.end.path.last().saturating_add(1);
+    let path = Path::top(after);
+    s.doc.insert_block(StoryRef::Body, &path, Block::Para(Paragraph::new()))?;
+    s.sel = Selection::caret(Pos::new(StoryRef::Body, path, 0));
+    s.goal_x = None;
+    Ok(())
+}
+
+fn insert_plot(s: &mut Session, v: &Value) -> CmdResult {
+    let target_chunk = match optional_chunk_id(v)? {
+        Some(id) => Some(find_chunk(s, id)?),
+        None => chunks::chunk_at(&s.doc, &s.sel.focus),
+    };
+
+    let explicit_png = p::str(v, "png").or_else(|| p::str(v, "data"));
+    let png_bytes = if let Some(b64) = explicit_png {
+        insert::base64_decode(b64).ok_or_else(|| CmdError::Params("bad base64 PNG plot data".into()))?
+    } else if let Some(cached) = target_chunk.as_ref().and_then(|r| r.chunk.id).and_then(|id| s.chunks.output(id)).and_then(|o| o.plot_png.clone()) {
+        cached
+    } else {
+        return Err(CmdError::Params("insert_plot requires PNG base64 data or a chunk with a cached PNG plot".into()));
+    };
+
+    if png_bytes.is_empty() {
+        return Err(CmdError::Params("plot PNG payload is empty".into()));
+    }
+    if png_bytes.len() > (200 << 20) {
+        return Err(CmdError::Failed("image is larger than 200 MB".into()));
+    }
+    // Validate image decodability before mutating the document.
+    match wordcraft_geom::picture::probe(&png_bytes) {
+        Ok(_) => {}
+        Err(wordcraft_geom::picture::Refusal::Unsupported(why)) => return Err(CmdError::Failed(why.into())),
+        Err(_) => return Err(CmdError::Params("plot PNG bytes could not be decoded as a valid image".into())),
+    }
+
+    let svg_opt: Option<&str> = match v.get("svg") {
+        None | Some(Value::Null) if explicit_png.is_none() => {
+            target_chunk.as_ref().and_then(|r| r.chunk.id).and_then(|id| s.chunks.output(id)).and_then(|o| o.plot_svg.as_deref())
+        }
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) => Some(s.as_str()),
+        Some(_) => return Err(CmdError::Params("svg: expected a string".into())),
+    };
+    if let Some(svg) = svg_opt
+        && svg.len() > MAX_ARCHIVED_SVG_BYTES
+    {
+        return Err(CmdError::Params(format!("svg: at most {MAX_ARCHIVED_SVG_BYTES} bytes")));
+    }
+    let archived_svg = svg_opt.filter(|s| !s.trim().is_empty() && s.contains("</svg>")).map(|s| s.as_bytes().to_vec());
+
+    let alt = p::str(v, "alt")
+        .map(str::to_owned)
+        .or_else(|| target_chunk.as_ref().and_then(|r| r.chunk.options.fig_caption()))
+        .unwrap_or_else(|| "Code chunk plot".to_owned());
+
+    if let Some(ref range) = target_chunk {
+        move_caret_below_chunk(s, range)?;
+    }
+
+    let width = p::f32(v, "width");
+    let mut out = insert::place_picture(s, png_bytes, width, &alt)?;
+    if let Some(svg_bytes) = archived_svg {
+        let svg_key = s.doc.add_media(svg_bytes, "svg");
+        out["svgMedia"] = json!(svg_key);
+    }
+    s.touch();
+    Ok(out)
+}
+
+fn parse_string_row(arr: &[Value], field: &str, text_budget: &mut usize) -> Result<Vec<String>, CmdError> {
+    if arr.len() > MAX_COLS {
+        return Err(CmdError::Params(format!("{field}: at most {MAX_COLS} columns")));
+    }
+    let mut cells = Vec::with_capacity(arr.len());
+    for item in arr {
+        let s = item.as_str().ok_or_else(|| CmdError::Params(format!("{field}: every cell must be a string")))?;
+        *text_budget = text_budget
+            .checked_add(s.len())
+            .filter(|&n| n <= MAX_INSERT_TABLE_TEXT_BYTES)
+            .ok_or_else(|| CmdError::Params(format!("table text exceeds {MAX_INSERT_TABLE_TEXT_BYTES} bytes")))?;
+        cells.push(s.to_owned());
+    }
+    Ok(cells)
+}
+
+fn insert_table(s: &mut Session, v: &Value) -> CmdResult {
+    let target_chunk = match optional_chunk_id(v)? {
+        Some(id) => Some(find_chunk(s, id)?),
+        None => chunks::chunk_at(&s.doc, &s.sel.focus),
+    };
+
+    let raw_headers = v.get("headers").and_then(Value::as_array).ok_or_else(|| CmdError::Params("headers: required array of strings".into()))?;
+    let mut text_budget = 0usize;
+    let headers = parse_string_row(raw_headers, "headers", &mut text_budget)?;
+    let raw_rows = match v.get("rows") {
+        None | Some(Value::Null) => &[][..],
+        Some(Value::Array(arr)) => arr.as_slice(),
+        Some(_) => return Err(CmdError::Params("rows: expected array of rows".into())),
+    };
+
+    let mut rows = Vec::with_capacity(raw_rows.len());
+    let mut cols = headers.len();
+    for row_val in raw_rows {
+        let row_arr = row_val.as_array().ok_or_else(|| CmdError::Params("rows: each row must be an array of strings".into()))?;
+        let parsed = parse_string_row(row_arr, "rows", &mut text_budget)?;
+        cols = cols.max(parsed.len());
+        rows.push(parsed);
+    }
+
+    if cols == 0 || cols > MAX_COLS {
+        return Err(CmdError::Params(format!("headers/rows: expected 1..={MAX_COLS} columns")));
+    }
+    let total_rows = 1usize.saturating_add(rows.len());
+    if total_rows > MAX_ROWS {
+        return Err(CmdError::Params(format!("rows: at most {MAX_ROWS} rows")));
+    }
+    if total_rows.checked_mul(cols).is_none_or(|cells| cells > MAX_INSERT_TABLE_CELLS) {
+        return Err(CmdError::Params(format!("table exceeds {MAX_INSERT_TABLE_CELLS} total cells")));
+    }
+
+    let width = s.doc.sections().first().map(|(_, sp)| sp.text_width()).unwrap_or(468.0);
+    let mut table = Table::new(total_rows, cols, width);
+    table.rows[0].props.header = true;
+    let bold_props = CharProps { bold: Some(true), ..Default::default() };
+
+    for (c, cell) in table.rows[0].cells.iter_mut().enumerate() {
+        let text = headers.get(c).map(String::as_str).unwrap_or("");
+        *cell = Cell::with_text("");
+        cell.blocks = vec![para_block(Paragraph::with_text(text, bold_props.clone()))];
+    }
+    for (r, row_data) in rows.iter().enumerate() {
+        if let Some(row) = table.rows.get_mut(r + 1) {
+            for (c, cell) in row.cells.iter_mut().enumerate() {
+                let text = row_data.get(c).map(String::as_str).unwrap_or("");
+                *cell = Cell::with_text(text);
+            }
+        }
+    }
+
+    let insert_at = if let Some(ref range) = target_chunk {
+        Path::top(range.end.path.last().saturating_add(1))
+    } else {
+        let at = delete_selection(s)?;
+        if s.doc.para_at(&at).is_some_and(|p| p.is_empty()) { at.path } else { at.path.with_last(at.path.last().saturating_add(1)) }
+    };
+
+    s.doc.insert_block(StoryRef::Body, &insert_at, Block::Table(table))?;
+    let next = insert_at.with_last(insert_at.last().saturating_add(1));
+    if s.doc.block(StoryRef::Body, &next).is_none() {
+        s.doc.insert_block(StoryRef::Body, &next, Block::Para(Paragraph::new()))?;
+    }
+    let mut first_cell = insert_at.0.clone();
+    first_cell.extend([0, 0, 0]);
+    s.sel = Selection::caret(Pos::new(StoryRef::Body, Path(first_cell), 0));
+    s.goal_x = None;
+    s.touch();
+
+    Ok(json!({
+        "table": insert_at.0,
+        "rows": total_rows,
+        "cols": cols,
+    }))
 }

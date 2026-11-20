@@ -30,6 +30,10 @@ CLI (`wordcraft-cli run`) and MCP (`execute`) call them the same way.
 | `code.run_all` | `Mod+Shift+Alt+Enter` | same as `run_chunk` (without `chunkId`) plus `"stopOnError"?: bool` | Runs the body's chunks in document order. `eval: false` chunks are reported as skipped. Stops at the first failure unless `stopOnError` is `false`. |
 | `code.restart_kernel` | — | `{}` | Forgets the recorded outputs and starts a new kernel generation. |
 | `code.clear_output` | — | `{"chunkId"?: number, "all"?: bool}` | Forgets the output of `chunkId`, the chunk at the caret when omitted, or every chunk with `"all": true`. |
+| `code.update_chunk` | — | `{"chunkId"?: number, "code": string, "language"?: "r"\|"python"}` | Updates the chunk source/language in the document as an undoable edit while preserving Quarto options and section breaks. |
+| `code.delete_chunk` | — | `{"chunkId"?: number}` | Deletes the block-level chunk control, its custom options property, and any cached output. |
+| `code.insert_plot` | — | `{"chunkId"?: number, "png"?: string, "svg"?: string, "width"?: number, "alt"?: string}` | Inserts the chunk's PNG plot inline below the chunk (and archives any lossless SVG payload in document media). |
+| `code.insert_table` | — | `{"chunkId"?: number, "headers": [string], "rows"?: [[string]]}` | Inserts a formatted native Word table below the chunk with bold repeating header row. |
 
 `timeoutMs` is clamped to 100…600000 (default 30000). `code` is capped at the model's 4 MiB chunk
 limit; longer code is refused, never truncated.
@@ -80,10 +84,9 @@ wordcraft-cli run --template sample \
 - Persistent interpreter sessions that keep variables between chunks
   (`batistalucasv/wordcraft-kernel#4`). Every run is a fresh process today, so
   `code.restart_kernel` can only drop stale outputs.
-- The visual chunk widget with the Run button and the output drawer
-  (`batistalucasv/wordcraft-kernel#8`). The commands here are what it calls.
-- Asynchronous execution: a call blocks for up to `timeoutMs`. A front end that must stay
-  responsive runs the command off its frame thread.
+- Asynchronous UI execution & canvas mounting: engine commands stay synchronous for CLI/MCP,
+  while `wordcraft-ui-egui` mounts interactive [`CodeChunk`] widgets over `Placed::Chunk`
+  rectangles and dispatches interactive runs asynchronously off the UI thread.
 
 ## Tests
 

@@ -60,6 +60,10 @@ pub(crate) fn issue_heading(issue: &serde_json::Value) -> String {
 }
 
 pub(super) fn context_menu(app: &mut WordApp, ui: &mut Ui) {
+    if let Some(chunk_id) = app.canvas.code_chunks.context_chunk {
+        crate::canvas::code_chunks::chunk_context_menu(app, ui, chunk_id);
+        return;
+    }
     if app.session.math.is_some() {
         return equation_menu(app, ui);
     }

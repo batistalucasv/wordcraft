@@ -36,6 +36,9 @@ impl WordApp {
         // close, New or Open counts it as a change (#1348). A draft the document refuses is not
         // part of it: saving and exporting go on without it (the refusal stays on the status
         // line), and replacing the document asks Save / Don't Save / Cancel about it.
+        if flushes_comment_drafts(id, &params) {
+            crate::canvas::code_chunks::flush_dirty(self);
+        }
         let refused = if flushes_comment_drafts(id, &params) { panes::flush_comment_drafts(self).err() } else { None };
         if id == "file.recover" && params.as_object().is_none_or(|p| p.is_empty()) {
             self.ui.backstage = true;
@@ -112,6 +115,20 @@ impl WordApp {
     /// Run a command for a script or an agent (control channel, MCP bridge): never asks first.
     /// UI-level commands (`ui.*`) are handled here, the rest by the engine.
     pub fn execute(&mut self, id: &str, params: Value) -> Result<Value, String> {
+        if matches!(
+            id,
+            "edit.undo"
+                | "edit.redo"
+                | "file.save"
+                | "file.saveAs"
+                | "file.exportPdf"
+                | "file.exportPng"
+                | "code.run_chunk"
+                | "code.run_all"
+                | "code.delete_chunk"
+        ) {
+            crate::canvas::code_chunks::flush_dirty(self);
+        }
         self.clear_command_targets(id);
         if let Some(error) = self.document_required_error(id) {
             return Err(error);
@@ -379,7 +396,21 @@ impl WordApp {
         // Opening a file, or a new document from a template, reads a file that may be protected.
         let retry = matches!(id, "file.open" | "file.newFromTemplate").then(|| params.clone());
         let retry_path = retry.clone();
-        let r = self.execute(id, params);
+        let r = if id == "code.run_chunk" {
+            crate::canvas::code_chunks::flush_dirty(self);
+            crate::canvas::code_chunks::run_chunk_async(self, &params, self.ctx.clone().as_ref())
+        } else if id == "code.run_all" {
+            crate::canvas::code_chunks::flush_dirty(self);
+            crate::canvas::code_chunks::run_all_async(self, &params, self.ctx.clone().as_ref())
+        } else {
+            self.execute(id, params)
+        };
+        if id == "code.insert_chunk"
+            && let Ok(v) = &r
+            && let Some(cid) = v.pointer("/chunk/id").and_then(Value::as_i64)
+        {
+            self.canvas.code_chunks.request_focus(cid, false);
+        }
         if let (Err(e), Some(params)) = (&r, retry)
             && wordcraft_engine::io::needs_password(e)
         {

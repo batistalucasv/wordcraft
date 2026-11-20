@@ -375,6 +375,43 @@ fn prepare_section_end(pb: &mut PageBuilder, sections: &[(usize, &SectionProps)]
     balance
 }
 
+fn mounted_chunks(doc: &Document, heights: &std::collections::BTreeMap<i64, u32>) -> HashMap<usize, (i64, usize, f32)> {
+    let mut map = HashMap::new();
+    if heights.is_empty() {
+        return map;
+    }
+    for r in doc.chunk_refs(StoryRef::Body) {
+        let Some(id) = r.chunk.id else { continue };
+        let Some(&centipts) = heights.get(&id) else { continue };
+        let first = r.start.path.last();
+        let last = r.end.path.last();
+        if last >= first && last < doc.body.len() {
+            let h = (centipts as f32 / 100.0).clamp(24.0, 20000.0);
+            map.insert(first, (id, last, h));
+        }
+    }
+    map
+}
+
+fn place_chunk(ctx: &Ctx, pb: &mut PageBuilder, id: i64, first: usize, last: usize, h: f32, body_top: f32) {
+    if ctx.doc.body.get(first).and_then(|b| b.as_para()).is_some_and(|p| p.props.page_break_before == Some(true)) && !pb.at_top() {
+        pb.new_page(first, body_top);
+    }
+    let mut top_gap = if pb.at_top() { 0.0 } else { 4.0 };
+    if !pb.at_top() && pb.y + top_gap + h > pb.bottom + 0.5 {
+        pb.advance(first, body_top);
+        top_gap = 0.0;
+    }
+    let y = pb.y + top_gap;
+    let rect = wordcraft_geom::Rect::new(pb.col_x(), y, pb.col_w(), h);
+    if let Some(pg) = pb.page() {
+        pg.items.push(Placed::Chunk { id, rect, first, last });
+    }
+    pb.after_break_mark = false;
+    pb.y = y + h + 6.0;
+    pb.content_bottom = pb.content_bottom.max(y + h);
+}
+
 fn place_block(ctx: &mut Ctx, pb: &mut PageBuilder, outline: &Option<OutlinePass>, block: usize, body_top: f32) {
     let Some(b) = ctx.doc.body.get(block) else { return };
     match (&**b, outline) {
@@ -394,17 +431,27 @@ fn place_section_blocks<'p>(
     (mut block, last): (usize, usize),
     (balance, body_top): (bool, f32),
 ) -> (usize, usize) {
+    let chunks = mounted_chunks(ctx.doc, &ctx.opts.chunk_heights);
     let mut from = balance.then(|| (block, Snap::take(pb, ctx)));
     while block <= last && ctx.doc.body.get(block).is_some() {
         let before = balance.then(|| (pb.pages.len(), Snap::take(pb, ctx)));
         pb.mark_block();
-        place_block(ctx, pb, outline, block, body_top);
+        let next = if outline.is_none()
+            && let Some(&(id, chunk_last, h)) = chunks.get(&block)
+            && chunk_last <= last
+        {
+            place_chunk(ctx, pb, id, block, chunk_last, h, body_top);
+            chunk_last + 1
+        } else {
+            place_block(ctx, pb, outline, block, body_top);
+            block + 1
+        };
         if let Some((pages, snap)) = before
             && pb.pages.len() != pages
         {
             from = Some((block, snap));
         }
-        block += 1;
+        block = next;
     }
     let discarded = from.map_or(0, |(first, snap)| balance_columns(ctx, pb, (first, block), &snap, body_top));
     (block, discarded)
@@ -458,7 +505,11 @@ fn fit_web_page(pages: &mut [Page]) {
     let bottom = p
         .items
         .iter()
-        .filter_map(|it| if let Placed::Lines { y, para, l0, l1, .. } = it { item_bottom(*y, para, *l0, *l1) } else { None })
+        .filter_map(|it| match it {
+            Placed::Lines { y, para, l0, l1, .. } => item_bottom(*y, para, *l0, *l1),
+            Placed::Chunk { rect, .. } => Some(rect.bottom()),
+            _ => None,
+        })
         .fold(0.0f32, f32::max);
     p.h = bottom + 36.0;
 }
@@ -697,11 +748,21 @@ fn balance_pass<'a>(
     snap.restore(pb, ctx);
     pb.balance = Some((page, h));
     pb.cap_columns();
-    for block in first..end {
-        match ctx.doc.body.get(block).map(|b| &**b) {
-            Some(Block::Para(p)) => place_para(ctx, pb, p, block, body_top),
-            Some(Block::Table(t)) => place_table(ctx, pb, t, block, body_top),
-            None => break,
+    let chunks = mounted_chunks(ctx.doc, &ctx.opts.chunk_heights);
+    let mut block = first;
+    while block < end {
+        if let Some(&(id, chunk_last, ch)) = chunks.get(&block)
+            && chunk_last < end
+        {
+            place_chunk(ctx, pb, id, block, chunk_last, ch, body_top);
+            block = chunk_last + 1;
+        } else {
+            match ctx.doc.body.get(block).map(|b| &**b) {
+                Some(Block::Para(p)) => place_para(ctx, pb, p, block, body_top),
+                Some(Block::Table(t)) => place_table(ctx, pb, t, block, body_top),
+                None => break,
+            }
+            block += 1;
         }
         // Spilled onto another page: too short (and no need to lay out the rest).
         if pb.pages.len() > page + 1 {
