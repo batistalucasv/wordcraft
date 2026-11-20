@@ -7582,6 +7582,7 @@ dependencies = [
  "nix 0.27.1",
  "proptest",
  "serde",
+ "serde_json",
  "thiserror 2.0.21",
 ]
 

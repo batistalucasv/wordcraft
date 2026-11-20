@@ -123,6 +123,39 @@ impl PlotFormat {
     }
 }
 
+/// A table captured from a chunk through `wc_table()`, in R (`data.frame` or matrix) or Python
+/// (`pandas.DataFrame`).
+///
+/// Every row has exactly `headers.len()` cells, padded with empty strings when the source was
+/// ragged. When the source has meaningful row labels (R row names other than the default
+/// sequence, Python index other than a `RangeIndex`), they are kept as an extra first column with
+/// an empty header.
+///
+/// Capture is bounded: at most 16 tables per run, 10,000 rows and 256 columns per table, 4,096
+/// characters per cell, and 250,000 cells across all tables. Anything past those limits is
+/// dropped, and a payload larger than 64 MiB is ignored entirely.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TabularOutput {
+    /// Column names in display order.
+    pub headers: Vec<String>,
+    /// Body rows, each with one text cell per header.
+    pub rows: Vec<Vec<String>>,
+}
+
+/// Maximum number of tables kept from a single execution.
+const MAX_TABLES: usize = 16;
+/// Maximum number of body rows kept per table.
+const MAX_TABLE_ROWS: usize = 10_000;
+/// Maximum number of columns kept per table.
+const MAX_TABLE_COLUMNS: usize = 256;
+/// Maximum number of characters kept in a single cell.
+const MAX_CELL_CHARS: usize = 4_096;
+/// Maximum aggregate cell count across all tables, before padding rows.
+const MAX_TOTAL_CELLS: usize = 250_000;
+/// Maximum size of the table payload a script may hand back.
+const MAX_TABLES_FILE_BYTES: u64 = 64 * 1024 * 1024;
+
 /// Request to execute code in a specific language.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutionRequest {
@@ -191,6 +224,9 @@ pub struct ExecutionResult {
     pub plot_png: Option<Vec<u8>>,
     /// Vector SVG XML string of plot/chart if generated and captured.
     pub plot_svg: Option<String>,
+    /// Tables passed to `wc_table()`, in call order.
+    #[serde(default)]
+    pub tables: Vec<TabularOutput>,
     /// Elapsed wall-clock execution time in milliseconds.
     pub duration_ms: u64,
 }
@@ -242,9 +278,15 @@ pub fn execute(request: &ExecutionRequest) -> Result<ExecutionResult, KernelErro
         .ok_or_else(|| KernelError::InterpreterNotFound { language: request.language, binary: request.language.binary_name() })?;
 
     let mut created_dir = None;
+    // The wrapper embeds these paths as string literals, so a lossy conversion would point the
+    // script at a file that does not exist.
+    let base = std::env::temp_dir();
+    if base.to_str().is_none() {
+        return Err(KernelError::Io("the temporary directory path is not valid UTF-8".to_owned()));
+    }
     for _ in 0..MAX_SCRATCH_DIR_ATTEMPTS {
         let unique_id = SCRIPT_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let candidate = std::env::temp_dir().join(format!("wordcraft-chunk-{}-{}", std::process::id(), unique_id));
+        let candidate = base.join(format!("wordcraft-chunk-{}-{}", std::process::id(), unique_id));
         match create_scratch_dir(&candidate) {
             Ok(()) => {
                 created_dir = Some(candidate);
@@ -260,10 +302,17 @@ pub fn execute(request: &ExecutionRequest) -> Result<ExecutionResult, KernelErro
 
     let plot_png_path = temp_dir.join("__wordcraft_plot__.png");
     let plot_svg_path = temp_dir.join("__wordcraft_plot__.svg");
+    let tables_file = temp_dir.join("__wordcraft_tables__.json");
     let script_file = temp_dir.join(format!("script.{}", request.language.extension()));
+    let user_file = temp_dir.join(format!("chunk.{}", request.language.extension()));
 
-    let wrapped_code =
-        prepare_wrapped_code(request.language, &request.code, request.capture_plots, request.plot_format, &plot_png_path, &plot_svg_path);
+    // The chunk runs as its own file in both languages: R sources it with printing of visible
+    // results, and Python compiles it as a module, so a docstring and a `__future__` import keep
+    // the placement the language requires.
+    fs::write(&user_file, request.code.as_bytes()).map_err(|e| KernelError::ScriptPreparation(format!("write {}: {e}", user_file.display())))?;
+
+    let captured = CapturePaths { png: &plot_png_path, svg: &plot_svg_path, tables: &tables_file, user: &user_file };
+    let wrapped_code = prepare_wrapped_code(request.language, request.capture_plots, request.plot_format, captured);
     fs::write(&script_file, wrapped_code.as_bytes()).map_err(|e| KernelError::ScriptPreparation(format!("write {}: {e}", script_file.display())))?;
 
     let mut cmd = Command::new(&binary);
@@ -311,10 +360,11 @@ pub fn execute(request: &ExecutionRequest) -> Result<ExecutionResult, KernelErro
         plot_svg = fs::read_to_string(&plot_svg_path).ok().filter(|content| is_complete_svg(content));
     }
 
+    let tables = read_tables(&tables_file);
     let exit_code = exit_status.and_then(|s| s.code());
     let success = exit_status.map(|s| s.success()).unwrap_or(false) && !timed_out;
 
-    Ok(ExecutionResult { stdout, stderr, exit_code, success, timed_out, output_truncated, plot_png, plot_svg, duration_ms })
+    Ok(ExecutionResult { stdout, stderr, exit_code, success, timed_out, output_truncated, plot_png, plot_svg, tables, duration_ms })
 }
 
 /// Create the per-run scratch directory exclusively, with owner-only permissions.
@@ -555,86 +605,550 @@ fn escape_path_literal(path: &Path) -> String {
     escaped
 }
 
-/// Wrap user code to intercept plots in PNG, SVG, or both.
-fn prepare_wrapped_code(
-    lang: CodeLanguage,
-    code: &str,
-    capture_plots: bool,
-    format: PlotFormat,
-    plot_png_path: &Path,
-    plot_svg_path: &Path,
-) -> String {
-    if !capture_plots {
-        return code.to_string();
+/// Paths the wrapped script writes its captured plot and tables to, and the chunk's own source.
+#[derive(Clone, Copy)]
+struct CapturePaths<'a> {
+    png: &'a Path,
+    svg: &'a Path,
+    tables: &'a Path,
+    user: &'a Path,
+}
+
+/// The R half of `wc_table()`: a private environment holding the captured tables, exposed to user
+/// code only through the `wc_table` function, so assignments such as `tables <- 1` cannot reach
+/// the driver's state. Every lookup resolves against `baseenv()` rather than the user's workspace.
+const R_TABLES_PRELUDE: &str = r##"local({
+  drv <- new.env(parent = baseenv())
+  drv$path <- "__WC_TABLES_PATH__"
+  drv$tables <- list()
+  drv$cells <- 0L
+  drv$bytes <- 0L
+  drv$dirty <- FALSE
+
+  # The hard caps always apply. A test may lower them through `.wc_cells_budget` / `.wc_budget`
+  # in the workspace, which is read at capture time so a chunk can set it before its first table.
+  cells_budget <- function() {
+    if (exists(".wc_cells_budget", envir = globalenv())) {
+      override <- suppressWarnings(as.numeric(get(".wc_cells_budget", envir = globalenv())))
+      if (length(override) == 1L && !is.na(override)) return(as.integer(min(max(override, 0), 250000)))
+    }
+    250000L
+  }
+
+  bytes_budget <- function() {
+    if (exists(".wc_budget", envir = globalenv())) {
+      override <- suppressWarnings(as.numeric(get(".wc_budget", envir = globalenv())))
+      if (length(override) == 1L && !is.na(override)) return(as.numeric(min(max(override, 0), 65011712)))
+    }
+    65011712
+  }
+
+  json_escape <- function(value) {
+    text <- as.character(value)
+    if (length(text) == 0L || is.na(text[1L])) return("\"\"")
+    text <- iconv(text[1L], from = "", to = "UTF-8", sub = "byte")
+    if (is.na(text)) return("\"\"")
+    chars <- strsplit(text, "", fixed = TRUE)[[1L]]
+    if (length(chars) == 0L) return("\"\"")
+    escaped <- vapply(chars, function(ch) {
+      code <- suppressWarnings(utf8ToInt(ch))
+      if (is.na(code)) ""
+      else if (ch == "\"") "\\\""
+      else if (ch == "\\") "\\\\"
+      else if (ch == "\b") "\\b"
+      else if (ch == "\f") "\\f"
+      else if (ch == "\n") "\\n"
+      else if (ch == "\r") "\\r"
+      else if (ch == "\t") "\\t"
+      else if (code < 32L) sprintf("\\u%04x", code)
+      else ch
+    }, character(1), USE.NAMES = FALSE)
+    paste0("\"", paste0(escaped, collapse = ""), "\"")
+  }
+
+  cell <- function(value, depth = 0L) {
+    if (is.null(value) || length(value) == 0L || depth > 8L) return("")
+    if (is.list(value)) return(cell(value[[1L]], depth + 1L))
+    if (length(value) > 1L) value <- value[1L]
+    if (is.na(value)) return("NA")
+    if (is.factor(value)) {
+      text <- tryCatch(as.character(value), error = function(e) "")
+      if (length(text) == 0L || is.na(text[1L])) return("NA")
+      return(substr(text[1L], 1L, 4096L))
+    }
+    text <- tryCatch(as.character(value), error = function(e) "")
+    if (length(text) == 0L || is.na(text[1L])) return("")
+    substr(text[1L], 1L, 4096L)
+  }
+
+  capture <- function(value) {
+    if (length(drv$tables) >= 16L) return(invisible(FALSE))
+    if (!is.data.frame(value) && !is.matrix(value)) return(invisible(FALSE))
+    input_rows <- nrow(value)
+    count <- min(input_rows, 10000L)
+
+    has_labels <- FALSE
+    labels <- NULL
+    if (is.matrix(value)) {
+      rn_mat <- rownames(value)
+      if (!is.null(rn_mat)) {
+        retained_labels <- as.character(rn_mat[seq_len(count)])
+        has_labels <- !identical(retained_labels, as.character(seq_len(count)))
+        labels <- retained_labels
+      }
+    } else if (.row_names_info(value, 1L) > 0L) {
+      rn_df <- .row_names_info(value, 0L)
+      is_compact <- is.integer(rn_df) && length(rn_df) == 2L && is.na(rn_df[1L])
+      if (!is_compact) {
+        retained_labels <- as.character(rn_df[seq_len(count)])
+        has_labels <- !identical(retained_labels, as.character(seq_len(count)))
+        labels <- retained_labels
+      }
     }
 
-    let png_str = escape_path_literal(plot_png_path);
-    let svg_str = escape_path_literal(plot_svg_path);
+    max_cols <- if (has_labels) 255L else 256L
+    cols_count <- min(ncol(value), max_cols)
+    if (cols_count == 0L && !has_labels) return(invisible(FALSE))
 
-    match lang {
-        CodeLanguage::R => match format {
-            PlotFormat::Png => format!(
+    raw_headers <- if (is.matrix(value)) colnames(value) else names(value)
+    df <- if (is.matrix(value)) {
+      base::as.data.frame(value[seq_len(count), seq_len(cols_count), drop = FALSE])
+    } else {
+      base::as.data.frame(value)
+    }
+    if (is.null(raw_headers) || length(raw_headers) < cols_count) raw_headers <- names(df)
+    if (is.null(raw_headers)) raw_headers <- rep("", cols_count)
+    headers <- raw_headers[seq_len(cols_count)]
+    headers <- vapply(headers, function(h) substr(as.character(h), 1L, 4096L), character(1), USE.NAMES = FALSE)
+    if (has_labels) headers <- c("", headers)
+    width <- length(headers)
+
+    # Cells are measured after JSON escaping, which can turn one character into six bytes, and the
+    # table framing is reserved before the first row is accepted.
+    budget <- bytes_budget()
+    escaped_headers <- vapply(headers, json_escape, character(1), USE.NAMES = FALSE)
+    framing <- sum(nchar(escaped_headers, type = "bytes")) + length(escaped_headers) + 40
+    if (drv$bytes + framing > budget) return(invisible(FALSE))
+
+    # A table with columns but no rows is still worth showing.
+    if (input_rows == 0L) {
+      drv$tables[[length(drv$tables) + 1L]] <- list(headers = as.list(escaped_headers), rows = list())
+      drv$bytes <- drv$bytes + framing
+      drv$dirty <- TRUE
+      return(invisible(TRUE))
+    }
+
+    remaining_cells <- cells_budget() - drv$cells
+    if (remaining_cells < width) return(invisible(FALSE))
+    count <- min(count, remaining_cells %/% width)
+    if (count == 0L) return(invisible(FALSE))
+
+    rows <- vector("list", count)
+    sizes <- numeric(count)
+    kept <- 0L
+    row_bytes <- 0
+    for (index in seq_len(count)) {
+      cells <- character(0)
+      for (column in seq_len(cols_count)) {
+        cells <- c(cells, cell(df[[column]][index]))
+      }
+      if (has_labels) cells <- c(cell(labels[index]), cells)
+      escaped <- vapply(cells, json_escape, character(1), USE.NAMES = FALSE)
+      size <- sum(nchar(escaped, type = "bytes")) + length(escaped) + 1
+      if (drv$bytes + framing + row_bytes + size > budget) break
+      row_bytes <- row_bytes + size
+      kept <- kept + 1L
+      rows[[kept]] <- escaped
+      sizes[[kept]] <- size
+    }
+    if (kept == 0L) return(invisible(FALSE))
+
+    # A nested capture can reach drv state while the cells above are converted, so the live budgets
+    # and table count are checked again before anything is committed.
+    if (length(drv$tables) >= 16L) return(invisible(FALSE))
+    remaining_cells <- cells_budget() - drv$cells
+    allowed <- budget - drv$bytes - framing
+    if (remaining_cells < width || allowed < 0) return(invisible(FALSE))
+    keep <- min(kept, remaining_cells %/% width)
+    if (keep == 0L) return(invisible(FALSE))
+    cumulative <- cumsum(sizes[seq_len(keep)])
+    keep <- sum(cumulative <= allowed)
+    if (keep == 0L) return(invisible(FALSE))
+    rows <- rows[seq_len(keep)]
+    drv$tables[[length(drv$tables) + 1L]] <- list(headers = as.list(escaped_headers), rows = rows)
+    drv$cells <- drv$cells + width * keep
+    drv$bytes <- drv$bytes + framing + cumulative[keep]
+    drv$dirty <- TRUE
+    invisible(TRUE)
+  }
+
+  # Replace the snapshot without truncating the previous one: a plain copy over an existing file
+  # empties it before the new bytes land.
+  replace_file <- function(tmp, target) {
+    if (suppressWarnings(base::file.rename(tmp, target))) return(TRUE)
+    backup <- paste0(target, ".bak")
+    suppressWarnings(base::file.remove(backup))
+    if (base::file.exists(target) && !suppressWarnings(base::file.rename(target, backup))) return(FALSE)
+    if (suppressWarnings(base::file.rename(tmp, target))) {
+      suppressWarnings(base::file.remove(backup))
+      return(TRUE)
+    }
+    if (base::file.exists(backup)) suppressWarnings(base::file.rename(backup, target))
+    FALSE
+  }
+
+  write_tables <- function() {
+    if (length(drv$tables) == 0L) return(invisible(NULL))
+    # The hard output limit, not the admission override: a chunk that lowered the budget after a
+    # capture must not lose the rows that capture already accepted.
+    budget <- 65011712
+    tmp <- paste0(drv$path, ".tmp")
+    con <- tryCatch(base::file(tmp, open = "wt", encoding = "UTF-8"), error = function(e) NULL)
+    if (is.null(con)) return(invisible(NULL))
+    written <- tryCatch({
+      cat("{\"tables\":[", file = con, sep = "")
+      bytes_written <- 11L
+      table_written <- 0L
+      closing_reserve <- 4L
+      for (table in drv$tables) {
+        headers <- base::unlist(table$headers, use.names = FALSE)
+        h_json <- paste0("[", paste0(headers, collapse = ","), "]")
+        prefix <- paste0(if (table_written > 0L) "," else "", "{\"headers\":", h_json, ",\"rows\":[")
+        prefix_bytes <- nchar(prefix, type = "bytes")
+        if (bytes_written + prefix_bytes + closing_reserve > budget) break
+        cat(prefix, file = con, sep = "")
+        bytes_written <- bytes_written + prefix_bytes
+        table_written <- table_written + 1L
+        row_written <- 0L
+        for (row in table$rows) {
+          r_json <- paste0("[", paste0(row, collapse = ","), "]")
+          r_str <- paste0(if (row_written > 0L) "," else "", r_json)
+          r_bytes <- nchar(r_str, type = "bytes")
+          if (bytes_written + r_bytes + closing_reserve > budget) break
+          cat(r_str, file = con, sep = "")
+          bytes_written <- bytes_written + r_bytes
+          row_written <- row_written + 1L
+        }
+        cat("]}", file = con, sep = "")
+        bytes_written <- bytes_written + 2L
+        if (bytes_written + 2L > budget) break
+      }
+      cat("]}\n", file = con, sep = "")
+      TRUE
+    }, error = function(e) FALSE)
+    # A failed flush on close leaves an incomplete file: publish only after both steps succeed.
+    closed <- isTRUE(tryCatch({ base::close(con); TRUE }, error = function(e) FALSE))
+    if (!written || !closed) {
+      suppressWarnings(base::file.remove(tmp))
+      return(invisible(NULL))
+    }
+    if (replace_file(tmp, drv$path)) drv$dirty <- FALSE else suppressWarnings(base::file.remove(tmp))
+    invisible(NULL)
+  }
+
+  assign("wc_table", function(value) {
+    if (!is.data.frame(value) && !is.matrix(value)) {
+      stop("wc_table() expects a data.frame or matrix")
+    }
+    # Publish each accepted capture: a timeout kills R before the finally block can run.
+    if (isTRUE(capture(value))) write_tables()
+    invisible(value)
+  }, envir = globalenv())
+  assign(".wc_write_tables", function() write_tables(), envir = globalenv())
+  assign(".wc_tables_dirty", function() isTRUE(drv$dirty), envir = globalenv())
+}, envir = new.env(parent = baseenv()))
+"##;
+
+/// The Python half of `wc_table()`. pandas is imported on first use, so a chunk that never passes
+/// a table does not pay for it.
+const PY_TABLES_PRELUDE: &str = r##"import json as _wc_json
+import os as _wc_os
+import sys as _wc_sys
+import threading as _wc_threading
+
+_wc_tables = []
+_wc_tables_path = "__WC_TABLES_PATH__"
+_wc_pandas = None
+_wc_cells = 0
+_wc_bytes = 0
+# The hard caps apply on their own; a test may lower these before calling wc_table().
+_wc_cells_budget = 250000
+_wc_bytes_budget = 62 * 1024 * 1024
+_wc_lock = _wc_threading.Lock()
+
+
+def _wc_cell(value):
+    if value is None:
+        return "NA"
+    if _wc_pandas is not None:
+        try:
+            if _wc_pandas.isna(value):
+                return "NA"
+        except (TypeError, ValueError):
+            pass
+    text = str(value)
+    if len(text) > 4096:
+        text = text[:4096]
+    return text.encode("utf-8", "replace").decode("utf-8")
+
+
+def _wc_capture(value):
+    global _wc_cells, _wc_bytes
+    if len(_wc_tables) >= 16:
+        return False
+    if _wc_pandas is None or not isinstance(value, _wc_pandas.DataFrame):
+        return False
+    try:
+        has_labels = not (
+            isinstance(value.index, _wc_pandas.RangeIndex)
+            and value.index.equals(_wc_pandas.RangeIndex(len(value)))
+        )
+        max_cols = 255 if has_labels else 256
+        sliced = value.iloc[:10000, :max_cols]
+        headers = [_wc_json.dumps(_wc_cell(col), ensure_ascii=False) for col in sliced.columns]
+        if has_labels:
+            headers = ['""'] + headers
+        if not headers:
+            return False
+        width = len(headers)
+        # Cells are measured after JSON encoding, which can turn one character into six bytes, and
+        # the table framing is reserved before the first row is accepted.
+        framing = sum(len(header.encode("utf-8")) for header in headers) + width + 40
+        cells_cap = min(_wc_cells_budget, 250000)
+        bytes_cap = min(_wc_bytes_budget, 62 * 1024 * 1024)
+        allowed = bytes_cap - _wc_bytes - framing
+        if allowed < 0:
+            return False
+        max_rows = max(0, min(10000, (cells_cap - _wc_cells) // width))
+        # Rows are converted outside the lock: a cell formatter may call wc_table() again, and
+        # holding the lock here would stall the chunk until its timeout.
+        rows = []
+        sizes = []
+        used = 0
+        for row in sliced.itertuples(index=has_labels, name=None):
+            if len(rows) >= max_rows:
+                break
+            converted = [_wc_json.dumps(_wc_cell(cell), ensure_ascii=False) for cell in row]
+            size = sum(len(cell.encode("utf-8")) for cell in converted) + len(converted) + 1
+            if used + size > allowed:
+                break
+            used += size
+            rows.append(converted)
+            sizes.append(size)
+        empty = not rows and len(sliced) == 0
+        if not rows and not empty:
+            return False
+    except Exception:
+        return False
+
+    with _wc_lock:
+        # A nested capture may have spent cells or bytes while the rows above were converted, so
+        # the live budgets are checked again before anything is committed.
+        if len(_wc_tables) >= 16:
+            return False
+        if empty:
+            if _wc_bytes + framing > min(_wc_bytes_budget, 62 * 1024 * 1024):
+                return False
+            _wc_tables.append({"headers": headers, "rows": []})
+            _wc_bytes += framing
+            return True
+        available_cells = min(_wc_cells_budget, 250000) - _wc_cells
+        available_bytes = min(_wc_bytes_budget, 62 * 1024 * 1024) - _wc_bytes - framing
+        keep = 0
+        used = 0
+        for size in sizes:
+            if keep >= available_cells // width or used + size > available_bytes:
+                break
+            used += size
+            keep += 1
+        if keep == 0:
+            return False
+        _wc_tables.append({"headers": headers, "rows": rows[:keep]})
+        _wc_cells += width * keep
+        _wc_bytes += framing + used
+    return True
+
+
+def _wc_write_tables():
+    if not _wc_tables:
+        return
+    budget = 62 * 1024 * 1024
+    tmp_path = _wc_tables_path + ".tmp"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as handle:
+            handle.write('{"tables":[')
+            bytes_written = 11
+            table_written = 0
+            closing_reserve = 4
+            for table in _wc_tables:
+                headers = table.get("headers", [])
+                rows = table.get("rows", [])
+                h_json = "[" + ",".join(headers) + "]"
+                prefix = ("," if table_written > 0 else "") + '{"headers":' + h_json + ',"rows":['
+                prefix_bytes = len(prefix.encode("utf-8"))
+                if bytes_written + prefix_bytes + closing_reserve > budget:
+                    break
+                handle.write(prefix)
+                bytes_written += prefix_bytes
+                table_written += 1
+                row_written = 0
+                for row in rows:
+                    r_json = "[" + ",".join(row) + "]"
+                    r_str = ("," if row_written > 0 else "") + r_json
+                    r_bytes = len(r_str.encode("utf-8"))
+                    if bytes_written + r_bytes + closing_reserve > budget:
+                        break
+                    handle.write(r_str)
+                    bytes_written += r_bytes
+                    row_written += 1
+                handle.write("]}")
+                bytes_written += 2
+                if bytes_written + 2 > budget:
+                    break
+            handle.write("]}\n")
+        # Replacing the target only after the rewrite finishes keeps the previous complete snapshot
+        # if the interpreter is killed mid-write.
+        _wc_os.replace(tmp_path, _wc_tables_path)
+    except Exception:
+        try:
+            _wc_os.remove(tmp_path)
+        except Exception:
+            pass
+
+
+def wc_table(value):
+    global _wc_pandas
+    if _wc_pandas is None:
+        try:
+            import pandas as _pandas
+            _wc_pandas = _pandas
+        except Exception as exc:
+            raise TypeError("wc_table() needs pandas") from exc
+    if not isinstance(value, _wc_pandas.DataFrame):
+        raise TypeError("wc_table() expects a pandas.DataFrame")
+    # Only publication takes the lock: capture commits under it too, and conversion stays outside
+    # so a nested call from a cell formatter cannot deadlock the chunk.
+    if _wc_capture(value):
+        with _wc_lock:
+            _wc_write_tables()
+    return None
+
+"##;
+
+/// The figure cleanup that follows a Python chunk when plots are captured.
+const PY_PLOT_CLEANUP: &str = r#"if _has_plt and plt is not None:
+    try:
+        if plt.get_fignums():
+            __WC_SAVE__
+            plt.close('all')
+    except Exception:
+        pass
+"#;
+
+/// R plot device setup and the final part of its `finally` block, or empty strings when plot
+/// capture is off. Tables are still written in that case.
+fn r_plot_sections(capture: bool, format: PlotFormat, captured: CapturePaths<'_>) -> (String, String) {
+    if !capture {
+        return (String::new(), String::new());
+    }
+    let png = escape_path_literal(captured.png);
+    let svg = escape_path_literal(captured.svg);
+    match format {
+        PlotFormat::Png => (
+            format!(
                 r#"options(warn = 1)
-.wc_plot_png <- "{png_str}"
+.wc_plot_png <- "{png}"
 setHook("plot.new", function() assign(".wc_has_plot", TRUE, envir = .GlobalEnv))
 setHook("grid.newpage", function() assign(".wc_has_plot", TRUE, envir = .GlobalEnv))
-png(.wc_plot_png, width = 1600, height = 1200, res = 200)
-tryCatch({{
-{code}
-}}, finally = {{
-  if (dev.cur() != 1) dev.off()
-  if (!exists(".wc_has_plot", envir = .GlobalEnv) || !get(".wc_has_plot", envir = .GlobalEnv)) {{
+png(.wc_plot_png, width = 1600, height = 1200, res = 200)"#
+            ),
+            r#"  if (dev.cur() != 1) dev.off()
+  if (!exists(".wc_has_plot", envir = .GlobalEnv) || !get(".wc_has_plot", envir = .GlobalEnv)) {
     if (file.exists(.wc_plot_png)) file.remove(.wc_plot_png)
-  }}
-}})
+  }
 "#
-            ),
-            PlotFormat::Svg => format!(
+            .to_owned(),
+        ),
+        PlotFormat::Svg => (
+            format!(
                 r#"options(warn = 1)
-.wc_plot_svg <- "{svg_str}"
+.wc_plot_svg <- "{svg}"
 setHook("plot.new", function() assign(".wc_has_plot", TRUE, envir = .GlobalEnv))
 setHook("grid.newpage", function() assign(".wc_has_plot", TRUE, envir = .GlobalEnv))
-svg(.wc_plot_svg, width = 8, height = 6)
-tryCatch({{
-{code}
-}}, finally = {{
-  if (dev.cur() != 1) dev.off()
-  if (!exists(".wc_has_plot", envir = .GlobalEnv) || !get(".wc_has_plot", envir = .GlobalEnv)) {{
-    if (file.exists(.wc_plot_svg)) file.remove(.wc_plot_svg)
-  }}
-}})
-"#
+svg(.wc_plot_svg, width = 8, height = 6)"#
             ),
-            PlotFormat::Both => format!(
+            r#"  if (dev.cur() != 1) dev.off()
+  if (!exists(".wc_has_plot", envir = .GlobalEnv) || !get(".wc_has_plot", envir = .GlobalEnv)) {
+    if (file.exists(.wc_plot_svg)) file.remove(.wc_plot_svg)
+  }
+"#
+            .to_owned(),
+        ),
+        PlotFormat::Both => (
+            format!(
                 r#"options(warn = 1)
-.wc_plot_png <- "{png_str}"
-.wc_plot_svg <- "{svg_str}"
+.wc_plot_png <- "{png}"
+.wc_plot_svg <- "{svg}"
 setHook("plot.new", function() assign(".wc_has_plot", TRUE, envir = .GlobalEnv))
 setHook("grid.newpage", function() assign(".wc_has_plot", TRUE, envir = .GlobalEnv))
 png(.wc_plot_png, width = 1600, height = 1200, res = 200)
-dev.control("enable")
-tryCatch({{
-{code}
-}}, finally = {{
-  if (exists(".wc_has_plot", envir = .GlobalEnv) && get(".wc_has_plot", envir = .GlobalEnv)) {{
+dev.control("enable")"#
+            ),
+            r#"  if (exists(".wc_has_plot", envir = .GlobalEnv) && get(".wc_has_plot", envir = .GlobalEnv)) {
     dev.copy(svg, .wc_plot_svg, width = 8, height = 6)
     dev.off()
-  }}
+  }
   if (dev.cur() != 1) dev.off()
-  if (!exists(".wc_has_plot", envir = .GlobalEnv) || !get(".wc_has_plot", envir = .GlobalEnv)) {{
+  if (!exists(".wc_has_plot", envir = .GlobalEnv) || !get(".wc_has_plot", envir = .GlobalEnv)) {
     if (file.exists(.wc_plot_png)) file.remove(.wc_plot_png)
     if (file.exists(.wc_plot_svg)) file.remove(.wc_plot_svg)
-  }}
-}})
+  }
 "#
-            ),
-        },
-        CodeLanguage::Python => {
-            let save_png = if format.captures_png() { format!(r#"plt.savefig("{png_str}", dpi=200, bbox_inches='tight')"#) } else { String::new() };
-            let save_svg =
-                if format.captures_svg() { format!(r#"plt.savefig("{svg_str}", format='svg', bbox_inches='tight')"#) } else { String::new() };
+            .to_owned(),
+        ),
+    }
+}
 
+/// Python's plot-saving lines for the chosen format.
+fn python_plot_save(format: PlotFormat, captured: CapturePaths<'_>) -> String {
+    let png = escape_path_literal(captured.png);
+    let svg = escape_path_literal(captured.svg);
+    match format {
+        PlotFormat::Png => format!(r#"plt.savefig("{png}", dpi=200, bbox_inches='tight')"#),
+        PlotFormat::Svg => format!(r#"plt.savefig("{svg}", format='svg', bbox_inches='tight')"#),
+        PlotFormat::Both => format!(
+            r#"plt.savefig("{png}", dpi=200, bbox_inches='tight')
+            plt.savefig("{svg}", format='svg', bbox_inches='tight')"#
+        ),
+    }
+}
+
+/// Wrap the chunk so tables are captured and, unless disabled, plots are intercepted.
+fn prepare_wrapped_code(lang: CodeLanguage, capture_plots: bool, format: PlotFormat, captured: CapturePaths<'_>) -> String {
+    let tables_str = escape_path_literal(captured.tables);
+    let user_str = escape_path_literal(captured.user);
+    match lang {
+        CodeLanguage::R => {
+            let prelude = R_TABLES_PRELUDE.replace("__WC_TABLES_PATH__", &tables_str);
+            let (setup, finally) = r_plot_sections(capture_plots, format, captured);
+            // `source(print.eval = TRUE)` keeps the automatic printing a plain Rscript run gives a
+            // bare expression; evaluating the chunk inline inside tryCatch would swallow it.
             format!(
+                r#"{prelude}
+{setup}
+tryCatch({{
+  source("{user_str}", local = globalenv(), print.eval = TRUE, encoding = "UTF-8")
+}}, finally = {{
+  if (exists(".wc_tables_dirty", envir = globalenv()) && .wc_tables_dirty()) try(.wc_write_tables(), silent = TRUE)
+{finally}}})
+"#
+            )
+        }
+        CodeLanguage::Python => {
+            let prelude = PY_TABLES_PRELUDE.replace("__WC_TABLES_PATH__", &tables_str);
+            // matplotlib is only touched when plots are captured: importing it and forcing the Agg
+            // backend would override a backend the chunk chose through MPLBACKEND or matplotlibrc.
+            let setup = if capture_plots {
                 r#"import sys
 
 _has_plt = False
@@ -645,21 +1159,121 @@ try:
     _has_plt = True
 except Exception:
     pass
-
-{code}
-
-if _has_plt and plt is not None:
-    try:
-        if plt.get_fignums():
-            {save_png}
-            {save_svg}
-            plt.close('all')
-    except Exception:
-        pass
 "#
+            } else {
+                ""
+            };
+            let cleanup = if capture_plots {
+                let save = python_plot_save(format, captured);
+                PY_PLOT_CLEANUP.replace("__WC_SAVE__", &save)
+            } else {
+                String::new()
+            };
+            // The chunk is compiled as its own module: a module docstring, a `from __future__`
+            // import and anything sharing its line keep the placement Python requires.
+            format!(
+                r#"{prelude}
+{setup}
+_wc_user_path = "{user_str}"
+with open(_wc_user_path, "rb") as _wc_user_file:
+    _wc_user_source = _wc_user_file.read()
+_wc_globals = globals()
+_wc_globals["__file__"] = _wc_user_path
+if _wc_sys.argv:
+    _wc_sys.argv[0] = _wc_user_path
+exec(compile(_wc_user_source, _wc_user_path, "exec"), _wc_globals)
+
+{cleanup}"#
             )
         }
     }
+}
+
+/// Anything unreadable, oversized or malformed yields no tables instead of an error.
+fn read_tables(path: &Path) -> Vec<TabularOutput> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(_) => return Vec::new(),
+    };
+    if !metadata.is_file() || metadata.len() > MAX_TABLES_FILE_BYTES {
+        return Vec::new();
+    }
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(_) => return Vec::new(),
+    };
+    read_tables_from_reader(file, MAX_TABLES_FILE_BYTES, MAX_TOTAL_CELLS)
+}
+
+#[derive(Deserialize)]
+struct RawTables {
+    #[serde(default)]
+    tables: Vec<RawTable>,
+}
+
+#[derive(Deserialize)]
+struct RawTable {
+    #[serde(default)]
+    headers: Vec<String>,
+    #[serde(default)]
+    rows: Vec<Vec<String>>,
+}
+
+/// Read and validate tabular data from a reader under strict byte and cell budgets.
+fn read_tables_from_reader<R: Read>(reader: R, max_bytes: u64, max_cells: usize) -> Vec<TabularOutput> {
+    let mut raw = Vec::new();
+    let mut limited = reader.take(max_bytes.saturating_add(1));
+    if limited.read_to_end(&mut raw).is_err() || raw.len() > max_bytes as usize {
+        return Vec::new();
+    }
+    let payload: RawTables = match serde_json::from_slice(&raw) {
+        Ok(payload) => payload,
+        Err(_) => return Vec::new(),
+    };
+    let tables: Vec<RawTable> = payload.tables.into_iter().take(MAX_TABLES).collect();
+    let mut projected: usize = 0;
+    for table in &tables {
+        let width = table.headers.len().min(MAX_TABLE_COLUMNS);
+        let rows = table.rows.len().min(MAX_TABLE_ROWS);
+        match width.checked_mul(rows).and_then(|cells| projected.checked_add(cells)) {
+            Some(total) => projected = total,
+            None => return Vec::new(),
+        }
+    }
+    if projected > max_cells {
+        return Vec::new();
+    }
+    tables.into_iter().filter_map(normalize_table).collect()
+}
+
+/// Clamp a table to the documented limits and make every row as wide as the headers.
+fn normalize_table(table: RawTable) -> Option<TabularOutput> {
+    let mut headers: Vec<String> = table.headers.into_iter().map(truncate_cell).collect();
+    if headers.is_empty() {
+        return None;
+    }
+    headers.truncate(MAX_TABLE_COLUMNS);
+    let width = headers.len();
+    let rows = table
+        .rows
+        .into_iter()
+        .take(MAX_TABLE_ROWS)
+        .map(|row| {
+            let mut row: Vec<String> = row.into_iter().map(truncate_cell).collect();
+            row.truncate(width);
+            row.resize(width, String::new());
+            row
+        })
+        .collect();
+    Some(TabularOutput { headers, rows })
+}
+
+/// Keep at most [`MAX_CELL_CHARS`] characters, never splitting a UTF-8 sequence.
+fn truncate_cell(text: String) -> String {
+    if text.chars().count() <= MAX_CELL_CHARS {
+        return text;
+    }
+    text.chars().take(MAX_CELL_CHARS).collect()
 }
 
 #[cfg(test)]
