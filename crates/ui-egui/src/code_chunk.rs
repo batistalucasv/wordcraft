@@ -15,7 +15,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use egui::text::LayoutJob;
 use egui::{Align, Align2, Color32, CornerRadius, FontId, Id, Key, Layout, Margin, RichText, Stroke, TextEdit, Ui, pos2, vec2};
@@ -63,6 +63,11 @@ const TABLE_MAX_H: f32 = 300.0;
 /// previews a bounded slice; insertion still carries the whole table.
 const TABLE_PREVIEW_ROWS: usize = 200;
 const TABLE_PREVIEW_COLS: usize = 50;
+
+/// Message shown when someone tries to run a chunk in the browser build, which has no
+/// local R/Python interpreter.
+#[cfg(any(target_arch = "wasm32", test))]
+const BROWSER_NO_INTERPRETER_MESSAGE: &str = "Code chunks run in the desktop app; the browser has no interpreter.";
 
 /// One run's reply from the worker thread: the kernel's result, or why it could not run.
 pub type RunResult = Result<ExecutionResult, wordcraft_kernel::KernelError>;
@@ -179,23 +184,24 @@ pub struct CodeChunk {
     output: Option<ChunkOutput>,
     /// The run in flight, when there is one.
     pending: Option<Receiver<RunResult>>,
-    started: Option<Instant>,
+    /// Monotonic start timestamp from [`crate::clock::now_ms`], in milliseconds.
+    started_ms: Option<f64>,
     /// The plot's texture, decoded on first sight of its bytes.
     plot_texture: Option<egui::TextureHandle>,
+    /// Remembers a failed PNG decode so corrupt bytes are not retried every frame.
+    plot_decode_failed: bool,
+    #[cfg(test)]
+    plot_decode_attempts: usize,
 }
 
 impl CodeChunk {
     /// A chunk in `language` holding `code`, with the source and the drawer closed until needed.
     pub fn new(language: CodeLanguage, code: impl Into<String>) -> Self {
-        let mut code = code.into();
-        if let Some((end, _)) = code.char_indices().nth(MAX_CODE_CHARS) {
-            code.truncate(end);
-        }
         Self {
             id: next_id(),
             language,
             available: interpreter_available(language),
-            code,
+            code: truncate_code(code),
             show_code: true,
             output_open: false,
             tab: OutputTab::Console,
@@ -203,8 +209,11 @@ impl CodeChunk {
             table_index: 0,
             output: None,
             pending: None,
-            started: None,
+            started_ms: None,
             plot_texture: None,
+            plot_decode_failed: false,
+            #[cfg(test)]
+            plot_decode_attempts: 0,
         }
     }
 
@@ -220,21 +229,19 @@ impl CodeChunk {
 
     /// Replace the source, keeping the language and the last output.
     pub fn set_code(&mut self, code: impl Into<String>) {
-        self.code = code.into();
+        self.code = truncate_code(code);
     }
 
-    /// Switch language. The last output belonged to the other interpreter, so it is dropped, and
-    /// a run in flight is abandoned.
+    /// Switch language. The last output belonged to the other interpreter, so it is dropped.
+    /// Does nothing while a run is in flight so a second interpreter cannot run concurrently.
     pub fn set_language(&mut self, language: CodeLanguage) {
-        if self.language == language {
+        if self.language == language || self.is_running() {
             return;
         }
         self.language = language;
         self.available = interpreter_available(language);
-        self.pending = None;
-        self.started = None;
         self.output = None;
-        self.plot_texture = None;
+        self.clear_plot_cache();
     }
 
     /// Whether the interpreter for the current language was found on `PATH`.
@@ -265,7 +272,7 @@ impl CodeChunk {
         self.table_index = 0;
         self.output = Some(output);
         self.output_open = true;
-        self.plot_texture = None;
+        self.clear_plot_cache();
     }
 
     /// Run the chunk now on a worker thread. Does nothing while another run is in flight.
@@ -276,7 +283,7 @@ impl CodeChunk {
         #[cfg(target_arch = "wasm32")]
         {
             let _ = ctx;
-            self.fail("Code chunks run in the desktop app; the browser has no interpreter.");
+            self.run_browser();
         }
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -296,12 +303,7 @@ impl CodeChunk {
             });
             match spawned {
                 Ok(_) => {
-                    self.output = None;
-                    self.plot_texture = None;
-                    self.output_open = true;
-                    self.tab = OutputTab::Console;
-                    self.pending = Some(rx);
-                    self.started = Some(Instant::now());
+                    self.begin_pending(rx);
                     ctx.request_repaint_after(Duration::from_millis(50));
                 }
                 Err(e) => self.fail(format!("The code runner could not start: {e}")),
@@ -311,14 +313,34 @@ impl CodeChunk {
 
     /// Show a run whose result will arrive on `rx`, from a host that executes chunks itself (an
     /// engine command). The widget then shows the spinner and applies the result exactly as Run
-    /// does.
+    /// does. Does nothing while another run is in flight.
     pub fn attach_run(&mut self, rx: Receiver<RunResult>) {
+        if self.is_running() {
+            return;
+        }
+        self.begin_pending(rx);
+    }
+
+    #[cfg(any(target_arch = "wasm32", test))]
+    fn run_browser(&mut self) {
+        if self.is_running() {
+            return;
+        }
+        self.fail(BROWSER_NO_INTERPRETER_MESSAGE);
+    }
+
+    fn begin_pending(&mut self, rx: Receiver<RunResult>) {
         self.output = None;
-        self.plot_texture = None;
+        self.clear_plot_cache();
         self.output_open = true;
         self.tab = OutputTab::Console;
         self.pending = Some(rx);
-        self.started = Some(Instant::now());
+        self.started_ms = Some(crate::clock::now_ms());
+    }
+
+    fn clear_plot_cache(&mut self) {
+        self.plot_texture = None;
+        self.plot_decode_failed = false;
     }
 
     /// Draw the chunk, returning the action the host must take, if any.
@@ -369,8 +391,8 @@ impl CodeChunk {
             None => ctx.request_repaint_after(Duration::from_millis(50)),
             Some(Some(result)) => {
                 self.pending = None;
-                self.started = None;
-                self.plot_texture = None;
+                self.started_ms = None;
+                self.clear_plot_cache();
                 match result {
                     Ok(result) => self.set_output(ChunkOutput::from_result(&result)),
                     Err(e) => self.fail(e.to_string()),
@@ -378,7 +400,7 @@ impl CodeChunk {
             }
             Some(None) => {
                 self.pending = None;
-                self.started = None;
+                self.started_ms = None;
                 self.fail("The code runner stopped before it reported a result.");
             }
         }
@@ -388,7 +410,7 @@ impl CodeChunk {
         self.output = Some(ChunkOutput::error(message));
         self.output_open = true;
         self.tab = OutputTab::Console;
-        self.plot_texture = None;
+        self.clear_plot_cache();
     }
 
     fn header(&mut self, ui: &mut Ui, t: &Tokens) {
@@ -402,21 +424,25 @@ impl CodeChunk {
             ui,
             |ui| {
                 ui.horizontal(|ui| {
-                    let badge = ui.add(
-                        egui::Button::new(RichText::new(format!("[ {} ]", language_name(current))).monospace().color(t.on_accent))
-                            .fill(t.accent)
-                            .corner_radius(CornerRadius::same(4))
-                            .min_size(vec2(0.0, 21.0)),
-                    );
-                    badge.clone().on_hover_text(crate::tl!("Choose the chunk's language"));
-                    crate::rtl::menu(&badge).show(|ui| {
-                        for language in [CodeLanguage::R, CodeLanguage::Python] {
-                            if ui.selectable_label(current == language, language_name(language)).clicked() {
-                                picked = Some(language);
-                                ui.close();
+                    let badge = ui
+                        .add_enabled(
+                            !self.is_running(),
+                            egui::Button::new(RichText::new(format!("[ {} ]", language_name(current))).monospace().color(t.on_accent))
+                                .fill(t.accent)
+                                .corner_radius(CornerRadius::same(4))
+                                .min_size(vec2(0.0, 21.0)),
+                        )
+                        .on_hover_text(crate::tl!("Choose the chunk's language"));
+                    if !self.is_running() {
+                        crate::rtl::menu(&badge).show(|ui| {
+                            for language in [CodeLanguage::R, CodeLanguage::Python] {
+                                if ui.selectable_label(current == language, language_name(language)).clicked() {
+                                    picked = Some(language);
+                                    ui.close();
+                                }
                             }
-                        }
-                    });
+                        });
+                    }
 
                     let arrow = if self.show_code { "▾" } else { "▸" };
                     if ui.add(egui::Button::new(RichText::new(arrow).color(t.text_dim)).frame(false)).clicked() {
@@ -434,7 +460,7 @@ impl CodeChunk {
                                 toggle_code = true;
                                 ui.close();
                             }
-                            if ui.add_enabled(self.output.is_some(), egui::Button::new(crate::tl!("Clear output"))).clicked() {
+                            if ui.add_enabled(self.output.is_some() && !self.is_running(), egui::Button::new(crate::tl!("Clear output"))).clicked() {
                                 clear = true;
                                 ui.close();
                             }
@@ -470,7 +496,10 @@ impl CodeChunk {
                             ui.label(RichText::new(text).color(color).size(11.5));
                         } else if self.is_running() {
                             ui.add(egui::Spinner::new().size(14.0));
-                            let secs = self.started.map_or(0.0, |started| started.elapsed().as_secs_f32());
+                            let secs = self.started_ms.map_or(0.0, |started| {
+                                let elapsed = (crate::clock::now_ms() - started) / 1000.0;
+                                if elapsed.is_finite() { elapsed.max(0.0) as f32 } else { 0.0 }
+                            });
                             ui.label(RichText::new(format!("{} {secs:.1} s", crate::tl!("Running…"))).color(t.text_dim).size(11.5));
                             ui.ctx().request_repaint_after(Duration::from_millis(100));
                         }
@@ -484,11 +513,9 @@ impl CodeChunk {
         if toggle_code {
             self.show_code = !self.show_code;
         }
-        if clear {
+        if clear && !self.is_running() {
             self.output = None;
-            self.plot_texture = None;
-            self.pending = None;
-            self.started = None;
+            self.clear_plot_cache();
         }
         if copy {
             ui.ctx().copy_text(self.code.clone());
@@ -638,10 +665,17 @@ impl CodeChunk {
             ui.label(RichText::new(crate::tl!("This run captured no plot.")).color(t.text_dim).size(12.0));
             return;
         }
-        if self.plot_texture.is_none() {
-            let png = output.plot_png.clone();
-            if let Some(png) = png {
-                self.plot_texture = decode_plot(ui.ctx(), &png, self.id);
+        if self.plot_texture.is_none()
+            && !self.plot_decode_failed
+            && let Some(png) = output.plot_png.as_deref()
+        {
+            #[cfg(test)]
+            {
+                self.plot_decode_attempts += 1;
+            }
+            self.plot_texture = decode_plot(ui.ctx(), png, self.id);
+            if self.plot_texture.is_none() {
+                self.plot_decode_failed = true;
             }
         }
 
@@ -906,6 +940,15 @@ fn language_name(language: CodeLanguage) -> &'static str {
         CodeLanguage::R => "R",
         CodeLanguage::Python => "Python",
     }
+}
+
+/// Keep at most [`MAX_CODE_CHARS`] characters, cutting on a UTF-8 boundary.
+fn truncate_code(code: impl Into<String>) -> String {
+    let mut code = code.into();
+    if let Some((end, _)) = code.char_indices().nth(MAX_CODE_CHARS) {
+        code.truncate(end);
+    }
+    code
 }
 
 /// Cut a stream to what the console lays out, at a character boundary.
