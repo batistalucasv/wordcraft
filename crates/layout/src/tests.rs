@@ -16374,3 +16374,90 @@ fn chunk_heights_reserve_vertical_space_and_push_following_blocks() {
         "top-level block 0 must stay intact"
     );
 }
+
+#[test]
+fn mounted_chunk_clears_contextual_spacing_and_rechecks_short_columns() {
+    use wordcraft_doc::section::{Columns, SectionStart};
+    use wordcraft_doc::{CodeChunk, Document, Paragraph, SectionProps, para_block};
+
+    // 1. Contextual spacing above a chunk must not consume space_after from the paragraph above
+    //    and make the paragraph below overlap the mounted chunk.
+    let mut d = Document::new();
+    let mut p_above = Paragraph::with_text("Above", Default::default());
+    p_above.props.space_after = Some(40.0);
+    p_above.props.contextual_spacing = Some(true);
+    let mut p_below = Paragraph::with_text("Below", Default::default());
+    p_below.props.contextual_spacing = Some(true);
+    d.body = vec![para_block(p_above)];
+    let cid = d.push_chunk(&CodeChunk::new("r", "x <- 1")).unwrap();
+    d.body.push(para_block(p_below));
+
+    let mut opts = LayoutOptions::default();
+    opts.chunk_heights.insert(cid, 6_000); // 60 pt
+    let laid = layout(&d, &mut LayoutCache::new(), &opts);
+    let chunk_rect = laid.pages[0]
+        .items
+        .iter()
+        .find_map(|it| match it {
+            Placed::Chunk { id, rect, .. } if *id == cid => Some(*rect),
+            _ => None,
+        })
+        .expect("mounted chunk");
+    let below_y = laid.pages[0]
+        .items
+        .iter()
+        .find_map(|it| match it {
+            Placed::Lines { path, y, .. } if path.0 == [2] => Some(*y),
+            _ => None,
+        })
+        .expect("below paragraph");
+    assert!(
+        below_y >= chunk_rect.bottom() - 0.1,
+        "paragraph below chunk ({below_y}) must not overlap chunk bottom ({}) via stale contextual spacing",
+        chunk_rect.bottom()
+    );
+
+    // 2. In a mid-page continuous 2-column section where neither shortened column can hold the
+    //    chunk, advancing from column 0 to column 1 must recheck available space and move the
+    //    chunk onto page 2 instead of overflowing past the bottom margin.
+    let mut cols_doc = Document::new();
+    let mut s1_paras = Vec::new();
+    for i in 0..30 {
+        let mut p = Paragraph::with_text(&format!("Lead {i}"), Default::default());
+        p.props.space_after = Some(6.0);
+        if i == 29 {
+            let s1 = SectionProps { page_h: 792.0, margin_top: 72.0, margin_bottom: 72.0, ..Default::default() };
+            p.section = Some(Box::new(s1));
+        }
+        s1_paras.push(para_block(p));
+    }
+    cols_doc.body = s1_paras;
+    let tall_id = cols_doc.push_chunk(&CodeChunk::new("python", "plot(1)")).unwrap();
+    cols_doc.last_section.page_h = 792.0;
+    cols_doc.last_section.margin_top = 72.0;
+    cols_doc.last_section.margin_bottom = 72.0;
+    cols_doc.last_section.start = SectionStart::Continuous;
+    cols_doc.last_section.columns = Columns { count: 2, space: 24.0, separator: false, widths: Vec::new() };
+
+    let mut tall_opts = LayoutOptions::default();
+    tall_opts.chunk_heights.insert(tall_id, 30_000); // 300 pt
+    let cols_laid = layout(&cols_doc, &mut LayoutCache::new(), &tall_opts);
+    let (chunk_page, chunk_rect) = cols_laid
+        .pages
+        .iter()
+        .enumerate()
+        .find_map(|(pi, page)| {
+            page.items.iter().find_map(|it| match it {
+                Placed::Chunk { id, rect, .. } if *id == tall_id => Some((pi, *rect)),
+                _ => None,
+            })
+        })
+        .expect("tall chunk placed");
+    assert_eq!(chunk_page, 1, "chunk too tall for shortened continuous columns must move to page 2");
+    assert!(
+        chunk_rect.bottom() <= cols_laid.pages[chunk_page].body.bottom() + 0.5,
+        "placed chunk ({}) must stay inside page body bottom ({})",
+        chunk_rect.bottom(),
+        cols_laid.pages[chunk_page].body.bottom()
+    );
+}

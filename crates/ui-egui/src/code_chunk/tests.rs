@@ -347,3 +347,65 @@ fn a_wide_table_previews_fifty_columns_and_says_so() {
     assert!(harness.query_by_label_contains("Showing the first").is_some(), "the drawer says the grid is a preview");
     assert!(harness.query_by_label_contains("c49").is_some(), "the last previewed column is drawn");
 }
+
+#[test]
+fn set_language_updates_in_read_mode_and_poll_carries_completed_output() {
+    let mut chunk = python();
+    chunk.read_only = true;
+    chunk.set_language(CodeLanguage::R);
+    assert_eq!(chunk.language(), CodeLanguage::R, "host sync must update language even in Read Mode");
+
+    let ctx = egui::Context::default();
+    let (tx, rx) = mpsc::channel();
+    chunk.pending = Some(rx);
+    chunk.pending_source = Some((CodeLanguage::R, "1 + 1".into()));
+    chunk.started = Some(Instant::now());
+    tx.send(Ok(result("[1] 2", None))).unwrap();
+
+    let completed = chunk.poll(&ctx).expect("completed run record");
+    chunk.set_language(CodeLanguage::Python);
+    assert_eq!(completed.language, CodeLanguage::R);
+    assert_eq!(completed.code, "1 + 1");
+    assert_eq!(completed.output.stdout, "[1] 2");
+    assert!(chunk.output().is_none(), "language switch still drops widget's displayed output");
+}
+
+#[test]
+fn embedded_chunk_emits_run_and_clear_requests_and_explains_svg_only_plot() {
+    let mut chunk = python();
+    chunk.set_output(ChunkOutput { plot_svg: Some("<svg xmlns=\"http://www.w3.org/2000/svg\"/>".into()), success: true, ..ChunkOutput::default() });
+    let mut fonts = false;
+    let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(760.0, 620.0)).build_ui_state(
+        move |ui, (chunk, saw_run, saw_clear): &mut (CodeChunk, bool, bool)| {
+            if !fonts {
+                crate::theme::install_fonts_for(ui.ctx(), false);
+                fonts = true;
+            }
+            ui.set_width(720.0);
+            let frame = chunk.show_embedded(ui);
+            *saw_run |= frame.run_requested;
+            *saw_clear |= frame.clear_requested;
+        },
+        (chunk, false, false),
+    );
+    for _ in 0..3 {
+        h.step();
+    }
+    assert!(
+        h.query_by_label_contains("Inline insertion requires a PNG").is_some(),
+        "SVG-only fallback must tell users to rerun with PNG or both formats"
+    );
+
+    h.get_by_label("▶ Run").click();
+    h.step();
+    assert!(h.state().1, "embedded Run button must emit run_requested without starting directly");
+    assert!(!h.state().0.is_running());
+
+    h.get_by_label("Options").click();
+    for _ in 0..2 {
+        h.step();
+    }
+    h.get_by_label("Clear output").click();
+    h.step();
+    assert!(h.state().2, "embedded header Clear output must emit clear_requested");
+}

@@ -19,6 +19,8 @@ pub(crate) struct Parked {
     autosave_path: Option<std::path::PathBuf>,
     /// Comment and reply text typed in this document and not yet written to it.
     comment_drafts: panes::CommentDrafts,
+    /// Code chunk edits typed in this document and not yet flushed into it.
+    chunk_drafts: crate::canvas::code_chunks::ChunkDrafts,
 }
 
 impl WordApp {
@@ -54,7 +56,7 @@ impl WordApp {
             return;
         }
         let left = std::mem::replace(&mut self.shown_document, id);
-        let seen = self.carry_document_state(left, id);
+        let seen = self.carry_document_state_with_canvas(left, id, true);
         self.window_shows(id);
 
         self.canvas.show_other_document(seen);
@@ -92,6 +94,10 @@ impl WordApp {
     /// dropped, if it was closed or replaced) and `to`'s comes back. Makes `to` the session's
     /// active document. Returns whether `to` had state put aside.
     pub(crate) fn carry_document_state(&mut self, from: u64, to: u64) -> bool {
+        self.carry_document_state_with_canvas(from, to, false)
+    }
+
+    fn carry_document_state_with_canvas(&mut self, from: u64, to: u64, same_canvas: bool) -> bool {
         if self.session.document_id() != to
             && let Err(e) = self.session.switch_document(to)
         {
@@ -100,7 +106,8 @@ impl WordApp {
         if from == to {
             return false;
         }
-        let leaving = Parked { autosave_path: self.autosave_path.take(), comment_drafts: std::mem::take(&mut self.comment_drafts) };
+        let chunk_drafts = if same_canvas { crate::canvas::code_chunks::take_dirty_drafts(self) } else { Default::default() };
+        let leaving = Parked { autosave_path: self.autosave_path.take(), comment_drafts: std::mem::take(&mut self.comment_drafts), chunk_drafts };
         if self.session.is_open(from) {
             self.parked.insert(from, leaving);
         }
@@ -109,6 +116,11 @@ impl WordApp {
         let back = back.unwrap_or_default();
         self.autosave_path = back.autosave_path;
         self.comment_drafts = back.comment_drafts;
+        if same_canvas {
+            self.canvas.code_chunks.restored_drafts = back.chunk_drafts;
+        } else if !back.chunk_drafts.is_empty() {
+            self.canvas.code_chunks.restored_drafts.extend(back.chunk_drafts);
+        }
         let session = &self.session;
         self.parked.retain(|d, _| session.is_open(*d));
         seen
@@ -165,7 +177,9 @@ impl WordApp {
     pub(crate) fn document_unsaved_by_id(&self, id: u64) -> bool {
         let dirty = self.session.document_dirty(id);
         let unconfirmed = self.saves_in_flight.iter().any(|s| s.marked_saved && s.document == id);
-        let dirty_chunks = id == self.session.document_id() && crate::canvas::code_chunks::has_dirty_chunks(self);
+        let dirty_chunks = (id == self.session.document_id() && crate::canvas::code_chunks::has_dirty_chunks(self))
+            || self.windows.has_dirty_chunks_for(id)
+            || self.parked.get(&id).is_some_and(|p| !p.chunk_drafts.is_empty());
         dirty || unconfirmed || dirty_chunks
     }
 

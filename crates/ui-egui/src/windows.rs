@@ -199,6 +199,11 @@ impl Windows {
         ids
     }
 
+    /// Whether any non-shown window displaying `doc` holds unapplied code chunk drafts.
+    pub(crate) fn has_dirty_chunks_for(&self, doc: u64) -> bool {
+        self.open.iter().any(|w| w.doc == doc && w.ui.as_ref().is_some_and(|ui| ui.canvas.code_chunks.has_dirty()))
+    }
+
     /// The title View › Window › Switch Windows gives the window, as the frame started.
     fn menu_title(&self, key: u64) -> Option<&str> {
         self.menu.title(self.get(key)?.id?)

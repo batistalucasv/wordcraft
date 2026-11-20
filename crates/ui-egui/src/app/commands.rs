@@ -66,6 +66,7 @@ impl WordApp {
             return Ok(json!({"pending": "saveChanges"}));
         }
         if !discards_document(id, &params)
+            && id != "file.open"
             && let Some(err) = chunk_refused
         {
             self.status(err.clone());
@@ -122,17 +123,16 @@ impl WordApp {
     /// Run a command for a script or an agent (control channel, MCP bridge): never asks first.
     /// UI-level commands (`ui.*`) are handled here, the rest by the engine.
     pub fn execute(&mut self, id: &str, params: Value) -> Result<Value, String> {
-        if matches!(
+        if matches!(id, "edit.undo" | "edit.redo") {
+            let _ = crate::canvas::code_chunks::flush_dirty(self);
+            if id == "edit.undo" && !self.session.can_undo() && crate::canvas::code_chunks::has_dirty_chunks(self) {
+                crate::canvas::code_chunks::revert_dirty_chunks(self);
+                self.after_command(id);
+                return Ok(json!({"undone": true}));
+            }
+        } else if matches!(
             id,
-            "edit.undo"
-                | "edit.redo"
-                | "file.save"
-                | "file.saveAs"
-                | "file.exportPdf"
-                | "file.exportPng"
-                | "code.run_chunk"
-                | "code.run_all"
-                | "code.delete_chunk"
+            "file.save" | "file.saveAs" | "file.exportPdf" | "file.exportPng" | "code.run_chunk" | "code.run_all" | "code.delete_chunk"
         ) && let Err(err) = crate::canvas::code_chunks::flush_dirty(self)
         {
             self.status(err.clone());
@@ -410,14 +410,22 @@ impl WordApp {
                 self.status(err.clone());
                 Err(err)
             } else {
-                crate::canvas::code_chunks::run_chunk_async(self, &params, self.ctx.clone().as_ref())
+                let res = crate::canvas::code_chunks::run_chunk_async(self, &params, self.ctx.clone().as_ref());
+                if let Err(err) = &res {
+                    self.status(err.clone());
+                }
+                res
             }
         } else if id == "code.run_all" {
             if let Err(err) = crate::canvas::code_chunks::flush_dirty(self) {
                 self.status(err.clone());
                 Err(err)
             } else {
-                crate::canvas::code_chunks::run_all_async(self, &params, self.ctx.clone().as_ref())
+                let res = crate::canvas::code_chunks::run_all_async(self, &params, self.ctx.clone().as_ref());
+                if let Err(err) = &res {
+                    self.status(err.clone());
+                }
+                res
             }
         } else {
             self.execute(id, params)

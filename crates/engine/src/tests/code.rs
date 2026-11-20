@@ -734,10 +734,12 @@ fn update_chunk_clamps_caret_on_utf8_boundary() {
     let mut s = s();
     let id = chunk_id(&run(&mut s, "code.insert_chunk", json!({"language": "python", "code": "abcdef"})));
     let range = chunks::chunks_in(&s.doc, StoryRef::Body).into_iter().find(|r| r.chunk.id == Some(id)).expect("chunk");
-    let code_block = range.start.path.last() + 1;
-    // Byte offset 3 sits strictly inside the 4-byte emoji '😀' once updated to "z😀".
-    s.sel = Selection::caret(wordcraft_doc::Pos::body(code_block, 3));
-    run(&mut s, "code.update_chunk", json!({"chunkId": id, "language": "python", "code": "z😀"}));
-    let p = s.doc.para(StoryRef::Body, &wordcraft_doc::Path::top(s.sel.focus.path.last())).expect("caret paragraph");
+    // Paragraph text has a leading 3-byte U+FFFC marker: "\u{FFFC}z😀" has 'z' at 3..4 and '😀' at 4..8.
+    // Offset 6 is valid in "\u{FFFC}abcdef\u{FFFC}" and lands strictly inside '😀' after replacement.
+    s.sel = Selection::caret(wordcraft_doc::Pos::new(StoryRef::Body, range.start.path.clone(), 6));
+    let out = run(&mut s, "code.update_chunk", json!({"chunkId": id, "language": "python", "code": "z😀"}));
+    let returned_off = out["focus"]["off"].as_u64().expect("returned focus offset") as usize;
+    let p = s.doc.para(StoryRef::Body, &range.start.path).expect("chunk source paragraph");
+    assert!(p.text.is_char_boundary(returned_off), "command-returned caret offset {returned_off} must land on a UTF-8 boundary of {:?}", p.text);
     assert!(p.text.is_char_boundary(s.sel.focus.off), "remapped caret offset {} must land on a UTF-8 boundary of {:?}", s.sel.focus.off, p.text);
 }

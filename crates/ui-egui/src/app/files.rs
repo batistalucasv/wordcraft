@@ -207,9 +207,10 @@ impl WordApp {
         if !self.has_unsaved_documents() {
             return true;
         }
-        // A comment draft the document refuses is an unsaved change: the prompt can drop it.
+        // A comment or chunk draft the document refuses is an unsaved change: the prompt can drop it.
         if self.has_document() {
             let _ = panes::flush_comment_drafts(self);
+            let _ = crate::canvas::code_chunks::flush_dirty(self);
         }
         if !self.has_unsaved_documents() {
             return true;

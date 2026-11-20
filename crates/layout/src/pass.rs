@@ -397,12 +397,13 @@ fn mounted_chunks(doc: &Document, heights: &std::collections::BTreeMap<i64, u32>
 }
 
 fn place_chunk(ctx: &mut Ctx, pb: &mut PageBuilder, id: i64, first: usize, last: usize, h: f32, body_top: f32) {
+    pb.prev = None;
     if ctx.doc.body.get(first).and_then(|b| b.as_para()).is_some_and(|p| ctx.doc.styles.resolve_para(&p.props).page_break_before) && !pb.at_top() {
         pb.new_page(first, body_top);
         ctx.fields.page = pb.number;
     }
     let mut top_gap = if pb.at_top() { 0.0 } else { 4.0 };
-    if !pb.fresh() && pb.y + top_gap + h > pb.bottom + 0.5 {
+    while !pb.fresh() && pb.y + top_gap + h > pb.bottom + 0.5 {
         pb.advance(first, body_top);
         ctx.fields.page = pb.number;
         top_gap = 0.0;

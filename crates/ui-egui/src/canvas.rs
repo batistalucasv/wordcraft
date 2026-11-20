@@ -358,6 +358,7 @@ impl CanvasState {
             last_font_color: old.last_font_color,
             last_shading: old.last_shading,
             ime_faces: old.ime_faces,
+            code_chunks: code_chunks::CodeChunksState::with_restored_drafts(old.code_chunks.restored_drafts),
             tab_kind: old.tab_kind,
             scale: old.scale,
             canvas_rect: old.canvas_rect,

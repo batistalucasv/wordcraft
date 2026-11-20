@@ -189,13 +189,24 @@ fn timeout_ms(v: &Value) -> u64 {
     p::u64(v, "timeoutMs").unwrap_or(chunks::DEFAULT_TIMEOUT_MS).clamp(chunks::MIN_TIMEOUT_MS, chunks::MAX_TIMEOUT_MS)
 }
 
+pub fn parse_plot_option(v: &Value, default: Option<PlotFormat>) -> Result<Option<PlotFormat>, CmdError> {
+    match v.get("plot") {
+        None | Some(Value::Null) => Ok(default),
+        Some(Value::String(s)) => match s.as_str() {
+            "none" => Ok(None),
+            "png" => Ok(Some(PlotFormat::Png)),
+            "svg" => Ok(Some(PlotFormat::Svg)),
+            "both" => Ok(Some(PlotFormat::Both)),
+            other => Err(CmdError::Params(format!("plot: expected \"png\", \"svg\", \"both\" or \"none\", not `{other}`"))),
+        },
+        Some(_) => Err(CmdError::Params("plot: expected \"png\", \"svg\", \"both\" or \"none\"".into())),
+    }
+}
+
 fn plot_option(v: &Value) -> Result<(bool, PlotFormat), CmdError> {
-    match p::str(v, "plot").unwrap_or("png") {
-        "none" => Ok((false, PlotFormat::Png)),
-        "png" => Ok((true, PlotFormat::Png)),
-        "svg" => Ok((true, PlotFormat::Svg)),
-        "both" => Ok((true, PlotFormat::Both)),
-        other => Err(CmdError::Params(format!("plot: expected \"png\", \"svg\", \"both\" or \"none\", not `{other}`"))),
+    match parse_plot_option(v, Some(PlotFormat::Png))? {
+        None => Ok((false, PlotFormat::Png)),
+        Some(fmt) => Ok((true, fmt)),
     }
 }
 
