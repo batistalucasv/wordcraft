@@ -285,7 +285,18 @@ fn is_executable_file(path: &Path) -> bool {
     if !metadata.is_file() {
         return false;
     }
-    #[cfg(unix)]
+    #[cfg(all(unix, not(any(target_os = "android", target_os = "redox"))))]
+    {
+        use nix::fcntl::AtFlags;
+        use nix::unistd::{AccessFlags, faccessat};
+        faccessat(None, path, AccessFlags::X_OK, AtFlags::AT_EACCESS).is_ok()
+    }
+    #[cfg(target_os = "android")]
+    {
+        use nix::unistd::{AccessFlags, access};
+        access(path, AccessFlags::X_OK).is_ok()
+    }
+    #[cfg(target_os = "redox")]
     {
         use std::os::unix::fs::PermissionsExt;
         metadata.permissions().mode() & 0o111 != 0
