@@ -603,3 +603,21 @@ fn run_all_runs_copied_empty_options_chunk_with_fresh_id() {
     assert_eq!(out["success"], true);
     assert_eq!(out["chunks"][0]["output"]["stdout"], "ran print(1)");
 }
+
+#[test]
+fn run_all_skips_copied_exact_budget_eval_false_chunk_with_echo() {
+    let mut s = s();
+    let eval_exact = format!("false #{}", "x".repeat(990));
+    let old_id =
+        chunk_id(&run(&mut s, "code.insert_chunk", json!({"language": "r", "code": "danger()", "options": {"eval": eval_exact, "echo": false}})));
+
+    let start = s.doc.control_ranges(StoryRef::Body)[0].start.clone();
+    s.doc.control_mut(&start).unwrap().id = Some(old_id + 77);
+    s.doc.remove_custom_prop(&wordcraft_doc::chunk::chunk_prop_name(old_id));
+
+    let fake = fake(&mut s);
+    let out = run(&mut s, "code.run_all", json!({}));
+    assert!(fake.seen.lock().unwrap().is_empty(), "exact-budget copied eval: false chunk must never execute");
+    assert_eq!(out["chunks"][0]["chunk"]["skipped"], "eval: false");
+    assert_eq!(out["success"], true);
+}

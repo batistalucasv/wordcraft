@@ -349,35 +349,11 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// Encode `language` and `options` into a `w:tag` string within [`MAX_CONTROL_TEXT`] chars.
-fn encode_control_tag(language: &str, options: &ChunkOptions) -> String {
-    let lang = if language.is_empty() { "text" } else { language };
-    let mut prefix = String::with_capacity(CHUNK_TAG.len() + lang.len() + 2);
-    prefix.push_str(CHUNK_TAG);
-    prefix.push_str(lang);
-    prefix.push('?');
-    if options.is_empty() {
-        return prefix;
-    }
-
-    let max_body = MAX_CONTROL_TEXT.saturating_sub(prefix.len());
+fn encode_tag_pairs(ordered: &[(&str, &str)], max_body: usize, options: &ChunkOptions) -> (String, bool) {
     let mut body = String::new();
-    let mut pair_ends: Vec<usize> = Vec::new();
     let mut truncated = false;
 
-    let mut ordered: Vec<(&str, &str)> = Vec::with_capacity(options.len());
-    for &key in PRIORITY_TAG_OPTIONS {
-        if let Some(val) = options.get(key) {
-            ordered.push((key, val));
-        }
-    }
-    for (key, val) in options.iter() {
-        if !PRIORITY_TAG_OPTIONS.contains(&key) {
-            ordered.push((key, val));
-        }
-    }
-
-    for (key, val) in ordered {
+    for &(key, val) in ordered {
         let sep = usize::from(!body.is_empty());
         let key_len = encoded_len(key);
         let val_len = encoded_len(val);
@@ -389,7 +365,6 @@ fn encode_control_tag(language: &str, options: &ChunkOptions) -> String {
             push_percent_encoded(&mut body, key);
             body.push('=');
             push_percent_encoded(&mut body, val);
-            pair_ends.push(body.len());
             continue;
         }
 
@@ -408,21 +383,47 @@ fn encode_control_tag(language: &str, options: &ChunkOptions) -> String {
                 push_percent_encoded(&mut body, key);
                 body.push('=');
                 body.push_str(compact);
-                pair_ends.push(body.len());
             }
         }
     }
 
-    if truncated {
-        // Reserve 1 byte for the `!` truncation marker directly after `?`.
-        let max_truncated_body = max_body.saturating_sub(1);
-        while body.len() > max_truncated_body {
-            pair_ends.pop();
-            body.truncate(pair_ends.last().copied().unwrap_or(0));
-        }
-        prefix.push('!');
+    (body, truncated)
+}
+
+/// Encode `language` and `options` into a `w:tag` string within [`MAX_CONTROL_TEXT`] chars.
+fn encode_control_tag(language: &str, options: &ChunkOptions) -> String {
+    let lang = if language.is_empty() { "text" } else { language };
+    let mut prefix = String::with_capacity(CHUNK_TAG.len() + lang.len() + 2);
+    prefix.push_str(CHUNK_TAG);
+    prefix.push_str(lang);
+    prefix.push('?');
+    if options.is_empty() {
+        return prefix;
     }
-    prefix.push_str(&body);
+
+    let max_body = MAX_CONTROL_TEXT.saturating_sub(prefix.len());
+    let mut ordered: Vec<(&str, &str)> = Vec::with_capacity(options.len());
+    for &key in PRIORITY_TAG_OPTIONS {
+        if let Some(val) = options.get(key) {
+            ordered.push((key, val));
+        }
+    }
+    for (key, val) in options.iter() {
+        if !PRIORITY_TAG_OPTIONS.contains(&key) {
+            ordered.push((key, val));
+        }
+    }
+
+    let (body, truncated) = encode_tag_pairs(&ordered, max_body, options);
+    if truncated {
+        // Reserve 1 byte for `!` before encoding so an exact-budget `eval` compacts rather than
+        // getting popped after filling `max_body`.
+        let (truncated_body, _) = encode_tag_pairs(&ordered, max_body.saturating_sub(1), options);
+        prefix.push('!');
+        prefix.push_str(&truncated_body);
+    } else {
+        prefix.push_str(&body);
+    }
     prefix
 }
 
@@ -992,6 +993,29 @@ mod tests {
         let refs = doc.chunk_refs(StoryRef::Body);
         assert!(!refs[0].chunk.options.eval());
         assert_eq!(refs[0].chunk.options.flag("warning"), Some(false));
+        assert!(!doc.chunk_options_missing(&refs[0]));
+    }
+
+    #[test]
+    fn exact_budget_eval_with_overflow_option_keeps_eval_false_on_copy() {
+        let mut doc = Document::new();
+        let mut c = CodeChunk::new("r", "stop('boom')");
+        // `wordcraft:chunk:r?` (18) + `eval=` (5) + `false%20%23` (11) + 990 `'x'` = 1024 == MAX_CONTROL_TEXT.
+        c.options.set("eval", format!("false #{}", "x".repeat(990)));
+        c.options.set("echo", "false");
+        let old_id = doc.push_chunk(&c).unwrap();
+
+        let range = &doc.control_ranges(StoryRef::Body)[0];
+        assert!(range.control.tag.chars().count() <= MAX_CONTROL_TEXT);
+        assert!(range.control.tag.starts_with("wordcraft:chunk:r?!"), "{}", range.control.tag);
+
+        let start = range.start.clone();
+        doc.control_mut(&start).unwrap().id = Some(old_id + 200);
+        doc.remove_custom_prop(&chunk_prop_name(old_id));
+
+        let refs = doc.chunk_refs(StoryRef::Body);
+        assert!(!refs[0].chunk.options.eval());
+        assert!(!refs[0].chunk.options.echo());
         assert!(!doc.chunk_options_missing(&refs[0]));
     }
 
