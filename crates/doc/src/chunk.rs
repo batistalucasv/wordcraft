@@ -678,7 +678,6 @@ impl Document {
         if found.chunk.language == effective_lang && found.chunk.code == code {
             return Ok(false);
         }
-        let new_tag = encode_control_tag(effective_lang, &found.chunk.options);
 
         if found.start.story != found.end.story || found.start.path.parent() != found.end.path.parent() {
             return Ok(false);
@@ -702,6 +701,10 @@ impl Document {
             return Ok(false);
         };
 
+        let new_tag = match control.tag.split_once('?') {
+            Some((_, suffix)) => format!("{CHUNK_TAG}{effective_lang}?{suffix}"),
+            None => format!("{CHUNK_TAG}{effective_lang}"),
+        };
         control.tag = new_tag;
         let mut updated = CodeChunk::new(effective_lang, code);
         updated.options = found.chunk.options.clone();
@@ -1178,5 +1181,28 @@ mod tests {
             panic!("expected Complete");
         };
         assert_eq!(opts.get("k"), Some("\u{FFFD} v"));
+    }
+
+    #[test]
+    fn update_chunk_preserves_missing_options_on_legacy_chunk() {
+        let mut doc = Document::new();
+        let chunk = CodeChunk::new("python", "x = 1");
+        let id = doc.push_chunk(&chunk).unwrap();
+        // Turn into a legacy chunk: strip tag query and custom property.
+        let range = &doc.control_ranges(StoryRef::Body)[0];
+        let start = range.start.clone();
+        doc.control_mut(&start).unwrap().tag = "wordcraft:chunk:python".to_string();
+        doc.remove_custom_prop(&chunk_prop_name(id));
+
+        let refs = doc.chunk_refs(StoryRef::Body);
+        assert!(doc.chunk_options_missing(&refs[0]));
+
+        let updated = doc.update_chunk(id, "r", "y = 2").unwrap();
+        assert!(updated);
+
+        let after_refs = doc.chunk_refs(StoryRef::Body);
+        assert_eq!(after_refs[0].chunk.language, "r");
+        assert_eq!(after_refs[0].chunk.code, "y = 2");
+        assert!(doc.chunk_options_missing(&after_refs[0]), "legacy chunk without options query or property must retain missing options status");
     }
 }

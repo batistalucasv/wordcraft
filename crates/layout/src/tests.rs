@@ -16461,3 +16461,31 @@ fn mounted_chunk_clears_contextual_spacing_and_rechecks_short_columns() {
         cols_laid.pages[chunk_page].body.bottom()
     );
 }
+
+#[test]
+fn oversized_chunk_taller_than_page_clamped_to_page_height_without_endless_advance() {
+    let mut doc = Document::new();
+    let id = doc.push_chunk(&wordcraft_doc::CodeChunk::new("python", "x = 1")).unwrap();
+    let mut opts = LayoutOptions::default();
+    // 100,000 centipts = 1000 pt, which exceeds standard letter page height (792 pt).
+    opts.chunk_heights.insert(id, 100_000);
+    let laid = layout(&doc, &mut LayoutCache::new(), &opts);
+    assert!(!laid.pages.is_empty(), "layout must terminate with pages");
+    let (chunk_page, chunk_rect) = laid
+        .pages
+        .iter()
+        .enumerate()
+        .find_map(|(pi, page)| {
+            page.items.iter().find_map(|it| match it {
+                Placed::Chunk { id: cid, rect, .. } if *cid == id => Some((pi, *rect)),
+                _ => None,
+            })
+        })
+        .expect("oversized chunk must be placed");
+    assert!(
+        chunk_rect.bottom() <= laid.pages[chunk_page].body.bottom() + 0.5,
+        "oversized chunk bottom ({}) must be clamped within page body bottom ({})",
+        chunk_rect.bottom(),
+        laid.pages[chunk_page].body.bottom()
+    );
+}

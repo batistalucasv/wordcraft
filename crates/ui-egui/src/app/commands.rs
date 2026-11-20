@@ -130,13 +130,21 @@ impl WordApp {
                 self.after_command(id);
                 return Ok(json!({"undone": true}));
             }
-        } else if matches!(
-            id,
-            "file.save" | "file.saveAs" | "file.exportPdf" | "file.exportPng" | "code.run_chunk" | "code.run_all" | "code.delete_chunk"
-        ) && let Err(err) = crate::canvas::code_chunks::flush_dirty(self)
+        } else if matches!(id, "file.save" | "file.saveAs" | "file.exportPdf" | "file.exportPng" | "code.run_chunk" | "code.run_all")
+            && let Err(err) = crate::canvas::code_chunks::flush_dirty(self)
         {
             self.status(err.clone());
             return Err(err);
+        } else if id == "code.delete_chunk" {
+            let delete_target = params
+                .get("chunkId")
+                .and_then(Value::as_i64)
+                .or(self.canvas.code_chunks.active_chunk)
+                .or_else(|| wordcraft_engine::chunks::chunk_at(&self.session.doc, &self.session.sel.focus).and_then(|r| r.chunk.id));
+            if let Err(err) = crate::canvas::code_chunks::flush_dirty_except(self, delete_target) {
+                self.status(err.clone());
+                return Err(err);
+            }
         }
         self.clear_command_targets(id);
         if let Some(error) = self.document_required_error(id) {
@@ -177,11 +185,26 @@ impl WordApp {
         let math_session = self.session.math.as_ref().map(|m| m.session);
         let composing_before = !self.canvas.ime_preedit.is_empty();
         let old_path = self.session.path.clone();
+        let delete_target = if id == "code.delete_chunk" {
+            params
+                .get("chunkId")
+                .and_then(Value::as_i64)
+                .or(self.canvas.code_chunks.active_chunk)
+                .or_else(|| wordcraft_engine::chunks::chunk_at(&self.session.doc, &self.session.sel.focus).and_then(|r| r.chunk.id))
+        } else {
+            None
+        };
         let r = if self.ime_origin {
             self.session.run_ime(id, &params).map_err(|e| e.to_string())
         } else {
             self.session.run(id, &params).map_err(|e| e.to_string())
         };
+        if id == "code.delete_chunk"
+            && r.is_ok()
+            && let Some(tid) = delete_target
+        {
+            self.canvas.code_chunks.discard_draft(tid);
+        }
         if self.session.ime_body_epoch() != body_epoch {
             self.canvas.ime_interrupted_preedit |= composing_before;
             // The body (or the whole document) was replaced under the same id — setText, a

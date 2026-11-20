@@ -6142,7 +6142,8 @@ fn refused_chunk_draft_blocks_save_and_run_and_keeps_document_unsaved() {
     assert!(!target.exists(), "refused save must not write stale chunk contents to disk");
 
     let run_res = h.state_mut().run("code.run_chunk", json!({"chunkId": chunk_id}));
-    assert!(run_res.is_err(), "running a chunk with an unflushable draft must fail instead of running stale code");
+    let err = run_res.unwrap_err();
+    assert!(err.contains("U+FFFC"), "error must identify U+FFFC, distinguishing draft validation refusal from worker failure: {err}");
     assert!(h.state().document_unsaved(), "document must stay unsaved until draft is resolved");
 }
 

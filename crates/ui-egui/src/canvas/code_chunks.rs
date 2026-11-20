@@ -27,10 +27,10 @@ pub(crate) type ChunkDrafts = HashMap<i64, (CodeLanguage, String)>;
 /// Per-chunk mounted widget and document-sync bookkeeping.
 pub(crate) struct CodeChunkEntry {
     pub(crate) widget: CodeChunk,
-    last_synced_lang: CodeLanguage,
-    last_synced_code: String,
-    dirty: bool,
-    last_edit_time: Option<f64>,
+    pub(crate) last_synced_lang: CodeLanguage,
+    pub(crate) last_synced_code: String,
+    pub(crate) dirty: bool,
+    pub(crate) last_edit_time: Option<f64>,
     measured_centipts: Option<u32>,
     applied_output_rev: Option<u64>,
 }
@@ -101,6 +101,14 @@ impl CodeChunksState {
 
     pub(crate) fn request_focus(&mut self, id: i64, at_end: bool) {
         self.pending_focus = Some((id, at_end));
+    }
+
+    pub(crate) fn discard_draft(&mut self, id: i64) {
+        self.widgets.remove(&id);
+        self.restored_drafts.remove(&id);
+        if self.active_chunk == Some(id) {
+            self.active_chunk = None;
+        }
     }
 
     fn has_in_flight_run(&self, id: i64) -> bool {
@@ -212,6 +220,9 @@ fn reconcile_entry(entry: &mut CodeChunkEntry, lang: CodeLanguage, code: &str) -
     }
     if entry.widget.language() != lang {
         entry.widget.set_language(lang);
+    }
+    if entry.widget.language() != lang {
+        return false;
     }
     if entry.widget.code() != code {
         entry.widget.set_code(code);
@@ -519,6 +530,9 @@ pub(crate) fn flush_one(app: &mut WordApp, id: i64) -> Result<(), String> {
     };
     let code = entry.widget.code().to_owned();
     let lang = entry.widget.language();
+    if entry.last_synced_code.len() > crate::code_chunk::MAX_CODE_CHARS && code.len() < entry.last_synced_code.len() {
+        return Ok(());
+    }
     if entry.last_synced_lang == lang && entry.last_synced_code == code {
         if let Some(entry) = app.canvas.code_chunks.widgets.get_mut(&id) {
             entry.dirty = false;
@@ -555,7 +569,12 @@ pub(crate) fn flush_one(app: &mut WordApp, id: i64) -> Result<(), String> {
 
 /// Flush every dirty code chunk editor into the document before Undo/Redo/Save/Export/Run.
 pub(crate) fn flush_dirty(app: &mut WordApp) -> Result<(), String> {
-    let mut ids: Vec<i64> = app.canvas.code_chunks.widgets.iter().filter(|(_, e)| e.dirty).map(|(id, _)| *id).collect();
+    flush_dirty_except(app, None)
+}
+
+/// Flush dirty code chunks, skipping an optional target chunk (e.g. for `code.delete_chunk`).
+pub(crate) fn flush_dirty_except(app: &mut WordApp, except: Option<i64>) -> Result<(), String> {
+    let mut ids: Vec<i64> = app.canvas.code_chunks.widgets.iter().filter(|(id, e)| e.dirty && Some(**id) != except).map(|(id, _)| *id).collect();
     ids.sort_unstable();
     let mut first_err = None;
     for id in ids {
@@ -565,7 +584,7 @@ pub(crate) fn flush_dirty(app: &mut WordApp) -> Result<(), String> {
             first_err = Some(err);
         }
     }
-    let mut parked_ids: Vec<i64> = app.canvas.code_chunks.restored_drafts.keys().copied().collect();
+    let mut parked_ids: Vec<i64> = app.canvas.code_chunks.restored_drafts.keys().filter(|id| Some(**id) != except).copied().collect();
     parked_ids.sort_unstable();
     for id in parked_ids {
         let Some((lang, code)) = app.canvas.code_chunks.restored_drafts.get(&id).cloned() else {
@@ -598,9 +617,24 @@ pub(crate) fn flush_dirty(app: &mut WordApp) -> Result<(), String> {
             }
         }
     }
+    // Also flush dirty chunk drafts from other non-shown windows displaying this document.
+    let current_doc = app.session.document_id();
+    if let Err(err) = app.windows.flush_dirty_chunks_for(&mut app.session, current_doc, except)
+        && first_err.is_none()
+    {
+        first_err = Some(err);
+    }
     match first_err {
         Some(err) => Err(err),
         None => Ok(()),
+    }
+}
+
+fn clear_chunk_output(app: &mut WordApp, id: i64) {
+    let _ = app.run("code.clear_output", json!({ "chunkId": id }));
+    if let Some(entry) = app.canvas.code_chunks.widgets.get_mut(&id) {
+        entry.widget.clear_output();
+        entry.applied_output_rev = None;
     }
 }
 
@@ -706,11 +740,7 @@ fn apply_paint_events(app: &mut WordApp, ui: &Ui, events: PaintEvents) {
     }
 
     for id in events.clear_requests {
-        let _ = app.run("code.clear_output", json!({ "chunkId": id }));
-        if let Some(entry) = app.canvas.code_chunks.widgets.get_mut(&id) {
-            entry.widget.clear_output();
-            entry.applied_output_rev = None;
-        }
+        clear_chunk_output(app, id);
     }
 
     for (id, action) in events.actions {
@@ -800,6 +830,16 @@ fn dispatch_chunk_action(app: &mut WordApp, chunk_id: i64, action: CodeChunkActi
             }
         }
         CodeChunkAction::InsertTable { headers, rows } => {
+            let _ = flush_one(app, chunk_id);
+            let is_stale = top_level_chunks(&app.session.doc)
+                .into_iter()
+                .find(|r| r.chunk.id == Some(chunk_id))
+                .is_some_and(|r| !app.session.chunks.output_matches(chunk_id, &r.chunk.language, &r.chunk.code));
+            if is_stale {
+                app.status("table output is stale; run the chunk again".to_string());
+                app.canvas.want_focus = true;
+                return;
+            }
             app.run("code.insert_table", json!({ "chunkId": chunk_id, "headers": headers, "rows": rows }))
         }
     };
@@ -917,11 +957,15 @@ pub(crate) fn maybe_enter_from_canvas_arrow(app: &mut WordApp, key: egui::Key, m
         return false;
     }
     let refs = top_level_chunks(&app.session.doc);
+    let has_placement = |cid: i64| {
+        app.canvas.code_chunks.is_mounted(cid)
+            && layout.pages.iter().any(|pg| pg.items.iter().any(|it| matches!(it, wordcraft_layout::Placed::Chunk { id, .. } if *id == cid)))
+    };
 
     if dir > 0 {
         for r in refs {
             let Some(cid) = r.chunk.id else { continue };
-            if !app.canvas.code_chunks.is_mounted(cid) {
+            if !has_placement(cid) {
                 continue;
             }
             let first = r.start.path.0.first().copied().unwrap_or(0) as usize;
@@ -939,7 +983,7 @@ pub(crate) fn maybe_enter_from_canvas_arrow(app: &mut WordApp, key: egui::Key, m
     } else {
         for r in refs.into_iter().rev() {
             let Some(cid) = r.chunk.id else { continue };
-            if !app.canvas.code_chunks.is_mounted(cid) {
+            if !has_placement(cid) {
                 continue;
             }
             let first = r.start.path.0.first().copied().unwrap_or(0) as usize;
@@ -1054,7 +1098,16 @@ pub(crate) fn run_chunk_async(app: &mut WordApp, params: &Value, ctx: Option<&eg
     if wordcraft_engine::file_access::current().is_some() {
         return Err("code execution is disabled under automation filesystem confinement".into());
     }
-    let chunk_id = params.get("chunkId").and_then(Value::as_i64).or(app.canvas.code_chunks.active_chunk);
+    if let Some(why) = app.session.why_disabled("code.run_chunk") {
+        return Err(why.into());
+    }
+    let chunk_id = match params.get("chunkId") {
+        None | Some(Value::Null) => app.canvas.code_chunks.active_chunk,
+        Some(v) => {
+            let id = v.as_i64().filter(|&n| n > 0).ok_or_else(|| "chunkId: expected a positive integer".to_string())?;
+            Some(id)
+        }
+    };
     let range = match chunk_id {
         Some(id) => {
             top_level_chunks(&app.session.doc).into_iter().find(|r| r.chunk.id == Some(id)).ok_or_else(|| format!("no code chunk with id {id}"))?
@@ -1092,8 +1145,14 @@ pub(crate) fn run_chunk_async(app: &mut WordApp, params: &Value, ctx: Option<&eg
             batch_id: 0,
             stop_on_error: false,
         };
-        launch_worker(app, queued, ctx)?;
-        Ok(json!({ "started": true, "chunk": { "id": id, "language": range.chunk.language } }))
+        app.canvas.code_chunks.queued_runs.push_back(queued);
+        pump_queued_runs(app, ctx);
+        let started = app.canvas.code_chunks.pending_runs.iter().any(|p| p.chunk_id == id);
+        if started {
+            Ok(json!({ "started": true, "chunk": { "id": id, "language": range.chunk.language } }))
+        } else {
+            Ok(json!({ "started": false, "queued": true, "chunk": { "id": id, "language": range.chunk.language } }))
+        }
     }
 }
 
@@ -1101,6 +1160,9 @@ pub(crate) fn run_chunk_async(app: &mut WordApp, params: &Value, ctx: Option<&eg
 pub(crate) fn run_all_async(app: &mut WordApp, params: &Value, ctx: Option<&egui::Context>) -> Result<Value, String> {
     if wordcraft_engine::file_access::current().is_some() {
         return Err("code execution is disabled under automation filesystem confinement".into());
+    }
+    if let Some(why) = app.session.why_disabled("code.run_all") {
+        return Err(why.into());
     }
     let ranges = top_level_chunks(&app.session.doc);
     if ranges.is_empty() {
@@ -1183,7 +1245,7 @@ pub(crate) fn chunk_context_menu(app: &mut WordApp, ui: &mut egui::Ui, id: i64) 
     }
     let has_output = app.canvas.code_chunks.widgets.get(&id).is_some_and(|e| e.widget.output().is_some()) || app.session.chunks.output(id).is_some();
     if item(ui, crate::tl!("Clear Output"), "", writable && has_output) {
-        let _ = app.run("code.clear_output", json!({ "chunkId": id }));
+        clear_chunk_output(app, id);
         ui.close();
     }
     if item(ui, crate::tl!("Restart Kernel"), "", writable) {

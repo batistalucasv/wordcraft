@@ -20,7 +20,7 @@ pub(crate) struct Parked {
     /// Comment and reply text typed in this document and not yet written to it.
     comment_drafts: panes::CommentDrafts,
     /// Code chunk edits typed in this document and not yet flushed into it.
-    chunk_drafts: crate::canvas::code_chunks::ChunkDrafts,
+    pub(crate) chunk_drafts: crate::canvas::code_chunks::ChunkDrafts,
 }
 
 impl WordApp {

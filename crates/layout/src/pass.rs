@@ -409,13 +409,15 @@ fn place_chunk(ctx: &mut Ctx, pb: &mut PageBuilder, id: i64, first: usize, last:
         top_gap = 0.0;
     }
     let y = pb.y + top_gap;
-    let rect = wordcraft_geom::Rect::new(pb.col_x(), y, pb.col_w(), h);
+    let max_h = (pb.bottom - y).max(24.0);
+    let placed_h = h.min(max_h);
+    let rect = wordcraft_geom::Rect::new(pb.col_x(), y, pb.col_w(), placed_h);
     if let Some(pg) = pb.page() {
         pg.items.push(Placed::Chunk { id, rect, first, last });
     }
     pb.after_break_mark = false;
-    pb.y = y + h + 6.0;
-    pb.content_bottom = pb.content_bottom.max(y + h);
+    pb.y = y + placed_h + 6.0;
+    pb.content_bottom = pb.content_bottom.max(y + placed_h);
 }
 
 fn place_block(ctx: &mut Ctx, pb: &mut PageBuilder, outline: &Option<OutlinePass>, block: usize, body_top: f32) {
@@ -436,8 +438,8 @@ fn place_section_blocks<'p>(
     outline: &Option<OutlinePass>,
     (mut block, last): (usize, usize),
     (balance, body_top): (bool, f32),
+    chunks: &HashMap<usize, (i64, usize, f32)>,
 ) -> (usize, usize) {
-    let chunks = mounted_chunks(ctx.doc, &ctx.opts.chunk_heights);
     let mut from = balance.then(|| (block, Snap::take(pb, ctx)));
     while block <= last && ctx.doc.body.get(block).is_some() {
         let before = balance.then(|| (pb.pages.len(), Snap::take(pb, ctx)));
@@ -459,7 +461,7 @@ fn place_section_blocks<'p>(
         }
         block = next;
     }
-    let discarded = from.map_or(0, |(first, snap)| balance_columns(ctx, pb, (first, block), &snap, body_top));
+    let discarded = from.map_or(0, |(first, snap)| balance_columns(ctx, pb, (first, block), &snap, body_top, chunks));
     (block, discarded)
 }
 
@@ -598,6 +600,7 @@ pub(crate) fn layout_pass(
 ) -> Pass {
     reset_cache(doc, cache, opts);
     let mut ctx = new_ctx(doc, cache, opts, (note_pages, marks, totals));
+    let chunks = mounted_chunks(doc, &opts.chunk_heights);
     let hf = Arc::clone(&ctx.hf);
     let sections = &hf.sections;
     let mode = Mode::of(opts.view);
@@ -650,7 +653,7 @@ pub(crate) fn layout_pass(
         pb.foot_top = sec.tops.foot;
         let last = (*end).min(doc.body.len().saturating_sub(1));
         let balance = prepare_section_end(&mut pb, sections, (si, mode.web));
-        let (next, discarded) = place_section_blocks(&mut ctx, &mut pb, &outline, (block, last), (balance, sec.tops.body));
+        let (next, discarded) = place_section_blocks(&mut ctx, &mut pb, &outline, (block, last), (balance, sec.tops.body), &chunks);
         (block, boxes_discarded) = (next, boxes_discarded + discarded);
         section_endnotes(&mut ctx, &mut pb, &mut endnotes, (sect, si, block));
     }
@@ -750,11 +753,11 @@ fn balance_pass<'a>(
     (first, end): (usize, usize),
     (page, top, h): (usize, f32, f32),
     body_top: f32,
+    chunks: &HashMap<usize, (i64, usize, f32)>,
 ) -> bool {
     snap.restore(pb, ctx);
     pb.balance = Some((page, h));
     pb.cap_columns();
-    let chunks = mounted_chunks(ctx.doc, &ctx.opts.chunk_heights);
     let mut block = first;
     while block < end {
         if let Some(&(id, chunk_last, ch)) = chunks.get(&block)
@@ -795,7 +798,14 @@ const BALANCE_PASSES: usize = 12;
 /// apply as usual, so the columns may come out a little uneven. Not balanced: a page with an
 /// explicit column break, which says where the columns end. Returns the text boxes laid out in the
 /// passes thrown away.
-fn balance_columns<'a>(ctx: &mut Ctx, pb: &mut PageBuilder<'a>, blocks: (usize, usize), snap: &Snap<'a>, body_top: f32) -> usize {
+fn balance_columns<'a>(
+    ctx: &mut Ctx,
+    pb: &mut PageBuilder<'a>,
+    blocks: (usize, usize),
+    snap: &Snap<'a>,
+    body_top: f32,
+    chunks: &HashMap<usize, (i64, usize, f32)>,
+) -> usize {
     let page = pb.pages.len().saturating_sub(1);
     let ncols = pb.cols.len().max(1) as f32;
     let top = pb.top;
@@ -810,7 +820,7 @@ fn balance_columns<'a>(ctx: &mut Ctx, pb: &mut PageBuilder<'a>, blocks: (usize, 
     {
         return 0;
     }
-    let pass = |ctx: &mut Ctx, pb: &mut PageBuilder<'a>, h: f32| balance_pass(ctx, pb, snap, blocks, (page, top, h), body_top);
+    let pass = |ctx: &mut Ctx, pb: &mut PageBuilder<'a>, h: f32| balance_pass(ctx, pb, snap, blocks, (page, top, h), body_top, chunks);
     // The text on the page fills `ncols` columns at least `used / ncols` high; the original layout
     // (`full`) fits, and so, nearly always, do columns as high as its tallest one.
     let mut lo = (used / ncols - 1.0).max(0.0);

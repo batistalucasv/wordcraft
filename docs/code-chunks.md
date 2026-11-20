@@ -40,9 +40,9 @@ CLI (`wordcraft-cli run`) and MCP (`execute`) call them the same way.
 | `code.restart_kernel` | — | `{}` | Forgets the recorded outputs and starts a new kernel generation. |
 | `code.clear_output` | — | `{"chunkId"?: number, "all"?: bool}` | Forgets the output of `chunkId`, the chunk at the caret when omitted, or every chunk with `"all": true`. |
 | `code.update_chunk` | — | `{"chunkId"?: number, "code": string, "language"?: "r"\|"python"}` | Updates the chunk source/language in the document as an undoable edit while preserving Quarto options and section breaks. |
-| `code.delete_chunk` | — | `{"chunkId"?: number}` | Deletes the block-level chunk control, its custom options property, and any cached output. |
-| `code.insert_plot` | — | `{"chunkId"?: number, "png"?: string, "svg"?: string, "width"?: number, "alt"?: string}` | Inserts the chunk's PNG plot inline below the chunk (and archives any lossless SVG payload in document media). When `chunkId` is omitted, uses the chunk at the caret if inside one; otherwise explicit `"png"` data inserts at the caret. |
-| `code.insert_table` | — | `{"chunkId"?: number, "headers": [string], "rows"?: [[string]]}` | Inserts a formatted native Word table with a bold repeating header row. When `chunkId` is supplied or the caret is inside a chunk, inserts directly below that chunk; when `chunkId` is omitted outside a chunk, inserts at the caret in the caret's story. |
+| `code.delete_chunk` | — | `{"chunkId"?: number}` | Deletes the block-level chunk control, its custom options property, and any cached output. Targeting a chunk requires a top-level body chunk, not a chunk inside a table cell. |
+| `code.insert_plot` | — | `{"chunkId"?: number, "png"?: string, "svg"?: string, "width"?: number, "alt"?: string}` | Inserts the chunk's PNG plot inline below the chunk. Targeting a chunk requires a top-level body chunk, not a chunk inside a table cell. When `chunkId` is omitted, uses the top-level body chunk at the caret if inside one; otherwise explicit `"png"` data inserts at the caret. |
+| `code.insert_table` | — | `{"chunkId"?: number, "headers": [string], "rows"?: [[string]]}` | Inserts a formatted native Word table with a bold repeating header row. Targeting a chunk requires a top-level body chunk, not a chunk inside a table cell. When `chunkId` is supplied or the caret is inside a top-level body chunk, inserts directly below that chunk; when `chunkId` is omitted outside a chunk, inserts at the caret in the caret's story. |
 
 `timeoutMs` is clamped to 100…600000 (default 30000). `code` is capped at the model's 4 MiB chunk
 limit; longer code is refused, never truncated.
@@ -94,7 +94,7 @@ wordcraft-cli run --template sample \
   (`batistalucasv/wordcraft-kernel#4`). Every run is a fresh process today, so
   `code.restart_kernel` can only drop stale outputs.
 - Asynchronous UI execution & canvas mounting: engine commands stay synchronous for CLI/MCP,
-  while `wordcraft-ui-egui` mounts interactive [`CodeChunk`] widgets over `Placed::Chunk`
+  while `wordcraft-ui-egui` mounts interactive `CodeChunk` widgets over `Placed::Chunk`
   rectangles and dispatches interactive runs asynchronously off the UI thread.
 
 ## Tests

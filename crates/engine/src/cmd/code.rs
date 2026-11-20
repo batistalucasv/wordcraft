@@ -559,7 +559,8 @@ fn insert_plot(s: &mut Session, v: &Value) -> CmdResult {
     }
     // Validate image decodability before mutating the document.
     match wordcraft_geom::picture::probe(&png_bytes) {
-        Ok(_) => {}
+        Ok(p) if p.format == image::ImageFormat::Png => {}
+        Ok(_) => return Err(CmdError::Params("plot image data must be a PNG".into())),
         Err(wordcraft_geom::picture::Refusal::Unsupported(why)) => return Err(CmdError::Failed(why.into())),
         Err(_) => return Err(CmdError::Params("plot PNG bytes could not be decoded as a valid image".into())),
     }
@@ -589,10 +590,9 @@ fn insert_plot(s: &mut Session, v: &Value) -> CmdResult {
     }
 
     let width = p::f32(v, "width");
-    let mut out = insert::place_picture(s, png_bytes, width, &alt)?;
+    let out = insert::place_picture(s, png_bytes, width, &alt)?;
     if let Some(svg_bytes) = archived_svg {
-        let svg_key = s.doc.add_media(svg_bytes, "svg");
-        out["svgMedia"] = json!(svg_key);
+        let _ = s.doc.add_media(svg_bytes, "svg");
     }
     s.touch();
     Ok(out)

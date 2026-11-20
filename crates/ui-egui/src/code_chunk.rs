@@ -31,7 +31,7 @@ mod tests;
 
 /// Longest source a chunk keeps, in characters. Pasted code is cut here rather than growing
 /// without bound.
-pub const MAX_CODE_CHARS: usize = 1024 * 1024;
+pub const MAX_CODE_CHARS: usize = 4 * 1024 * 1024;
 
 /// Most of a stream the console shows, in bytes. The kernel already captured the whole output;
 /// this only bounds what is laid out every frame.

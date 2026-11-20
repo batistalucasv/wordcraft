@@ -692,7 +692,7 @@ fn insert_plot_and_insert_table_place_content_below_chunk() {
         }),
     );
     assert!(res["media"].as_str().is_some());
-    assert!(res["svgMedia"].as_str().is_some());
+    assert!(res.get("svgMedia").is_none());
     let has_img = s.doc.para(StoryRef::Body, &wordcraft_doc::Path::top(1)).is_some_and(|p| !p.objects.is_empty());
     assert!(has_img, "inserted plot paragraph should sit directly below chunk at block 1");
 }
@@ -704,6 +704,9 @@ fn insert_table_and_plot_validate_before_mutating_on_bad_input() {
     let before = s.doc.clone();
     assert!(matches!(s.run("code.insert_table", &json!({"chunkId": id, "headers": []})), Err(CmdError::Params(_))));
     assert!(matches!(s.run("code.insert_plot", &json!({"chunkId": id, "png": "not-valid-base64!!!"})), Err(CmdError::Params(_))));
+    // Valid GIF image bytes, but not PNG: must return CmdError::Params without mutating doc.
+    let gif_b64 = crate::cmd::insert::base64_encode(b"GIF89a\x01\x00\x01\x00\x80\x00\x00\x00\x00\x00\xff\xff\xff!\xf9\x04\x01\x00\x00\x00\x00,\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02D\x01\x00;");
+    assert!(matches!(s.run("code.insert_plot", &json!({"chunkId": id, "png": gif_b64})), Err(CmdError::Params(_))));
     assert_eq!(s.doc, before, "rejected plot/table must leave document untouched");
 }
 
