@@ -360,8 +360,9 @@ fn capture_drains_pending_output_after_cancel() {
     });
 
     thread::sleep(Duration::from_millis(20));
-    has_data.store(true, Ordering::Release);
     cancel.store(true, Ordering::Release);
+    thread::sleep(Duration::from_millis(10));
+    has_data.store(true, Ordering::Release);
     handle.join().expect("reader thread");
 
     assert_eq!(sink.snapshot().as_slice(), b"pending");
