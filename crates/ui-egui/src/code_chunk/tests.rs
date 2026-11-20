@@ -28,6 +28,7 @@ fn result(stdout: &str, plot: Option<Vec<u8>>) -> ExecutionResult {
         exit_code: Some(0),
         success: true,
         timed_out: false,
+        output_truncated: false,
         plot_png: plot,
         plot_svg: None,
         duration_ms: 120,
