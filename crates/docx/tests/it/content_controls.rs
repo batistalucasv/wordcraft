@@ -392,3 +392,46 @@ fn range_toc_without_control_stays_unwrapped_and_section_break_toc_control_hands
     let xml_sect = document_xml(&write(&d_sect).unwrap());
     assert!(xml_sect.contains("Chapter One") && xml_sect.contains("Section"), "{xml_sect}");
 }
+
+/// A code chunk (`wordcraft:chunk:<language>`) is an ordinary content control to Word: the tag is
+/// plain text, the content is ordinary paragraphs, and the options live in custom properties
+/// (`docProps/custom.xml`), which Word keeps. Everything must survive a save and reload.
+#[test]
+fn code_chunks_round_trip_as_tagged_content_controls() {
+    use wordcraft_doc::{CodeChunk, chunk::chunk_prop_name};
+
+    let mut chunk = CodeChunk::new("r", "x <- 1\nplot(x)");
+    chunk.options.set("echo", "FALSE");
+    chunk.options.set("fig-cap", "\"A plot\"");
+    let mut d = Document::new();
+    let id = d.push_chunk(&chunk).unwrap();
+
+    let bytes = write(&d).unwrap();
+    let xml = document_xml(&bytes);
+    assert!(xml.contains(r#"<w:tag w:val="wordcraft:chunk:r"/>"#), "{xml}");
+    assert!(xml.contains("<w:sdt>") && xml.contains("<w:sdtContent>"), "{xml}");
+
+    let back = read(&bytes).unwrap();
+    let chunks = back.chunks();
+    assert_eq!(chunks.len(), 1, "a chunk reads back whole");
+    assert_eq!(chunks[0].language, "r");
+    assert_eq!(chunks[0].code, "x <- 1\nplot(x)");
+    assert_eq!(chunks[0].options.get("echo"), Some("FALSE"));
+    assert_eq!(chunks[0].options.fig_caption().as_deref(), Some("A plot"));
+    assert_eq!(chunks[0].id, Some(id));
+    assert!(back.custom_props.iter().any(|p| p.name == chunk_prop_name(id)), "the options property stays with the control");
+
+    let again = read(&write(&back).unwrap()).unwrap();
+    assert_eq!(again.chunks(), back.chunks());
+}
+
+/// A chunk whose code is empty is still a control, and still reads back empty rather than vanishing.
+#[test]
+fn an_empty_code_chunk_round_trips() {
+    let mut d = Document::new();
+    d.push_chunk(&wordcraft_doc::CodeChunk::new("python", "")).unwrap();
+    let back = read(&write(&d).unwrap()).unwrap();
+    assert_eq!(back.chunks().len(), 1);
+    assert_eq!(back.chunks()[0].code, "");
+    assert_eq!(back.chunks()[0].language, "python");
+}

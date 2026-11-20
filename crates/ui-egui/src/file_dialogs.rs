@@ -39,8 +39,10 @@ pub type FileDialogAnswer = Result<Vec<String>, String>;
 const MAX_FONTS_PER_PICK: usize = 2000;
 
 const PICTURES: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "bmp", "wmf", "emf"];
-const DOCUMENTS: &[&str] =
-    &["docx", "docm", "dotx", "dotm", "doc", "dot", "odt", "ott", "fodt", "rtf", "txt", "md", "html", "htm", "mht", "mhtml", "tex", "json", "xml"];
+const DOCUMENTS: &[&str] = &[
+    "docx", "docm", "dotx", "dotm", "doc", "dot", "odt", "ott", "fodt", "rtf", "txt", "md", "qmd", "rmd", "Rmd", "html", "htm", "mht", "mhtml",
+    "tex", "json", "xml",
+];
 
 /// The file types Open offers, as (label, extensions; `*` is any file): pictures for Insert/Change
 /// Picture, recipient lists for Select Recipients › Use an Existing List…, documents otherwise.
@@ -319,9 +321,9 @@ impl WordApp {
                     }
                     // Word XML even over a Word 2003 XML file, which a save by path would keep.
                     let format = if ext == "xml" { wordcraft_engine::cmd::file::FORMAT_FLAT_OPC } else { crate::print_page::EXPORT_WORD_2003 };
-                    self.run("file.saveAs", json!({"path": path, "format": format}))
+                    self.run("file.saveAs", json!({"path": path, "format": format, "copy": true}))
                 } else {
-                    self.run("file.saveAs", json!({"path": path}))
+                    self.run("file.saveAs", json!({"path": path, "copy": true}))
                 };
                 match &r {
                     Ok(_) => {
