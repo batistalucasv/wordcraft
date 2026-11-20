@@ -33,6 +33,8 @@ const MAX_SCRATCH_DIR_ATTEMPTS: u64 = 10;
 const PROCESS_GROUP_REAP_TIMEOUT: Duration = Duration::from_secs(2);
 /// Most bytes retained from each stream; the rest is drained and discarded.
 const MAX_CAPTURED_BYTES: usize = 10 * 1024 * 1024;
+/// Maximum size of a captured plot artifact (PNG or SVG) read back from disk.
+const MAX_PLOT_BYTES: u64 = 20 * 1024 * 1024;
 /// Size of each read from a child pipe.
 const CAPTURE_CHUNK_BYTES: usize = 8 * 1024;
 /// How long a cancellable reader sleeps between non-blocking reads.
@@ -252,24 +254,46 @@ pub fn is_language_available(language: CodeLanguage) -> bool {
     which_binary(language).is_some()
 }
 
-/// Search PATH for the language's binary.
+/// Search PATH for the language's executable binary.
 pub fn which_binary(language: CodeLanguage) -> Option<PathBuf> {
-    let name = language.binary_name();
     let path_var = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path_var) {
+    which_binary_in(language, &path_var)
+}
+
+fn which_binary_in(language: CodeLanguage, path_var: &std::ffi::OsStr) -> Option<PathBuf> {
+    let name = language.binary_name();
+    for dir in std::env::split_paths(path_var) {
         let candidate = dir.join(name);
-        if candidate.is_file() {
+        if is_executable_file(&candidate) {
             return Some(candidate);
         }
         #[cfg(windows)]
         {
             let exe_candidate = dir.join(format!("{name}.exe"));
-            if exe_candidate.is_file() {
+            if is_executable_file(&exe_candidate) {
                 return Some(exe_candidate);
             }
         }
     }
     None
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 /// Execute a code chunk and collect outputs.
@@ -351,13 +375,13 @@ pub fn execute(request: &ExecutionRequest) -> Result<ExecutionResult, KernelErro
     let stderr = String::from_utf8_lossy(&stderr.bytes).into_owned();
 
     let mut plot_png = None;
-    if request.capture_plots && request.plot_format.captures_png() && plot_png_path.is_file() {
-        plot_png = fs::read(&plot_png_path).ok().filter(|bytes| is_complete_png(bytes));
+    if request.capture_plots && request.plot_format.captures_png() {
+        plot_png = read_plot_png(&plot_png_path, MAX_PLOT_BYTES);
     }
 
     let mut plot_svg = None;
-    if request.capture_plots && request.plot_format.captures_svg() && plot_svg_path.is_file() {
-        plot_svg = fs::read_to_string(&plot_svg_path).ok().filter(|content| is_complete_svg(content));
+    if request.capture_plots && request.plot_format.captures_svg() {
+        plot_svg = read_plot_svg(&plot_svg_path, MAX_PLOT_BYTES);
     }
 
     let tables = read_tables(&tables_file);
@@ -1233,6 +1257,48 @@ finally:
     }
 }
 
+/// Read at most `max_bytes` from `reader`, returning `None` on I/O error or if more bytes remain.
+fn read_bounded_bytes<R: Read>(reader: R, max_bytes: u64) -> Option<Vec<u8>> {
+    let mut raw = Vec::new();
+    let mut limited = reader.take(max_bytes.saturating_add(1));
+    if limited.read_to_end(&mut raw).is_err() || u64::try_from(raw.len()).unwrap_or(u64::MAX) > max_bytes {
+        return None;
+    }
+    Some(raw)
+}
+
+/// Open `path` as a regular file whose current size fits within `max_bytes`.
+fn open_bounded_file(path: &Path, max_bytes: u64) -> Option<fs::File> {
+    let metadata = fs::metadata(path).ok()?;
+    if !metadata.is_file() || metadata.len() > max_bytes {
+        return None;
+    }
+    let file = fs::File::open(path).ok()?;
+    let file_meta = file.metadata().ok()?;
+    if !file_meta.is_file() || file_meta.len() > max_bytes {
+        return None;
+    }
+    Some(file)
+}
+
+/// Read a generated PNG plot from `path` under `max_bytes`, rejecting incomplete or oversized files.
+fn read_plot_png(path: &Path, max_bytes: u64) -> Option<Vec<u8>> {
+    read_plot_png_from_reader(open_bounded_file(path, max_bytes)?, max_bytes)
+}
+
+fn read_plot_png_from_reader<R: Read>(reader: R, max_bytes: u64) -> Option<Vec<u8>> {
+    read_bounded_bytes(reader, max_bytes).filter(|bytes| is_complete_png(bytes))
+}
+
+/// Read a generated SVG plot from `path` under `max_bytes`, rejecting incomplete, non-UTF-8, or oversized files.
+fn read_plot_svg(path: &Path, max_bytes: u64) -> Option<String> {
+    read_plot_svg_from_reader(open_bounded_file(path, max_bytes)?, max_bytes)
+}
+
+fn read_plot_svg_from_reader<R: Read>(reader: R, max_bytes: u64) -> Option<String> {
+    read_bounded_bytes(reader, max_bytes).and_then(|bytes| String::from_utf8(bytes).ok()).filter(|content| is_complete_svg(content))
+}
+
 /// Anything unreadable, oversized or malformed yields no tables instead of an error. When the
 /// primary snapshot cannot be read, the previous complete one beside it is tried under the same
 /// limits: a failed replacement leaves `<path>.bak` behind.
@@ -1247,11 +1313,7 @@ fn read_tables(path: &Path) -> Vec<TabularOutput> {
 
 /// `None` means the file was missing, oversized or malformed; `Some` may still be empty.
 fn read_tables_file(path: &Path) -> Option<Vec<TabularOutput>> {
-    let metadata = fs::metadata(path).ok()?;
-    if !metadata.is_file() || metadata.len() > MAX_TABLES_FILE_BYTES {
-        return None;
-    }
-    let file = fs::File::open(path).ok()?;
+    let file = open_bounded_file(path, MAX_TABLES_FILE_BYTES)?;
     read_tables_payload(file, MAX_TABLES_FILE_BYTES, MAX_TOTAL_CELLS)
 }
 
@@ -1277,11 +1339,7 @@ fn read_tables_from_reader<R: Read>(reader: R, max_bytes: u64, max_cells: usize)
 
 /// `None` covers an unreadable, oversized or malformed payload; `Some` may still be empty.
 fn read_tables_payload<R: Read>(reader: R, max_bytes: u64, max_cells: usize) -> Option<Vec<TabularOutput>> {
-    let mut raw = Vec::new();
-    let mut limited = reader.take(max_bytes.saturating_add(1));
-    if limited.read_to_end(&mut raw).is_err() || raw.len() > max_bytes as usize {
-        return None;
-    }
+    let raw = read_bounded_bytes(reader, max_bytes)?;
     let payload: RawTables = serde_json::from_slice(&raw).ok()?;
     let tables: Vec<RawTable> = payload.tables.into_iter().take(MAX_TABLES).collect();
     let mut projected: usize = 0;
