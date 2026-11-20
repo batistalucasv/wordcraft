@@ -85,6 +85,7 @@ impl Session {
             widened,
             edit_marks,
             go_back_step,
+            chunk_outputs: _,
         } = DocState::new(doc, 1, ViewState::default());
         Session {
             doc,
@@ -163,6 +164,7 @@ impl Session {
             ribbon: crate::RibbonLayout::default(),
             editing_lang: None,
             read_aloud: Default::default(),
+            chunks: Default::default(),
             windows: Default::default(),
             password,
             #[cfg(not(target_arch = "wasm32"))]

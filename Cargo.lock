@@ -7513,6 +7513,7 @@ dependencies = [
  "wordcraft-fonts",
  "wordcraft-formats",
  "wordcraft-geom",
+ "wordcraft-kernel",
  "wordcraft-layout",
  "wordcraft-pdf",
  "wordcraft-render",

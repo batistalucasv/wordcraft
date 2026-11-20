@@ -87,6 +87,7 @@ pub struct DocState {
     pub(super) widened: Option<Widened>,
     pub(super) edit_marks: Vec<Pos>,
     pub(super) go_back_step: usize,
+    pub(super) chunk_outputs: crate::chunks::DocChunkOutputs,
 }
 
 impl DocState {
@@ -143,6 +144,7 @@ impl DocState {
             widened: None,
             edit_marks: Vec::new(),
             go_back_step: 0,
+            chunk_outputs: Default::default(),
         }
     }
 
@@ -249,6 +251,8 @@ impl Session {
             // Shared by every open document.
             // Names the document it belongs to, so it never applies to another one.
             review_style: _,
+            // Per-document chunk outputs are swapped with `DocState::chunk_outputs` below.
+            chunks: _,
             user_dict_path: _,
             clipboard: _,
             clipboard_text: _,
@@ -345,6 +349,7 @@ impl Session {
             widened,
             edit_marks,
             go_back_step,
+            chunk_outputs,
         } = d;
         swap(&mut self.doc, doc);
         swap(&mut self.sel, sel);
@@ -394,6 +399,7 @@ impl Session {
         swap(&mut self.widened, widened);
         swap(&mut self.edit_marks, edit_marks);
         swap(&mut self.go_back_step, go_back_step);
+        swap(self.chunks.doc_outputs_mut(), chunk_outputs);
         // A picked Drawing Canvas member (#2637) belongs to the document left behind.
         self.member = None;
     }

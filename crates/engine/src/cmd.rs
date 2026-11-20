@@ -5,6 +5,7 @@ pub mod canvas;
 pub mod caret;
 pub mod chart;
 pub mod citations;
+pub mod code;
 pub mod column;
 pub mod connectors;
 pub mod controls;
@@ -93,6 +94,7 @@ pub fn registry() -> Registry {
     v.extend(fields::specs());
     v.extend(mailings::specs());
     v.extend(citations::specs());
+    v.extend(code::specs());
     v.extend(index::specs());
     v.extend(objects::specs());
     v.extend(shape_fill::specs());
