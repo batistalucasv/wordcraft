@@ -7,10 +7,19 @@
 A document can hold executable **code chunks** in the style of Quarto / R Markdown / Jupyter. A
 chunk is ordinary document content, not a sidecar file:
 
-- a block-level **content control** tagged `wordcraft:chunk:<language>` whose content is the code,
-  one paragraph per line in the `CodeChunk` paragraph style (a shaded, bordered code box);
-- its Quarto options (`eval`, `echo`, `fig-cap`, `label`…) in the custom document property
-  `wordcraft.chunk.<control id>`, which Word preserves on a round trip;
+- a block-level **content control** tagged `wordcraft:chunk:<language>?<options>` (or
+  `wordcraft:chunk:<language>?` when empty) whose content is the code, one paragraph per line in
+  the `CodeChunk` paragraph style (a shaded, bordered code box). Keeping a compact, bounded form of
+  the Quarto options (`eval`, `echo`, `fig-cap`, `label`…) in `w:tag` (up to 1024 characters, with
+  `eval` serialized first) makes options travel with the control when copied and pasted in Word
+  under a fresh `w:id`;
+- the full options JSON in the custom document property `wordcraft.chunk.<control id>`, which Word
+  preserves on a normal round trip and which remains authoritative when options exceed the 1024-char
+  `w:tag` budget;
+- if a tagged chunk has neither a matching `wordcraft.chunk.<id>` property nor tag-carried options
+  (for example a legacy `wordcraft:chunk:<language>` control copied in Word without `?` options, or
+  an overflowed tag missing `eval`), `code.run_all` refuses to run it rather than assuming
+  `eval: true`;
 - the model and the `.qmd`/`.Rmd` reader and writer live in `wordcraft_doc::chunk` and
   `wordcraft_formats::quarto`, so a chunk survives Save, Open, and a Quarto export.
 

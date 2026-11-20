@@ -408,7 +408,7 @@ fn code_chunks_round_trip_as_tagged_content_controls() {
 
     let bytes = write(&d).unwrap();
     let xml = document_xml(&bytes);
-    assert!(xml.contains(r#"<w:tag w:val="wordcraft:chunk:r"/>"#), "{xml}");
+    assert!(xml.contains(r#"<w:tag w:val="wordcraft:chunk:r?"#), "{xml}");
     assert!(xml.contains("<w:sdt>") && xml.contains("<w:sdtContent>"), "{xml}");
 
     let back = read(&bytes).unwrap();
@@ -434,4 +434,48 @@ fn an_empty_code_chunk_round_trips() {
     assert_eq!(back.chunks().len(), 1);
     assert_eq!(back.chunks()[0].code, "");
     assert_eq!(back.chunks()[0].language, "python");
+}
+
+/// Copying a chunk in Word gives the pasted control a new `w:id` with no matching
+/// `wordcraft.chunk.<new_id>` custom property. Because the options travel in `w:tag`, saving and
+/// reloading preserves `eval: false` and the rest of the chunk's options.
+#[test]
+fn copied_chunk_with_fresh_id_and_no_property_survives_docx_round_trip() {
+    use wordcraft_doc::{CodeChunk, chunk::chunk_prop_name};
+
+    let mut chunk = CodeChunk::new("r", "unlink('data.csv')");
+    chunk.options.set("eval", "false");
+    chunk.options.set("echo", "FALSE");
+    chunk.options.set("fig-cap", "\"Copied plot\"");
+    chunk.options.set("label", "fig-copy");
+    let mut d = Document::new();
+    let original_id = d.push_chunk(&chunk).unwrap();
+    let copied_id = original_id + 777;
+
+    let bytes = write(&d).unwrap();
+    let mut z = craft_zip::Archive::open(&bytes, craft_zip::Limits { max_entries: 10_000, max_total_bytes: 64 << 20 }).unwrap();
+    let names: Vec<String> = z.names().map(|n| n.into_owned()).collect();
+    let mut zw = craft_zip::Writer::new();
+    for name in names {
+        let mut entry = z.read(&name, 16 << 20).unwrap().unwrap();
+        if name == "word/document.xml" {
+            let xml = String::from_utf8(entry).unwrap();
+            let old_id_xml = format!(r#"<w:id w:val="{original_id}"/>"#);
+            let new_id_xml = format!(r#"<w:id w:val="{copied_id}"/>"#);
+            assert!(xml.contains(&old_id_xml), "{xml}");
+            entry = xml.replace(&old_id_xml, &new_id_xml).into_bytes();
+        }
+        zw.add(&name, &entry, craft_zip::Compression::Deflated).unwrap();
+    }
+    let copied_bytes = zw.finish().unwrap();
+
+    let back = read(&copied_bytes).unwrap();
+    assert!(!back.custom_props.iter().any(|p| p.name == chunk_prop_name(copied_id)));
+    let chunks = back.chunks();
+    assert_eq!(chunks.len(), 1);
+    assert_eq!(chunks[0].id, Some(copied_id));
+    assert!(!chunks[0].options.eval());
+    assert!(!chunks[0].options.echo());
+    assert_eq!(chunks[0].options.fig_caption().as_deref(), Some("Copied plot"));
+    assert_eq!(chunks[0].options.label(), Some("fig-copy"));
 }

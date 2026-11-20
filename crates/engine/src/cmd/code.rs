@@ -249,6 +249,18 @@ fn run_all(s: &mut Session, v: &Value) -> CmdResult {
             }));
             continue;
         }
+        if s.doc.chunk_options_missing(&range) {
+            success = false;
+            results.push(json!({
+                "chunk": {"id": range.chunk.id, "language": range.chunk.language, "success": false},
+                "error": "code chunk options are missing; refusing to assume eval: true",
+            }));
+            if stop {
+                stopped = true;
+                break;
+            }
+            continue;
+        }
         let entry = match runnable_language(&range) {
             Ok(language) => {
                 let id = chunk_id(s, &range);
