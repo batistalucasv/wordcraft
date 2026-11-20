@@ -35,6 +35,7 @@ craft-ssip = { git = "https://github.com/storytold/craft-libs", rev = "93dac78c9
 wordcraft-engine = { path = "crates/engine" }
 wordcraft-mcp = { path = "crates/mcp" }
 wordcraft-zotero = { path = "crates/zotero" }
+wordcraft-kernel = { path = "crates/kernel" }
 wordcraft-control-key = { path = "crates/control-key" }
 wordcraft-ui-egui = { path = "crates/ui-egui" }
 craft-codepage = { git = "https://github.com/storytold/craft-libs", rev = "93dac78c93a7f1fd66e2022edeb089233b1dc45a", version = "=0.1.0" }
@@ -49,6 +50,7 @@ log = "0.4"
 # All date/time conversion goes through chrono (no hand-rolled calendar code beyond the 400-year range extension; AGENTS.md).
 chrono = { version = "0.4.45", default-features = false, features = ["std"] }
 proptest = "1"
+command-group = "5.0.1"
 rayon = "1"
 unicode-bidi = "0.3"
 unicode-segmentation = "1"
