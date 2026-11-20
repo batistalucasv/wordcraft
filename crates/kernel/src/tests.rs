@@ -299,8 +299,9 @@ fn capture_retains_at_most_the_limit() {
     for _ in 0..8 {
         sink.retain(&chunk, 256);
     }
-    assert_eq!(sink.snapshot().len(), 256);
-    assert!(sink.is_truncated());
+    let captured = sink.snapshot();
+    assert_eq!(captured.bytes.len(), 256);
+    assert!(captured.truncated);
 }
 
 #[cfg(unix)]
@@ -327,6 +328,7 @@ fn capture_keeps_draining_after_the_limit() {
 }
 
 struct PendingReader {
+    first_read: Arc<AtomicBool>,
     has_data: Arc<AtomicBool>,
     payload: &'static [u8],
     delivered: bool,
@@ -334,6 +336,9 @@ struct PendingReader {
 
 impl Read for PendingReader {
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if !self.first_read.swap(true, Ordering::AcqRel) {
+            return Err(std::io::Error::from(ErrorKind::WouldBlock));
+        }
         if !self.has_data.load(Ordering::Acquire) {
             return Err(std::io::Error::from(ErrorKind::WouldBlock));
         }
@@ -352,38 +357,81 @@ fn capture_drains_pending_output_after_cancel() {
     let sink = CaptureSink::new();
     let cancel = Arc::new(AtomicBool::new(false));
     let has_data = Arc::new(AtomicBool::new(false));
+    let first_read = Arc::new(AtomicBool::new(false));
     let thread_sink = sink.clone();
     let thread_cancel = Arc::clone(&cancel);
     let thread_data = Arc::clone(&has_data);
+    let thread_first = Arc::clone(&first_read);
     let handle = thread::spawn(move || {
-        capture_into(PendingReader { has_data: thread_data, payload: b"pending", delivered: false }, &thread_sink, &thread_cancel, 1024)
+        capture_into(
+            PendingReader { first_read: thread_first, has_data: thread_data, payload: b"pending", delivered: false },
+            &thread_sink,
+            &thread_cancel,
+            1024,
+        )
     });
 
-    thread::sleep(Duration::from_millis(20));
+    while !first_read.load(Ordering::Acquire) {
+        thread::yield_now();
+    }
     cancel.store(true, Ordering::Release);
-    thread::sleep(Duration::from_millis(10));
     has_data.store(true, Ordering::Release);
     handle.join().expect("reader thread");
 
-    assert_eq!(sink.snapshot().as_slice(), b"pending");
+    assert_eq!(sink.snapshot().bytes.as_slice(), b"pending");
+}
+
+struct EndlessReader;
+
+impl Read for EndlessReader {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        buffer.fill(b'x');
+        Ok(buffer.len())
+    }
+}
+
+#[test]
+fn capture_stops_draining_at_the_deadline() {
+    let sink = CaptureSink::new();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let thread_sink = sink.clone();
+    let thread_cancel = Arc::clone(&cancel);
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let handle = thread::spawn(move || {
+        capture_into(EndlessReader, &thread_sink, &thread_cancel, 1024);
+        let _ = done_tx.send(());
+    });
+
+    thread::sleep(Duration::from_millis(10));
+    cancel.store(true, Ordering::Release);
+    assert!(done_rx.recv_timeout(Duration::from_secs(1)).is_ok(), "drain must stop at the deadline");
+    handle.join().expect("reader thread");
+    assert_eq!(sink.snapshot().bytes.len(), 1024);
 }
 
 #[cfg(target_os = "linux")]
-fn process_is_running(pid: i32) -> bool {
-    let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
-        return false;
+fn process_is_running(pid: i32) -> std::io::Result<bool> {
+    let stat = match fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => stat,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
     };
     let Some((_, rest)) = stat.rsplit_once(')') else {
-        return false;
+        return Err(std::io::Error::new(ErrorKind::InvalidData, "unexpected /proc/<pid>/stat format"));
     };
-    !rest.trim_start().starts_with('Z')
+    Ok(!rest.trim_start().starts_with('Z'))
 }
 
 #[cfg(all(unix, not(target_os = "linux")))]
-fn process_is_running(pid: i32) -> bool {
+fn process_is_running(pid: i32) -> std::io::Result<bool> {
+    use nix::errno::Errno;
     use nix::sys::signal::kill;
     use nix::unistd::Pid;
-    kill(Pid::from_raw(pid), None).is_ok()
+    match kill(Pid::from_raw(pid), None) {
+        Ok(()) => Ok(true),
+        Err(Errno::ESRCH) => Ok(false),
+        Err(error) => Err(std::io::Error::other(error.to_string())),
+    }
 }
 
 #[cfg(unix)]
@@ -408,7 +456,7 @@ time.sleep(30)
     assert!(started.elapsed() < Duration::from_secs(8), "timeout must not wait for the descendant");
     let pid: i32 = result.stdout.trim().parse().expect("descendant pid");
     let deadline = Instant::now() + Duration::from_secs(2);
-    while process_is_running(pid) {
+    while process_is_running(pid).expect("liveness probe") {
         assert!(Instant::now() < deadline, "the timed-out group must not leave a descendant");
         thread::sleep(Duration::from_millis(20));
     }

@@ -3,6 +3,7 @@
 //! Provides isolated, safe subprocess execution with timeout enforcement,
 //! output capture (stdout, stderr, exit status), and plot interception (PNG and vector SVG).
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
+#![forbid(unsafe_code)]
 
 use std::fmt;
 use std::fs;
@@ -346,37 +347,38 @@ struct Captured {
     truncated: bool,
 }
 
-/// Shared sink: the reader appends under the lock, and the caller can still
-/// snapshot it if the reader has to be detached.
+/// Shared sink: reads and snapshots go through one mutex, so the bytes and
+/// their truncation flag are always consistent.
 #[derive(Clone)]
 struct CaptureSink {
-    bytes: Arc<Mutex<Vec<u8>>>,
-    truncated: Arc<AtomicBool>,
+    state: Arc<Mutex<CaptureState>>,
+}
+
+#[derive(Default)]
+struct CaptureState {
+    bytes: Vec<u8>,
+    truncated: bool,
 }
 
 impl CaptureSink {
     fn new() -> Self {
-        Self { bytes: Arc::new(Mutex::new(Vec::new())), truncated: Arc::new(AtomicBool::new(false)) }
+        Self { state: Arc::new(Mutex::new(CaptureState::default())) }
     }
 
     fn retain(&self, chunk: &[u8], limit: usize) {
-        let mut bytes = self.bytes.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let remaining = limit.saturating_sub(bytes.len());
+        let mut state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let remaining = limit.saturating_sub(state.bytes.len());
         if chunk.len() > remaining {
-            bytes.extend_from_slice(&chunk[..remaining]);
-            drop(bytes);
-            self.truncated.store(true, Ordering::Release);
+            state.bytes.extend_from_slice(&chunk[..remaining]);
+            state.truncated = true;
         } else {
-            bytes.extend_from_slice(chunk);
+            state.bytes.extend_from_slice(chunk);
         }
     }
 
-    fn snapshot(&self) -> Vec<u8> {
-        self.bytes.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone()
-    }
-
-    fn is_truncated(&self) -> bool {
-        self.truncated.load(Ordering::Acquire)
+    fn snapshot(&self) -> Captured {
+        let state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        Captured { bytes: state.bytes.clone(), truncated: state.truncated }
     }
 }
 
@@ -409,7 +411,7 @@ impl CaptureReader {
                 let _ = self.handle.join();
             }
         }
-        Captured { bytes: self.sink.snapshot(), truncated: self.sink.is_truncated() }
+        self.sink.snapshot()
     }
 }
 
@@ -431,16 +433,16 @@ fn capture_into<R: Read>(mut pipe: R, sink: &CaptureSink, cancel: &AtomicBool, l
         if cancel.load(Ordering::Acquire) && drain_deadline.is_none() {
             drain_deadline = Some(Instant::now() + CAPTURE_DRAIN_TIMEOUT);
         }
+        if let Some(deadline) = drain_deadline
+            && Instant::now() >= deadline
+        {
+            return;
+        }
         match pipe.read(&mut chunk) {
             Ok(0) => return,
             Ok(read) => sink.retain(&chunk[..read], limit),
             Err(error) if error.kind() == ErrorKind::Interrupted => continue,
             Err(error) if error.kind() == ErrorKind::WouldBlock => {
-                if let Some(deadline) = drain_deadline
-                    && Instant::now() >= deadline
-                {
-                    return;
-                }
                 thread::sleep(CAPTURE_POLL_INTERVAL);
             }
             Err(_) => return,
