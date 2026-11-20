@@ -36,6 +36,8 @@ const MAX_CAPTURED_BYTES: usize = 10 * 1024 * 1024;
 const CAPTURE_CHUNK_BYTES: usize = 8 * 1024;
 /// How long a cancellable reader sleeps between non-blocking reads.
 const CAPTURE_POLL_INTERVAL: Duration = Duration::from_millis(5);
+/// How long to keep draining queued output after cancellation.
+const CAPTURE_DRAIN_TIMEOUT: Duration = Duration::from_millis(100);
 /// Grace for a blocking reader to see EOF after its group is killed.
 #[cfg(not(unix))]
 const CAPTURE_STOP_TIMEOUT: Duration = Duration::from_secs(1);
@@ -424,15 +426,21 @@ fn spawn_capture<R: Read + Send + 'static>(pipe: R, limit: usize) -> std::io::Re
 
 fn capture_into<R: Read>(mut pipe: R, sink: &CaptureSink, cancel: &AtomicBool, limit: usize) {
     let mut chunk = [0_u8; CAPTURE_CHUNK_BYTES];
+    let mut drain_deadline = None;
     loop {
-        if cancel.load(Ordering::Acquire) {
-            return;
+        if cancel.load(Ordering::Acquire) && drain_deadline.is_none() {
+            drain_deadline = Some(Instant::now() + CAPTURE_DRAIN_TIMEOUT);
         }
         match pipe.read(&mut chunk) {
             Ok(0) => return,
             Ok(read) => sink.retain(&chunk[..read], limit),
             Err(error) if error.kind() == ErrorKind::Interrupted => continue,
             Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                if let Some(deadline) = drain_deadline
+                    && Instant::now() >= deadline
+                {
+                    return;
+                }
                 thread::sleep(CAPTURE_POLL_INTERVAL);
             }
             Err(_) => return,

@@ -326,6 +326,65 @@ fn capture_keeps_draining_after_the_limit() {
     assert!(captured.truncated);
 }
 
+struct PendingReader {
+    has_data: Arc<AtomicBool>,
+    payload: &'static [u8],
+    delivered: bool,
+}
+
+impl Read for PendingReader {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if !self.has_data.load(Ordering::Acquire) {
+            return Err(std::io::Error::from(ErrorKind::WouldBlock));
+        }
+        if self.delivered {
+            return Ok(0);
+        }
+        self.delivered = true;
+        let read = self.payload.len().min(buffer.len());
+        buffer[..read].copy_from_slice(&self.payload[..read]);
+        Ok(read)
+    }
+}
+
+#[test]
+fn capture_drains_pending_output_after_cancel() {
+    let sink = CaptureSink::new();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let has_data = Arc::new(AtomicBool::new(false));
+    let thread_sink = sink.clone();
+    let thread_cancel = Arc::clone(&cancel);
+    let thread_data = Arc::clone(&has_data);
+    let handle = thread::spawn(move || {
+        capture_into(PendingReader { has_data: thread_data, payload: b"pending", delivered: false }, &thread_sink, &thread_cancel, 1024)
+    });
+
+    thread::sleep(Duration::from_millis(20));
+    has_data.store(true, Ordering::Release);
+    cancel.store(true, Ordering::Release);
+    handle.join().expect("reader thread");
+
+    assert_eq!(sink.snapshot().as_slice(), b"pending");
+}
+
+#[cfg(target_os = "linux")]
+fn process_is_running(pid: i32) -> bool {
+    let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    let Some((_, rest)) = stat.rsplit_once(')') else {
+        return false;
+    };
+    !rest.trim_start().starts_with('Z')
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn process_is_running(pid: i32) -> bool {
+    use nix::sys::signal::kill;
+    use nix::unistd::Pid;
+    kill(Pid::from_raw(pid), None).is_ok()
+}
+
 #[cfg(unix)]
 #[test]
 fn python_timeout_kills_same_group_descendant() {
@@ -347,13 +406,8 @@ time.sleep(30)
     assert!(result.timed_out);
     assert!(started.elapsed() < Duration::from_secs(8), "timeout must not wait for the descendant");
     let pid: i32 = result.stdout.trim().parse().expect("descendant pid");
-    use nix::sys::signal::kill;
-    use nix::unistd::Pid;
     let deadline = Instant::now() + Duration::from_secs(2);
-    loop {
-        if kill(Pid::from_raw(pid), None).is_err() {
-            break;
-        }
+    while process_is_running(pid) {
         assert!(Instant::now() < deadline, "the timed-out group must not leave a descendant");
         thread::sleep(Duration::from_millis(20));
     }
