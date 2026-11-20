@@ -304,7 +304,7 @@ impl ParaLayout {
 
     /// Caret position identifying the start of visual line `li`, retaining `Some(li)` affinity
     /// and a valid caret offset on `li` when `li` begins with a continuation fragment.
-    pub(crate) fn line_start_pos(&self, story: wordcraft_doc::StoryRef, path: wordcraft_doc::Path, li: usize) -> Option<wordcraft_doc::Pos> {
+    pub fn line_start_pos(&self, story: wordcraft_doc::StoryRef, path: wordcraft_doc::Path, li: usize) -> Option<wordcraft_doc::Pos> {
         let line = self.lines.get(li)?;
         let off = if self.is_line_continuation(li) { self.line_offsets(li).into_iter().min().unwrap_or(line.start) } else { line.start };
         Some(wordcraft_doc::Pos::with_affinity(story, path, off, self.continuation_affinity(li, off)))

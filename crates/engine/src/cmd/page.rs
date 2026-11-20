@@ -186,15 +186,17 @@ fn manual_hyphenation(s: &mut Session, v: &Value) -> CmdResult {
                 continue;
             };
             for li in (*l0).max(1)..*l1 {
-                let (Some(prev), Some(line)) = (para.lines.get(li - 1), para.lines.get(li)) else { continue };
+                let (Some(prev), Some(_line)) = (para.lines.get(li - 1), para.lines.get(li)) else { continue };
                 if prev.end != wordcraft_layout::LineEnd::Wrap || prev.hyphen.is_some() {
                     continue;
                 }
-                let at = Pos::new(*story, path.clone(), line.start);
+                let Some(line_pos) = para.line_start_pos(*story, path.clone(), li) else { continue };
+                let start = line_pos.off;
+                let at = line_pos.at(start);
                 if at < from || best.as_ref().is_some_and(|(b, _)| *b <= at) {
                     continue;
                 }
-                let Some(rest) = text.get(line.start..) else { continue };
+                let Some(rest) = text.get(start..) else { continue };
                 let len = rest.char_indices().find(|(_, c)| !(c.is_alphabetic() || *c == '\'' || *c == '\u{2019}')).map_or(rest.len(), |(i, _)| i);
                 let Some(word) = rest.get(..len) else { continue };
                 // A word with an optional hyphen already breaks where its author said.
@@ -208,12 +210,12 @@ fn manual_hyphenation(s: &mut Session, v: &Value) -> CmdResult {
                 // The room left at the end of the line above, and the width of each first part.
                 let room = prev.right - prev.end_x();
                 let hyphen_w = para
-                    .x_of(li, line.start)
-                    .zip(para.x_of(li, line.start + word.chars().next().map_or(0, char::len_utf8)))
+                    .x_of(li, start)
+                    .zip(para.x_of(li, start + word.chars().next().map_or(0, char::len_utf8)))
                     .map_or(6.0, |(a, b)| (b - a) * 0.6);
                 let fits = |pt: usize| {
                     let bytes = word.char_indices().nth(pt).map_or(word.len(), |(i, _)| i);
-                    match (para.x_of(li, line.start), para.x_of(li, line.start + bytes)) {
+                    match (para.x_of(li, start), para.x_of(li, start + bytes)) {
                         (Some(a), Some(b)) => (b - a) + hyphen_w <= room,
                         _ => false,
                     }

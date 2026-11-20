@@ -65,7 +65,7 @@ pub fn specs() -> Vec<CommandSpec> {
             let to_end = p::bool(v, "end").unwrap_or(false);
             let (a, b) = s.sel.ordered();
             let at = if to_end { b } else { a };
-            s.sel = Selection::caret(at.at(at.off));
+            s.sel = Selection::caret(at);
             sel_result(s)
         })
         .key("Escape")

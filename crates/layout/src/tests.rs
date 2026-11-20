@@ -16857,7 +16857,7 @@ fn clicking_and_selecting_wrapped_field() {
     assert_eq!(hit1.off, obj_len, "clicking a later line of a wrapped field skips to field end");
 
     let caret1 = l.caret(&hit1).expect("caret should exist");
-    assert!(caret1.top > l.pages[0].body.y + l0.top, "caret on field end is placed past line 0");
+    assert_eq!(caret1.top, l.pages[0].body.y + l1.top, "caret on continuation line 1 lands on line 1");
 
     // 3. Selecting the field highlights all its lines.
     let rects = l.selection_rects(&doc, &Pos::body(0, 0), &Pos::body(0, obj_len), 0);
@@ -17319,4 +17319,123 @@ fn typing_style_baseline_honors_visual_affinity_in_wrapped_field_with_page_split
     }
     assert!(saw_middle_on_page0, "expected at least one middle continuation line on page 0");
     assert!(saw_page_split_continuation, "expected at least one continuation line after page split");
+}
+
+/// Numbered-paragraph label and tab narrowing on line 0 splits field words wider than the remaining
+/// first-line span while keeping words that fit after the label grouped, and hitting the exclusion
+/// prepass work cap falls back to smaller wrapping clusters instead of a partially sampled bound.
+#[test]
+fn field_result_respects_first_line_list_label_span_and_exclusion_prepass_cap() {
+    use wordcraft_doc::numbering::{AbstractNum, Level, LevelSuffix, Num};
+    use wordcraft_doc::para::{Anchor, Float, Wrap};
+    use wordcraft_doc::props::NumRef;
+    use wordcraft_doc::section::NumFormat;
+
+    // 1. 100pt numbered paragraph where label + tab stop at 72pt leave 28pt for text on line 0.
+    let make_numbered_doc = |word: &str, as_field: bool| {
+        let mut d = Document::new();
+        d.last_section.page_w = 100.0;
+        d.last_section.margin_left = 0.0;
+        d.last_section.margin_right = 0.0;
+        d.last_section.margin_top = 0.0;
+        d.last_section.margin_bottom = 0.0;
+        Arc::make_mut(&mut d.styles).default_chr.font = Some(WRAP_TEST_FONT.into());
+        Arc::make_mut(&mut d.styles).default_chr.size = Some(12.0);
+        let lvl = Level {
+            format: NumFormat::Decimal,
+            text: "%1.".into(),
+            suffix: LevelSuffix::Tab,
+            indent: 0.0,
+            hanging: 0.0,
+            tab: Some(72.0),
+            ..Level::default()
+        };
+        let numbering = Arc::make_mut(&mut d.numbering);
+        numbering.abstracts.push(AbstractNum { id: 1, levels: vec![lvl], ..AbstractNum::default() });
+        numbering.nums.push(Num { id: 1, abstract_id: 1, ..Num::default() });
+
+        let mut p = Paragraph::new();
+        p.props.numbering = Some(NumRef { num: 1, level: 0 });
+        if as_field {
+            p.insert_object(
+                0,
+                InlineObject::Field {
+                    instr: "DOCVARIABLE item".into(),
+                    result: word.into(),
+                    locked: false,
+                    dirty: false,
+                    code: false,
+                    form: String::new(),
+                },
+                &Default::default(),
+            )
+            .unwrap();
+        } else {
+            p.insert_text(0, word, &Default::default()).unwrap();
+        }
+        d.body = vec![wordcraft_doc::para_block(p)];
+        d
+    };
+
+    // A short ~18pt field word ("WWW") fits in the 28pt span after the label and stays one cluster.
+    let l_short = lay(&make_numbered_doc("WWW", true));
+    let Placed::Lines { para: p_short, .. } = &l_short.pages[0].items[0] else { panic!("expected lines") };
+    assert_eq!(p_short.clusters.len(), 1, "short field word fitting after label should stay one cluster");
+    assert_eq!(p_short.lines.len(), 1, "short field word should fit on line 0 after label");
+    assert!(p_short.lines[0].end_x() <= 100.5);
+
+    // A ~60pt field word ("WWWWWWWW") exceeds the 28pt span after the label (though < 100pt column)
+    // and splits into grapheme clusters so it wraps after the label like ordinary text.
+    let long_word = "WWWWWWWW";
+    let l_field = lay(&make_numbered_doc(long_word, true));
+    let l_text = lay(&make_numbered_doc(long_word, false));
+    let Placed::Lines { para: p_field, .. } = &l_field.pages[0].items[0] else { panic!("expected field lines") };
+    let Placed::Lines { para: p_text, .. } = &l_text.pages[0].items[0] else { panic!("expected text lines") };
+    assert!(p_field.lines.len() >= 2, "60pt field word must wrap after label in 100pt numbered paragraph");
+    assert_eq!(p_field.lines.len(), p_text.lines.len(), "numbered field line count must match plain text");
+    for (i, (lf, lt)) in p_field.lines.iter().zip(&p_text.lines).enumerate() {
+        assert!(lf.end_x() <= lf.right + 0.5, "numbered field line {i} overflowed right edge: {} > {}", lf.end_x(), lf.right);
+        assert!((lf.end_x() - lt.end_x()).abs() < 1.0, "numbered line {i} end_x matches plain text: {} vs {}", lf.end_x(), lt.end_x());
+    }
+
+    // 2. When many floating exclusions exceed the prepass cap, conservative_span_bound falls back to
+    // smaller wrapping clusters rather than using a partially sampled early width.
+    let mut d = Document::new();
+    d.last_section.page_w = 200.0;
+    d.last_section.margin_left = 0.0;
+    d.last_section.margin_right = 0.0;
+    d.last_section.margin_top = 0.0;
+    d.last_section.margin_bottom = 0.0;
+    Arc::make_mut(&mut d.styles).default_chr.font = Some(WRAP_TEST_FONT.into());
+    Arc::make_mut(&mut d.styles).default_chr.size = Some(12.0);
+    let mut p = Paragraph::new();
+    // Insert many non-narrowing floats at the top so the prepass cap is exceeded before a narrow float.
+    for idx in 0..80 {
+        let float =
+            Float { wrap: Wrap::Square, h_rel: Anchor::Column, v_rel: Anchor::Paragraph, x: 185.0, y: idx as f32 * 0.5, ..Default::default() };
+        p.insert_object(p.len(), rect_shape(10.0, 2.0, float), &Default::default()).unwrap();
+    }
+    // Also place a float on line 0 that leaves only 40pt of room on the left (`0..40`).
+    let narrow_float = Float { wrap: Wrap::Square, h_rel: Anchor::Column, v_rel: Anchor::Paragraph, x: 40.0, y: 0.0, ..Default::default() };
+    p.insert_object(p.len(), rect_shape(160.0, 60.0, narrow_float), &Default::default()).unwrap();
+    p.insert_object(
+        p.len(),
+        InlineObject::Field {
+            instr: "DOCVARIABLE capped".into(),
+            result: "WWWWWWWWWWWW".into(),
+            locked: false,
+            dirty: false,
+            code: false,
+            form: String::new(),
+        },
+        &Default::default(),
+    )
+    .unwrap();
+    d.body = vec![wordcraft_doc::para_block(p)];
+    let l_capped = lay(&d);
+    let Placed::Lines { para: p_capped, .. } = &l_capped.pages[0].items[0] else { panic!("expected lines") };
+    assert!(p_capped.lines.len() >= 2, "capped exclusion prepass must retain smaller wrapping clusters");
+    for (i, ln) in p_capped.lines.iter().enumerate() {
+        assert!(ln.end_x() <= ln.right + 0.5, "line {i} overflowed span beside float under capped prepass: {} > {}", ln.end_x(), ln.right);
+    }
 }

@@ -409,6 +409,41 @@ fn hyphenation_options_and_manual_hyphenation() {
     assert!(found > 0, "no candidates");
     assert_eq!(s.doc.plain_text(wordcraft_doc::StoryRef::Body).matches('\u{ad}').count(), found);
     assert!(s.run("layout.manualHyphenation", &json!({"from": {"block": 999, "off": 0}})).unwrap()["done"] == true);
+
+    // When a line begins with a wrapped field continuation followed by a hyphenatable word on that line,
+    // manual_hyphenation inspects the line's first caret offset (`line_start_pos`) rather than `Line.start`.
+    let mut doc = wordcraft_doc::Document::new();
+    doc.last_section.margin_left = 206.0;
+    doc.last_section.margin_right = 206.0;
+    let mut p = wordcraft_doc::Paragraph::new();
+    p.insert_object(
+        0,
+        wordcraft_doc::InlineObject::Field {
+            instr: "DOCVARIABLE lead".into(),
+            result: "alpha beta gamma delta 123456789012345 ".into(),
+            locked: false,
+            dirty: false,
+            code: false,
+            form: String::new(),
+        },
+        &Default::default(),
+    )
+    .unwrap();
+    let field_end = p.len();
+    p.insert_text(field_end, "uncharacteristically", &Default::default()).unwrap();
+    doc.body = vec![wordcraft_doc::para_block(p)];
+    let mut s_field = Session::new(doc);
+    {
+        let l = s_field.layout();
+        let crate::layout::Placed::Lines { para, .. } = &l.pages[0].items[0] else { panic!("expected paragraph lines") };
+        let line1_start = para.line_start_pos(wordcraft_doc::StoryRef::Body, wordcraft_doc::Path::top(0), 1).expect("line 1 start pos");
+        assert_eq!(line1_start.affinity, Some(1), "expected line 1 to start with a wrapped field continuation");
+        assert_eq!(para.lines[1].start, 0, "Line.start on continuation line 1 is the field start offset");
+    }
+    let cand = s_field.run("layout.manualHyphenation", &json!({})).unwrap();
+    assert_ne!(cand["done"], json!(true), "expected hyphenation candidate on wrapped field continuation: {cand}");
+    assert_eq!(cand["pos"]["off"].as_u64(), Some(field_end as u64), "candidate pos must point after wrapped field, not Line.start");
+    assert_eq!(cand["word"].as_str(), Some("uncharacteristically"));
 }
 
 /// `layout.pageNumberFormat` sets the section's number format and start; a call without
