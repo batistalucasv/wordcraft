@@ -1,6 +1,6 @@
 //! The interactive code chunk: a rounded code container with a language badge, a Run button, an
 //! options menu, a monospace editor with line numbers and light syntax colouring, and a
-//! collapsible output drawer holding the console and a zoomable plot viewer.
+//! collapsible output drawer holding the console, a zoomable plot viewer and captured tables.
 //!
 //! The widget is UI only. It keeps its own state (language, source, output and the run in
 //! flight) and tells the host what must reach the document through [`CodeChunkAction`].
@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use egui::text::LayoutJob;
 use egui::{Align, Align2, Color32, CornerRadius, FontId, Id, Key, Layout, Margin, RichText, Stroke, TextEdit, Ui, pos2, vec2};
-use wordcraft_kernel::{CodeLanguage, ExecutionResult};
+use wordcraft_kernel::{CodeLanguage, ExecutionResult, TabularOutput};
 
 #[cfg(not(target_arch = "wasm32"))]
 use wordcraft_kernel::{ExecutionRequest, PlotFormat};
@@ -56,6 +56,14 @@ const CONSOLE_MAX_H: f32 = 180.0;
 /// Largest height the plot scrolls in before the page takes over.
 const PLOT_MAX_H: f32 = 280.0;
 
+/// Largest height the table scrolls in before the page takes over.
+const TABLE_MAX_H: f32 = 300.0;
+
+/// Rows and columns laid out for one table. The kernel keeps up to 10,000 rows, so the drawer
+/// previews a bounded slice; insertion still carries the whole table.
+const TABLE_PREVIEW_ROWS: usize = 200;
+const TABLE_PREVIEW_COLS: usize = 50;
+
 /// One run's reply from the worker thread: the kernel's result, or why it could not run.
 pub type RunResult = Result<ExecutionResult, wordcraft_kernel::KernelError>;
 
@@ -66,6 +74,8 @@ pub enum OutputTab {
     Console,
     /// The captured plot, with zoom and an action to put it in the document.
     Plot,
+    /// Tables passed to `wc_table()`, with an action to put the chosen one in the document.
+    Table,
 }
 
 /// A finished run's output.
@@ -87,6 +97,8 @@ pub struct ChunkOutput {
     pub plot_png: Option<Vec<u8>>,
     /// Vector SVG of the captured plot, for insertion at full quality.
     pub plot_svg: Option<String>,
+    /// Tables passed to `wc_table()`, in call order.
+    pub tables: Vec<TabularOutput>,
     /// Why the chunk could not run at all (no interpreter, worker failure). When set, the other
     /// fields carry nothing.
     pub error: Option<String>,
@@ -109,6 +121,7 @@ impl ChunkOutput {
             duration_ms: result.duration_ms,
             plot_png: result.plot_png.clone(),
             plot_svg: result.plot_svg.clone(),
+            tables: result.tables.clone(),
             error: None,
         }
     }
@@ -116,6 +129,11 @@ impl ChunkOutput {
     /// Whether the run captured a plot in either format.
     pub fn has_plot(&self) -> bool {
         self.plot_png.is_some() || self.plot_svg.is_some()
+    }
+
+    /// Whether the run captured at least one table.
+    pub fn has_tables(&self) -> bool {
+        !self.tables.is_empty()
     }
 }
 
@@ -129,6 +147,14 @@ pub enum CodeChunkAction {
         png: Option<Vec<u8>>,
         /// The lossless vector, if one was captured.
         svg: Option<String>,
+    },
+    /// Add a captured table to the document as a native Word table. The whole table is carried,
+    /// not the bounded preview the drawer draws.
+    InsertTable {
+        /// Column names in display order.
+        headers: Vec<String>,
+        /// Body rows, each with one cell per header.
+        rows: Vec<Vec<String>>,
     },
 }
 
@@ -148,6 +174,8 @@ pub struct CodeChunk {
     pub tab: OutputTab,
     /// The plot viewer's scale; 1.0 shows one image pixel per device pixel.
     pub zoom: f32,
+    /// Which captured table the drawer shows when a run produced more than one.
+    table_index: usize,
     output: Option<ChunkOutput>,
     /// The run in flight, when there is one.
     pending: Option<Receiver<RunResult>>,
@@ -172,6 +200,7 @@ impl CodeChunk {
             output_open: false,
             tab: OutputTab::Console,
             zoom: 1.0,
+            table_index: 0,
             output: None,
             pending: None,
             started: None,
@@ -224,9 +253,16 @@ impl CodeChunk {
     }
 
     /// Show a finished output, as when a saved document restores its chunk: opens the drawer and
-    /// picks the plot tab when there is a plot.
+    /// picks the plot tab when there is a plot, then the table tab when there are tables.
     pub fn set_output(&mut self, output: ChunkOutput) {
-        self.tab = if output.has_plot() { OutputTab::Plot } else { OutputTab::Console };
+        self.tab = if output.has_plot() {
+            OutputTab::Plot
+        } else if output.has_tables() {
+            OutputTab::Table
+        } else {
+            OutputTab::Console
+        };
+        self.table_index = 0;
         self.output = Some(output);
         self.output_open = true;
         self.plot_texture = None;
@@ -547,11 +583,16 @@ impl CodeChunk {
             ui.add_enabled_ui(has_plot, |ui| {
                 ui.selectable_value(&mut self.tab, OutputTab::Plot, crate::tl!("Plot"));
             });
+            let has_tables = self.output.as_ref().is_some_and(ChunkOutput::has_tables);
+            ui.add_enabled_ui(has_tables, |ui| {
+                ui.selectable_value(&mut self.tab, OutputTab::Table, crate::tl!("Table"));
+            });
         });
         ui.add_space(2.0);
         match self.tab {
             OutputTab::Console => Self::console(ui, self.output.as_ref(), t, self.id),
             OutputTab::Plot => self.plot(ui, t, action),
+            OutputTab::Table => self.table(ui, t, action),
         }
     }
 
@@ -654,6 +695,132 @@ impl CodeChunk {
         }
     }
 
+    fn table(&mut self, ui: &mut Ui, t: &Tokens, action: &mut Option<CodeChunkAction>) {
+        let Some(output) = self.output.as_ref() else {
+            ui.label(RichText::new(crate::tl!("Run the chunk to see its table.")).color(t.text_dim).size(12.0));
+            return;
+        };
+        if !output.has_tables() {
+            ui.label(RichText::new(crate::tl!("This run captured no table.")).color(t.text_dim).size(12.0));
+            return;
+        }
+
+        let count = output.tables.len();
+        let mut selected = self.table_index.min(count - 1);
+        if count > 1 {
+            ui.horizontal_wrapped(|ui| {
+                for index in 0..count {
+                    let label = format!("{} {}", crate::tl!("Table"), index + 1);
+                    if ui.selectable_label(selected == index, label).clicked() {
+                        selected = index;
+                    }
+                }
+            });
+        }
+        self.table_index = selected;
+
+        let Some(output) = self.output.as_ref() else { return };
+        let Some(table) = output.tables.get(self.table_index) else { return };
+        let preview_rows = table.rows.len().min(TABLE_PREVIEW_ROWS);
+        let preview_cols = table.headers.len().min(TABLE_PREVIEW_COLS);
+        if preview_cols == 0 {
+            ui.label(RichText::new(crate::tl!("This run captured no table.")).color(t.text_dim).size(12.0));
+            return;
+        }
+        let mut insert = false;
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(format!("{} × {}", table.rows.len(), table.headers.len())).color(t.text_dim).size(11.0))
+                .on_hover_text(crate::tl!("Rows × columns"));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let response = ui.button(crate::tl!("Insert into document"));
+                if response.clicked() {
+                    insert = true;
+                }
+                response.on_hover_text(crate::tl!("Add the table to the document as a Word table"));
+            });
+        });
+
+        // A column opens at the width of its longest previewed cell, so numeric columns stay
+        // readable without measuring every one of the kernel's rows each frame. Only the first 32
+        // characters can affect the width, since the result is capped below that.
+        let widths: Vec<f32> = (0..preview_cols)
+            .map(|column| {
+                let header = table.headers.get(column).map_or(0, |cell| cell.chars().take(32).count());
+                let body = table
+                    .rows
+                    .iter()
+                    .take(preview_rows)
+                    .map(|row| row.get(column).map_or(0, |cell| cell.chars().take(32).count()))
+                    .max()
+                    .unwrap_or(0);
+                (header.max(body) as f32 * 7.0).clamp(48.0, 240.0)
+            })
+            .collect();
+        // A wide frame gets a horizontal scrollbar rather than clipped columns that cannot be
+        // reached. The table keeps its own vertical scrollbar inside.
+        let scrollbar = ui.spacing().scroll.bar_width + ui.spacing().scroll.bar_inner_margin + ui.spacing().scroll.bar_outer_margin;
+        let total_width = widths.iter().sum::<f32>() + ui.spacing().item_spacing.x * widths.len() as f32 + scrollbar;
+        egui::ScrollArea::horizontal().id_salt(("wordcraft-code-chunk-table-scroll", self.id, self.table_index)).auto_shrink([false, true]).show(
+            ui,
+            |ui| {
+                ui.set_min_width(total_width);
+                let mut builder = egui_extras::TableBuilder::new(ui)
+                    .id_salt(("wordcraft-code-chunk-table", self.id, self.table_index))
+                    .striped(true)
+                    .resizable(true)
+                    .auto_shrink([false, true])
+                    .max_scroll_height(TABLE_MAX_H)
+                    .cell_layout(Layout::left_to_right(Align::Center));
+                for width in &widths {
+                    builder = builder.column(egui_extras::Column::initial(*width).at_least(40.0).clip(true));
+                }
+                builder
+                    .header(20.0, |mut header| {
+                        for column in 0..preview_cols {
+                            header.col(|ui| {
+                                let text = table.headers.get(column).map_or("", String::as_str);
+                                ui.add(egui::Label::new(RichText::new(text).strong().size(11.5).color(t.text)));
+                            });
+                        }
+                    })
+                    .body(|body| {
+                        body.rows(18.0, preview_rows, |mut row| {
+                            let cells = &table.rows[row.index()];
+                            for column in 0..preview_cols {
+                                row.col(|ui| {
+                                    let text = cells.get(column).map_or("", String::as_str);
+                                    let label = egui::Label::new(RichText::new(text).monospace().size(11.0).color(t.text));
+                                    if is_numeric(text) {
+                                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                            ui.add(label);
+                                        });
+                                    } else {
+                                        ui.add(label);
+                                    }
+                                });
+                            }
+                        });
+                    });
+            },
+        );
+        if preview_rows < table.rows.len() || preview_cols < table.headers.len() {
+            ui.label(
+                RichText::new(format!(
+                    "{} {} × {}. {}",
+                    crate::tl!("Showing the first"),
+                    preview_rows,
+                    preview_cols,
+                    crate::tl!("Inserting keeps the whole table.")
+                ))
+                .color(t.text_dim)
+                .size(11.0),
+            );
+        }
+        if insert {
+            *action = Some(CodeChunkAction::InsertTable { headers: table.headers.clone(), rows: table.rows.clone() });
+        }
+    }
+
     fn status(&self) -> Option<(String, StatusKind)> {
         if self.is_running() {
             return None;
@@ -681,6 +848,11 @@ enum StatusKind {
     Ok,
     Warn,
     Fail,
+}
+
+/// Whether a cell reads as a number, so the table lines it up on the right.
+fn is_numeric(text: &str) -> bool {
+    !text.is_empty() && text.parse::<f64>().is_ok()
 }
 
 fn next_id() -> u64 {
