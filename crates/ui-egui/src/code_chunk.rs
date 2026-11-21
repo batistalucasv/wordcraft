@@ -66,7 +66,6 @@ const TABLE_PREVIEW_COLS: usize = 50;
 
 /// Message shown when someone tries to run a chunk in the browser build, which has no
 /// local R/Python interpreter.
-#[cfg(any(target_arch = "wasm32", test))]
 const BROWSER_NO_INTERPRETER_MESSAGE: &str = "Code chunks run in the desktop app; the browser has no interpreter.";
 
 /// One run's reply from the worker thread: the kernel's result, or why it could not run.
@@ -293,6 +292,8 @@ pub struct CodeChunk {
     plot_decode_failed: Vec<bool>,
     #[cfg(test)]
     plot_decode_attempts: usize,
+    #[cfg(test)]
+    force_browser_for_test: bool,
     /// Optional human-readable chunk label (`#| label: ...`).
     label: String,
     editing_label: bool,
@@ -326,6 +327,8 @@ impl CodeChunk {
             plot_decode_failed: Vec::new(),
             #[cfg(test)]
             plot_decode_attempts: 0,
+            #[cfg(test)]
+            force_browser_for_test: false,
             label: String::new(),
             editing_label: false,
             label_draft: String::new(),
@@ -708,11 +711,7 @@ impl CodeChunk {
                             run = true;
                         }
                         if !self.available {
-                            run_button.on_disabled_hover_text(format!(
-                                "{} was not found on PATH. Install {} to run this chunk.",
-                                current.binary_name(),
-                                language_name(current)
-                            ));
+                            run_button.on_disabled_hover_text(unavailable_run_message(current, self.is_browser()));
                         } else if !self.read_only {
                             run_button.on_hover_text(crate::tl!("Run the chunk (Ctrl+Enter)"));
                         }
@@ -1017,25 +1016,24 @@ impl CodeChunk {
             self.plot_textures.resize_with(count, || None);
             self.plot_decode_failed.resize(count, false);
         }
-        let (png_bytes, svg_xml) = {
+        let has_png = {
             let Some(output) = self.output.as_ref() else { return };
-            let Some((png, svg)) = output.plot_at(selected) else { return };
-            (png.map(ToOwned::to_owned), svg.map(ToOwned::to_owned))
-        };
-
-        if self.plot_textures[selected].is_none()
-            && !self.plot_decode_failed[selected]
-            && let Some(png) = png_bytes.as_deref()
-        {
-            #[cfg(test)]
+            let Some((png, _)) = output.plot_at(selected) else { return };
+            if self.plot_textures[selected].is_none()
+                && !self.plot_decode_failed[selected]
+                && let Some(png) = png
             {
-                self.plot_decode_attempts += 1;
+                #[cfg(test)]
+                {
+                    self.plot_decode_attempts += 1;
+                }
+                self.plot_textures[selected] = decode_plot(ui.ctx(), png, self.id, selected);
+                if self.plot_textures[selected].is_none() {
+                    self.plot_decode_failed[selected] = true;
+                }
             }
-            self.plot_textures[selected] = decode_plot(ui.ctx(), png, self.id, selected);
-            if self.plot_textures[selected].is_none() {
-                self.plot_decode_failed[selected] = true;
-            }
-        }
+            png.is_some()
+        };
 
         let texture = self.plot_textures[selected].clone();
         let mut insert = false;
@@ -1056,11 +1054,11 @@ impl CodeChunk {
                 self.zoom = (room / natural.x.max(1.0)).clamp(MIN_ZOOM, MAX_ZOOM);
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let response = ui.add_enabled(!self.read_only && png_bytes.is_some(), egui::Button::new(crate::tl!("Insert into document")));
+                let response = ui.add_enabled(!self.read_only && has_png, egui::Button::new(crate::tl!("Insert into document")));
                 if response.clicked() {
                     insert = true;
                 }
-                let tip = if png_bytes.is_none() {
+                let tip = if !has_png {
                     crate::tl!("Inline insertion requires a PNG plot; rerun with PNG or both formats.")
                 } else {
                     crate::tl!("Add the plot to the document as a picture")
@@ -1082,7 +1080,7 @@ impl CodeChunk {
                     });
                 });
         } else {
-            let message = if png_bytes.is_none() {
+            let message = if !has_png {
                 crate::tl!("The plot is vector-only (SVG). Inline insertion requires a PNG; rerun the chunk with PNG or both plot formats.")
             } else {
                 crate::tl!("This plot could not be decoded for preview.")
@@ -1090,8 +1088,8 @@ impl CodeChunk {
             ui.label(RichText::new(message).color(t.text_dim).size(12.0));
         }
 
-        if insert {
-            *action = Some(CodeChunkAction::InsertPlot { png: png_bytes, svg: svg_xml });
+        if insert && let Some((png, svg)) = self.output.as_ref().and_then(|o| o.plot_at(selected)) {
+            *action = Some(CodeChunkAction::InsertPlot { png: png.map(ToOwned::to_owned), svg: svg.map(ToOwned::to_owned) });
         }
     }
 
@@ -1239,6 +1237,22 @@ impl CodeChunk {
             let code = output.exit_code.map_or_else(|| "—".to_owned(), |code| code.to_string());
             Some((format!("× {} {code}", crate::tl!("Exit")), StatusKind::Fail))
         }
+    }
+
+    fn is_browser(&self) -> bool {
+        #[cfg(test)]
+        if self.force_browser_for_test {
+            return true;
+        }
+        cfg!(target_arch = "wasm32")
+    }
+}
+
+fn unavailable_run_message(language: CodeLanguage, browser: bool) -> String {
+    if browser {
+        crate::tl!(BROWSER_NO_INTERPRETER_MESSAGE).to_owned()
+    } else {
+        format!("{} was not found on PATH. Install {} to run this chunk.", language.binary_name(), language_name(language))
     }
 }
 
