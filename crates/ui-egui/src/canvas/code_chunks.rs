@@ -586,71 +586,7 @@ pub(crate) fn sync_before_layout(app: &mut WordApp, ui: &Ui) {
 
 /// Flush one dirty chunk widget into the document as a clean `code.update_chunk` transaction.
 pub(crate) fn flush_one(app: &mut WordApp, id: i64) -> Result<(), String> {
-    let Some(entry) = app.canvas.code_chunks.widgets.get(&id) else {
-        return Ok(());
-    };
-    if !entry.dirty {
-        return Ok(());
-    }
-    let live = top_level_chunks(&app.session.doc).into_iter().find(|r| r.chunk.id == Some(id));
-    match live {
-        None => {
-            if let Some(entry) = app.canvas.code_chunks.widgets.get_mut(&id) {
-                entry.dirty = false;
-                entry.last_edit_time = None;
-            }
-            return Ok(());
-        }
-        Some(r) => {
-            if let Some(live_lang) = parse_lang(&r.chunk.language)
-                && let Some(entry) = app.canvas.code_chunks.widgets.get_mut(&id)
-                && reconcile_entry(entry, live_lang, &r.chunk.code)
-            {
-                return Ok(());
-            }
-        }
-    }
-
-    let Some(entry) = app.canvas.code_chunks.widgets.get(&id) else {
-        return Ok(());
-    };
-    let code = entry.widget.code().to_owned();
-    let lang = entry.widget.language();
-    if entry.last_synced_code.len() > crate::code_chunk::MAX_CODE_CHARS && code.len() < entry.last_synced_code.len() {
-        return Ok(());
-    }
-    if entry.last_synced_lang == lang && entry.last_synced_code == code {
-        if let Some(entry) = app.canvas.code_chunks.widgets.get_mut(&id) {
-            entry.dirty = false;
-            entry.last_edit_time = None;
-        }
-        return Ok(());
-    }
-    match app.session.run(
-        "code.update_chunk",
-        &json!({
-            "chunkId": id,
-            "language": lang.as_str(),
-            "code": code,
-        }),
-    ) {
-        Ok(_) => {
-            if let Some(entry) = app.canvas.code_chunks.widgets.get_mut(&id) {
-                entry.last_synced_lang = lang;
-                entry.last_synced_code = code;
-                entry.dirty = false;
-                entry.last_edit_time = None;
-            }
-            Ok(())
-        }
-        Err(e) => {
-            // Stop repeating timer flushes every frame, but keep `dirty = true` until resolved.
-            if let Some(entry) = app.canvas.code_chunks.widgets.get_mut(&id) {
-                entry.last_edit_time = None;
-            }
-            Err(e.to_string())
-        }
-    }
+    app.canvas.code_chunks.flush_one(&mut app.session, id)
 }
 
 /// Flush every dirty code chunk editor into the document before Undo/Redo/Save/Export/Run.
@@ -660,49 +596,7 @@ pub(crate) fn flush_dirty(app: &mut WordApp) -> Result<(), String> {
 
 /// Flush dirty code chunks, skipping an optional target chunk (e.g. for `code.delete_chunk`).
 pub(crate) fn flush_dirty_except(app: &mut WordApp, except: Option<i64>) -> Result<(), String> {
-    let mut ids: Vec<i64> = app.canvas.code_chunks.widgets.iter().filter(|(id, e)| e.dirty && Some(**id) != except).map(|(id, _)| *id).collect();
-    ids.sort_unstable();
-    let mut first_err = None;
-    for id in ids {
-        if let Err(err) = flush_one(app, id)
-            && first_err.is_none()
-        {
-            first_err = Some(err);
-        }
-    }
-    let mut parked_ids: Vec<i64> = app.canvas.code_chunks.restored_drafts.keys().filter(|id| Some(**id) != except).copied().collect();
-    parked_ids.sort_unstable();
-    for id in parked_ids {
-        let Some((lang, code)) = app.canvas.code_chunks.restored_drafts.get(&id).cloned() else {
-            continue;
-        };
-        let live = top_level_chunks(&app.session.doc).into_iter().find(|r| r.chunk.id == Some(id));
-        let Some(r) = live else {
-            app.canvas.code_chunks.restored_drafts.remove(&id);
-            continue;
-        };
-        if r.chunk.language == lang.as_str() && r.chunk.code == code {
-            app.canvas.code_chunks.restored_drafts.remove(&id);
-            continue;
-        }
-        match app.session.run(
-            "code.update_chunk",
-            &json!({
-                "chunkId": id,
-                "language": lang.as_str(),
-                "code": code,
-            }),
-        ) {
-            Ok(_) => {
-                app.canvas.code_chunks.restored_drafts.remove(&id);
-            }
-            Err(e) => {
-                if first_err.is_none() {
-                    first_err = Some(e.to_string());
-                }
-            }
-        }
-    }
+    let mut first_err = app.canvas.code_chunks.flush_dirty_except(&mut app.session, except).err();
     // Also flush dirty chunk drafts from other non-shown windows displaying this document.
     let current_doc = app.session.document_id();
     if let Err(err) = app.windows.flush_dirty_chunks_for(&mut app.session, current_doc, except)
@@ -713,6 +607,128 @@ pub(crate) fn flush_dirty_except(app: &mut WordApp, except: Option<i64>) -> Resu
     match first_err {
         Some(err) => Err(err),
         None => Ok(()),
+    }
+}
+
+impl CodeChunksState {
+    /// Flush one dirty chunk widget into `session` after reconciling external document edits.
+    pub(crate) fn flush_one(&mut self, session: &mut wordcraft_engine::Session, id: i64) -> Result<(), String> {
+        let Some(entry) = self.widgets.get(&id) else {
+            return Ok(());
+        };
+        if !entry.dirty {
+            return Ok(());
+        }
+        let live = top_level_chunks(&session.doc).into_iter().find(|r| r.chunk.id == Some(id));
+        match live {
+            None => {
+                if let Some(entry) = self.widgets.get_mut(&id) {
+                    entry.dirty = false;
+                    entry.last_edit_time = None;
+                }
+                return Ok(());
+            }
+            Some(r) => {
+                if let Some(live_lang) = parse_lang(&r.chunk.language)
+                    && let Some(entry) = self.widgets.get_mut(&id)
+                    && reconcile_entry(entry, live_lang, &r.chunk.code)
+                {
+                    return Ok(());
+                }
+            }
+        }
+
+        let Some(entry) = self.widgets.get(&id) else {
+            return Ok(());
+        };
+        let code = entry.widget.code().to_owned();
+        let lang = entry.widget.language();
+        if entry.last_synced_code.len() > crate::code_chunk::MAX_CODE_CHARS && code.len() < entry.last_synced_code.len() {
+            return Ok(());
+        }
+        if entry.last_synced_lang == lang && entry.last_synced_code == code {
+            if let Some(entry) = self.widgets.get_mut(&id) {
+                entry.dirty = false;
+                entry.last_edit_time = None;
+            }
+            return Ok(());
+        }
+        match session.run(
+            "code.update_chunk",
+            &json!({
+                "chunkId": id,
+                "language": lang.as_str(),
+                "code": code,
+            }),
+        ) {
+            Ok(_) => {
+                if let Some(entry) = self.widgets.get_mut(&id) {
+                    entry.last_synced_lang = lang;
+                    entry.last_synced_code = code;
+                    entry.dirty = false;
+                    entry.last_edit_time = None;
+                }
+                Ok(())
+            }
+            Err(e) => {
+                // Stop repeating timer flushes every frame, but keep `dirty = true` until resolved.
+                if let Some(entry) = self.widgets.get_mut(&id) {
+                    entry.last_edit_time = None;
+                }
+                Err(e.to_string())
+            }
+        }
+    }
+
+    /// Flush dirty chunk widgets and restored drafts into `session`, skipping an optional target chunk.
+    pub(crate) fn flush_dirty_except(&mut self, session: &mut wordcraft_engine::Session, except: Option<i64>) -> Result<(), String> {
+        let mut ids: Vec<i64> = self.widgets.iter().filter(|(id, e)| e.dirty && Some(**id) != except).map(|(id, _)| *id).collect();
+        ids.sort_unstable();
+        let mut first_err = None;
+        for id in ids {
+            if let Err(err) = self.flush_one(session, id)
+                && first_err.is_none()
+            {
+                first_err = Some(err);
+            }
+        }
+        let mut parked_ids: Vec<i64> = self.restored_drafts.keys().filter(|id| Some(**id) != except).copied().collect();
+        parked_ids.sort_unstable();
+        for id in parked_ids {
+            let Some((lang, code)) = self.restored_drafts.get(&id).cloned() else {
+                continue;
+            };
+            let live = top_level_chunks(&session.doc).into_iter().find(|r| r.chunk.id == Some(id));
+            let Some(r) = live else {
+                self.restored_drafts.remove(&id);
+                continue;
+            };
+            if r.chunk.language == lang.as_str() && r.chunk.code == code {
+                self.restored_drafts.remove(&id);
+                continue;
+            }
+            match session.run(
+                "code.update_chunk",
+                &json!({
+                    "chunkId": id,
+                    "language": lang.as_str(),
+                    "code": code,
+                }),
+            ) {
+                Ok(_) => {
+                    self.restored_drafts.remove(&id);
+                }
+                Err(e) => {
+                    if first_err.is_none() {
+                        first_err = Some(e.to_string());
+                    }
+                }
+            }
+        }
+        match first_err {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
     }
 }
 

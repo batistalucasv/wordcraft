@@ -514,3 +514,77 @@ fn every_open_replaces_an_untouched_blank_document_in_its_window() {
     }
     std::fs::remove_dir_all(second.parent().unwrap()).ok();
 }
+
+/// If window A holds an unapplied `x = 1` draft based on `x = 0`, and window B commits `x = 2`
+/// then saves before A redraws, flushing non-shown window A must reconcile its widget to `x = 2`
+/// instead of overwriting `x = 2` with stale `x = 1`. When the live source still matches A's
+/// recorded baseline, flushing from B must still commit A's draft.
+#[test]
+fn flushing_non_shown_window_reconciles_stale_chunk_draft_and_preserves_valid_draft_flush() {
+    let mut rig = Rig::new();
+    let mut a = WordApp::new(Session::new(wordcraft_doc::Document::new()), Services::default());
+    let chunk_id = a.run("code.insert_chunk", json!({"language": "python", "code": "x = 0"})).unwrap()["chunk"]["id"].as_i64().unwrap();
+    let doc_id = a.session.document_id();
+    let win_a = a.windows.shown();
+    rig.frames(&mut a, 2);
+
+    a.run("view.newWindow", json!({})).unwrap();
+    let win_b = a.windows.shown();
+    assert_ne!(win_a, win_b);
+    rig.frames(&mut a, 3);
+
+    // 1. Window A holds an unapplied `x = 1` draft based on `x = 0`.
+    assert!(a.enter_window(win_a));
+    {
+        let entry = a.canvas.code_chunks.widgets.get_mut(&chunk_id).expect("chunk mounted in window A");
+        assert_eq!(entry.last_synced_code, "x = 0");
+        entry.widget.set_code("x = 1");
+        entry.mark_dirty_for_test();
+    }
+
+    // Window B becomes active, commits `x = 2`, and triggers a flush (e.g. Save) before A redraws.
+    assert!(a.enter_window(win_b));
+    assert!(a.windows.has_dirty_chunks_for(doc_id), "non-shown window A holds a dirty draft");
+    a.run("code.update_chunk", json!({"chunkId": chunk_id, "language": "python", "code": "x = 2"})).unwrap();
+    crate::canvas::code_chunks::flush_dirty(&mut a).unwrap();
+
+    assert_eq!(
+        wordcraft_engine::chunks::chunks_in(&a.session.doc, StoryRef::Body)[0].chunk.code,
+        "x = 2",
+        "stale draft in non-shown window A must not overwrite newer committed source from window B"
+    );
+    assert!(!a.windows.has_dirty_chunks_for(doc_id), "window A's stale draft must be reconciled clean");
+
+    assert!(a.enter_window(win_a));
+    {
+        let entry = a.canvas.code_chunks.widgets.get(&chunk_id).expect("chunk mounted in window A");
+        assert!(!entry.dirty);
+        assert_eq!(entry.last_synced_code, "x = 2");
+        assert_eq!(entry.widget.code(), "x = 2");
+    }
+
+    // 2. When live source still matches window A's recorded baseline (`x = 2`), flushing from window B
+    //    must commit window A's `x = 3` draft into the document.
+    {
+        let entry = a.canvas.code_chunks.widgets.get_mut(&chunk_id).expect("chunk mounted in window A");
+        entry.widget.set_code("x = 3");
+        entry.mark_dirty_for_test();
+    }
+    assert!(a.enter_window(win_b));
+    assert!(a.windows.has_dirty_chunks_for(doc_id));
+    crate::canvas::code_chunks::flush_dirty(&mut a).unwrap();
+
+    assert_eq!(
+        wordcraft_engine::chunks::chunks_in(&a.session.doc, StoryRef::Body)[0].chunk.code,
+        "x = 3",
+        "valid draft in non-shown window A whose baseline still matches live source must flush"
+    );
+    assert!(!a.windows.has_dirty_chunks_for(doc_id));
+    assert!(a.enter_window(win_a));
+    {
+        let entry = a.canvas.code_chunks.widgets.get(&chunk_id).expect("chunk mounted in window A");
+        assert!(!entry.dirty);
+        assert_eq!(entry.last_synced_code, "x = 3");
+        assert_eq!(entry.widget.code(), "x = 3");
+    }
+}

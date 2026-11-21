@@ -192,54 +192,20 @@ impl Windows {
 
     /// Flush any unapplied code chunk drafts in non-shown windows displaying `doc_id`.
     pub(crate) fn flush_dirty_chunks_for(&mut self, session: &mut wordcraft_engine::Session, doc_id: u64, except: Option<i64>) -> Result<(), String> {
+        let mut first_err = None;
         for (_, w) in self.list.iter_mut() {
             if w.doc == doc_id
                 && let Some(ui) = w.ui.as_mut()
+                && let Err(err) = ui.canvas.code_chunks.flush_dirty_except(session, except)
+                && first_err.is_none()
             {
-                let mut ids: Vec<i64> =
-                    ui.canvas.code_chunks.widgets.iter().filter(|(id, e)| e.dirty && Some(**id) != except).map(|(id, _)| *id).collect();
-                ids.sort_unstable();
-                for id in ids {
-                    let (lang, code) = {
-                        let Some(entry) = ui.canvas.code_chunks.widgets.get(&id) else { continue };
-                        (entry.widget.language(), entry.widget.code().to_string())
-                    };
-                    session
-                        .run(
-                            "code.update_chunk",
-                            &serde_json::json!({
-                                "chunkId": id,
-                                "language": lang.as_str(),
-                                "code": code,
-                            }),
-                        )
-                        .map_err(|e| e.to_string())?;
-                    if let Some(entry) = ui.canvas.code_chunks.widgets.get_mut(&id) {
-                        entry.dirty = false;
-                        entry.last_synced_lang = lang;
-                        entry.last_synced_code = code;
-                        entry.last_edit_time = None;
-                    }
-                }
-                let mut parked_ids: Vec<i64> = ui.canvas.code_chunks.restored_drafts.keys().filter(|id| Some(**id) != except).copied().collect();
-                parked_ids.sort_unstable();
-                for id in parked_ids {
-                    let Some((lang, code)) = ui.canvas.code_chunks.restored_drafts.get(&id).cloned() else { continue };
-                    session
-                        .run(
-                            "code.update_chunk",
-                            &serde_json::json!({
-                                "chunkId": id,
-                                "language": lang.as_str(),
-                                "code": code,
-                            }),
-                        )
-                        .map_err(|e| e.to_string())?;
-                    ui.canvas.code_chunks.restored_drafts.remove(&id);
-                }
+                first_err = Some(err);
             }
         }
-        Ok(())
+        match first_err {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
     }
 }
 
