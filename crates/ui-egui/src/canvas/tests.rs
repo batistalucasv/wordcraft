@@ -3438,3 +3438,215 @@ fn arrow_into_chunk_on_unplaced_page_keeps_focus_request_scrolls_and_focuses_edi
     assert_eq!(h.state().canvas.code_chunks.active_chunk, Some(chunk_p1));
     assert!(h.ctx.memory(|m| m.has_focus(editor_id)));
 }
+
+fn has_vertical_stroke_of_height(shape: &egui::Shape, target_h: f32) -> bool {
+    match shape {
+        egui::Shape::Vec(v) => v.iter().any(|s| has_vertical_stroke_of_height(s, target_h)),
+        egui::Shape::LineSegment { points, .. } => {
+            (points[0].x - points[1].x).abs() < 1.0 && ((points[0].y - points[1].y).abs() - target_h).abs() < 2.0
+        }
+        egui::Shape::Path(p) => {
+            p.points.len() == 2 && (p.points[0].x - p.points[1].x).abs() < 1.0 && ((p.points[0].y - p.points[1].y).abs() - target_h).abs() < 2.0
+        }
+        _ => false,
+    }
+}
+
+fn assert_start_screen_qmd_open_paints_caret(qmd_b64: &str) {
+    let mut a_bs = WordApp::new(wordcraft_engine::Session::new(wordcraft_doc::Document::new()), Default::default());
+    a_bs.start_screen();
+    let ctx_bs = crate::test_harness::context();
+    ctx_bs.all_styles_mut(|s| s.animation_time = egui::Style::default().animation_time);
+    for i in 0..2 {
+        crate::test_harness::pass(
+            &ctx_bs,
+            &mut a_bs,
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 900.0))),
+                time: Some(i as f64 * 0.016),
+                ..Default::default()
+            },
+        );
+    }
+    a_bs.open_from_platform("start-screen.qmd", Some(qmd_b64)).unwrap();
+    a_bs.ui.backstage = false;
+
+    let mut painted_caret = false;
+    for i in 2..6 {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 900.0))),
+            time: Some(i as f64 * 0.016),
+            ..Default::default()
+        };
+        craft::ui::shell::embed::before_input(&ctx_bs, |out| a_bs.frame_input(out));
+        let mut full = ctx_bs.run_ui(input, |ui| {
+            crate::test_harness::logic(ui.ctx(), &mut a_bs);
+            a_bs.ui(ui);
+        });
+        if let Some(bar) = a_bs.canvas.glide.drawn() {
+            let h_caret = (bar[1].y - bar[0].y).abs();
+            painted_caret |= full.shapes.iter().any(|c| has_vertical_stroke_of_height(&c.shape, h_caret));
+        }
+        full.textures_delta.clear();
+    }
+    assert!(a_bs.canvas.focused(&ctx_bs), "canvas must receive focus when opening .qmd from Start screen");
+    assert!(a_bs.canvas.glide.drawn().is_some());
+    assert!(a_bs.canvas.glide.opacity() > 0.0);
+    assert!(painted_caret, "CaretMarks must paint a visible vertical caret stroke on screen");
+}
+
+#[test]
+fn canvas_caret_renders_outside_chunks_on_initial_qmd_open() {
+    let qmd = "\
+---
+title: \"Ecology Report\"
+format: docx
+---
+
+# Introduction
+
+First prose paragraph outside chunks.
+
+```{r}
+#| label: setup
+x <- 1:10
+mean(x)
+```
+
+Middle prose paragraph between chunks.
+
+```{r}
+#| label: plot-one
+plot(1:10)
+```
+
+Before Python chunk.
+
+```{python}
+#| label: py-end
+import math
+print(math.pi)
+```
+";
+    let qmd_b64 = wordcraft_engine::cmd::insert::base64_encode(qmd.as_bytes());
+
+    // 1. Opening a .qmd with prose and 3 mounted chunks (2 R, 1 Python, ending with a chunk)
+    //    must visibly render the canvas caret without focusing or inserting a chunk first.
+    let mut a = WordApp::new(wordcraft_engine::Session::new(wordcraft_doc::Document::new()), Default::default());
+    a.open_from_platform("ecology-report.qmd", Some(&qmd_b64)).unwrap();
+
+    let mut h = crate::test_harness::builder().with_size(egui::vec2(1280.0, 900.0)).build_ui_state(
+        |ui, app: &mut WordApp| {
+            let ctx = ui.ctx().clone();
+            crate::test_harness::driver_logic(&ctx, app);
+            app.ui(ui);
+        },
+        a,
+    );
+    h.ctx.all_styles_mut(|s| s.animation_time = egui::Style::default().animation_time);
+    steps(&mut h, 6);
+
+    let chunk_ids: Vec<i64> =
+        wordcraft_engine::chunks::chunks_in(&h.state().session.doc, StoryRef::Body).into_iter().map(|r| r.chunk.id.expect("chunk id")).collect();
+    assert_eq!(chunk_ids.len(), 3, "expected 3 imported code chunks");
+    for &id in &chunk_ids {
+        assert!(h.state().canvas.code_chunks.is_mounted(id), "chunk {id} must be mounted");
+    }
+    assert!(h.state().canvas.focused(&h.ctx), "canvas must have focus after initial .qmd open");
+    assert_eq!(h.state().canvas.code_chunks.active_chunk, None);
+    assert!(!crate::canvas::code_chunks::caret_in_mounted_chunk(h.state()));
+    assert!(h.state().canvas.glide.drawn().is_some(), "canvas caret must be drawn on initial .qmd open");
+    assert!(h.state().canvas.glide.opacity() > 0.0, "canvas caret must be visible on initial .qmd open");
+
+    // 2. Clicking in prose between chunks and typing must place the caret and keep it visible.
+    let mid_para = h
+        .state()
+        .session
+        .doc
+        .body
+        .iter()
+        .position(|b| b.as_para().is_some_and(|p| p.plain_text().contains("Middle prose")))
+        .expect("middle prose paragraph");
+    let layout = h.state_mut().session.layout();
+    let c_mid = layout.caret(&Pos::body(mid_para, 6)).expect("middle prose caret");
+    let pt_mid = page_to_screen(h.state_mut(), c_mid.page, c_mid.x, c_mid.top + c_mid.height / 2.0).expect("middle prose on screen");
+
+    h.event(egui::Event::PointerMoved(pt_mid));
+    h.event(egui::Event::PointerButton { pos: pt_mid, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() });
+    h.app_frame();
+    h.event(egui::Event::PointerButton { pos: pt_mid, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() });
+    steps(&mut h, 4);
+
+    assert_eq!(h.state().session.sel.focus.path, wordcraft_doc::Path::top(mid_para));
+    assert!(h.state().canvas.focused(&h.ctx), "clicking prose must keep canvas focused");
+    assert!(!crate::canvas::code_chunks::caret_in_mounted_chunk(h.state()));
+    let bar_before_type = h.state().canvas.glide.drawn().expect("canvas caret must be drawn after clicking prose");
+    assert!(h.state().canvas.glide.opacity() > 0.0, "canvas caret must be visible after clicking prose");
+
+    h.input_mut().events.push(egui::Event::Text("ABC".into()));
+    steps(&mut h, 4);
+
+    assert_eq!(
+        h.state().session.doc.para(StoryRef::Body, &wordcraft_doc::Path::top(mid_para)).map(|p| p.text.as_str()),
+        Some("MiddleABC prose paragraph between chunks.")
+    );
+    let bar_after_type = h.state().canvas.glide.drawn().expect("canvas caret must remain drawn while typing in prose");
+    assert!(h.state().canvas.glide.opacity() > 0.0, "canvas caret must remain visible while typing in prose");
+    assert!(bar_after_type[0].x > bar_before_type[0].x, "caret must advance right after typing: {bar_before_type:?} -> {bar_after_type:?}");
+
+    // 3. Clicking in blank page space below the trailing chunk must create a trailing paragraph and show the caret.
+    let last_chunk_id = *chunk_ids.last().expect("trailing chunk");
+    let last_rect = h.state().canvas.code_chunks.screen_rects[&last_chunk_id];
+    let pt_below = egui::pos2(last_rect.left() + 24.0, last_rect.bottom() + 30.0);
+    h.event(egui::Event::PointerMoved(pt_below));
+    h.event(egui::Event::PointerButton { pos: pt_below, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() });
+    h.app_frame();
+    h.event(egui::Event::PointerButton { pos: pt_below, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() });
+    steps(&mut h, 4);
+
+    assert!(h.state().canvas.focused(&h.ctx));
+    assert!(!crate::canvas::code_chunks::caret_in_mounted_chunk(h.state()));
+    assert!(h.state().canvas.glide.drawn().is_some(), "canvas caret must render below trailing chunk");
+    assert!(h.state().canvas.glide.opacity() > 0.0, "canvas caret must be visible below trailing chunk");
+
+    // 4. Opening a .qmd that starts with a code chunk and clicking prose below must show the caret.
+    let chunk_first_qmd = "```{r}\nx <- 1\n```\n\nProse below first chunk.\n";
+    let chunk_first_b64 = wordcraft_engine::cmd::insert::base64_encode(chunk_first_qmd.as_bytes());
+    let mut a_cf = WordApp::new(wordcraft_engine::Session::new(wordcraft_doc::Document::new()), Default::default());
+    a_cf.open_from_platform("chunk-first.qmd", Some(&chunk_first_b64)).unwrap();
+    let mut h_cf = crate::test_harness::builder().with_size(egui::vec2(1280.0, 900.0)).build_ui_state(
+        |ui, app: &mut WordApp| {
+            let ctx = ui.ctx().clone();
+            crate::test_harness::driver_logic(&ctx, app);
+            app.ui(ui);
+        },
+        a_cf,
+    );
+    h_cf.ctx.all_styles_mut(|s| s.animation_time = egui::Style::default().animation_time);
+    steps(&mut h_cf, 4);
+    assert!(crate::canvas::code_chunks::caret_in_mounted_chunk(h_cf.state()), "initial caret inside leading chunk stays suppressed");
+
+    let prose_idx = h_cf
+        .state()
+        .session
+        .doc
+        .body
+        .iter()
+        .position(|b| b.as_para().is_some_and(|p| p.plain_text().contains("Prose below")))
+        .expect("prose below leading chunk");
+    let l_cf = h_cf.state_mut().session.layout();
+    let c_cf = l_cf.caret(&Pos::body(prose_idx, 5)).expect("prose caret");
+    let pt_cf = page_to_screen(h_cf.state_mut(), c_cf.page, c_cf.x, c_cf.top + c_cf.height / 2.0).expect("prose on screen");
+    h_cf.event(egui::Event::PointerMoved(pt_cf));
+    h_cf.event(egui::Event::PointerButton { pos: pt_cf, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() });
+    h_cf.app_frame();
+    h_cf.event(egui::Event::PointerButton { pos: pt_cf, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() });
+    steps(&mut h_cf, 4);
+
+    assert!(!crate::canvas::code_chunks::caret_in_mounted_chunk(h_cf.state()));
+    assert!(h_cf.state().canvas.glide.drawn().is_some(), "clicking prose below leading chunk must draw canvas caret");
+    assert!(h_cf.state().canvas.glide.opacity() > 0.0, "canvas caret must be visible after clicking prose below leading chunk");
+
+    // 5. Opening a .qmd from the Start screen must focus the canvas and emit an actual vertical caret stroke.
+    assert_start_screen_qmd_open_paints_caret(&qmd_b64);
+}
