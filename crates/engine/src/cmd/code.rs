@@ -12,7 +12,7 @@ use serde_json::{Map, Value, json};
 use wordcraft_doc::chunk::{CODE_OUTPUT_STYLE, MAX_CHUNK_LINES};
 use wordcraft_doc::para::OBJ;
 use wordcraft_doc::table::{Cell, MAX_COLS, MAX_ROWS, Table};
-use wordcraft_doc::{Block, CharProps, ChunkOptions, ChunkRef, CodeChunk, Paragraph, Path, Pos, StoryRef, para_block};
+use wordcraft_doc::{Block, CharProps, ChunkOptions, ChunkRef, CodeChunk, Paragraph, Path, Pos, RevisionKind, StoryRef, para_block};
 use wordcraft_kernel::{CodeLanguage, ExecutionRequest, PlotFormat};
 
 use super::{delete_selection, insert, pos_json, sel_result};
@@ -864,7 +864,38 @@ pub(crate) fn exit_below_chunk_range(s: &mut Session, range: &ChunkRef, insert_n
         if crate::cmd::protect::enforced(&s.doc) {
             return Err(CmdError::Disabled("the document is protected".into()));
         }
+        let end_path = Path::top(last);
+        let mark_revs = s.doc.para(StoryRef::Body, &end_path).map(|p| (p.mark.ins, p.mark.del)).unwrap_or_default();
         s.doc.insert_block(StoryRef::Body, &path, Block::Para(Paragraph::new()))?;
+        // A section break belongs to the trailing paragraph mark, so it moves to the new
+        // paragraph just like `split_paragraph` (and returns to `end_path` if the break is
+        // rejected under Track Changes).
+        let section = {
+            let p = s.doc.para_mut(StoryRef::Body, &end_path)?;
+            let section = p.section.take();
+            if section.is_some() {
+                p.touch();
+            }
+            section
+        };
+        if let Some(section) = section {
+            let t = s.doc.para_mut(StoryRef::Body, &path)?;
+            t.section = Some(section);
+            t.touch();
+        }
+        if s.doc.settings.track_changes {
+            let rid = super::new_revision(s, RevisionKind::Insert);
+            let p = s.doc.para_mut(StoryRef::Body, &end_path)?;
+            p.mark.ins = Some(rid);
+            p.mark.del = None;
+            p.touch();
+            // The newly inserted paragraph ends with the original trailing mark, keeping that
+            // mark's revisions (matching `split_para_as`), while `end_path` carries the inserted
+            // paragraph break so rejecting it joins and removes the new paragraph even at story end.
+            let t = s.doc.para_mut(StoryRef::Body, &path)?;
+            (t.mark.ins, t.mark.del) = mark_revs;
+            t.touch();
+        }
         s.touch();
         Pos::new(StoryRef::Body, path, 0)
     };

@@ -845,6 +845,128 @@ fn new_paragraph_at_trailing_chunk_end_exits_below_chunk_instead_of_expanding_it
 }
 
 #[test]
+fn new_paragraph_at_chunk_end_tracks_insertion_and_reject_removes_it() {
+    // 1. Trailing chunk at the end of the body: rejectAll, single reject, and acceptAll.
+    let mut s = s();
+    run(&mut s, "text.insert", json!({"text": "Above"}));
+    run(&mut s, "code.insert_chunk", json!({"language": "r", "code": "x <- 1"}));
+    run(&mut s, "file.setAuthor", json!({"name": "Alice"}));
+    run(&mut s, "review.trackChanges", json!({"value": true}));
+    caret_into(&mut s, 0);
+
+    run(&mut s, "text.newParagraph", json!({}));
+    assert_eq!(s.doc.body.len(), 3, "Enter at chunk end inserts a trailing blank paragraph");
+    assert!(chunks::chunk_at(&s.doc, &s.sel.focus).is_none());
+    let chunk_end = s.doc.para(StoryRef::Body, &wordcraft_doc::Path::top(1)).expect("chunk paragraph");
+    let inserted = s.doc.para(StoryRef::Body, &wordcraft_doc::Path::top(2)).expect("new paragraph");
+    assert!(chunk_end.mark.ins.is_some(), "the inserted paragraph break must be recorded on the chunk-end mark");
+    assert_eq!(inserted.mark.ins, None, "the trailing paragraph keeps the original mark");
+
+    let ch = run(&mut s, "review.changes", json!({}));
+    assert_eq!(ch.as_array().map(Vec::len), Some(1), "{ch}");
+    assert_eq!((ch[0]["kind"].as_str(), ch[0]["author"].as_str()), (Some("insert"), Some("Alice")));
+
+    // Single-change navigation + reject removes the inserted paragraph even at the end of the body.
+    run(&mut s, "review.nextChange", json!({}));
+    run(&mut s, "review.reject", json!({}));
+    assert_eq!(s.doc.body.len(), 2, "rejecting the tracked chunk-end Enter must remove the inserted paragraph");
+    assert_eq!(chunks::chunks_in(&s.doc, StoryRef::Body)[0].chunk.code, "x <- 1");
+    assert_eq!(s.doc.para(StoryRef::Body, &wordcraft_doc::Path::top(1)).and_then(|p| p.mark.ins), None);
+
+    // Typing tracked text into the new paragraph and running rejectAll removes both text and paragraph.
+    caret_into(&mut s, 0);
+    run(&mut s, "text.newParagraph", json!({}));
+    run(&mut s, "text.insert", json!({"text": "After"}));
+    assert_eq!(s.doc.body.len(), 3);
+    run(&mut s, "review.rejectAll", json!({}));
+    assert_eq!(s.doc.body.len(), 2, "rejectAll must remove the inserted paragraph and its tracked text");
+    assert!(s.doc.revisions.is_empty());
+    assert_eq!(chunks::chunks_in(&s.doc, StoryRef::Body)[0].chunk.code, "x <- 1");
+
+    // Accepting keeps the inserted paragraph and clears the revision mark.
+    caret_into(&mut s, 0);
+    run(&mut s, "text.newParagraph", json!({}));
+    run(&mut s, "review.acceptAll", json!({}));
+    assert_eq!(s.doc.body.len(), 3);
+    assert!(s.doc.revisions.is_empty());
+    assert!(s.doc.body.iter().filter_map(|b| b.as_para()).all(|p| p.mark.ins.is_none() && p.mark.del.is_none()));
+}
+
+#[test]
+fn new_paragraph_at_chunk_end_rejects_cleanly_before_paragraph_table_and_section_break() {
+    // Followed by a normal paragraph (`insert_chunk` on a blank doc leaves `[Chunk, ""]`).
+    let mut s1 = s();
+    run(&mut s1, "code.insert_chunk", json!({"language": "r", "code": "a <- 1"}));
+    s1.sel = Selection::caret(wordcraft_doc::Pos::body(1, 0));
+    run(&mut s1, "text.insert", json!({"text": "Below"}));
+    assert_eq!(s1.doc.body.len(), 2);
+    run(&mut s1, "review.trackChanges", json!({"value": true}));
+    caret_into(&mut s1, 0);
+    run(&mut s1, "text.newParagraph", json!({}));
+    assert_eq!(s1.doc.body.len(), 3);
+    run(&mut s1, "review.rejectAll", json!({}));
+    assert_eq!(s1.doc.body.len(), 2);
+    assert_eq!(chunks::chunks_in(&s1.doc, StoryRef::Body)[0].chunk.code, "a <- 1");
+    assert_eq!(s1.doc.para(StoryRef::Body, &wordcraft_doc::Path::top(1)).map(|p| p.text.as_str()), Some("Below"));
+
+    // Followed by a table (where a trailing-mark revision on the inserted paragraph cannot join).
+    let mut s2 = s();
+    let id = chunk_id(&run(&mut s2, "code.insert_chunk", json!({"language": "python", "code": "x = 1"})));
+    run(&mut s2, "code.insert_table", json!({"chunkId": id, "headers": ["h"], "rows": [["1"]]}));
+    assert!(matches!(&*s2.doc.body[1], wordcraft_doc::Block::Table(_)));
+    let before_len = s2.doc.body.len();
+    run(&mut s2, "review.trackChanges", json!({"value": true}));
+    caret_into(&mut s2, 0);
+    run(&mut s2, "text.newParagraph", json!({}));
+    assert_eq!(s2.doc.body.len(), before_len + 1);
+    run(&mut s2, "review.rejectAll", json!({}));
+    assert_eq!(s2.doc.body.len(), before_len, "rejectAll must remove the blank paragraph inserted before a table");
+    assert!(matches!(&*s2.doc.body[1], wordcraft_doc::Block::Table(_)));
+
+    // Trailing chunk carrying a section break: rejecting the Enter restores the section break.
+    let mut s3 = s();
+    run(&mut s3, "text.insert", json!({"text": "Above"}));
+    run(&mut s3, "code.insert_chunk", json!({"language": "r", "code": "b <- 2"}));
+    assert_eq!(s3.doc.body.len(), 2);
+    if let Some(wordcraft_doc::Block::Para(p)) = s3.doc.body.get_mut(1).map(std::sync::Arc::make_mut) {
+        p.section = Some(Box::new(wordcraft_doc::SectionProps::default()));
+    }
+    run(&mut s3, "review.trackChanges", json!({"value": true}));
+    caret_into(&mut s3, 0);
+    run(&mut s3, "text.newParagraph", json!({}));
+    assert_eq!(s3.doc.body.len(), 3);
+    assert!(s3.doc.para(StoryRef::Body, &wordcraft_doc::Path::top(2)).is_some_and(|p| p.section.is_some()));
+    run(&mut s3, "review.rejectAll", json!({}));
+    assert_eq!(s3.doc.body.len(), 2);
+    assert!(
+        s3.doc.para(StoryRef::Body, &wordcraft_doc::Path::top(1)).is_some_and(|p| p.section.is_some()),
+        "rejecting a tracked chunk-end Enter must preserve the chunk's trailing section break"
+    );
+
+    // `code.exit_below_chunk` tracks the insertion only when it actually inserts a trailing paragraph.
+    let mut s4 = s();
+    run(&mut s4, "text.insert", json!({"text": "Above"}));
+    let cid = chunk_id(&run(&mut s4, "code.insert_chunk", json!({"language": "r", "code": "c <- 3"})));
+    assert_eq!(s4.doc.body.len(), 2);
+    run(&mut s4, "review.trackChanges", json!({"value": true}));
+    run(&mut s4, "code.exit_below_chunk", json!({"chunkId": cid}));
+    assert_eq!(s4.doc.body.len(), 3);
+    assert_eq!(s4.doc.revisions.len(), 1);
+    run(&mut s4, "review.rejectAll", json!({}));
+    assert_eq!(s4.doc.body.len(), 2, "rejectAll must remove the trailing paragraph created by code.exit_below_chunk");
+    assert!(s4.doc.revisions.is_empty());
+    // When a paragraph already follows, `code.exit_below_chunk` only moves the caret and records no revision.
+    run(&mut s4, "review.trackChanges", json!({"value": false}));
+    run(&mut s4, "code.exit_below_chunk", json!({"chunkId": cid}));
+    assert_eq!(s4.doc.body.len(), 3);
+    run(&mut s4, "review.trackChanges", json!({"value": true}));
+    caret_into(&mut s4, 0);
+    run(&mut s4, "code.exit_below_chunk", json!({"chunkId": cid}));
+    assert_eq!(s4.doc.body.len(), 3);
+    assert!(s4.doc.revisions.is_empty(), "moving the caret to an existing block must not record a revision");
+}
+
+#[test]
 fn insert_at_caret_insert_output_and_chunk_label_commands() {
     let mut s = s();
     run(&mut s, "text.insert", json!({"text": "Intro"}));
