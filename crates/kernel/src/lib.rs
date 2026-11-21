@@ -1174,17 +1174,58 @@ svg(.wc_plot_svg_seq, width = 8, height = 6, onefile = FALSE)"#
 setHook("plot.new", function() assign(".wc_has_plot", TRUE, envir = .GlobalEnv))
 setHook("grid.newpage", function() assign(".wc_has_plot", TRUE, envir = .GlobalEnv))
 png(.wc_plot_png_seq, width = 1600, height = 1200, res = 200)
+.wc_png_dev <- grDevices::dev.cur()
 dev.control("enable")"#
             ),
-            r#"  if (exists(".wc_has_plot", envir = .GlobalEnv) && get(".wc_has_plot", envir = .GlobalEnv)) {
-    dev.copy(svg, .wc_plot_svg, width = 8, height = 6)
-    dev.off()
+            r#"  .wc_svg_tmp <- base::paste0(.wc_plot_svg, ".tmp")
+  .wc_svg_copied <- FALSE
+  .wc_has <- base::exists(".wc_has_plot", envir = .GlobalEnv) && base::isTRUE(base::get(".wc_has_plot", envir = .GlobalEnv))
+  .wc_dev_tracked <- base::exists(".wc_png_dev", envir = .GlobalEnv)
+  .wc_dev_alive <- .wc_dev_tracked && base::length(.wc_png_dev) == 1L && (.wc_png_dev %in% grDevices::dev.list())
+  if (.wc_has && .wc_dev_alive) {
+    base::tryCatch({
+      grDevices::dev.set(.wc_png_dev)
+      .wc_svg_dev <- grDevices::dev.copy(grDevices::svg, .wc_svg_tmp, width = 8, height = 6)
+      if (base::length(.wc_svg_dev) == 1L && !base::is.na(.wc_svg_dev) && .wc_svg_dev > 1L) {
+        grDevices::dev.off(.wc_svg_dev)
+        .wc_svg_copied <- base::file.exists(.wc_svg_tmp)
+      }
+    }, error = function(e) NULL)
   }
-  if (dev.cur() != 1) dev.off()
-  if (!exists(".wc_has_plot", envir = .GlobalEnv) || !get(".wc_has_plot", envir = .GlobalEnv)) {
-    for (.wc_f in Sys.glob(sub("\\.png$", "_*.png", .wc_plot_png))) if (file.exists(.wc_f)) file.remove(.wc_f)
-    if (file.exists(.wc_plot_png)) file.remove(.wc_plot_png)
-    if (file.exists(.wc_plot_svg)) file.remove(.wc_plot_svg)
+  if (.wc_dev_alive && (.wc_png_dev %in% grDevices::dev.list())) {
+    base::tryCatch(grDevices::dev.off(.wc_png_dev), error = function(e) NULL)
+  } else if (!.wc_dev_tracked && grDevices::dev.cur() != 1L) {
+    base::tryCatch(grDevices::dev.off(), error = function(e) NULL)
+  }
+  if (!.wc_has) {
+    for (.wc_f in base::Sys.glob(base::sub("\\.png$", "_*.png", .wc_plot_png))) if (base::file.exists(.wc_f)) base::file.remove(.wc_f)
+    if (base::file.exists(.wc_plot_png)) base::file.remove(.wc_plot_png)
+    if (base::file.exists(.wc_plot_svg)) base::file.remove(.wc_plot_svg)
+    if (base::file.exists(.wc_svg_tmp)) base::file.remove(.wc_svg_tmp)
+  } else if (.wc_svg_copied) {
+    # dev.copy() captures the final page of the PNG device; pair the SVG with that exact page
+    # index after closing the PNG device so every numbered PNG is already flushed to disk.
+    .wc_png_stem <- base::sub("\\.png$", "", base::basename(.wc_plot_png))
+    .wc_png_prefix <- base::paste0(.wc_png_stem, "_")
+    .wc_svg_index <- 0L
+    for (.wc_f in base::list.files(base::dirname(.wc_plot_png), all.files = TRUE)) {
+      if (base::startsWith(.wc_f, .wc_png_prefix) && base::endsWith(.wc_f, ".png")) {
+        .wc_mid <- base::substr(.wc_f, base::nchar(.wc_png_prefix) + 1L, base::nchar(.wc_f) - 4L)
+        if (base::grepl("^[0-9]+$", .wc_mid)) {
+          .wc_idx <- base::suppressWarnings(base::as.integer(.wc_mid))
+          if (!base::is.na(.wc_idx) && .wc_idx > .wc_svg_index) .wc_svg_index <- .wc_idx
+        }
+      }
+    }
+    if (.wc_svg_index >= 1L) {
+      .wc_svg_target <- base::paste0(base::sub("\\.svg$", "", .wc_plot_svg), "_", base::sprintf("%03d", .wc_svg_index), ".svg")
+      if (base::file.exists(.wc_svg_target)) base::file.remove(.wc_svg_target)
+      if (!base::suppressWarnings(base::file.rename(.wc_svg_tmp, .wc_svg_target)) && base::file.exists(.wc_svg_tmp)) {
+        base::file.remove(.wc_svg_tmp)
+      }
+    } else if (base::file.exists(.wc_svg_tmp)) {
+      base::file.remove(.wc_svg_tmp)
+    }
   }
 "#
             .to_owned(),
@@ -1370,12 +1411,10 @@ fn read_plots(png_base: &Path, svg_base: &Path, language: CodeLanguage, format: 
         };
         let svg = if format.captures_svg() {
             let numbered = numbered_plot_path(svg_base, index);
-            if index == 1 {
-                if matches!((language, format), (CodeLanguage::R, PlotFormat::Both)) {
-                    None
-                } else {
-                    read_plot_svg(&numbered, MAX_PLOT_BYTES).or_else(|| read_plot_svg(svg_base, MAX_PLOT_BYTES))
-                }
+            // In R `Both` mode the wrapper numbers the copied SVG with its exact plot index; never
+            // fall back to an unnumbered `svg_base`, which could belong to a later plot.
+            if index == 1 && !matches!((language, format), (CodeLanguage::R, PlotFormat::Both)) {
+                read_plot_svg(&numbered, MAX_PLOT_BYTES).or_else(|| read_plot_svg(svg_base, MAX_PLOT_BYTES))
             } else {
                 read_plot_svg(&numbered, MAX_PLOT_BYTES)
             }
@@ -1383,12 +1422,6 @@ fn read_plots(png_base: &Path, svg_base: &Path, language: CodeLanguage, format: 
             None
         };
         if png.is_none() && svg.is_none() {
-            if index == 1
-                && matches!((language, format), (CodeLanguage::R, PlotFormat::Both))
-                && let Some(last_svg) = read_plot_svg(svg_base, MAX_PLOT_BYTES)
-            {
-                plots.push(PlotOutput { png: None, svg: Some(last_svg) });
-            }
             break;
         }
         let item_bytes = png.as_ref().map_or(0, Vec::len).saturating_add(svg.as_ref().map_or(0, String::len));
@@ -1397,15 +1430,6 @@ fn read_plots(png_base: &Path, svg_base: &Path, language: CodeLanguage, format: 
         }
         used_bytes = used_bytes.saturating_add(item_bytes);
         plots.push(PlotOutput { png, svg });
-    }
-
-    if matches!((language, format), (CodeLanguage::R, PlotFormat::Both))
-        && let Some(last) = plots.last_mut()
-        && last.svg.is_none()
-        && let Some(last_svg) = read_plot_svg(svg_base, MAX_PLOT_BYTES)
-        && used_bytes.saturating_add(last_svg.len()) <= MAX_TOTAL_PLOT_BYTES
-    {
-        last.svg = Some(last_svg);
     }
 
     plots

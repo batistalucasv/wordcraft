@@ -1441,3 +1441,112 @@ fn captures_multiple_plots_skips_python_without_matplotlib_and_runs_r() {
         assert_eq!(r_calls, 1, "R multi-plot branch must run independently of matplotlib availability");
     }
 }
+
+fn minimal_valid_png(tag: u8) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(PNG_HEADER.len() + 16 + PNG_IEND.len());
+    bytes.extend_from_slice(PNG_HEADER);
+    bytes.extend_from_slice(&[tag; 16]);
+    bytes.extend_from_slice(PNG_IEND);
+    bytes
+}
+
+fn minimal_valid_svg(label: &str) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><svg xmlns=\"http://www.w3.org/2000/svg\"><title>{label}</title><rect width=\"10\" height=\"10\"/></svg>"
+    )
+}
+
+#[test]
+fn read_plots_r_both_pairs_svg_only_with_the_same_plot_index() {
+    // 17 PNGs plus SVG 17: reader keeps only PNGs 1..=16 and must not attach SVG 17 to PNG 16.
+    let (dir, _guard) = test_scratch_dir("wc-r-both-17");
+    let png_base = dir.join("__wordcraft_plot__.png");
+    let svg_base = dir.join("__wordcraft_plot__.svg");
+    for index in 1..=(MAX_PLOTS + 1) {
+        fs::write(numbered_plot_path(&png_base, index), minimal_valid_png(index as u8)).expect("write png");
+    }
+    fs::write(numbered_plot_path(&svg_base, MAX_PLOTS + 1), minimal_valid_svg("plot-17")).expect("write svg 17");
+    let plots = read_plots(&png_base, &svg_base, CodeLanguage::R, PlotFormat::Both);
+    assert_eq!(plots.len(), MAX_PLOTS);
+    assert!(plots.iter().all(|plot| plot.png.is_some() && plot.svg.is_none()), "SVG 17 must not attach to any kept PNG");
+
+    // Unnumbered svg_base alongside multiple PNGs must never be guessed onto plot 1 or plot 2.
+    let (dir_unnumbered, _guard_unnumbered) = test_scratch_dir("wc-r-both-unnumbered");
+    let png_base = dir_unnumbered.join("__wordcraft_plot__.png");
+    let svg_base = dir_unnumbered.join("__wordcraft_plot__.svg");
+    fs::write(numbered_plot_path(&png_base, 1), minimal_valid_png(1)).expect("write png 1");
+    fs::write(numbered_plot_path(&png_base, 2), minimal_valid_png(2)).expect("write png 2");
+    fs::write(&svg_base, minimal_valid_svg("unindexed")).expect("write unnumbered svg");
+    let plots = read_plots(&png_base, &svg_base, CodeLanguage::R, PlotFormat::Both);
+    assert_eq!(plots.len(), 2);
+    assert!(plots.iter().all(|plot| plot.png.is_some() && plot.svg.is_none()), "unnumbered SVG must not attach blindly in R Both mode");
+
+    // Numbered SVG 2 attaches strictly to plot 2, leaving plot 1 without SVG.
+    let (dir_two, _guard_two) = test_scratch_dir("wc-r-both-two");
+    let png_base = dir_two.join("__wordcraft_plot__.png");
+    let svg_base = dir_two.join("__wordcraft_plot__.svg");
+    let svg_two = minimal_valid_svg("plot-2");
+    fs::write(numbered_plot_path(&png_base, 1), minimal_valid_png(1)).expect("write png 1");
+    fs::write(numbered_plot_path(&png_base, 2), minimal_valid_png(2)).expect("write png 2");
+    fs::write(numbered_plot_path(&svg_base, 2), &svg_two).expect("write svg 2");
+    let plots = read_plots(&png_base, &svg_base, CodeLanguage::R, PlotFormat::Both);
+    assert_eq!(plots.len(), 2);
+    assert!(plots[0].png.is_some() && plots[0].svg.is_none());
+    assert!(plots[1].png.is_some());
+    assert_eq!(plots[1].svg.as_deref(), Some(svg_two.as_str()));
+
+    // Ordinary 1-plot run pairs PNG 1 and SVG 1.
+    let (dir_one, _guard_one) = test_scratch_dir("wc-r-both-one");
+    let png_base = dir_one.join("__wordcraft_plot__.png");
+    let svg_base = dir_one.join("__wordcraft_plot__.svg");
+    let svg_one = minimal_valid_svg("plot-1");
+    fs::write(numbered_plot_path(&png_base, 1), minimal_valid_png(1)).expect("write png 1");
+    fs::write(numbered_plot_path(&svg_base, 1), &svg_one).expect("write svg 1");
+    let plots = read_plots(&png_base, &svg_base, CodeLanguage::R, PlotFormat::Both);
+    assert_eq!(plots.len(), 1);
+    assert!(plots[0].png.is_some());
+    assert_eq!(plots[0].svg.as_deref(), Some(svg_one.as_str()));
+}
+
+#[test]
+fn r_plot_both_does_not_pair_svg_beyond_plot_limit_with_last_kept_png() {
+    if !is_language_available(CodeLanguage::R) {
+        return;
+    }
+
+    let code = format!("for (i in 1:{}) plot(1:3, (1:3) * i, main = paste('Plot', i))\n", MAX_PLOTS + 1);
+    let result = execute(&ExecutionRequest::new(CodeLanguage::R, code).with_plot_format(PlotFormat::Both)).expect("r execute");
+
+    assert!(result.success, "stderr: {}", result.stderr);
+    assert_eq!(result.plots.len(), MAX_PLOTS, "must keep only the first {MAX_PLOTS} plots");
+    assert!(result.plot_png.is_some(), "first PNG must still be populated");
+    assert!(result.plot_svg.is_none(), "first plot must not receive plot 17's SVG");
+    for (idx, plot) in result.plots.iter().enumerate() {
+        assert!(plot.png.is_some(), "plot {} must have a PNG", idx + 1);
+        assert!(plot.svg.is_none(), "plot {} must not be paired with plot {}'s SVG", idx + 1, MAX_PLOTS + 1);
+    }
+}
+
+#[test]
+fn r_plot_both_pairs_svg_with_its_own_plot_for_single_multi_and_mfrow_runs() {
+    if !is_language_available(CodeLanguage::R) {
+        return;
+    }
+
+    // Two plots: SVG belongs only to plot 2, never to plot 1.
+    let two_plots = "plot(1:5, 1:5, main = 'One')\nplot(1:5, 5:1, main = 'Two')\n";
+    let res = execute(&ExecutionRequest::new(CodeLanguage::R, two_plots).with_plot_format(PlotFormat::Both)).expect("r execute");
+    assert!(res.success, "stderr: {}", res.stderr);
+    assert_eq!(res.plots.len(), 2);
+    assert!(res.plots[0].png.is_some() && res.plots[0].svg.is_none(), "plot 1 has only PNG");
+    assert!(res.plots[1].png.is_some() && res.plots[1].svg.is_some(), "plot 2 pairs its PNG with its SVG");
+    assert!(res.plot_svg.is_none(), "plot_svg mirrors plot 1");
+
+    // Multi-panel single page (`par(mfrow)`): still page 1, so PNG 1 and SVG 1 pair together.
+    let mfrow = "par(mfrow = c(1, 2))\nplot(1:5, 1:5)\nplot(1:5, 5:1)\n";
+    let res = execute(&ExecutionRequest::new(CodeLanguage::R, mfrow).with_plot_format(PlotFormat::Both)).expect("r execute");
+    assert!(res.success, "stderr: {}", res.stderr);
+    assert_eq!(res.plots.len(), 1);
+    assert!(res.plots[0].png.is_some() && res.plots[0].svg.is_some(), "mfrow single page must pair PNG 1 and SVG 1");
+    assert!(res.plot_png.is_some() && res.plot_svg.is_some());
+}
