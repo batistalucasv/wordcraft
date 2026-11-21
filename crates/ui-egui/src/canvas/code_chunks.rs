@@ -44,6 +44,7 @@ struct PendingRun {
     generation: u64,
     batch_id: u64,
     stop_on_error: bool,
+    invalidated: bool,
     rx: Receiver<Result<wordcraft_kernel::ExecutionResult, String>>,
 }
 
@@ -133,21 +134,49 @@ impl CodeChunksState {
             *batch_map.entry(batch_id).or_insert_with(|| target.allocate_batch_id())
         };
         for mut run in self.pending_runs.drain(..) {
-            if !target.pending_runs.iter().any(|r| r.chunk_id == run.chunk_id) {
+            if run.invalidated {
+                if matches!(run.rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)) {
+                    target.pending_runs.push(run);
+                }
+            } else if !target.pending_runs.iter().any(|r| !r.invalidated && r.chunk_id == run.chunk_id) {
                 run.batch_id = remap(target, run.batch_id, run.stop_on_error);
                 target.pending_runs.push(run);
             }
         }
         for mut run in self.queued_runs.drain(..) {
-            if !target.queued_runs.iter().any(|r| r.chunk_id == run.chunk_id) && !target.pending_runs.iter().any(|r| r.chunk_id == run.chunk_id) {
+            if !target.queued_runs.iter().any(|r| r.chunk_id == run.chunk_id)
+                && !target.pending_runs.iter().any(|r| !r.invalidated && r.chunk_id == run.chunk_id)
+            {
                 run.batch_id = remap(target, run.batch_id, run.stop_on_error);
                 target.queued_runs.push_back(run);
             }
         }
     }
 
+    fn invalidate_stale_runs(&mut self, current_gen: u64) {
+        self.queued_runs.retain(|q| q.generation == current_gen);
+        let mut newly_invalidated = Vec::new();
+        for run in &mut self.pending_runs {
+            if run.generation != current_gen && !run.invalidated {
+                run.invalidated = true;
+                newly_invalidated.push(run.chunk_id);
+            }
+        }
+        for id in newly_invalidated {
+            let has_current = self.pending_runs.iter().any(|p| !p.invalidated && p.generation == current_gen && p.chunk_id == id);
+            if !has_current && let Some(entry) = self.widgets.get_mut(&id) {
+                entry.widget.clear_output();
+                entry.applied_output_rev = None;
+            }
+        }
+    }
+
+    fn reap_invalidated_runs(&mut self) {
+        self.pending_runs.retain(|run| !run.invalidated || matches!(run.rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)));
+    }
+
     fn has_in_flight_run(&self, id: i64) -> bool {
-        self.pending_runs.iter().any(|r| r.chunk_id == id)
+        self.pending_runs.iter().any(|r| !r.invalidated && r.chunk_id == id)
             || self.queued_runs.iter().any(|r| r.chunk_id == id)
             || self.widgets.get(&id).is_some_and(|e| e.widget.is_running())
     }
@@ -162,7 +191,7 @@ impl CodeChunksState {
         rx: Receiver<Result<wordcraft_kernel::ExecutionResult, String>>,
     ) {
         let (generation, batch_id, stop_on_error) = batch;
-        self.pending_runs.push(PendingRun { chunk_id, language, code: code.to_owned(), generation, batch_id, stop_on_error, rx });
+        self.pending_runs.push(PendingRun { chunk_id, language, code: code.to_owned(), generation, batch_id, stop_on_error, invalidated: false, rx });
     }
 
     #[cfg(test)]
@@ -346,16 +375,16 @@ fn poll_pending_runs(app: &mut WordApp, ctx: &egui::Context) {
         return;
     }
     let current_gen = app.session.chunks.generation();
+    app.canvas.code_chunks.invalidate_stale_runs(current_gen);
     let live_ids: HashSet<i64> = top_level_chunks(&app.session.doc).into_iter().filter_map(|r| r.chunk.id).collect();
     let pending = std::mem::take(&mut app.canvas.code_chunks.pending_runs);
     let mut still_running = Vec::new();
     let mut any_stored = false;
     let mut failed_batches = Vec::new();
     for run in pending {
-        if run.generation != current_gen {
-            if let Some(entry) = app.canvas.code_chunks.widgets.get_mut(&run.chunk_id) {
-                entry.widget.clear_output();
-                entry.applied_output_rev = None;
+        if run.invalidated {
+            if matches!(run.rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)) {
+                still_running.push(run);
             }
             continue;
         }
@@ -517,21 +546,8 @@ pub(crate) fn sync_before_layout(app: &mut WordApp, ui: &Ui) {
     let kernel_gen = app.session.chunks.generation();
     let gen_changed = app.canvas.code_chunks.last_generation != Some(kernel_gen);
     if gen_changed {
-        app.canvas.code_chunks.queued_runs.retain(|q| q.generation == kernel_gen);
-        let mut stale_ids = Vec::new();
-        app.canvas.code_chunks.pending_runs.retain(|p| {
-            let keep = p.generation == kernel_gen;
-            if !keep {
-                stale_ids.push(p.chunk_id);
-            }
-            keep
-        });
-        for id in stale_ids {
-            if let Some(entry) = app.canvas.code_chunks.widgets.get_mut(&id) {
-                entry.widget.clear_output();
-                entry.applied_output_rev = None;
-            }
-        }
+        app.canvas.code_chunks.invalidate_stale_runs(kernel_gen);
+        app.canvas.code_chunks.reap_invalidated_runs();
     }
     if app.canvas.code_chunks.last_outputs_rev != Some(rev) || gen_changed {
         for (&id, entry) in &mut app.canvas.code_chunks.widgets {
@@ -1241,6 +1257,8 @@ fn pump_queued_runs(app: &mut WordApp, ctx: Option<&egui::Context>) {
     #[cfg(not(target_arch = "wasm32"))]
     {
         let current_gen = app.session.chunks.generation();
+        app.canvas.code_chunks.invalidate_stale_runs(current_gen);
+        app.canvas.code_chunks.reap_invalidated_runs();
         let live_ids: HashSet<i64> = top_level_chunks(&app.session.doc).into_iter().filter_map(|r| r.chunk.id).collect();
         app.canvas.code_chunks.queued_runs.retain(|q| q.generation == current_gen && live_ids.contains(&q.chunk_id));
 
@@ -1248,7 +1266,7 @@ fn pump_queued_runs(app: &mut WordApp, ctx: Option<&egui::Context>) {
             let Some(front) = app.canvas.code_chunks.queued_runs.front() else {
                 break;
             };
-            if front.stop_on_error && app.canvas.code_chunks.pending_runs.iter().any(|p| p.batch_id == front.batch_id) {
+            if front.stop_on_error && app.canvas.code_chunks.pending_runs.iter().any(|p| !p.invalidated && p.batch_id == front.batch_id) {
                 break;
             }
             let Some(next) = app.canvas.code_chunks.queued_runs.pop_front() else {
@@ -1261,6 +1279,11 @@ fn pump_queued_runs(app: &mut WordApp, ctx: Option<&egui::Context>) {
                     app.canvas.code_chunks.queued_runs.retain(|q| q.batch_id != batch_id);
                 }
             }
+        }
+        if !app.canvas.code_chunks.pending_runs.is_empty()
+            && let Some(ctx) = ctx
+        {
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
     }
 }
@@ -1301,6 +1324,7 @@ fn launch_worker(app: &mut WordApp, queued: QueuedRun, ctx: Option<&egui::Contex
         generation: queued.generation,
         batch_id: queued.batch_id,
         stop_on_error: queued.stop_on_error,
+        invalidated: false,
         rx: rx_store,
     });
     if let Some(ctx) = ctx {
@@ -1317,6 +1341,9 @@ pub(crate) fn run_chunk_async(app: &mut WordApp, params: &Value, ctx: Option<&eg
     if let Some(why) = app.session.why_disabled("code.run_chunk") {
         return Err(why.into());
     }
+    let current_gen = app.session.chunks.generation();
+    app.canvas.code_chunks.invalidate_stale_runs(current_gen);
+    app.canvas.code_chunks.reap_invalidated_runs();
     let chunk_id = match params.get("chunkId") {
         None | Some(Value::Null) => app.canvas.code_chunks.active_chunk,
         Some(v) => {
@@ -1357,13 +1384,13 @@ pub(crate) fn run_chunk_async(app: &mut WordApp, params: &Value, ctx: Option<&eg
             code: range.chunk.code.clone(),
             timeout_ms,
             plot,
-            generation: app.session.chunks.generation(),
+            generation: current_gen,
             batch_id: 0,
             stop_on_error: false,
         };
         app.canvas.code_chunks.queued_runs.push_back(queued);
         pump_queued_runs(app, ctx);
-        let started = app.canvas.code_chunks.pending_runs.iter().any(|p| p.chunk_id == id);
+        let started = app.canvas.code_chunks.pending_runs.iter().any(|p| !p.invalidated && p.chunk_id == id);
         if started {
             Ok(json!({ "started": true, "chunk": { "id": id, "language": range.chunk.language } }))
         } else {
@@ -1391,6 +1418,8 @@ pub(crate) fn run_all_async(app: &mut WordApp, params: &Value, ctx: Option<&egui
         Some(_) => return Err("stopOnError: expected a boolean".into()),
     };
     let generation = app.session.chunks.generation();
+    app.canvas.code_chunks.invalidate_stale_runs(generation);
+    app.canvas.code_chunks.reap_invalidated_runs();
     let batch_id = app.canvas.code_chunks.allocate_batch_id();
     let mut batch = Vec::new();
     let mut seen_ids = HashSet::new();

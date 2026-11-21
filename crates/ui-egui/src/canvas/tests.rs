@@ -2988,6 +2988,102 @@ fn transfer_in_flight_runs_remaps_batch_ids_to_prevent_collisions() {
 }
 
 #[test]
+fn restart_kernel_keeps_invalidated_chunk_workers_counted_until_they_exit() {
+    let mut a = WordApp::new(wordcraft_engine::Session::new(wordcraft_doc::Document::new()), Default::default());
+    let mut chunks = Vec::new();
+    for i in 1..=5 {
+        let id = a.run("code.insert_chunk", json!({"language": "python", "code": format!("x{i} = {i}")})).unwrap()["chunk"]["id"].as_i64().unwrap();
+        chunks.push(id);
+    }
+
+    let mut h = crate::test_harness::builder().with_size(egui::vec2(1280.0, 860.0)).build_ui_state(
+        |ui, app: &mut WordApp| {
+            let ctx = ui.ctx().clone();
+            crate::test_harness::driver_logic(&ctx, app);
+            app.ui(ui);
+        },
+        a,
+    );
+    steps(&mut h, 4);
+
+    let gen0 = h.state().session.chunks.generation();
+    let mut old_store_txs = Vec::new();
+    let mut old_ui_txs = Vec::new();
+    for &cid in &chunks[..4] {
+        let (tx_ui, rx_ui) = std::sync::mpsc::channel();
+        let (tx_store, rx_store) = std::sync::mpsc::channel();
+        h.state_mut().canvas.code_chunks.widgets.get_mut(&cid).unwrap().widget.attach_run(rx_ui);
+        h.state_mut().canvas.code_chunks.push_pending_for_test(cid, wordcraft_kernel::CodeLanguage::Python, "x = 1", (gen0, 1, false), rx_store);
+        old_ui_txs.push(tx_ui);
+        old_store_txs.push(tx_store);
+    }
+    assert_eq!(h.state().canvas.code_chunks.pending_len_for_test(), 4);
+
+    // Restarting the kernel advances the generation and detaches widget spinners,
+    // but the 4 still-running workers must keep occupying the concurrency limit until they exit.
+    h.state_mut().run("code.restart_kernel", json!({})).unwrap();
+    let gen1 = h.state().session.chunks.generation();
+    assert_ne!(gen0, gen1);
+
+    // Queue a new run in gen1 while all 4 gen0 workers are still active: it must stay queued rather than starting a 5th worker.
+    let run_res = h.state_mut().run("code.run_chunk", json!({"chunkId": chunks[4]})).unwrap();
+    assert_eq!(run_res["started"], json!(false), "must not start a new worker while 4 invalidated workers are still running");
+    assert_eq!(run_res["queued"], json!(true));
+    for &cid in &chunks[..3] {
+        h.state_mut().canvas.code_chunks.queue_for_test(cid, wordcraft_kernel::CodeLanguage::Python, "x = 2", gen1, 2, false);
+    }
+
+    let ctx = h.ctx.clone();
+    let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+        crate::canvas::code_chunks::sync_before_layout(h.state_mut(), ui);
+    });
+    out.textures_delta.clear();
+
+    for &cid in &chunks[..4] {
+        assert!(!h.state().canvas.code_chunks.widgets[&cid].widget.is_running(), "widget spinner must clear on restart");
+        assert!(h.state().canvas.code_chunks.widgets[&cid].widget.output().is_none());
+    }
+    assert_eq!(h.state().canvas.code_chunks.pending_len_for_test(), 4, "all 4 invalidated workers must remain counted while alive");
+    assert_eq!(h.state().canvas.code_chunks.queued_len_for_test(), 4, "new gen1 runs must wait in queue while 4 invalidated workers are alive");
+
+    // Clear the queue to test slot release and result discarding deterministically as invalidated workers exit.
+    h.state_mut().run("code.restart_kernel", json!({})).unwrap();
+    let stale_res = wordcraft_kernel::ExecutionResult {
+        stdout: "stale-from-gen0".into(),
+        stderr: String::new(),
+        exit_code: Some(0),
+        success: true,
+        timed_out: false,
+        output_truncated: false,
+        plot_png: None,
+        plot_svg: None,
+        plots: Vec::new(),
+        tables: Vec::new(),
+        duration_ms: 5,
+    };
+    old_store_txs[0].send(Ok(stale_res.clone())).unwrap();
+    old_store_txs[1].send(Err("stale-err".into())).unwrap();
+    let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+        crate::canvas::code_chunks::sync_before_layout(h.state_mut(), ui);
+    });
+    out.textures_delta.clear();
+    assert_eq!(h.state().canvas.code_chunks.pending_len_for_test(), 2, "2 exited invalidated workers must release their slots");
+    for &cid in &chunks[..4] {
+        assert!(h.state().session.chunks.output(cid).is_none(), "invalidated worker results must be discarded");
+        assert!(h.state().canvas.code_chunks.widgets[&cid].widget.output().is_none());
+    }
+
+    // Dropping the remaining 2 worker senders releases the final 2 slots.
+    drop(old_store_txs);
+    drop(old_ui_txs);
+    let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+        crate::canvas::code_chunks::sync_before_layout(h.state_mut(), ui);
+    });
+    out.textures_delta.clear();
+    assert_eq!(h.state().canvas.code_chunks.pending_len_for_test(), 0);
+}
+
+#[test]
 fn canvas_caret_renders_after_offscreen_or_hidden_chunk_loses_focus() {
     let mut a = WordApp::new(wordcraft_engine::Session::new(wordcraft_doc::Document::new()), Default::default());
     a.run("text.insert", json!({"text": "Intro paragraph above chunk 1."})).unwrap();
