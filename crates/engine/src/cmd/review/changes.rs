@@ -252,12 +252,41 @@ fn resolve_all(s: &mut Session, accept: bool) -> CmdResult {
     if accept {
         s.doc.compare_hf = None;
     } else if let Some(flags) = s.doc.compare_hf.take() {
-        let ends: Vec<usize> = s.doc.sections().into_iter().map(|(e, _)| e).collect();
+        let sections = s.doc.sections();
+        let ends: Vec<usize> = sections.iter().map(|(e, _)| *e).collect();
+        let num_sections = ends.len();
+        let mut seen_keys = std::collections::HashSet::new();
+        let mut restored_ends = std::collections::HashSet::new();
+
         for (sec_idx, title_page) in flags.title_page {
+            if seen_keys.len() >= num_sections {
+                break;
+            }
+            if !seen_keys.insert(sec_idx) {
+                continue;
+            }
             match sec_idx {
-                Some(si) if si + 1 < ends.len() => {
-                    if let Some(&e) = ends.get(si) {
-                        s.doc.section_mut(e).title_page = title_page;
+                Some(si) if si < ends.len().saturating_sub(1) => {
+                    let target_end = if let Some(&(e, sec)) = sections.get(si) {
+                        // If the section at `si` already has the target title_page and has no
+                        // first header/footer, but another section shifted and needs restoration, find it.
+                        if sec.title_page == title_page && sec.headers.first.is_none() && sec.footers.first.is_none() {
+                            sections
+                                .iter()
+                                .find(|(cand_e, cand_sec)| {
+                                    !restored_ends.contains(cand_e)
+                                        && (cand_sec.title_page != title_page || cand_sec.headers.first.is_some() || cand_sec.footers.first.is_some())
+                                })
+                                .map(|(cand_e, _)| *cand_e)
+                                .unwrap_or(e)
+                        } else {
+                            e
+                        }
+                    } else {
+                        continue;
+                    };
+                    if restored_ends.insert(target_end) {
+                        s.doc.section_mut(target_end).title_page = title_page;
                     }
                 }
                 Some(_) => {}
@@ -350,6 +379,40 @@ fn revision_span(p: &Paragraph, off: usize) -> Option<std::ops::Range<usize>> {
     Some(start..end)
 }
 
+fn story_has_revisions(doc: &Document, st: StoryRef) -> bool {
+    for path in doc.para_paths(st) {
+        if let Some(p) = doc.para(st, &path) {
+            if p.mark.ins.is_some() || p.mark.del.is_some() || p.mark.fmt_change.is_some() || p.props.fmt_change.is_some() {
+                return true;
+            }
+            for (_, c) in p.run_ranges() {
+                if c.ins.is_some() || c.del.is_some() || c.fmt_change.is_some() {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn doc_has_revisions(doc: &Document) -> bool {
+    if story_has_revisions(doc, StoryRef::Body) {
+        return true;
+    }
+    for &k in doc.parts.keys() {
+        if story_has_revisions(doc, StoryRef::Part(k)) {
+            return true;
+        }
+    }
+    if doc.styles.styles.iter().any(|st| st.para_change.is_some() || st.chr_change.is_some()) {
+        return true;
+    }
+    if doc.last_section.fmt_change.is_some() {
+        return true;
+    }
+    false
+}
+
 fn resolve_sel(s: &mut Session, accept: bool, next: bool) -> CmdResult {
     // The style change Next / Previous Change selected: that one alone. A caret put at the
     // document start any other way resolves no style change.
@@ -411,6 +474,61 @@ fn resolve_sel(s: &mut Session, accept: bool, next: bool) -> CmdResult {
     }
     crate::cmd::moves::resolve(s, &moves, accept)?;
     resolve_styles_sel(s, whole_body, accept)?;
+    if let StoryRef::Part(part_id) = a.story {
+        if !story_has_revisions(&s.doc, a.story) {
+            let sections = s.doc.sections();
+            let num_sections = sections.len();
+            let mut found = None;
+            for (sec_idx, &(end, sec)) in sections.iter().enumerate() {
+                let sec_key = (sec_idx + 1 < num_sections).then_some(sec_idx);
+                if sec.headers.first == Some(part_id) || sec.footers.first == Some(part_id) {
+                    found = Some((sec_key, end, true));
+                    break;
+                }
+                if sec.headers.even == Some(part_id) || sec.footers.even == Some(part_id) {
+                    found = Some((sec_key, end, false));
+                    break;
+                }
+            }
+            if let Some((sec_key, end, is_first)) = found {
+                if is_first {
+                    if let Some(flags) = s.doc.compare_hf.as_mut() {
+                        let orig_tp = flags.title_page.iter().position(|(k, _)| *k == sec_key).map(|idx| flags.title_page.remove(idx).1);
+                        if !accept {
+                            if let Some(orig) = orig_tp {
+                                if sec_key.is_some() {
+                                    s.doc.section_mut(end).title_page = orig;
+                                } else {
+                                    s.doc.last_section.title_page = orig;
+                                }
+                            }
+                        }
+                    }
+                } else if let Some(flags) = s.doc.compare_hf.as_mut() {
+                    if accept {
+                        flags.even_odd = None;
+                    } else {
+                        let any_even_has_rev = sections.iter().any(|(_, sec)| {
+                            [sec.headers.even, sec.footers.even].into_iter().flatten().any(|id| story_has_revisions(&s.doc, StoryRef::Part(id)))
+                        });
+                        if !any_even_has_rev {
+                            if let Some(orig) = flags.even_odd.take() {
+                                s.doc.settings.even_odd_headers = orig;
+                            }
+                        }
+                    }
+                }
+                if let Some(flags) = &s.doc.compare_hf {
+                    if flags.title_page.is_empty() && flags.even_odd.is_none() {
+                        s.doc.compare_hf = None;
+                    }
+                }
+            }
+        }
+    }
+    if !doc_has_revisions(&s.doc) {
+        s.doc.compare_hf = None;
+    }
     s.sel = Selection::caret(a);
     s.clamp_selection();
     if next { select_next_unresolved(s) } else { sel_result(s) }
