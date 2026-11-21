@@ -11,6 +11,7 @@ mod cell_floats;
 mod complex;
 mod float_top;
 mod grid;
+mod keep_next_section;
 mod ligature;
 pub(crate) mod linear;
 mod missing_glyphs;
@@ -20,6 +21,7 @@ mod numeral;
 mod pages;
 mod styleref;
 mod table_contact;
+mod table_first_line;
 mod textbox;
 mod vertical;
 
@@ -4664,7 +4666,8 @@ fn tall_rows_split_across_pages() {
         .find_map(|i| if let Placed::Lines { path, para, .. } = i { (path.0 == vec![1, 0, 0, 0]).then_some(para.lines.len()) } else { None })
         .unwrap_or(0);
     assert_eq!(total, n);
-    // "Can't split" rows move whole instead.
+    // A "can't split" row taller than a page splits too, from the top of a page, as in Word (#6823);
+    // a shorter one moves on whole (`table_first_line`).
     let mut d2 = Document::from_text("before\nafter");
     t.rows[0].props.cant_split = true;
     d2.insert_block(StoryRef::Body, &Path::top(1), wordcraft_doc::Block::Table(t)).unwrap();
@@ -8021,6 +8024,46 @@ fn a_page_break_at_the_bottom_of_a_full_page_leaves_no_blank_page() {
     assert_eq!(l.pages.len(), 2, "pages: {}", l.pages.len());
     let last_on_2 = l.pages[1].items.iter().any(|it| matches!(it, Placed::Lines { path, .. } if path.0 == [27]));
     assert!(last_on_2, "the text after the break is on page 2");
+}
+
+/// Measured in Word for Mac: a paragraph holding only a page break is an ordinary line. When it
+/// doesn't fit at the bottom of a full page it goes to the next one, and its break leaves that
+/// page blank. Only a break with text after it in its paragraph stays on the full page (#534).
+/// WordCraft kept both on the page, so a paper's references started a page early.
+#[test]
+fn a_paragraph_of_only_a_page_break_moves_when_it_does_not_fit() {
+    use wordcraft_doc::props::LineSpacing;
+    let chr = wordcraft_doc::CharProps { font: Some("Source Sans 3".into()), size: Some(12.0), ..Default::default() };
+    let doc = |spacing: LineSpacing, room: f32, tail: &[&str]| {
+        let para = |text: &str| {
+            let mut p = wordcraft_doc::Paragraph::with_text(text, chr.clone());
+            p.mark = chr.clone();
+            p.props = ParaProps { line_spacing: Some(spacing), space_before: Some(0.0), space_after: Some(0.0), ..Default::default() };
+            wordcraft_doc::para_block(p)
+        };
+        let mut d = Document::new();
+        d.body = (0..20).map(|i| para(&format!("Line {i}"))).chain(tail.iter().map(|t| para(t))).collect();
+        let l = lay(&d);
+        let pitch = l.caret(&Pos::body(1, 0)).unwrap().top - l.caret(&Pos::body(0, 0)).unwrap().top;
+        d.last_section.margin_bottom = d.last_section.page_h - d.last_section.margin_top - 20.0 * pitch - room;
+        d
+    };
+    let pages = |d: &Document| lay(d).pages.len();
+    let single = {
+        let l = lay(&doc(LineSpacing::Multiple(1.0), 600.0, &[]));
+        l.caret(&Pos::body(1, 0)).unwrap().top - l.caret(&Pos::body(0, 0)).unwrap().top
+    };
+    let only = ["\u{000C}", "After"];
+    let start = ["\u{000C}After"];
+    // Exactly 24 pt lines, 10 pt left: the break's own paragraph moves, a blank page follows.
+    assert_eq!(pages(&doc(LineSpacing::Exactly(24.0), 10.0, &only)), 3, "exact, break only");
+    assert_eq!(pages(&doc(LineSpacing::Exactly(24.0), 10.0, &start)), 2, "exact, break before text");
+    // Double spacing: the paragraph moves when its text cannot fit. Its leading can hang into
+    // the bottom margin once the paragraph mark fits.
+    assert_eq!(pages(&doc(LineSpacing::Multiple(2.0), single - 0.2, &only)), 3, "double, text doesn't fit");
+    assert_eq!(pages(&doc(LineSpacing::Multiple(2.0), single + 0.2, &only)), 2, "double, leading hangs");
+    assert_eq!(pages(&doc(LineSpacing::Multiple(2.0), 2.0 * single + 0.2, &only)), 2, "double, line fits");
+    assert_eq!(pages(&doc(LineSpacing::Multiple(2.0), single - 0.2, &start)), 2, "double, break before text");
 }
 
 /// #534: indents in characters (`w:firstLineChars`) are measured in the paragraph mark's font
