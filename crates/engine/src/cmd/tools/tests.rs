@@ -1184,19 +1184,21 @@ fn numbering_change_independent_resolution_and_coalescing() {
     // Edit 1: change level from 0 to 1
     s_track.run("para.listLevel", &json!({"level": 1})).unwrap();
     let p1 = s_track.doc.para(StoryRef::Body, &wordcraft_doc::Path::top(0)).unwrap();
-    assert_eq!(p1.props.num_change.as_ref().unwrap().previous_numbering(), Some(NumRef { num: 1, level: 0 }));
+    assert!(p1.props.fmt_change.is_some(), "tracked listLevel change records fmt_change (w:pPrChange)");
+    assert_eq!(p1.props.fmt_change.as_ref().unwrap().old.numbering, Some(NumRef { num: 1, level: 0 }));
+    assert!(p1.props.num_change.is_none(), "tracked listLevel change does not emit num_change");
     // Edit 2: change level to 2 (coalesces with edit 1, keeping baseline level 0)
     s_track.run("para.listLevel", &json!({"level": 2})).unwrap();
     let p2 = s_track.doc.para(StoryRef::Body, &wordcraft_doc::Path::top(0)).unwrap();
     assert_eq!(
-        p2.props.num_change.as_ref().unwrap().previous_numbering(),
+        p2.props.fmt_change.as_ref().unwrap().old.numbering,
         Some(NumRef { num: 1, level: 0 }),
         "coalesced edit preserves original baseline level 0"
     );
-    // Edit 3: restore baseline level 0 (clears num_change)
+    // Edit 3: restore baseline level 0 (clears fmt_change)
     s_track.run("para.listLevel", &json!({"level": 0})).unwrap();
     let p3 = s_track.doc.para(StoryRef::Body, &wordcraft_doc::Path::top(0)).unwrap();
-    assert!(p3.props.num_change.is_none(), "restoring baseline clears num_change");
+    assert!(p3.props.fmt_change.is_none(), "restoring baseline clears fmt_change");
 
     // 10. Successive edits preserve unparseable legacy original
     let mut s_legacy = Session::new(Document::from_text("Legacy item"));
@@ -1229,25 +1231,43 @@ fn numbering_change_independent_resolution_and_coalescing() {
     s_coalesce.run("para.bullets", &json!({})).unwrap();
     let p_c1 = s_coalesce.doc.para(StoryRef::Body, &wordcraft_doc::Path::top(0)).unwrap();
     assert!(p_c1.props.numbering.is_some());
-    assert!(p_c1.props.num_change.is_some());
+    assert!(p_c1.props.fmt_change.is_some(), "tracked list edit records fmt_change (w:pPrChange)");
+    assert!(p_c1.props.num_change.is_none(), "tracked list edit does not emit num_change");
     // Step 2: Format paragraph (center alignment)
     s_coalesce.run("para.alignCenter", &json!({})).unwrap();
     let p_c2 = s_coalesce.doc.para(StoryRef::Body, &wordcraft_doc::Path::top(0)).unwrap();
     assert_eq!(p_c2.props.align, Some(wordcraft_doc::props::Align::Center));
     assert!(p_c2.props.fmt_change.is_some());
-    // Verify fmt_change.old does not retain intermediate numbering
-    assert!(p_c2.props.fmt_change.as_ref().unwrap().old.numbering.is_none(), "fmt_change baseline strips numbering");
+    // Verify fmt_change.old preserves the original unnumbered baseline
+    assert!(p_c2.props.fmt_change.as_ref().unwrap().old.numbering.is_none(), "fmt_change baseline retains initial unnumbered state");
     // Step 3: Remove bullets (toggle off)
     s_coalesce.run("para.bullets", &json!({"off": true})).unwrap();
     let p_c3 = s_coalesce.doc.para(StoryRef::Body, &wordcraft_doc::Path::top(0)).unwrap();
     assert!(p_c3.props.numbering.is_none_or(|n| n.num == 0), "numbering removed");
-    assert!(p_c3.props.num_change.is_none(), "num_change coalesced back to None baseline");
     assert!(p_c3.props.fmt_change.is_some(), "alignment fmt_change remains active");
     // Step 4: Reject all restores unnumbered and left-aligned baseline
     s_coalesce.run("review.rejectAll", &json!({})).unwrap();
     let p_c4 = s_coalesce.doc.para(StoryRef::Body, &wordcraft_doc::Path::top(0)).unwrap();
     assert!(p_c4.props.numbering.is_none_or(|n| n.num == 0), "baseline unnumbered is preserved after rejection");
     assert_eq!(p_c4.props.align, None, "alignment restored to default");
+
+    // 12. Tracked paragraph formatting on a numbered item preserves list in fmt_change baseline
+    let mut s_numbered = Session::new(Document::from_text("Numbered item"));
+    s_numbered.doc.para_mut(StoryRef::Body, &wordcraft_doc::Path::top(0)).unwrap().props.numbering = Some(NumRef { num: 1, level: 0 });
+    s_numbered.doc.settings.track_changes = true;
+    s_numbered.prefs.markup.track_formatting = true;
+    s_numbered.author = "Author".into();
+    s_numbered.run("para.alignCenter", &json!({})).unwrap();
+    let p_num = s_numbered.doc.para(StoryRef::Body, &wordcraft_doc::Path::top(0)).unwrap();
+    assert_eq!(p_num.props.align, Some(wordcraft_doc::props::Align::Center));
+    let fc = p_num.props.fmt_change.as_ref().expect("fmt_change recorded");
+    assert_eq!(fc.old.numbering, Some(NumRef { num: 1, level: 0 }), "fmt_change baseline must retain list numbering");
+    assert!(p_num.props.num_change.is_none(), "tracked formatting edit does not emit num_change");
+    // Rejecting format change restores default alignment and preserves numbering
+    s_numbered.run("review.rejectAll", &json!({})).unwrap();
+    let p_num_rej = s_numbered.doc.para(StoryRef::Body, &wordcraft_doc::Path::top(0)).unwrap();
+    assert_eq!(p_num_rej.props.align, None, "alignment restored to default");
+    assert_eq!(p_num_rej.props.numbering, Some(NumRef { num: 1, level: 0 }), "numbering preserved after rejecting format change");
 }
 
 /// Verification for DOCX roundtrip of snapshot-only list removals and imported w:pPrChange rejection.
@@ -1513,9 +1533,10 @@ fn style_inherited_numbering_and_compare_fmt_change_preservation() {
     session.run("para.bullets", &json!({"off": true})).unwrap();
     let p_after = session.doc.para(StoryRef::Body, &wordcraft_doc::Path::top(0)).unwrap();
     assert_eq!(p_after.props.numbering, Some(NumRef { num: 0, level: 0 }));
-    assert!(p_after.props.num_change.is_some(), "removing style-inherited numbering tracks num_change");
+    assert!(p_after.props.fmt_change.is_some(), "removing style-inherited numbering tracks fmt_change (w:pPrChange)");
+    assert!(p_after.props.num_change.is_none(), "tracked list edit does not emit num_change");
 
-    // Coalescing when neither value inherits a list: no spurious num_change
+    // Coalescing when neither value inherits a list: no spurious fmt_change
     let doc_plain = Document::from_text("Plain text");
     let mut s_plain = Session::new(doc_plain);
     s_plain.doc.settings.track_changes = true;
@@ -1523,7 +1544,7 @@ fn style_inherited_numbering_and_compare_fmt_change_preservation() {
     s_plain.author = "Author".into();
     s_plain.run("para.bullets", &json!({"off": true})).unwrap();
     let p_plain = s_plain.doc.para(StoryRef::Body, &wordcraft_doc::Path::top(0)).unwrap();
-    assert!(p_plain.props.num_change.is_none(), "no num_change when neither value inherits a list");
+    assert!(p_plain.props.fmt_change.is_none(), "no fmt_change when neither value inherits a list");
 
     // 2. Compare preserves old.fmt_change when new has no fmt_change and formatting matches
     let mut old_p = Paragraph::with_text("Formatted", CharProps::default());

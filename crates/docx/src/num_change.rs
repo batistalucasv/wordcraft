@@ -1,6 +1,6 @@
 //! Exact `w:numberingChange` snapshot overrides in a DOCX custom XML part.
 //!
-//! ECMA-376 §17.3.1.20 stores only `w:original` on `<w:numberingChange>`, never a `w:numId`.
+//! ECMA-376 §17.3.1.19 stores only `w:original` on `<w:numberingChange>`, never a `w:numId`.
 //! When two lists share the same level format, or when a list is edited in place after a revision
 //! was recorded, `w:original` alone cannot distinguish the paragraph's prior list from another
 //! list whose definition matches the historical string. WordCraft writes this namespaced store
@@ -387,6 +387,19 @@ pub(crate) fn fingerprint_shared_model<'a>(source: &craft_wordmodel::Document, o
         walk(&g.blocks, &format!("g{i}"), &mut h, 0);
     }
 
+    // craft-docx writes a repeated w:nsid only on the first abstractNum that has it
+    // (write/styles.rs). Dedup nsids here so the fingerprint matches whether computed
+    // before save or after re-reading from DOCX.
+    let mut written_nsids: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut abstract_nsids: std::collections::HashMap<u32, &str> = std::collections::HashMap::new();
+    for a in &source.numbering.abstracts {
+        if let Some(nsid) = a.nsid.as_deref()
+            && written_nsids.insert(nsid)
+        {
+            abstract_nsids.insert(a.id, nsid);
+        }
+    }
+
     let mut sorted_overrides: Vec<&SnapshotEntry> = overrides.into_iter().collect();
     sorted_overrides.sort_by_key(|e| &e.loc);
     for entry in sorted_overrides {
@@ -402,7 +415,7 @@ pub(crate) fn fingerprint_shared_model<'a>(source: &craft_wordmodel::Document, o
                     if let Some(abs) = source.numbering.abstract_of(nr.num) {
                         fnv1a_u8(&mut h, 1);
                         fnv1a_u32(&mut h, abs.id);
-                        if let Some(nsid) = abs.nsid.as_deref() {
+                        if let Some(nsid) = abstract_nsids.get(&abs.id) {
                             fnv1a_bytes(&mut h, nsid.as_bytes());
                         }
                     } else {

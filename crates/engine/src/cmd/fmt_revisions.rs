@@ -160,53 +160,48 @@ impl Recorder<'_> {
                 None => style_num,
             }
         };
-        let b_eff = effective_num_for(b);
-        let a_eff = effective_num_for(a);
-        let num_diff = b_eff != a_eff;
-        let num_change = if num_diff {
-            if self.is_compare() {
+        let (num_change, props) = if self.is_compare() {
+            let b_eff = effective_num_for(b);
+            let a_eff = effective_num_for(a);
+            let num_diff = b_eff != a_eff;
+            let nc = if num_diff {
                 let rev = self.rid();
-                Some(wordcraft_doc::props::NumChange::boxed(rev, b.props.numbering))
+                let has_styled_num = self
+                    .styles
+                    .and_then(|st| st.resolve_para(&ParaProps { style: a.props.style.clone(), ..Default::default() }).numbering)
+                    .is_some_and(|n| n.num != 0);
+                let snapshot = if b_eff.is_none() && a_eff.is_some() && has_styled_num { Some(NumRef { num: 0, level: 0 }) } else { b_eff };
+                Some(wordcraft_doc::props::NumChange::boxed(rev, snapshot))
+            } else if a.props.num_change.is_some() {
+                None
             } else {
-                let had = b.props.num_change.as_ref();
-                let own = had.filter(|c| self.own(c.rev));
-                let change = match own {
-                    Some(c) if !c.is_parseable() => {
-                        Some(Box::new(wordcraft_doc::props::NumChange { rev: c.rev, original: c.original.clone(), snapshot: c.snapshot }))
-                    }
-                    Some(c) => {
-                        let prev = c.snapshot;
-                        let prev_eff = match prev {
-                            Some(nr) if nr.num == 0 => {
-                                let style_num = self
-                                    .styles
-                                    .and_then(|st| st.resolve_para(&ParaProps { style: a.props.style.clone(), ..Default::default() }).numbering)
-                                    .filter(|n| n.num != 0);
-                                if style_num.is_some() { Some(NumRef { num: 0, level: nr.level }) } else { None }
-                            }
-                            Some(nr) => Some(nr),
-                            None => self
-                                .styles
-                                .and_then(|st| st.resolve_para(&ParaProps { style: b.props.style.clone(), ..Default::default() }).numbering)
-                                .filter(|n| n.num != 0),
-                        };
-                        if prev_eff == a_eff {
-                            None
-                        } else {
-                            Some(Box::new(wordcraft_doc::props::NumChange { rev: c.rev, original: c.original.clone(), snapshot: prev }))
-                        }
-                    }
-                    None => {
-                        let rev = self.rid();
-                        wordcraft_doc::props::NumChange::boxed(rev, b.props.numbering)
-                    }
+                b.props.num_change.clone()
+            };
+            // In Compare: check whether non-numbering paragraph properties changed.
+            // Strip numbering only for the diff comparison, not for the stored `old`.
+            let formatting_changed = strip_num(&b.props) != strip_num(&a.props);
+            let p_change = if formatting_changed {
+                let (had, has) = (&b.props.fmt_change, &a.props.fmt_change);
+                let own = had.as_ref().filter(|c| self.own(c.rev));
+                let old = own.map(|c| c.old.clone()).unwrap_or_else(|| b.props.formatting());
+                let want = if old == a.props.formatting() {
+                    None
+                } else {
+                    let rev = own.map(|c| c.rev).unwrap_or_else(|| self.rid());
+                    PropChange::boxed(rev, old)
                 };
-                Some(change)
-            }
+                (want != *has).then_some(Replacement(want))
+            } else if a.props.fmt_change.is_some() {
+                None
+            } else {
+                b.props.fmt_change.clone().map(Replacement)
+            };
+            (nc, p_change)
         } else {
-            None
+            // Normal tracked edits: keep on pPrChange (fmt_change), preserving numbering in baseline.
+            let p_change = self.change(&b.props, &a.props, ParaProps::formatting, |p| &p.fmt_change);
+            (None, p_change)
         };
-        let props = self.change(&b.props, &a.props, strip_num, |p| &p.fmt_change);
         if runs.is_empty() && mark.is_none() && props.is_none() && num_change.is_none() {
             return;
         }
@@ -375,7 +370,9 @@ impl ParaPropTracker {
             styles: Some(&s.doc.styles),
             rid: None,
         };
-        r.change(before, after, strip_num, |p| &p.fmt_change).map(|Replacement(change)| change).unwrap_or_else(|| after.fmt_change.clone())
+        r.change(before, after, ParaProps::formatting, |p| &p.fmt_change)
+            .map(|Replacement(change)| change)
+            .unwrap_or_else(|| after.fmt_change.clone())
     }
 }
 
@@ -397,7 +394,7 @@ pub(crate) fn record_para_props(s: &mut Session, story: StoryRef, path: &Path, b
         styles: Some(&s.doc.styles),
         rid: None,
     };
-    if let Some(Replacement(want)) = r.change(before, &after, strip_num, |p| &p.fmt_change) {
+    if let Some(Replacement(want)) = r.change(before, &after, ParaProps::formatting, |p| &p.fmt_change) {
         let p = s.doc.para_mut(story, path)?;
         p.props.fmt_change = want;
         p.touch();
@@ -446,7 +443,11 @@ pub fn char_diff(c: &CharProps) -> Vec<Value> {
 
 /// The properties a paragraph's change set.
 pub fn para_diff(p: &ParaProps) -> Vec<Value> {
-    if let Some(ch) = &p.fmt_change { diff(&strip_num(&ch.old), &strip_num(p)) } else { Vec::new() }
+    if let Some(ch) = &p.fmt_change {
+        if p.num_change.is_some() { diff(&strip_num(&ch.old), &strip_num(p)) } else { diff(&ch.old.formatting(), &p.formatting()) }
+    } else {
+        Vec::new()
+    }
 }
 
 /// The properties a paragraph's numbering change sets.
