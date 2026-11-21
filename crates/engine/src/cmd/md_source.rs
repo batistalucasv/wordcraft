@@ -71,35 +71,97 @@ enum TextFormat {
     Quarto,
 }
 
+/// Fixed-size fingerprint of a file's bytes when the file is too large to keep verbatim in memory
+/// (`> MAX_SOURCE_BYTES`), so Save can still tell whether the exported bytes differ from the
+/// file's own text without retaining the full source string.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BytesFingerprint {
+    len: usize,
+    hash_a: u64,
+    hash_b: u64,
+}
+
+impl BytesFingerprint {
+    fn of(bytes: &[u8]) -> Self {
+        use std::hash::Hasher;
+        let mut a = std::collections::hash_map::DefaultHasher::new();
+        a.write_u64(0x9E37_79B9_7F4A_7C15);
+        a.write(bytes);
+        let mut b = std::collections::hash_map::DefaultHasher::new();
+        b.write_u64(0xBF58_476D_1CE4_E5B9);
+        b.write_usize(bytes.len());
+        for chunk in bytes.rchunks(4096) {
+            b.write(chunk);
+        }
+        Self { len: bytes.len(), hash_a: a.finish(), hash_b: b.finish() }
+    }
+}
+
 /// A Markdown or Quarto file's own text, which keeps what the document can't (front matter,
 /// comments, callouts, shortcodes, attribute lists, a code block's language, the author's own
 /// spacing): the text the file was opened or last saved with, and the last text the view applied.
 /// Either stands for the document while reading it gives the document as it is, so an Undo back
 /// to either finds it again.
+///
+/// Files larger than [`MAX_SOURCE_BYTES`] are not kept verbatim in memory; instead their byte
+/// fingerprint is recorded so Save still reports `rewritten: true` when an export differs from
+/// the file's own text.
 #[derive(Clone, Default)]
 pub struct FileText {
     saved: Option<String>,
     latest: Option<String>,
+    oversized: Option<BytesFingerprint>,
     cached_exact: RefCell<Option<(u64, TextFormat, Option<String>)>>,
 }
 
 impl FileText {
     /// A file's bytes as its text, if they can be written back as they are: valid UTF-8,
-    /// not empty, and no longer than the view takes.
+    /// not empty, and no longer than the view takes. Larger valid UTF-8 files record only a
+    /// fingerprint so Save still knows when exporting rewrites the file.
     pub fn from_bytes(bytes: &[u8]) -> Self {
-        let keep = !bytes.is_empty() && bytes.len() <= MAX_SOURCE_BYTES;
-        let saved = keep.then(|| std::str::from_utf8(bytes).ok()).flatten().map(str::to_string);
-        Self { saved, latest: None, cached_exact: RefCell::new(None) }
+        if bytes.is_empty() {
+            return Self::default();
+        }
+        let Ok(text) = std::str::from_utf8(bytes) else {
+            return Self::default();
+        };
+        if bytes.len() <= MAX_SOURCE_BYTES {
+            Self { saved: Some(text.to_string()), latest: None, oversized: None, cached_exact: RefCell::new(None) }
+        } else {
+            Self { saved: None, latest: None, oversized: Some(BytesFingerprint::of(bytes)), cached_exact: RefCell::new(None) }
+        }
     }
 
     /// The text just written to the file, which is the file's own text now.
     pub fn saved(text: Option<String>) -> Self {
-        Self { saved: text, latest: None, cached_exact: RefCell::new(None) }
+        Self { saved: text, latest: None, oversized: None, cached_exact: RefCell::new(None) }
     }
 
     /// No text is kept.
     pub fn is_empty(&self) -> bool {
         self.saved.is_none() && self.latest.is_none()
+    }
+
+    /// Whether Save needs the exported bytes to check if they differ from an oversized source.
+    pub(crate) fn needs_bytes_for_rewrite_check(&self) -> bool {
+        self.oversized.is_some()
+    }
+
+    /// Whether `bytes` differ from an oversized source file's own bytes.
+    pub(crate) fn differs_from_oversized(&self, bytes: &[u8]) -> bool {
+        self.oversized.is_some_and(|fp| fp != BytesFingerprint::of(bytes))
+    }
+
+    /// Whether writing `written` bytes to a Markdown or Quarto file rewrote the file's own text.
+    ///
+    /// For files larger than [`MAX_SOURCE_BYTES`], this checks whether the written bytes differ
+    /// from the opened file's own text. For kept files, any non-exact save (`!used_exact`)
+    /// rewrites the retained text.
+    pub(crate) fn is_rewritten(&self, used_exact: bool, written: &[u8]) -> bool {
+        if let Some(fp) = self.oversized {
+            return fp != BytesFingerprint::of(written);
+        }
+        !used_exact && !self.is_empty()
     }
 }
 
@@ -248,7 +310,8 @@ fn enter(s: &mut Session) -> Result<(), CmdError> {
     let (text, loses_content, block_lines) = match exact_text(s, TextFormat::Markdown) {
         Some(text) => {
             let (_, lines) = parse_with_lines(&s.doc, &text);
-            (text, false, lines)
+            let loses_content = s.md_file.differs_from_oversized(text.as_bytes());
+            (text, loses_content, lines)
         }
         None => {
             let text = wordcraft_formats::markdown::export(&s.doc);
@@ -256,7 +319,7 @@ fn enter(s: &mut Session) -> Result<(), CmdError> {
                 return Err(CmdError::Failed(too_long()));
             }
             let (doc, lines) = parse_with_lines(&s.doc, &text);
-            let loses_content = !doc.same_content(&s.doc);
+            let loses_content = !doc.same_content(&s.doc) || s.md_file.differs_from_oversized(text.as_bytes());
             (text, loses_content, lines)
         }
     };
@@ -1037,5 +1100,158 @@ mod tests {
 
         s.run("text.insert", &json!({"text": "Again "})).unwrap();
         assert_eq!(save(&mut s)["rewritten"], false, "warned once for Quarto as for Markdown");
+    }
+
+    /// Builds a valid UTF-8 body string longer than `MAX_SOURCE_BYTES` made of a single plain
+    /// paragraph so it parses quickly while exceeding the retained source text ceiling.
+    fn oversized_padding() -> String {
+        "a".repeat(MAX_SOURCE_BYTES + 64)
+    }
+
+    #[test]
+    fn oversized_markdown_and_quarto_files_warn_on_save_when_export_drops_text() {
+        let pad = oversized_padding();
+        let md_with_comment = format!("<!-- outside comment -->\n\n{pad}\n");
+        let qmd_with_comment = format!("<!-- outside comment -->\n\n{pad}\n\n```{{r}}\nx <- 1\n```\n");
+
+        let cases: [(&str, &str, &str); 4] = [
+            ("oversized-md", "large.md", &md_with_comment),
+            ("oversized-markdown", "large.markdown", &md_with_comment),
+            ("oversized-qmd", "large.qmd", &qmd_with_comment),
+            ("oversized-rmd", "large.Rmd", &qmd_with_comment),
+        ];
+
+        for (tag, filename, content) in cases {
+            assert!(content.len() > MAX_SOURCE_BYTES, "{tag} fixture must exceed MAX_SOURCE_BYTES");
+            let dir = ScratchDir::new(tag);
+            let path = dir.0.join(filename);
+            std::fs::write(&path, content.as_bytes()).unwrap();
+
+            let mut s = Session::new(Document::from_text(""));
+            s.run("file.open", &json!({"path": path.to_string_lossy()})).unwrap();
+            assert!(s.md_file.is_empty(), "{tag}: oversized file text is not kept verbatim in memory");
+
+            // Unedited save re-exports the file, dropping the HTML comment: must signal rewritten=true.
+            let r1 = save(&mut s);
+            assert_eq!(r1["rewritten"], true, "{tag}: first save dropping comment must set rewritten=true");
+            let saved = std::fs::read_to_string(&path).unwrap();
+            assert!(!saved.contains("<!-- outside comment -->"), "{tag}: exported file drops outside comment");
+
+            // Second save warns only once, matching smaller files.
+            let r2 = save(&mut s);
+            assert_eq!(r2["rewritten"], false, "{tag}: second save must not warn again");
+        }
+    }
+
+    #[test]
+    fn oversized_handed_over_markdown_and_quarto_warn_on_save_when_export_differs() {
+        let pad = oversized_padding();
+        let md_with_comment = format!("<!-- handed comment -->\n\n{pad}\n");
+        let qmd_with_comment = format!("<!-- handed comment -->\n\n{pad}\n\n```{{r}}\nx <- 1\n```\n");
+
+        for (tag, filename, content) in
+            [("oversized-handed-md", "handed.md", &md_with_comment), ("oversized-handed-qmd", "handed.qmd", &qmd_with_comment)]
+        {
+            let dir = ScratchDir::new(tag);
+            let path = dir.0.join(filename);
+            std::fs::write(&path, b"stale").unwrap();
+            let mut s = Session::new(Document::from_text(""));
+            let data = crate::cmd::insert::base64_encode(content.as_bytes());
+            s.run("file.open", &json!({"path": path.to_string_lossy(), "data": data})).unwrap();
+            assert!(s.md_file.is_empty(), "{tag}: oversized handed-over text is not kept verbatim");
+
+            assert_eq!(save(&mut s)["rewritten"], true, "{tag}: first save dropping comment must warn");
+            assert_eq!(save(&mut s)["rewritten"], false, "{tag}: second save must not warn again");
+        }
+    }
+
+    #[test]
+    fn oversized_canonical_markdown_and_quarto_only_warn_when_export_differs() {
+        let pad = oversized_padding();
+        // Build canonical exported bytes for Markdown and Quarto directly from the exporter so
+        // an unedited save produces byte-identical output.
+        let md_canonical = wordcraft_formats::markdown::export(&wordcraft_formats::markdown::import(&pad));
+        let qmd_src = format!("{pad}\n\n```{{r}}\nx <- 1\n```\n");
+        let qmd_canonical = wordcraft_formats::quarto::export(&wordcraft_formats::quarto::import(&qmd_src)).unwrap();
+        assert!(md_canonical.len() > MAX_SOURCE_BYTES);
+        assert!(qmd_canonical.len() > MAX_SOURCE_BYTES);
+
+        for (tag, filename, canonical) in [("oversized-canon-md", "canon.md", &md_canonical), ("oversized-canon-qmd", "canon.qmd", &qmd_canonical)] {
+            // Unedited save where exported bytes match the file's own text -> rewritten=false.
+            let dir = ScratchDir::new(&format!("{tag}-unedited"));
+            let path = dir.0.join(filename);
+            std::fs::write(&path, canonical.as_bytes()).unwrap();
+            let mut s = Session::new(Document::from_text(""));
+            s.run("file.open", &json!({"path": path.to_string_lossy()})).unwrap();
+            assert_eq!(save(&mut s)["rewritten"], false, "{tag}: identical export must not warn");
+
+            // Edited save where exported bytes differ from the file's own text -> rewritten=true once.
+            let dir_ed = ScratchDir::new(&format!("{tag}-edited"));
+            let path_ed = dir_ed.0.join(filename);
+            std::fs::write(&path_ed, canonical.as_bytes()).unwrap();
+            let mut s_ed = Session::new(Document::from_text(""));
+            s_ed.run("file.open", &json!({"path": path_ed.to_string_lossy()})).unwrap();
+            s_ed.run("text.insert", &json!({"text": "Edited "})).unwrap();
+            assert_eq!(save(&mut s_ed)["rewritten"], true, "{tag}: differing export after edit must warn");
+            assert_eq!(save(&mut s_ed)["rewritten"], false, "{tag}: warns only once");
+        }
+    }
+
+    #[test]
+    fn oversized_quarto_md_copy_keeps_warning_for_subsequent_quarto_save() {
+        let pad = oversized_padding();
+        let qmd_with_comment = format!("<!-- outside comment -->\n\n{pad}\n\n```{{r}}\nx <- 1\n```\n");
+        let dir = ScratchDir::new("oversized-qmd-copy");
+        let qmd_path = dir.0.join("article.qmd");
+        let md_copy_path = dir.0.join("copy.md");
+        std::fs::write(&qmd_path, qmd_with_comment.as_bytes()).unwrap();
+
+        let mut s = Session::new(Document::from_text(""));
+        s.run("file.open", &json!({"path": qmd_path.to_string_lossy()})).unwrap();
+
+        // Saving a copy as .md must not clear the oversized state for the active .qmd file.
+        let r_copy = s.run("file.saveAs", &json!({"path": md_copy_path.to_string_lossy()})).unwrap();
+        assert_eq!(r_copy["rewritten"], true);
+        assert_eq!(s.path.as_deref(), Some(qmd_path.as_path()));
+
+        assert_eq!(save(&mut s)["rewritten"], true, "subsequent .qmd save still warns");
+        assert_eq!(save(&mut s)["rewritten"], false, "second .qmd save warns only once");
+    }
+
+    #[test]
+    fn oversized_comment_heavy_markdown_warns_even_after_source_view_edit() {
+        let huge_comment = format!("<!-- {} -->\n\nShort body.\n", "c".repeat(MAX_SOURCE_BYTES + 64));
+        assert!(huge_comment.len() > MAX_SOURCE_BYTES);
+
+        let dir = ScratchDir::new("oversized-comment-md-source");
+        let path = dir.0.join("comments.md");
+        std::fs::write(&path, huge_comment.as_bytes()).unwrap();
+
+        let mut s = Session::new(Document::from_text(""));
+        s.run("file.open", &json!({"path": path.to_string_lossy()})).unwrap();
+
+        s.run(TOGGLE, &json!({})).unwrap();
+        assert!(s.md_source.as_ref().unwrap().loses_content, "entering Markdown Source after dropping oversized comments must report content loss");
+        set_text(&mut s, "Updated body.\n");
+        assert_eq!(save(&mut s)["rewritten"], true, "first save replacing oversized comments must warn");
+
+        set_text(&mut s, "Updated again.\n");
+        assert_eq!(save(&mut s)["rewritten"], false, "subsequent source-view save keeps the new text");
+    }
+
+    #[test]
+    fn oversized_non_utf8_markdown_stays_consistent_with_small_non_utf8() {
+        let mut latin1 = b"Caf\xE9 ".to_vec();
+        latin1.resize(MAX_SOURCE_BYTES + 64, b'a');
+        latin1.push(b'\n');
+
+        let dir = ScratchDir::new("oversized-latin1");
+        let path = dir.0.join("latin1.md");
+        std::fs::write(&path, &latin1).unwrap();
+
+        let mut s = Session::new(Document::from_text(""));
+        s.run("file.open", &json!({"path": path.to_string_lossy()})).unwrap();
+        assert!(s.md_file.is_empty());
+        assert_eq!(save(&mut s)["rewritten"], false);
     }
 }

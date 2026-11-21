@@ -1049,16 +1049,28 @@ pub fn save_path(path: &std::path::Path, doc: &Document) -> Result<(), String> {
 }
 
 /// [`save_path`], encrypted with `password` as [`save_bytes_with`] does.
-#[cfg(not(target_arch = "wasm32"))]
 pub fn save_path_with(path: &std::path::Path, doc: &Document, password: Option<&str>, opts: &ExportOptions) -> Result<(), String> {
+    save_path_with_bytes(path, doc, password, opts).map(|_| ())
+}
+
+/// [`save_path_with`], returning the exact bytes written so callers can compare them against the
+/// file's original bytes without serialising or reading back a second time.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn save_path_with_bytes(path: &std::path::Path, doc: &Document, password: Option<&str>, opts: &ExportOptions) -> Result<Vec<u8>, String> {
     crate::file_access::check_write(&path.to_string_lossy())?;
     let bytes = save_bytes_with(&path.to_string_lossy(), doc, password, opts)?;
-    safe_save::write(path, &bytes).map_err(|e| format!("{}: {e}", path.display()))
+    safe_save::write(path, &bytes).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(bytes)
 }
 
 /// Saves a document to `path` with optional password and export options on web targets.
 #[cfg(target_arch = "wasm32")]
-pub fn save_path_with(path: &std::path::Path, _doc: &Document, _password: Option<&str>, _opts: &ExportOptions) -> Result<(), String> {
+pub(crate) fn save_path_with_bytes(
+    path: &std::path::Path,
+    _doc: &Document,
+    _password: Option<&str>,
+    _opts: &ExportOptions,
+) -> Result<Vec<u8>, String> {
     Err(format!("{}: files are saved through the browser on the web", path.display()))
 }
 
