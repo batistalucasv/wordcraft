@@ -1464,31 +1464,39 @@ fn which_binary_skips_non_executable_candidates() {
 }
 
 #[test]
-fn captures_multiple_plots_in_creation_order() {
-    if is_language_available(CodeLanguage::Python) && matplotlib_available() {
-        let py_code = r#"
+fn python_captures_multiple_plots_in_creation_order() {
+    if !is_language_available(CodeLanguage::Python) || !matplotlib_available() {
+        return;
+    }
+
+    let py_code = r#"
 import matplotlib.pyplot as plt
 fig1, ax1 = plt.subplots()
 ax1.plot([0, 1], [0, 1])
 fig2, ax2 = plt.subplots()
 ax2.plot([0, 1], [1, 0])
 "#;
-        let res = execute(&ExecutionRequest::new(CodeLanguage::Python, py_code).with_plot_format(PlotFormat::Both)).expect("python execute");
-        assert!(res.success, "stderr: {}", res.stderr);
-        assert_eq!(res.plots.len(), 2, "must capture both Python figures");
-        assert!(res.plots[0].png.is_some() && res.plots[0].svg.is_some());
-        assert!(res.plots[1].png.is_some() && res.plots[1].svg.is_some());
-        assert_eq!(res.plot_png.as_ref(), res.plots[0].png.as_ref());
+    let res = execute(&ExecutionRequest::new(CodeLanguage::Python, py_code).with_plot_format(PlotFormat::Both)).expect("python execute");
+    assert!(res.success, "stderr: {}", res.stderr);
+    assert_eq!(res.plots.len(), 2, "must capture both Python figures");
+    assert!(res.plots[0].png.is_some() && res.plots[0].svg.is_some());
+    assert!(res.plots[1].png.is_some() && res.plots[1].svg.is_some());
+    assert_eq!(res.plot_png.as_ref(), res.plots[0].png.as_ref());
+    assert_eq!(res.plot_svg.as_ref(), res.plots[0].svg.as_ref());
+}
+
+#[test]
+fn r_captures_multiple_plots_in_creation_order() {
+    if !is_language_available(CodeLanguage::R) {
+        return;
     }
 
-    if is_language_available(CodeLanguage::R) {
-        let r_code = "plot(1:5, 1:5)\nplot(1:5, 5:1)\n";
-        let res = execute(&ExecutionRequest::new(CodeLanguage::R, r_code).with_plot_format(PlotFormat::Png)).expect("r execute");
-        assert!(res.success, "stderr: {}", res.stderr);
-        assert_eq!(res.plots.len(), 2, "must capture both R plots");
-        assert!(res.plots[0].png.is_some() && res.plots[1].png.is_some());
-        assert_eq!(res.plot_png.as_ref(), res.plots[0].png.as_ref());
-    }
+    let r_code = "plot(1:5, 1:5)\nplot(1:5, 5:1)\n";
+    let res = execute(&ExecutionRequest::new(CodeLanguage::R, r_code).with_plot_format(PlotFormat::Png)).expect("r execute");
+    assert!(res.success, "stderr: {}", res.stderr);
+    assert_eq!(res.plots.len(), 2, "must capture both R plots");
+    assert!(res.plots[0].png.is_some() && res.plots[1].png.is_some());
+    assert_eq!(res.plot_png.as_ref(), res.plots[0].png.as_ref());
 }
 
 #[cfg(unix)]
@@ -1524,7 +1532,7 @@ fn captures_multiple_plots_skips_python_without_matplotlib_and_runs_r() {
 
     let test_bin = std::env::current_exe().expect("current test executable");
     let mut cmd = Command::new(test_bin);
-    cmd.args(["--exact", "tests::captures_multiple_plots_in_creation_order", "--nocapture"])
+    cmd.args(["captures_multiple_plots_in_creation_order", "--nocapture"])
         .env("PATH", shim_path)
         .env("WC_TEST_REAL_PYTHON", &real_python)
         .env("WC_TEST_PY_MARKER", &py_marker);
@@ -1532,18 +1540,18 @@ fn captures_multiple_plots_skips_python_without_matplotlib_and_runs_r() {
         cmd.env("WC_TEST_REAL_R", real_r).env("WC_TEST_R_MARKER", &r_marker);
     }
 
-    let output = cmd.output().expect("run captures_multiple_plots_in_creation_order without matplotlib");
+    let output = cmd.output().expect("run multi-plot tests without matplotlib");
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(output.status.success(), "test must pass when Python lacks matplotlib\nstdout:\n{stdout}\nstderr:\n{stderr}");
-    assert!(stdout.contains("1 passed"), "expected exact test to execute\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(output.status.success(), "tests must pass when Python lacks matplotlib\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(stdout.contains("2 passed"), "expected both Python and R multi-plot tests to execute\nstdout:\n{stdout}\nstderr:\n{stderr}");
 
     let py_calls = fs::read_to_string(&py_marker).expect("python probe must have run").lines().count();
     assert_eq!(py_calls, 1, "only matplotlib_available() should invoke python3 when matplotlib is absent");
 
     if real_r.is_some() {
-        let r_calls = fs::read_to_string(&r_marker).expect("R branch must still run when matplotlib is absent").lines().count();
-        assert_eq!(r_calls, 1, "R multi-plot branch must run independently of matplotlib availability");
+        let r_calls = fs::read_to_string(&r_marker).expect("R test must still run when matplotlib is absent").lines().count();
+        assert_eq!(r_calls, 1, "R multi-plot test must run independently of matplotlib availability");
     }
 }
 
@@ -1654,4 +1662,297 @@ fn r_plot_both_pairs_svg_with_its_own_plot_for_single_multi_and_mfrow_runs() {
     assert_eq!(res.plots.len(), 1);
     assert!(res.plots[0].png.is_some() && res.plots[0].svg.is_some(), "mfrow single page must pair PNG 1 and SVG 1");
     assert!(res.plot_png.is_some() && res.plot_svg.is_some());
+}
+
+#[test]
+fn r_table_retry_keeps_backup_when_primary_is_missing() {
+    if !is_language_available(CodeLanguage::R) {
+        return;
+    }
+
+    // Failed retry with missing primary must leave the `.bak` snapshot intact for recovery.
+    let failed_retry = r#"
+wc_table(data.frame(x = 1L))
+stopifnot(file.rename("__wordcraft_tables__.json", "__wordcraft_tables__.json.bak"))
+ok <- environment(wc_table)$replace_file("__missing__.tmp", "__wordcraft_tables__.json")
+stopifnot(!ok)
+stopifnot(!file.exists("__wordcraft_tables__.json"))
+stopifnot(file.exists("__wordcraft_tables__.json.bak"))
+"#;
+    let res = execute(&ExecutionRequest::new(CodeLanguage::R, failed_retry).with_plot_capture(false)).expect("r execute");
+    assert!(res.success, "stderr: {}", res.stderr);
+    assert_eq!(res.tables.len(), 1, "reader must recover the preserved .bak snapshot");
+    assert_eq!(res.tables[0].headers, vec!["x".to_owned()]);
+    assert_eq!(res.tables[0].rows, vec![vec!["1".to_owned()]]);
+
+    // A later successful publish installs the new primary and removes `.bak`.
+    let retry_then_succeed = r#"
+wc_table(data.frame(x = 1L))
+stopifnot(file.rename("__wordcraft_tables__.json", "__wordcraft_tables__.json.bak"))
+ok <- environment(wc_table)$replace_file("__missing__.tmp", "__wordcraft_tables__.json")
+stopifnot(!ok, file.exists("__wordcraft_tables__.json.bak"))
+wc_table(data.frame(y = 2L))
+stopifnot(file.exists("__wordcraft_tables__.json"))
+stopifnot(!file.exists("__wordcraft_tables__.json.bak"))
+"#;
+    let res = execute(&ExecutionRequest::new(CodeLanguage::R, retry_then_succeed).with_plot_capture(false)).expect("r execute");
+    assert!(res.success, "stderr: {}", res.stderr);
+    assert_eq!(res.tables.len(), 2, "both snapshots must be present after successful retry");
+    assert_eq!(res.tables[0].rows, vec![vec!["1".to_owned()]]);
+    assert_eq!(res.tables[1].rows, vec![vec!["2".to_owned()]]);
+}
+
+#[test]
+fn python_timeout_preserves_unflushed_stdout() {
+    if !is_language_available(CodeLanguage::Python) {
+        return;
+    }
+
+    let code = "import time\nprint('before timeout')\ntime.sleep(30)\n";
+    let req = ExecutionRequest::new(CodeLanguage::Python, code).with_plot_capture(false).with_timeout(1_500);
+    let result = execute(&req).expect("execution failed");
+
+    assert!(result.timed_out);
+    assert!(!result.success);
+    assert!(result.stdout.contains("before timeout"), "unflushed stdout must survive Python timeout: {:?}", result.stdout);
+}
+
+#[test]
+fn python_plot_save_keeps_braces_in_scratch_path_out_of_f_strings() {
+    let png = Path::new("/tmp/{plots}/__wordcraft_plot__.png");
+    let svg = Path::new("/tmp/{plots}/__wordcraft_plot__.svg");
+    let tables = Path::new("/tmp/{plots}/__wordcraft_tables__.json");
+    let user = Path::new("/tmp/{plots}/chunk.py");
+    let captured = CapturePaths { png, svg, tables, user };
+
+    for format in [PlotFormat::Png, PlotFormat::Svg, PlotFormat::Both] {
+        let wrapped = prepare_wrapped_code(CodeLanguage::Python, true, format, captured);
+        assert!(!wrapped.contains(r#"f"/tmp/{plots}"#), "scratch path must not be interpolated inside an f-string ({format:?})");
+        if format.captures_png() {
+            assert!(wrapped.contains(r#"_wc_png_prefix = "/tmp/{plots}/__wordcraft_plot__""#), "PNG prefix must live in an ordinary string literal");
+        }
+        if format.captures_svg() {
+            assert!(wrapped.contains(r#"_wc_svg_prefix = "/tmp/{plots}/__wordcraft_plot__""#), "SVG prefix must live in an ordinary string literal");
+        }
+    }
+
+    if !is_language_available(CodeLanguage::Python) || !matplotlib_available() {
+        return;
+    }
+
+    let (dir, _guard) = test_scratch_dir("wc-{plots}-brace");
+    let png_path = dir.join("__wordcraft_plot__.png");
+    let svg_path = dir.join("__wordcraft_plot__.svg");
+    let tables_path = dir.join("__wordcraft_tables__.json");
+    let user_path = dir.join("chunk.py");
+    let script_path = dir.join("script.py");
+
+    let user_code = r#"
+import matplotlib.pyplot as plt
+plt.figure()
+plt.plot([0, 1], [0, 1])
+plt.figure()
+plt.plot([0, 1], [1, 0])
+"#;
+    fs::write(&user_path, user_code).expect("write user chunk");
+    let wrapped = prepare_wrapped_code(
+        CodeLanguage::Python,
+        true,
+        PlotFormat::Both,
+        CapturePaths { png: &png_path, svg: &svg_path, tables: &tables_path, user: &user_path },
+    );
+    fs::write(&script_path, wrapped).expect("write wrapped script");
+
+    let binary = which_binary(CodeLanguage::Python).expect("python3 binary");
+    let output = Command::new(binary).arg("-u").arg(&script_path).current_dir(&dir).output().expect("run wrapped script");
+    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+
+    let plots = read_plots(&png_path, &svg_path, CodeLanguage::Python, PlotFormat::Both);
+    assert_eq!(plots.len(), 2, "both figures must save when scratch path contains braces");
+    assert!(plots[0].png.is_some() && plots[0].svg.is_some());
+    assert!(plots[1].png.is_some() && plots[1].svg.is_some());
+}
+
+#[test]
+fn read_plots_continues_after_rejected_artifact_and_enforces_aggregate_limit() {
+    use std::io::{Seek, SeekFrom, Write};
+
+    // Oversized PNG 1 (> MAX_PLOT_BYTES) must be skipped without preventing valid PNG 2 from being read.
+    let (dir, _guard) = test_scratch_dir("wc-plots-skip-oversized");
+    let png_base = dir.join("__wordcraft_plot__.png");
+    let svg_base = dir.join("__wordcraft_plot__.svg");
+    {
+        let mut file = fs::File::create(&png_base).expect("create oversized png 1");
+        file.write_all(PNG_HEADER).expect("write png header");
+        file.seek(SeekFrom::Start(MAX_PLOT_BYTES + 1 - PNG_IEND.len() as u64)).expect("seek png");
+        file.write_all(PNG_IEND).expect("write png iend");
+    }
+    let valid_2 = minimal_valid_png(2);
+    fs::write(numbered_plot_path(&png_base, 2), &valid_2).expect("write valid png 2");
+
+    let plots = read_plots(&png_base, &svg_base, CodeLanguage::Python, PlotFormat::Png);
+    assert_eq!(plots.len(), 1, "valid PNG 2 must still be returned when PNG 1 is rejected");
+    assert_eq!(plots[0].png.as_deref(), Some(valid_2.as_slice()));
+
+    // Truncated PNG 1 must also be skipped while keeping valid PNG 2, and aggregate byte cap must still hold.
+    let (dir_cap, _guard_cap) = test_scratch_dir("wc-plots-aggregate-cap");
+    let png_base = dir_cap.join("__wordcraft_plot__.png");
+    let svg_base = dir_cap.join("__wordcraft_plot__.svg");
+    let png_1 = minimal_valid_png(1); // 36 bytes
+    let png_3 = minimal_valid_png(3); // 36 bytes
+    let png_4 = minimal_valid_png(4); // 36 bytes
+    fs::write(numbered_plot_path(&png_base, 1), &png_1).expect("write png 1");
+    fs::write(numbered_plot_path(&png_base, 2), PNG_HEADER).expect("write truncated png 2");
+    fs::write(numbered_plot_path(&png_base, 3), &png_3).expect("write png 3");
+    fs::write(numbered_plot_path(&png_base, 4), &png_4).expect("write png 4");
+
+    let aggregate_cap = png_1.len() + png_3.len();
+    let plots = read_plots_with_limits(&png_base, &svg_base, CodeLanguage::Python, PlotFormat::Png, MAX_PLOT_BYTES, aggregate_cap);
+    assert_eq!(plots.len(), 2, "must skip rejected plot 2, read plot 3, and stop at aggregate limit before plot 4");
+    assert_eq!(plots[0].png.as_deref(), Some(png_1.as_slice()));
+    assert_eq!(plots[1].png.as_deref(), Some(png_3.as_slice()));
+}
+
+#[test]
+fn python_captures_figures_in_creation_order_with_nonascending_ids() {
+    if !is_language_available(CodeLanguage::Python) || !matplotlib_available() {
+        return;
+    }
+
+    // Create figure 20 before figure 10, then re-activate figure 20: creation order must stay [20, 10].
+    let code = r#"
+import matplotlib.pyplot as plt
+plt.rcParams["svg.fonttype"] = "none"
+
+fig20 = plt.figure(20)
+fig20.suptitle("FIG-TWENTY-FIRST")
+plt.plot([0, 1], [0, 1])
+
+fig10 = plt.figure(10)
+fig10.suptitle("FIG-TEN-SECOND")
+plt.plot([0, 1], [1, 0])
+
+plt.figure(20)
+"#;
+    let res = execute(&ExecutionRequest::new(CodeLanguage::Python, code).with_plot_format(PlotFormat::Both)).expect("python execute");
+    assert!(res.success, "stderr: {}", res.stderr);
+    assert_eq!(res.plots.len(), 2, "must capture both figures");
+    let svg0 = res.plots[0].svg.as_deref().expect("first figure SVG");
+    let svg1 = res.plots[1].svg.as_deref().expect("second figure SVG");
+    assert!(svg0.contains("FIG-TWENTY-FIRST") && !svg0.contains("FIG-TEN-SECOND"), "figure 20 must be captured first");
+    assert!(svg1.contains("FIG-TEN-SECOND") && !svg1.contains("FIG-TWENTY-FIRST"), "figure 10 must be captured second");
+    assert_eq!(res.plot_svg.as_deref(), Some(svg0), "plot_svg must mirror the first created figure");
+    assert_eq!(res.plot_png.as_ref(), res.plots[0].png.as_ref(), "plot_png must mirror the first created figure");
+
+    // Closing figure 20 and recreating it places the recreated figure after figure 10.
+    let recreate_code = r#"
+import matplotlib.pyplot as plt
+plt.rcParams["svg.fonttype"] = "none"
+
+plt.figure(20)
+plt.plot([0, 1], [0, 1])
+
+fig10 = plt.figure(10)
+fig10.suptitle("FIG-TEN-KEPT")
+plt.plot([0, 1], [1, 0])
+
+plt.close(20)
+fig20_new = plt.figure(20)
+fig20_new.suptitle("FIG-TWENTY-RECREATED")
+plt.plot([0, 1], [0, 2])
+"#;
+    let res = execute(&ExecutionRequest::new(CodeLanguage::Python, recreate_code).with_plot_format(PlotFormat::Svg)).expect("python execute");
+    assert!(res.success, "stderr: {}", res.stderr);
+    assert_eq!(res.plots.len(), 2);
+    let svg0 = res.plots[0].svg.as_deref().expect("first surviving figure SVG");
+    let svg1 = res.plots[1].svg.as_deref().expect("recreated figure SVG");
+    assert!(svg0.contains("FIG-TEN-KEPT"), "surviving figure 10 must come before recreated figure 20");
+    assert!(svg1.contains("FIG-TWENTY-RECREATED"), "recreated figure 20 must come second");
+}
+
+#[cfg(unix)]
+#[test]
+fn which_binary_resolves_relative_entries_to_absolute_and_keeps_absolute_unchanged() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    let (dir, _guard) = test_scratch_dir("wc-which-abs");
+    let abs_dir = std::path::absolute(&dir).expect("absolute scratch dir");
+
+    // Relative PATH entry resolves to an absolute path under the base directory.
+    let rel_sub = Path::new("rel-bin");
+    let rel_dir = abs_dir.join(rel_sub);
+    fs::create_dir(&rel_dir).expect("create rel-bin");
+    let rel_bin = rel_dir.join(CodeLanguage::Python.binary_name());
+    fs::write(&rel_bin, b"#!/bin/sh\n").expect("write rel bin");
+    fs::set_permissions(&rel_bin, fs::Permissions::from_mode(0o755)).expect("chmod rel bin");
+
+    let rel_path = std::env::join_paths([rel_sub]).expect("join relative PATH");
+    let found = which_binary_in_from(CodeLanguage::Python, &rel_path, Some(&abs_dir)).expect("must find relative PATH binary");
+    assert!(found.is_absolute(), "resolved binary path must be absolute: {}", found.display());
+    assert_eq!(found, rel_bin);
+
+    // Absolute PATH entry (including a symlinked virtualenv bin) stays unchanged without canonicalization.
+    let real_target_dir = abs_dir.join("real-bin");
+    fs::create_dir(&real_target_dir).expect("create real-bin");
+    let real_bin = real_target_dir.join(CodeLanguage::Python.binary_name());
+    fs::write(&real_bin, b"#!/bin/sh\n").expect("write real bin");
+    fs::set_permissions(&real_bin, fs::Permissions::from_mode(0o755)).expect("chmod real bin");
+
+    let venv_dir = abs_dir.join("venv-bin");
+    fs::create_dir(&venv_dir).expect("create venv-bin");
+    let venv_link = venv_dir.join(CodeLanguage::Python.binary_name());
+    symlink(&real_bin, &venv_link).expect("create venv symlink");
+
+    let abs_path = std::env::join_paths([&venv_dir]).expect("join absolute PATH");
+    let found_abs = which_binary_in(CodeLanguage::Python, &abs_path).expect("must find absolute PATH binary");
+    assert_eq!(found_abs, venv_link, "absolute PATH entry must stay unchanged without resolving symlinks");
+}
+
+#[cfg(unix)]
+#[test]
+fn execute_resolves_relative_path_interpreter_independently_of_working_dir() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if let Some(work_dir) = std::env::var_os("WC_TEST_REL_PATH_WORKDIR") {
+        let req = ExecutionRequest::new(CodeLanguage::Python, "print('ignored')").with_plot_capture(false).with_working_dir(PathBuf::from(work_dir));
+        let res = execute(&req).expect("execute with relative PATH");
+        assert!(res.success, "stderr: {}", res.stderr);
+        assert_eq!(res.stdout.trim(), "HOST-INTERPRETER");
+        return;
+    }
+
+    let (dir, _guard) = test_scratch_dir("wc-exec-rel-path");
+    let dir = std::path::absolute(&dir).expect("absolute scratch dir");
+    let host_dir = dir.join("host");
+    let child_with_decoy = dir.join("child-decoy");
+    let child_empty = dir.join("child-empty");
+    fs::create_dir_all(host_dir.join("rel-bin")).expect("create host rel-bin");
+    fs::create_dir_all(child_with_decoy.join("rel-bin")).expect("create child rel-bin");
+    fs::create_dir_all(&child_empty).expect("create child empty dir");
+
+    let host_py = host_dir.join("rel-bin").join(CodeLanguage::Python.binary_name());
+    fs::write(&host_py, b"#!/bin/sh\nprintf 'HOST-INTERPRETER\\n'\n").expect("write host shim");
+    fs::set_permissions(&host_py, fs::Permissions::from_mode(0o755)).expect("chmod host shim");
+
+    let decoy_py = child_with_decoy.join("rel-bin").join(CodeLanguage::Python.binary_name());
+    fs::write(&decoy_py, b"#!/bin/sh\nprintf 'DECOY-INTERPRETER\\n'\nexit 1\n").expect("write decoy shim");
+    fs::set_permissions(&decoy_py, fs::Permissions::from_mode(0o755)).expect("chmod decoy shim");
+
+    let test_bin = std::env::current_exe().expect("current test executable");
+    for child_dir in [&child_with_decoy, &child_empty] {
+        let output = Command::new(&test_bin)
+            .args(["--exact", "tests::execute_resolves_relative_path_interpreter_independently_of_working_dir", "--nocapture"])
+            .current_dir(&host_dir)
+            .env("PATH", "rel-bin")
+            .env("WC_TEST_REL_PATH_WORKDIR", child_dir)
+            .output()
+            .expect("run relative PATH subprocess check");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "relative PATH must resolve from host cwd, not {}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            child_dir.display()
+        );
+    }
 }

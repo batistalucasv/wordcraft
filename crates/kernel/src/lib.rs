@@ -276,21 +276,48 @@ pub fn which_binary(language: CodeLanguage) -> Option<PathBuf> {
 }
 
 fn which_binary_in(language: CodeLanguage, path_var: &std::ffi::OsStr) -> Option<PathBuf> {
+    which_binary_in_from(language, path_var, None)
+}
+
+fn which_binary_in_from(language: CodeLanguage, path_var: &std::ffi::OsStr, base_dir: Option<&Path>) -> Option<PathBuf> {
     let name = language.binary_name();
     for dir in std::env::split_paths(path_var) {
-        let candidate = dir.join(name);
-        if is_executable_file(&candidate) {
+        if let Some(candidate) = resolve_executable_candidate(&dir, name, base_dir) {
             return Some(candidate);
         }
         #[cfg(windows)]
         {
-            let exe_candidate = dir.join(format!("{name}.exe"));
-            if is_executable_file(&exe_candidate) {
+            let exe_name = format!("{name}.exe");
+            if let Some(exe_candidate) = resolve_executable_candidate(&dir, &exe_name, base_dir) {
                 return Some(exe_candidate);
             }
         }
     }
     None
+}
+
+fn resolve_executable_candidate(dir: &Path, binary_name: &str, base_dir: Option<&Path>) -> Option<PathBuf> {
+    let candidate = if dir.is_absolute() {
+        dir.join(binary_name)
+    } else if let Some(base) = base_dir {
+        let joined = base.join(dir).join(binary_name);
+        if joined.is_absolute() {
+            joined
+        } else {
+            let abs = std::path::absolute(&joined).ok()?;
+            if !abs.is_absolute() {
+                return None;
+            }
+            abs
+        }
+    } else {
+        let abs = std::path::absolute(dir.join(binary_name)).ok()?;
+        if !abs.is_absolute() {
+            return None;
+        }
+        abs
+    };
+    is_executable_file(&candidate).then_some(candidate)
 }
 
 fn is_executable_file(path: &Path) -> bool {
@@ -369,6 +396,9 @@ pub fn execute(request: &ExecutionRequest) -> Result<ExecutionResult, KernelErro
         RunContainment::new(&temp_dir, request.working_dir.is_none()).map_err(|e| KernelError::Io(format!("prepare process containment: {e}")))?;
 
     let mut cmd = Command::new(&binary);
+    if request.language == CodeLanguage::Python {
+        cmd.arg("-u");
+    }
     cmd.arg(&script_file);
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped());
@@ -806,12 +836,16 @@ const R_TABLES_PRELUDE: &str = r##"local({
   # Replace the snapshot without truncating the previous one: a plain copy over an existing file
   # empties it before the new bytes land.
   replace_file <- function(tmp, target) {
-    if (suppressWarnings(base::file.rename(tmp, target))) return(TRUE)
     backup <- paste0(target, ".bak")
-    suppressWarnings(base::file.remove(backup))
-    if (base::file.exists(target) && !suppressWarnings(base::file.rename(target, backup))) return(FALSE)
     if (suppressWarnings(base::file.rename(tmp, target))) {
-      suppressWarnings(base::file.remove(backup))
+      if (base::file.exists(backup)) suppressWarnings(base::file.remove(backup))
+      return(TRUE)
+    }
+    if (!base::file.exists(target)) return(FALSE)
+    if (base::file.exists(backup)) suppressWarnings(base::file.remove(backup))
+    if (!suppressWarnings(base::file.rename(target, backup))) return(FALSE)
+    if (suppressWarnings(base::file.rename(tmp, target))) {
+      if (base::file.exists(backup)) suppressWarnings(base::file.remove(backup))
       return(TRUE)
     }
     if (base::file.exists(backup)) suppressWarnings(base::file.rename(backup, target))
@@ -1083,7 +1117,14 @@ def wc_table(value):
 /// The figure cleanup that follows a Python chunk when plots are captured.
 const PY_PLOT_CLEANUP: &str = r#"if _has_plt and plt is not None:
     try:
-        _wc_nums = list(plt.get_fignums())[:16]
+        def _wc_fig_key(_num):
+            try:
+                _fig = _wc_orig_figure(_num) if _wc_orig_figure is not None else plt.figure(_num)
+                return (_wc_fig_order.get(_fig, _wc_fig_seq + 1), _num)
+            except Exception:
+                return (_wc_fig_seq + 1, _num)
+
+        _wc_nums = sorted(plt.get_fignums(), key=_wc_fig_key)[:16]
         if _wc_nums:
             __WC_SAVE__
             plt.close('all')
@@ -1218,27 +1259,31 @@ fn python_plot_save(format: PlotFormat, captured: CapturePaths<'_>) -> String {
     let svg_prefix = svg_seq.strip_suffix("_002.svg").unwrap_or(&svg_seq);
     match format {
         PlotFormat::Png => format!(
-            r#"plt.figure(_wc_nums[0])
+            r#"_wc_png_prefix = "{png_prefix}"
+            _wc_orig_figure(_wc_nums[0])
             plt.savefig("{png}", dpi=200, bbox_inches='tight')
             for _wc_i, _wc_num in enumerate(_wc_nums[1:], start=2):
-                plt.figure(_wc_num)
-                plt.savefig(f"{png_prefix}_{{_wc_i:03d}}.png", dpi=200, bbox_inches='tight')"#
+                _wc_orig_figure(_wc_num)
+                plt.savefig(_wc_png_prefix + f"_{{_wc_i:03d}}.png", dpi=200, bbox_inches='tight')"#
         ),
         PlotFormat::Svg => format!(
-            r#"plt.figure(_wc_nums[0])
+            r#"_wc_svg_prefix = "{svg_prefix}"
+            _wc_orig_figure(_wc_nums[0])
             plt.savefig("{svg}", format='svg', bbox_inches='tight')
             for _wc_i, _wc_num in enumerate(_wc_nums[1:], start=2):
-                plt.figure(_wc_num)
-                plt.savefig(f"{svg_prefix}_{{_wc_i:03d}}.svg", format='svg', bbox_inches='tight')"#
+                _wc_orig_figure(_wc_num)
+                plt.savefig(_wc_svg_prefix + f"_{{_wc_i:03d}}.svg", format='svg', bbox_inches='tight')"#
         ),
         PlotFormat::Both => format!(
-            r#"plt.figure(_wc_nums[0])
+            r#"_wc_png_prefix = "{png_prefix}"
+            _wc_svg_prefix = "{svg_prefix}"
+            _wc_orig_figure(_wc_nums[0])
             plt.savefig("{png}", dpi=200, bbox_inches='tight')
             plt.savefig("{svg}", format='svg', bbox_inches='tight')
             for _wc_i, _wc_num in enumerate(_wc_nums[1:], start=2):
-                plt.figure(_wc_num)
-                plt.savefig(f"{png_prefix}_{{_wc_i:03d}}.png", dpi=200, bbox_inches='tight')
-                plt.savefig(f"{svg_prefix}_{{_wc_i:03d}}.svg", format='svg', bbox_inches='tight')"#
+                _wc_orig_figure(_wc_num)
+                plt.savefig(_wc_png_prefix + f"_{{_wc_i:03d}}.png", dpi=200, bbox_inches='tight')
+                plt.savefig(_wc_svg_prefix + f"_{{_wc_i:03d}}.svg", format='svg', bbox_inches='tight')"#
         ),
     }
 }
@@ -1269,13 +1314,33 @@ tryCatch({{
             // matplotlib is only touched when plots are captured: importing it and forcing the Agg
             // backend would override a backend the chunk chose through MPLBACKEND or matplotlibrc.
             let setup = if capture_plots {
-                r#"import sys
+                r#"import functools as _wc_functools
+import sys
+import weakref as _wc_weakref
 
 _has_plt = False
+_wc_fig_order = _wc_weakref.WeakKeyDictionary()
+_wc_fig_seq = 0
+_wc_orig_figure = None
 try:
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
+    _wc_orig_figure = plt.figure
+
+    @_wc_functools.wraps(_wc_orig_figure)
+    def _wc_track_figure(*args, **kwargs):
+        global _wc_fig_seq
+        _fig = _wc_orig_figure(*args, **kwargs)
+        try:
+            if _fig not in _wc_fig_order:
+                _wc_fig_seq += 1
+                _wc_fig_order[_fig] = _wc_fig_seq
+        except Exception:
+            pass
+        return _fig
+
+    plt.figure = _wc_track_figure
     _has_plt = True
 except Exception:
     pass
@@ -1364,6 +1429,17 @@ fn read_plot_svg_from_reader<R: Read>(reader: R, max_bytes: u64) -> Option<Strin
 }
 
 fn read_plots(png_base: &Path, svg_base: &Path, language: CodeLanguage, format: PlotFormat) -> Vec<PlotOutput> {
+    read_plots_with_limits(png_base, svg_base, language, format, MAX_PLOT_BYTES, MAX_TOTAL_PLOT_BYTES)
+}
+
+fn read_plots_with_limits(
+    png_base: &Path,
+    svg_base: &Path,
+    language: CodeLanguage,
+    format: PlotFormat,
+    max_plot_bytes: u64,
+    max_total_plot_bytes: usize,
+) -> Vec<PlotOutput> {
     let mut plots = Vec::new();
     let mut used_bytes = 0usize;
 
@@ -1371,9 +1447,9 @@ fn read_plots(png_base: &Path, svg_base: &Path, language: CodeLanguage, format: 
         let png = if format.captures_png() {
             let numbered = numbered_plot_path(png_base, index);
             if index == 1 {
-                read_plot_png(&numbered, MAX_PLOT_BYTES).or_else(|| read_plot_png(png_base, MAX_PLOT_BYTES))
+                read_plot_png(&numbered, max_plot_bytes).or_else(|| read_plot_png(png_base, max_plot_bytes))
             } else {
-                read_plot_png(&numbered, MAX_PLOT_BYTES)
+                read_plot_png(&numbered, max_plot_bytes)
             }
         } else {
             None
@@ -1383,18 +1459,18 @@ fn read_plots(png_base: &Path, svg_base: &Path, language: CodeLanguage, format: 
             // In R `Both` mode the wrapper numbers the copied SVG with its exact plot index; never
             // fall back to an unnumbered `svg_base`, which could belong to a later plot.
             if index == 1 && !matches!((language, format), (CodeLanguage::R, PlotFormat::Both)) {
-                read_plot_svg(&numbered, MAX_PLOT_BYTES).or_else(|| read_plot_svg(svg_base, MAX_PLOT_BYTES))
+                read_plot_svg(&numbered, max_plot_bytes).or_else(|| read_plot_svg(svg_base, max_plot_bytes))
             } else {
-                read_plot_svg(&numbered, MAX_PLOT_BYTES)
+                read_plot_svg(&numbered, max_plot_bytes)
             }
         } else {
             None
         };
         if png.is_none() && svg.is_none() {
-            break;
+            continue;
         }
         let item_bytes = png.as_ref().map_or(0, Vec::len).saturating_add(svg.as_ref().map_or(0, String::len));
-        if used_bytes.saturating_add(item_bytes) > MAX_TOTAL_PLOT_BYTES {
+        if used_bytes.saturating_add(item_bytes) > max_total_plot_bytes {
             break;
         }
         used_bytes = used_bytes.saturating_add(item_bytes);
