@@ -15,7 +15,7 @@
 //! document, so it is kept verbatim in the custom property [`FRONT_MATTER_PROP`] and written
 //! back at the top.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use wordcraft_doc::{Blocks, ChunkOptions, CodeChunk, Document, StoryRef};
 
@@ -118,8 +118,12 @@ fn push_chunk(out: &mut String, chunk: &CodeChunk) {
     out.push_str(if chunk.language.is_empty() { "text" } else { chunk.language.as_str() });
     out.push('}');
     out.push('\n');
+    let retained = inspect_retained_yaml(&chunk.code);
     for (key, value) in chunk.options.iter() {
         if !option_name_ok(key) {
+            continue;
+        }
+        if retained.as_ref().is_some_and(|r| r.top_level_keys.contains(&option_key(key))) {
             continue;
         }
         out.push_str("#| ");
@@ -134,7 +138,7 @@ fn push_chunk(out: &mut String, chunk: &CodeChunk) {
         out.push('\n');
     }
     let first_line = chunk.code.lines().next().unwrap_or("");
-    if first_line.trim_start().starts_with("#|") && !starts_with_retained_yaml(&chunk.code) {
+    if first_line.trim_start().starts_with("#|") && retained.is_none() {
         out.push('\n');
     }
     out.push_str(&chunk.code);
@@ -145,29 +149,281 @@ fn push_chunk(out: &mut String, chunk: &CodeChunk) {
     out.push_str("\n\n");
 }
 
-/// Whether `code` begins with YAML cell options that were retained in the code verbatim.
-fn starts_with_retained_yaml(code: &str) -> bool {
-    for line in code.lines() {
-        let t = line.trim_start();
-        if !t.starts_with("#|") {
-            break;
+/// Top-level option entry seen inside a retained leading `#|` YAML block.
+enum RetainedYamlEntry {
+    /// Supported single-line scalar option (`key: value`), kept in `ChunkOptions`.
+    Scalar(String, String),
+    /// Complex or oversized YAML option (`fig-cap: |`, list, nested mapping, etc.) whose key
+    /// lives verbatim in `code` and supersedes any header option of the same name.
+    Complex(String),
+}
+
+/// Summary of a leading `#|` YAML block that contains complex YAML and therefore stays
+/// verbatim in `chunk.code`.
+struct RetainedYamlBlock {
+    entries: Vec<RetainedYamlEntry>,
+    top_level_keys: HashSet<String>,
+}
+
+enum YamlScanState {
+    TopLevel,
+    BlockScalar,
+    NestedValue,
+    DoubleQuoted,
+    SingleQuoted,
+    Flow { depth: usize, quote: Option<char> },
+}
+
+/// Strip the `#|` cell-option prefix and at most one delimiter space, returning the YAML line.
+fn hash_pipe_yaml(line: &str) -> Option<&str> {
+    let after_hash = line.trim_start().strip_prefix("#|")?;
+    Some(after_hash.strip_prefix(' ').unwrap_or(after_hash))
+}
+
+/// Whether a YAML line starts a block sequence item (`-`, `- ...`, or `-\t...`).
+fn is_yaml_sequence_item(yaml: &str) -> bool {
+    yaml == "-" || yaml.starts_with("- ") || yaml.starts_with("-\t")
+}
+
+/// Return the YAML body of the next non-blank, non-comment `#|` line at or after `start`.
+fn next_nonblank_noncomment_hash_pipe<'a>(lines: &[&'a str], start: usize) -> Option<&'a str> {
+    for &line in lines.get(start..)? {
+        let yaml = hash_pipe_yaml(line)?;
+        let trimmed = yaml.trim();
+        if !trimmed.is_empty() && !trimmed.starts_with('#') {
+            return Some(yaml);
         }
-        let after_hash = t.strip_prefix("#|").unwrap_or("");
-        let trimmed_content = after_hash.trim();
-        if trimmed_content.starts_with('-') {
-            return true;
-        }
-        if let Some((_, value)) = trimmed_content.split_once(':') {
-            let v = value.trim();
-            if v.starts_with('|') || v.starts_with('>') {
-                return true;
-            }
-        }
-        if after_hash.starts_with("  ") || after_hash.starts_with('\t') {
+    }
+    None
+}
+
+/// Scan a double-quoted YAML segment starting inside `"..."`.
+/// Returns `true` if an unescaped closing `"` is found on this line.
+fn scan_double_quoted(s: &str) -> bool {
+    let mut escaped = false;
+    for c in s.chars() {
+        if escaped {
+            escaped = false;
+        } else if c == '\\' {
+            escaped = true;
+        } else if c == '"' {
             return true;
         }
     }
     false
+}
+
+/// Scan a single-quoted YAML segment starting inside `'...'`.
+/// In YAML 1.2, `''` is an escaped single quote; a lone `'` closes the string.
+fn scan_single_quoted(s: &str) -> bool {
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\'' {
+            if chars.peek() == Some(&'\'') {
+                chars.next();
+            } else {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Advance flow-collection nesting state across `s`, returning `(depth, quote)` at end of line
+/// or `(0, None)` as soon as the flow collection closes.
+fn scan_flow(s: &str, mut depth: usize, mut quote: Option<char>) -> (usize, Option<char>) {
+    let mut escaped = false;
+    let mut prev: Option<char> = None;
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match quote {
+            Some('"') => {
+                if escaped {
+                    escaped = false;
+                } else if c == '\\' {
+                    escaped = true;
+                } else if c == '"' {
+                    quote = None;
+                }
+            }
+            Some('\'') => {
+                if c == '\'' {
+                    if chars.peek() == Some(&'\'') {
+                        chars.next();
+                    } else {
+                        quote = None;
+                    }
+                }
+            }
+            _ => match c {
+                '"' | '\'' => quote = Some(c),
+                '[' | '{' => depth = depth.saturating_add(1),
+                ']' | '}' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        return (0, None);
+                    }
+                }
+                '#' if prev.is_none_or(|p| matches!(p, ' ' | '\t')) => break,
+                _ => {}
+            },
+        }
+        prev = Some(c);
+    }
+    (depth, quote)
+}
+
+/// If `value` begins a multiline YAML construct (block scalar, nested value, unclosed quote,
+/// unclosed flow collection, or a plain scalar followed by indented continuation lines), return
+/// the scanner state needed to consume its remaining lines.
+fn multiline_value_state(value: &str, lines: &[&str], next_idx: usize) -> Option<YamlScanState> {
+    let scalar_val = wordcraft_doc::chunk::strip_yaml_comment(value);
+    if scalar_val.starts_with('|') || scalar_val.starts_with('>') {
+        return Some(YamlScanState::BlockScalar);
+    }
+    if scalar_val.is_empty() {
+        let starts_nested = next_nonblank_noncomment_hash_pipe(lines, next_idx)
+            .is_some_and(|next| next.starts_with(' ') || next.starts_with('\t') || is_yaml_sequence_item(next));
+        return starts_nested.then_some(YamlScanState::NestedValue);
+    }
+    if let Some(rest) = value.strip_prefix('"') {
+        if !scan_double_quoted(rest) {
+            return Some(YamlScanState::DoubleQuoted);
+        }
+    } else if let Some(rest) = value.strip_prefix('\'') {
+        if !scan_single_quoted(rest) {
+            return Some(YamlScanState::SingleQuoted);
+        }
+    } else if value.starts_with('[') || value.starts_with('{') {
+        let (depth, quote) = scan_flow(value, 0, None);
+        if depth > 0 || quote.is_some() {
+            return Some(YamlScanState::Flow { depth, quote });
+        }
+    }
+    if next_nonblank_noncomment_hash_pipe(lines, next_idx).is_some_and(|next| next.starts_with(' ') || next.starts_with('\t')) {
+        return Some(YamlScanState::BlockScalar);
+    }
+    None
+}
+
+/// Inspect leading `#|` lines for complex YAML (block scalars, sequences, nested mappings,
+/// multiline quoted scalars/flow collections). When complex YAML is present, returns the
+/// top-level scalar options and top-level keys so the block can stay verbatim in `code` while
+/// WordCraft still sees scalar options like `eval: false` and export avoids duplicating them.
+fn inspect_retained_yaml(text: &str) -> Option<RetainedYamlBlock> {
+    let lines: Vec<&str> = text.lines().take_while(|l| l.trim_start().starts_with("#|")).collect();
+    if lines.is_empty() {
+        return None;
+    }
+
+    let mut entries = Vec::new();
+    let mut top_level_keys = HashSet::new();
+    let mut has_complex = false;
+    let mut state = YamlScanState::TopLevel;
+
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        let Some(yaml) = hash_pipe_yaml(line) else {
+            break;
+        };
+        let is_blank = yaml.trim().is_empty();
+        let is_indented = !is_blank && (yaml.starts_with(' ') || yaml.starts_with('\t'));
+
+        match state {
+            YamlScanState::BlockScalar => {
+                if is_blank || is_indented {
+                    i += 1;
+                    continue;
+                }
+                state = YamlScanState::TopLevel;
+                continue;
+            }
+            YamlScanState::NestedValue => {
+                if is_blank || is_indented || yaml.starts_with('#') || is_yaml_sequence_item(yaml) {
+                    i += 1;
+                    continue;
+                }
+                state = YamlScanState::TopLevel;
+                continue;
+            }
+            YamlScanState::DoubleQuoted => {
+                if scan_double_quoted(yaml) {
+                    state = YamlScanState::TopLevel;
+                }
+                i += 1;
+                continue;
+            }
+            YamlScanState::SingleQuoted => {
+                if scan_single_quoted(yaml) {
+                    state = YamlScanState::TopLevel;
+                }
+                i += 1;
+                continue;
+            }
+            YamlScanState::Flow { depth, quote } => {
+                let (next_depth, next_quote) = scan_flow(yaml, depth, quote);
+                state = if next_depth == 0 && next_quote.is_none() {
+                    YamlScanState::TopLevel
+                } else {
+                    YamlScanState::Flow { depth: next_depth, quote: next_quote }
+                };
+                i += 1;
+                continue;
+            }
+            YamlScanState::TopLevel => {}
+        }
+
+        if is_blank || yaml.starts_with('#') {
+            i += 1;
+            continue;
+        }
+        if is_indented || is_yaml_sequence_item(yaml) {
+            has_complex = true;
+            i += 1;
+            continue;
+        }
+
+        let Some((raw_key, raw_value)) = yaml.split_once(':') else {
+            break;
+        };
+        // Per YAML 1.2, a mapping `:` is followed by separation whitespace or end-of-line.
+        if !raw_value.is_empty() && !raw_value.starts_with([' ', '\t']) {
+            break;
+        }
+        let raw_key = raw_key.trim();
+        let value = raw_value.trim();
+        if !option_name_ok(raw_key) {
+            if raw_key.starts_with('"') || raw_key.starts_with('\'') {
+                has_complex = true;
+                if let Some(next_state) = multiline_value_state(value, &lines, i + 1) {
+                    state = next_state;
+                }
+                i += 1;
+                continue;
+            }
+            break;
+        }
+
+        let key = option_key(raw_key);
+        if key.is_empty() {
+            break;
+        }
+        top_level_keys.insert(key.clone());
+
+        if let Some(next_state) = multiline_value_state(value, &lines, i + 1) {
+            has_complex = true;
+            entries.push(RetainedYamlEntry::Complex(key));
+            state = next_state;
+        } else if wordcraft_doc::chunk::strip_yaml_comment(value).is_empty() || line.len() > MAX_OPTION_LINE {
+            entries.push(RetainedYamlEntry::Complex(key));
+        } else {
+            entries.push(RetainedYamlEntry::Scalar(key, value.to_string()));
+        }
+        i += 1;
+    }
+
+    has_complex.then_some(RetainedYamlBlock { entries, top_level_keys })
 }
 
 /// Whether an option name can be written as a `#|` line (names come from files).
@@ -597,38 +853,21 @@ fn parse_option(part: &str, options: &mut ChunkOptions) {
 
 /// Strip the leading `#| key: value` lines, returning the code and the options they set.
 fn strip_option_lines(body: &str, mut options: ChunkOptions) -> (String, ChunkOptions) {
-    let lines: Vec<&str> = body.split('\n').collect();
-    // Leave the cell options block in `code` unchanged when it contains unsupported YAML.
-    let mut i = 0;
-    let mut has_unsupported = false;
-    while i < lines.len() {
-        let t = lines[i].trim_start();
-        if !t.starts_with("#|") {
-            break;
-        }
-        let after_hash = t.strip_prefix("#|").unwrap_or("");
-        let trimmed_content = after_hash.trim();
-        if trimmed_content.starts_with('-') {
-            has_unsupported = true;
-            break;
-        }
-        if let Some((_, value)) = trimmed_content.split_once(':') {
-            let v = value.trim();
-            if v.starts_with('|') || v.starts_with('>') {
-                has_unsupported = true;
-                break;
+    // Keep complex YAML blocks verbatim in `code` for export, while still reading top-level
+    // scalar options from that same block so WordCraft honours flags such as `eval: false`.
+    if let Some(retained) = inspect_retained_yaml(body) {
+        for entry in retained.entries {
+            match entry {
+                RetainedYamlEntry::Scalar(key, value) => options.set(key, value),
+                RetainedYamlEntry::Complex(key) => {
+                    options.remove(&key);
+                }
             }
         }
-        if after_hash.starts_with("  ") || after_hash.starts_with('\t') {
-            has_unsupported = true;
-            break;
-        }
-        i += 1;
-    }
-    if has_unsupported {
         return (body.to_string(), options);
     }
 
+    let lines: Vec<&str> = body.split('\n').collect();
     let mut start = 0;
     while start < lines.len() {
         let line = lines[start];
@@ -1136,5 +1375,92 @@ print(sites)
         assert_eq!(chunks[1].options.label(), Some("second"));
         assert_eq!(doc.custom_prop("WORDCRAFT.CHUNK.3"), Some("{\"eval\":\"false\"}"));
         assert_eq!(doc.custom_prop("wordcraft.chunk.4"), Some("{\"label\":\"keep\"}"));
+    }
+
+    #[test]
+    fn retained_yaml_cell_options_parse_scalar_options_without_duplicating_on_export() {
+        let source = "```{python}\n#| fig-cap: |\n#|   Caption\n#| eval: false\nprint(1)\n```\n";
+        let doc = import(source);
+        let chunks = doc.chunks();
+        assert_eq!(chunks.len(), 1);
+        assert!(!chunks[0].options.eval(), "eval: false in a retained YAML block must disable evaluation");
+        assert_eq!(chunks[0].options.get("eval"), Some("false"));
+        assert_eq!(chunks[0].code, "#| fig-cap: |\n#|   Caption\n#| eval: false\nprint(1)");
+
+        let exported = export(&doc);
+        assert!(exported.contains("```{python}\n#| fig-cap: |\n#|   Caption\n#| eval: false\nprint(1)\n```"), "{exported}");
+        assert_eq!(exported.matches("#| eval:").count(), 1, "eval must not be emitted twice: {exported}");
+        assert_eq!(export(&import(&exported)), exported, "round trip must be idempotent");
+    }
+
+    #[test]
+    fn retained_yaml_ignores_nested_and_block_scalar_lines_while_reading_top_level_scalars() {
+        let block_scalar =
+            "```{python}\n#| fig-cap: |\n#|   Example line:\n#|   eval: false\n#|\n#|   second paragraph\n#| echo: false\nprint(1)\n```\n";
+        let doc = import(block_scalar);
+        let chunks = doc.chunks();
+        assert_eq!(chunks.len(), 1);
+        assert!(chunks[0].options.eval(), "indented eval: false inside fig-cap block scalar must not disable eval");
+        assert!(!chunks[0].options.echo(), "top-level echo: false after block scalar must be parsed");
+        let exported = export(&doc);
+        assert_eq!(exported.matches("#| echo:").count(), 1, "{exported}");
+        assert_eq!(export(&import(&exported)), exported);
+
+        let nested_and_list = concat!(
+            "```{r}\n",
+            "#| label: fig-panels\n",
+            "#| fig.width: 6\n",
+            "#| fig-subcap: # panel captions\n",
+            "#|   - \"First\"\n",
+            "#|   - \"Second\"\n",
+            "#| params:\n",
+            "#|   eval: true\n",
+            "#| layout: [\n",
+            "#|   [1, 1]\n",
+            "#| ]\n",
+            "#| eval: false\n",
+            "plot(1)\n",
+            "```\n",
+        );
+        let doc = import(nested_and_list);
+        let chunks = doc.chunks();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].options.label(), Some("fig-panels"));
+        assert_eq!(chunks[0].options.get("fig-width"), Some("6"));
+        assert!(!chunks[0].options.eval());
+        let exported = export(&doc);
+        assert_eq!(exported.matches("#| label:").count(), 1, "{exported}");
+        assert_eq!(exported.matches("fig.width:").count(), 1, "{exported}");
+        assert_eq!(exported.matches("fig-width:").count(), 0, "alias must not duplicate as canonical key: {exported}");
+        assert_eq!(exported.matches("#| eval:").count(), 1, "{exported}");
+        assert_eq!(export(&import(&exported)), exported);
+
+        let multiline_quoted = "```{python}\n#| fig-cap: \"First line\n#| eval: false\"\n#| echo: false\nprint(1)\n```\n";
+        let doc = import(multiline_quoted);
+        let chunks = doc.chunks();
+        assert_eq!(chunks.len(), 1);
+        assert!(chunks[0].options.eval(), "eval: false inside multiline double-quoted caption must not disable eval");
+        assert!(!chunks[0].options.echo());
+        let exported = export(&doc);
+        assert_eq!(exported.matches("#| echo:").count(), 1, "{exported}");
+        assert_eq!(export(&import(&exported)), exported);
+    }
+
+    #[test]
+    fn header_options_merge_with_retained_yaml_without_duplicating_keys() {
+        let source = "```{r, echo=FALSE, eval=TRUE, fig.cap=\"Header\"}\n#| fig-cap: |\n#|   Multiline\n#|   caption\n#| eval: false\nplot(1)\n```\n";
+        let doc = import(source);
+        let chunks = doc.chunks();
+        assert_eq!(chunks.len(), 1);
+        assert!(!chunks[0].options.echo(), "header echo=FALSE must be preserved");
+        assert!(!chunks[0].options.eval(), "#| eval: false must override header eval=TRUE");
+        assert_eq!(chunks[0].options.fig_caption(), None, "block scalar fig-cap must supersede header fig.cap");
+
+        let exported = export(&doc);
+        assert!(exported.contains("```{r}\n#| echo: FALSE\n#| fig-cap: |\n#|   Multiline\n#|   caption\n#| eval: false\nplot(1)\n```"), "{exported}");
+        assert_eq!(exported.matches("#| echo:").count(), 1, "{exported}");
+        assert_eq!(exported.matches("#| eval:").count(), 1, "{exported}");
+        assert_eq!(exported.matches("#| fig-cap:").count(), 1, "{exported}");
+        assert_eq!(export(&import(&exported)), exported, "second round trip must be idempotent");
     }
 }
