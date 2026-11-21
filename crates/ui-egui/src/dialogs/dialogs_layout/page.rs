@@ -7,6 +7,7 @@ use craft::ui::patterns::form_dialogs::FormCx;
 use craft::ui::pickers::Select;
 use craft::ui::runtime::env::{Label, LengthUnits};
 use craft::ui::sections::Section;
+use craft::ui::text::NumberField;
 use egui::Ui;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -360,7 +361,12 @@ impl WordForm for PageNumbersForm {
                 cx.labelled(ui, 1, Label::from(tl!("Start at:")), SideLabel::new().layout(FieldLayout::After), Radio::new(false));
             });
         });
-        if super::count_field(ui, tl!("Start at:"), &mut self.start, 0..=100_000, true) {
+        let fmt = self.format.clone();
+        let codec = craft::behavior::NumberCodec::new(craft::behavior::Reader::new(), 0).or_parse(move |s| parse_page_start(s, &fmt));
+        let out =
+            NumberField::new(tl!("Start at:").to_string(), Bind::given(Some(f64::from(self.start)))).codec(codec).range(0.0..=100_000.0).show(ui);
+        if let Some(n) = super::edited(&out.edit.events) {
+            self.start = (n.round().max(0.0) as u32).clamp(0, 100_000);
             self.cont = false;
         }
         true

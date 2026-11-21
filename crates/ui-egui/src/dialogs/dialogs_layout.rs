@@ -107,7 +107,7 @@ pub(crate) fn count_field(ui: &mut Ui, label: &str, value: &mut u32, range: Rang
 }
 
 /// The value a number field's events leave, `None` when they carry none.
-fn edited(events: &craft::behavior::EditEvents<Option<f64>>) -> Option<f64> {
+pub(super) fn edited(events: &craft::behavior::EditEvents<Option<f64>>) -> Option<f64> {
     events.iter().filter_map(|e| e.value().copied().flatten()).next_back()
 }
 
