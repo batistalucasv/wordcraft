@@ -2621,10 +2621,16 @@ fn refused_chunk_draft_survives_document_switch_allows_undo_and_reports_run_erro
     assert!(crate::canvas::code_chunks::has_dirty_chunks(h.state()));
     assert!(h.state().canvas.code_chunks.widgets[&chunk_id].widget.code().contains('\u{FFFC}'));
 
-    // Document Undo succeeds despite the refused draft, and Undo with empty stack reverts the draft.
+    // First Undo reverts the refused draft without consuming document insertion history;
+    // the next Undo then steps the document history and removes the chunk.
     assert!(h.state().session.can_undo());
     h.state_mut().run("edit.undo", json!({})).unwrap();
-    assert!(wordcraft_engine::chunks::chunks_in(&h.state().session.doc, StoryRef::Body).is_empty(), "undo must step the document");
+    assert!(!crate::canvas::code_chunks::has_dirty_chunks(h.state()));
+    assert_eq!(h.state().canvas.code_chunks.widgets[&chunk_id].widget.code(), "x = 1");
+    assert_eq!(wordcraft_engine::chunks::chunks_in(&h.state().session.doc, StoryRef::Body).len(), 1, "refused draft undo must keep the chunk");
+    assert!(h.state().session.can_undo());
+    h.state_mut().run("edit.undo", json!({})).unwrap();
+    assert!(wordcraft_engine::chunks::chunks_in(&h.state().session.doc, StoryRef::Body).is_empty(), "second undo must step the document");
     h.state_mut().run("edit.redo", json!({})).unwrap();
     steps(&mut h, 2);
 
@@ -3233,4 +3239,92 @@ fn exiting_or_clicking_below_trailing_chunk_creates_editable_paragraph_and_shows
     h.input_mut().events.push(egui::Event::Text("After click".into()));
     steps(&mut h, 4);
     assert_eq!(h.state().session.doc.para(StoryRef::Body, &wordcraft_doc::Path::top(base_blocks)).map(|p| p.text.as_str()), Some("After click"));
+}
+
+#[test]
+fn refused_chunk_checkpoint_reverts_draft_on_undo_blocks_redo_and_preserves_valid_undo_flow() {
+    let mut a = WordApp::new(wordcraft_engine::Session::new(wordcraft_doc::Document::new()), Default::default());
+    let chunk_id = a.run("code.insert_chunk", json!({"language": "python", "code": "x = 1"})).unwrap()["chunk"]["id"].as_i64().unwrap();
+
+    let mut h = crate::test_harness::builder().with_size(egui::vec2(1280.0, 860.0)).build_ui_state(
+        |ui, app: &mut WordApp| {
+            let ctx = ui.ctx().clone();
+            crate::test_harness::driver_logic(&ctx, app);
+            app.ui(ui);
+        },
+        a,
+    );
+    steps(&mut h, 4);
+
+    // 1. After inserting a chunk (insertion history exists), entering U+FFFC and invoking Undo
+    //    must revert the refused draft as its own Undo action instead of removing the whole chunk.
+    let entry = h.state_mut().canvas.code_chunks.widgets.get_mut(&chunk_id).unwrap();
+    entry.widget.set_code("x = 1\u{FFFC}");
+    entry.mark_dirty_for_test();
+    assert!(crate::canvas::code_chunks::has_dirty_chunks(h.state()));
+    assert!(h.state().canvas.code_chunks.widgets[&chunk_id].widget.code().contains('\u{FFFC}'));
+    assert!(h.state().session.can_undo());
+
+    h.state_mut().run("edit.undo", json!({})).unwrap();
+    steps(&mut h, 2);
+    assert!(!crate::canvas::code_chunks::has_dirty_chunks(h.state()), "undo must clear the refused draft");
+    assert_eq!(h.state().canvas.code_chunks.widgets[&chunk_id].widget.code(), "x = 1");
+    let chunks = wordcraft_engine::chunks::chunks_in(&h.state().session.doc, StoryRef::Body);
+    assert_eq!(chunks.len(), 1, "first undo must not remove the chunk when checkpointing fails");
+    assert_eq!(chunks[0].chunk.code, "x = 1");
+    assert!(h.state().session.can_undo(), "chunk insertion must remain on the engine undo stack");
+
+    // A second Undo now consumes the insertion history, and Redo restores the chunk.
+    h.state_mut().run("edit.undo", json!({})).unwrap();
+    assert!(wordcraft_engine::chunks::chunks_in(&h.state().session.doc, StoryRef::Body).is_empty());
+    h.state_mut().run("edit.redo", json!({})).unwrap();
+    steps(&mut h, 2);
+    assert_eq!(wordcraft_engine::chunks::chunks_in(&h.state().session.doc, StoryRef::Body).len(), 1);
+
+    // 2. With redo history present, invoking Redo while a refused draft is dirty must report the
+    //    checkpoint refusal instead of running engine Redo and overwriting the retained draft.
+    h.state_mut().run("code.update_chunk", json!({"chunkId": chunk_id, "language": "python", "code": "x = 2"})).unwrap();
+    h.state_mut().run("edit.undo", json!({})).unwrap();
+    steps(&mut h, 2);
+    assert!(h.state().session.can_redo());
+
+    let entry = h.state_mut().canvas.code_chunks.widgets.get_mut(&chunk_id).unwrap();
+    entry.widget.set_code("x = 1\u{FFFC}");
+    entry.mark_dirty_for_test();
+    h.state_mut().status = None;
+    let redo_err = h.state_mut().run("edit.redo", json!({})).unwrap_err();
+    assert!(redo_err.contains("U+FFFC"), "redo error must explain checkpoint refusal: {redo_err}");
+    assert_eq!(h.state().status.as_ref().map(|s| s.text.as_str()), Some(redo_err.as_str()));
+    assert!(h.state().session.can_redo(), "refused redo must not advance engine redo history");
+    assert_eq!(wordcraft_engine::chunks::chunks_in(&h.state().session.doc, StoryRef::Body)[0].chunk.code, "x = 1");
+    assert!(crate::canvas::code_chunks::has_dirty_chunks(h.state()));
+    assert!(h.state().canvas.code_chunks.widgets[&chunk_id].widget.code().contains('\u{FFFC}'));
+
+    // Revert the refused draft so we can verify the valid checkpoint-and-undo flow next.
+    h.state_mut().run("edit.undo", json!({})).unwrap();
+    steps(&mut h, 2);
+    assert!(!crate::canvas::code_chunks::has_dirty_chunks(h.state()));
+    assert_eq!(h.state().canvas.code_chunks.widgets[&chunk_id].widget.code(), "x = 1");
+
+    // 3. Valid dirty source keeps the existing checkpoint-and-undo-and-redo flow intact.
+    h.state_mut().canvas.code_chunks.request_focus(chunk_id, true);
+    steps(&mut h, 2);
+    h.input_mut().events.extend([
+        egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE },
+        egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed: false, repeat: false, modifiers: egui::Modifiers::NONE },
+        egui::Event::Text("y = 2".into()),
+    ]);
+    h.app_frame();
+    assert!(crate::canvas::code_chunks::has_dirty_chunks(h.state()));
+
+    h.state_mut().run("edit.undo", json!({})).unwrap();
+    steps(&mut h, 2);
+    assert!(!crate::canvas::code_chunks::has_dirty_chunks(h.state()));
+    assert_eq!(wordcraft_engine::chunks::chunks_in(&h.state().session.doc, StoryRef::Body)[0].chunk.code, "x = 1");
+    assert_eq!(h.state().canvas.code_chunks.widgets[&chunk_id].widget.code(), "x = 1");
+
+    h.state_mut().run("edit.redo", json!({})).unwrap();
+    steps(&mut h, 2);
+    assert_eq!(wordcraft_engine::chunks::chunks_in(&h.state().session.doc, StoryRef::Body)[0].chunk.code, "x = 1\ny = 2");
+    assert_eq!(h.state().canvas.code_chunks.widgets[&chunk_id].widget.code(), "x = 1\ny = 2");
 }
