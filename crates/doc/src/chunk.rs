@@ -394,12 +394,21 @@ fn encode_tag_pairs(ordered: &[(&str, &str)], max_body: usize, options: &ChunkOp
 
 /// Encode `language` and `options` into a `w:tag` string within [`MAX_CONTROL_TEXT`] chars.
 fn encode_control_tag(language: &str, options: &ChunkOptions) -> String {
+    encode_control_tag_with_truncated(language, options, false)
+}
+
+/// Encode `language` and `options` into a `w:tag` string within [`MAX_CONTROL_TEXT`] chars,
+/// optionally carrying forward the `!` truncated marker when full options are unavailable.
+fn encode_control_tag_with_truncated(language: &str, options: &ChunkOptions, force_truncated: bool) -> String {
     let lang = if language.is_empty() { "text" } else { language };
     let mut prefix = String::with_capacity(CHUNK_TAG.len() + lang.len() + 2);
     prefix.push_str(CHUNK_TAG);
     prefix.push_str(lang);
     prefix.push('?');
     if options.is_empty() {
+        if force_truncated {
+            prefix.push('!');
+        }
         return prefix;
     }
 
@@ -414,6 +423,13 @@ fn encode_control_tag(language: &str, options: &ChunkOptions) -> String {
         if !PRIORITY_TAG_OPTIONS.contains(&key) {
             ordered.push((key, val));
         }
+    }
+
+    if force_truncated {
+        let (truncated_body, _) = encode_tag_pairs(&ordered, max_body.saturating_sub(1), options);
+        prefix.push('!');
+        prefix.push_str(&truncated_body);
+        return prefix;
     }
 
     let (body, truncated) = encode_tag_pairs(&ordered, max_body, options);
@@ -488,14 +504,18 @@ fn code_of(doc: &Document, start: &Pos, end: &Pos) -> Option<String> {
     Some(lines.join("\n"))
 }
 
+/// Parse full options from `wordcraft.chunk.<id>` when present and valid JSON.
+fn custom_prop_options(doc: &Document, control: &ContentControl) -> Option<ChunkOptions> {
+    let json = control.id.and_then(|id| doc.custom_prop(&chunk_prop_name(id)))?;
+    serde_json::from_str::<ChunkOptions>(json).ok()
+}
+
 /// The options for `control`, along with whether the options are missing/incomplete.
 ///
 /// Prefers the custom property `wordcraft.chunk.<id>` when present and valid JSON (since it has
 /// no 1024-char tag limit), and falls back to options encoded on `control.tag`.
 fn options_of(doc: &Document, control: &ContentControl) -> (ChunkOptions, bool) {
-    if let Some(json) = control.id.and_then(|id| doc.custom_prop(&chunk_prop_name(id)))
-        && let Ok(opts) = serde_json::from_str::<ChunkOptions>(json)
-    {
+    if let Some(opts) = custom_prop_options(doc, control) {
         return (opts, false);
     }
     match decode_tag_options(&control.tag) {
@@ -704,8 +724,12 @@ impl Document {
             return Ok(false);
         };
 
-        let new_tag =
-            if control.tag.contains('?') { encode_control_tag(effective_lang, &found.chunk.options) } else { format!("{CHUNK_TAG}{effective_lang}") };
+        let has_full_options_prop = custom_prop_options(self, &control).is_some();
+        let new_tag = match decode_tag_options(&control.tag) {
+            TagOptions::Missing => format!("{CHUNK_TAG}{effective_lang}"),
+            TagOptions::Truncated(_) if !has_full_options_prop => encode_control_tag_with_truncated(effective_lang, &found.chunk.options, true),
+            TagOptions::Complete(_) | TagOptions::Truncated(_) => encode_control_tag(effective_lang, &found.chunk.options),
+        };
         control.tag = new_tag;
         let mut updated = CodeChunk::new(effective_lang, code);
         updated.options = found.chunk.options.clone();
@@ -1304,5 +1328,84 @@ mod tests {
         let range2 = &doc2.control_ranges(StoryRef::Body)[0];
         assert!(range2.control.tag.starts_with("wordcraft:chunk:r?"));
         assert!(range2.control.tag.chars().count() <= MAX_CONTROL_TEXT);
+    }
+
+    #[test]
+    fn update_chunk_preserves_incomplete_options_on_copied_truncated_chunk() {
+        let mut doc = Document::new();
+        let id = doc.push_chunk(&CodeChunk::new("r", "x <- 1")).unwrap();
+        let start = doc.control_ranges(StoryRef::Body)[0].start.clone();
+        doc.control_mut(&start).unwrap().tag = "wordcraft:chunk:r?!echo=false".to_string();
+        doc.remove_custom_prop(&chunk_prop_name(id));
+
+        let before = doc.chunk_refs(StoryRef::Body);
+        assert!(doc.chunk_options_missing(&before[0]));
+        assert!(!before[0].chunk.options.echo());
+
+        // Editing source only must keep the `!` truncated marker and missing-options status.
+        assert!(doc.update_chunk(id, "r", "x <- 2").unwrap());
+        let after = doc.chunk_refs(StoryRef::Body);
+        assert_eq!(after[0].chunk.code, "x <- 2");
+        assert!(!after[0].chunk.options.echo());
+        assert!(
+            doc.chunk_options_missing(&after[0]),
+            "copied chunk with truncated tag and no custom property must keep incomplete options after edit"
+        );
+        let range = &doc.control_ranges(StoryRef::Body)[0];
+        assert!(range.control.tag.starts_with("wordcraft:chunk:r?!"), "{}", range.control.tag);
+        assert!(range.control.tag.chars().count() <= MAX_CONTROL_TEXT);
+
+        // Changing language also keeps `!` and recovered options bounded.
+        assert!(doc.update_chunk(id, "python", "x = 3").unwrap());
+        let after_lang = doc.chunk_refs(StoryRef::Body);
+        assert_eq!(after_lang[0].chunk.language, "python");
+        assert!(!after_lang[0].chunk.options.echo());
+        assert!(doc.chunk_options_missing(&after_lang[0]));
+        let range_lang = &doc.control_ranges(StoryRef::Body)[0];
+        assert!(range_lang.control.tag.starts_with("wordcraft:chunk:python?!"), "{}", range_lang.control.tag);
+        assert!(range_lang.control.tag.chars().count() <= MAX_CONTROL_TEXT);
+
+        // Empty truncated tag (`?!`) with no custom property also remains incomplete.
+        let start_empty = range_lang.start.clone();
+        doc.control_mut(&start_empty).unwrap().tag = "wordcraft:chunk:r?!".to_string();
+        assert!(doc.update_chunk(id, "r", "x <- 4").unwrap());
+        let after_empty = doc.chunk_refs(StoryRef::Body);
+        assert!(doc.chunk_options_missing(&after_empty[0]));
+        assert_eq!(doc.control_ranges(StoryRef::Body)[0].control.tag, "wordcraft:chunk:r?!");
+
+        // Complete options in a copied chunk tag (no `!`, no custom property) stay complete.
+        let mut complete_doc = Document::new();
+        let complete_id = complete_doc.push_chunk(&CodeChunk::new("r", "a <- 1")).unwrap();
+        let complete_start = complete_doc.control_ranges(StoryRef::Body)[0].start.clone();
+        complete_doc.control_mut(&complete_start).unwrap().tag = "wordcraft:chunk:r?echo=false".to_string();
+        complete_doc.remove_custom_prop(&chunk_prop_name(complete_id));
+        assert!(complete_doc.update_chunk(complete_id, "r", "a <- 2").unwrap());
+        let complete_after = complete_doc.chunk_refs(StoryRef::Body);
+        assert!(!complete_doc.chunk_options_missing(&complete_after[0]));
+        assert!(!complete_after[0].chunk.options.echo());
+        assert_eq!(complete_doc.control_ranges(StoryRef::Body)[0].control.tag, "wordcraft:chunk:r?echo=false");
+
+        // When a valid full custom property exists, re-encoding uses the full options.
+        let mut prop_doc = Document::new();
+        let mut prop_chunk = CodeChunk::new("r", "b <- 1");
+        prop_chunk.options.set("echo", "false");
+        let prop_id = prop_doc.push_chunk(&prop_chunk).unwrap();
+        let prop_start = prop_doc.control_ranges(StoryRef::Body)[0].start.clone();
+        prop_doc.control_mut(&prop_start).unwrap().tag = "wordcraft:chunk:r?!echo=false".to_string();
+        assert!(prop_doc.update_chunk(prop_id, "r", "b <- 2").unwrap());
+        let prop_after = prop_doc.chunk_refs(StoryRef::Body);
+        assert!(!prop_doc.chunk_options_missing(&prop_after[0]));
+        assert_eq!(prop_doc.control_ranges(StoryRef::Body)[0].control.tag, "wordcraft:chunk:r?echo=false");
+
+        // When the custom property is malformed JSON, treat options as unavailable and keep `!`.
+        let mut bad_prop_doc = Document::new();
+        let bad_id = bad_prop_doc.push_chunk(&CodeChunk::new("r", "c <- 1")).unwrap();
+        let bad_start = bad_prop_doc.control_ranges(StoryRef::Body)[0].start.clone();
+        bad_prop_doc.control_mut(&bad_start).unwrap().tag = "wordcraft:chunk:r?!echo=false".to_string();
+        bad_prop_doc.set_custom_prop(&chunk_prop_name(bad_id), "{not valid json");
+        assert!(bad_prop_doc.update_chunk(bad_id, "r", "c <- 2").unwrap());
+        let bad_after = bad_prop_doc.chunk_refs(StoryRef::Body);
+        assert!(bad_prop_doc.chunk_options_missing(&bad_after[0]));
+        assert_eq!(bad_prop_doc.control_ranges(StoryRef::Body)[0].control.tag, "wordcraft:chunk:r?!echo=false");
     }
 }
