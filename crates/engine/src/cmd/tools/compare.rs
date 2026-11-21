@@ -146,6 +146,7 @@ pub(super) fn compare(s: &mut Session, v: &Value) -> CmdResult {
     let mut budget = MAX_COMPARE_CELLS;
     let mut char_fallbacks = 0usize;
     let mut ctx = DiffCtx { ins, del, opts: &opts, budget: &mut budget, char_fallbacks: &mut char_fallbacks, plain_revised };
+    s.doc.clear_compare_hf();
     let (out, body_changes, sources) = compare_blocks(&mut s.doc, &run, &mut ctx, &old, &new, true);
     s.doc.body = out;
     let mut changes = body_changes;
@@ -531,9 +532,12 @@ fn compare_headers_and_footers(
 
         if orig_title_page != rev_title_page {
             if let Some(end) = sec_key.and_then(|si| res_ends.get(si).copied()) {
-                s.doc.section_mut(end).title_page = rev_title_page;
+                let sec = s.doc.section_mut(end);
+                sec.title_page = rev_title_page;
+                sec.compare_title_page = wordcraft_doc::section::CompareTitlePage(Some(orig_title_page));
             } else {
                 s.doc.last_section.title_page = rev_title_page;
+                s.doc.last_section.compare_title_page = wordcraft_doc::section::CompareTitlePage(Some(orig_title_page));
             }
             let flags = s.doc.compare_hf.get_or_insert_with(Default::default);
             if !flags.title_page.iter().any(|(k, _)| *k == sec_key) {
