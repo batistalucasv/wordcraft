@@ -3952,3 +3952,92 @@ fn outline_view_shows_caret_and_skips_chunk_arrow_intercept_when_chunk_is_not_pl
     );
     assert_eq!(h.state().canvas.code_chunks.pending_focus, None);
 }
+
+#[test]
+fn mounted_code_chunks_accept_mouse_clicks_and_ribbon_run_all_executes_chunks() {
+    use egui_kittest::kittest::Queryable;
+
+    let mut a = WordApp::new(wordcraft_engine::Session::new(wordcraft_doc::Document::new()), Default::default());
+    a.run("text.insert", json!({"text": "Intro text above chunks."})).unwrap();
+    a.run("text.newParagraph", json!({})).unwrap();
+    let chunk1 = a.run("code.insert_chunk", json!({"language": "python", "code": "x = 2 + 2\nprint(x)"})).unwrap()["chunk"]["id"].as_i64().unwrap();
+    a.run("caret.docEnd", json!({})).unwrap();
+    a.run("text.newParagraph", json!({})).unwrap();
+    let chunk2 = a.run("code.insert_chunk", json!({"language": "python", "code": "print('second')"})).unwrap()["chunk"]["id"].as_i64().unwrap();
+    a.run("caret.docStart", json!({})).unwrap();
+    a.canvas.code_chunks.pending_focus = None;
+
+    let mut h = crate::test_harness::builder().with_size(egui::vec2(1440.0, 900.0)).build_ui_state(
+        |ui, app: &mut WordApp| {
+            let ctx = ui.ctx().clone();
+            crate::test_harness::driver_logic(&ctx, app);
+            app.ui(ui);
+        },
+        a,
+    );
+    steps(&mut h, 6);
+
+    let click_at = |h: &mut egui_kittest::Harness<'_, WordApp>, pt: Pos2| {
+        h.event(egui::Event::PointerMoved(pt));
+        h.app_frame();
+        h.event(egui::Event::PointerButton { pos: pt, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() });
+        h.app_frame();
+        h.event(egui::Event::PointerButton { pos: pt, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() });
+        h.app_frame();
+        h.app_frame();
+    };
+
+    // 1. Clicking inside a mounted chunk's editor must give it keyboard focus despite `PageRulers`.
+    let editor_id = h.state().canvas.code_chunks.widgets[&chunk1].widget.editor_id();
+    let editor_rect = h.ctx.read_response(editor_id).expect("mounted chunk editor rect").rect;
+    click_at(&mut h, editor_rect.center());
+    assert!(h.ctx.memory(|m| m.has_focus(editor_id)), "clicking inside a mounted chunk editor must focus its TextEdit");
+    assert_eq!(h.state().canvas.code_chunks.active_chunk, Some(chunk1));
+
+    // 2. Clicking a mounted chunk's Options button must open its popup menu.
+    let sr1 = h.state().canvas.code_chunks.screen_rects[&chunk1];
+    let options_rect = h.query_all_by_label("Options").map(|n| n.rect()).find(|r| sr1.intersects(*r)).expect("Options button inside chunk1");
+    click_at(&mut h, options_rect.center());
+    assert!(h.query_by_label("Copy code").is_some(), "clicking Options inside a mounted chunk must open the options menu");
+    // Dismiss popup before continuing.
+    h.event(egui::Event::Key { key: egui::Key::Escape, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() });
+    steps(&mut h, 2);
+
+    // 3. Clicking a mounted chunk's Run button must dispatch execution (when Python is available).
+    if wordcraft_kernel::is_language_available(wordcraft_kernel::CodeLanguage::Python) {
+        let run_rect = h.query_all_by_label("Run").next().expect("Run button in mounted chunk").rect();
+        click_at(&mut h, run_rect.center());
+        let mut ran = h.state().canvas.code_chunks.pending_len_for_test() > 0 || h.state().session.chunks.output(chunk1).is_some();
+        for _ in 0..80 {
+            if h.state().session.chunks.output(chunk1).is_some() {
+                ran = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            h.app_frame();
+        }
+        assert!(ran, "clicking Run inside a mounted chunk must start execution");
+        let out1 = h.state().session.chunks.output(chunk1).expect("chunk1 output after clicking Run");
+        assert!(out1.success, "chunk1 stderr: {}", out1.stderr);
+        assert_eq!(out1.stdout.trim(), "4");
+
+        // 4. Clicking Insert -> Code Chunk -> Run All Code Chunks must run both chunks.
+        h.state_mut().run("code.clear_output", json!({"all": true})).unwrap();
+        steps(&mut h, 2);
+        let ins_pt = h.get_by_label("Insert").rect().center();
+        click_at(&mut h, ins_pt);
+        let cc_rect = h.get_by_label("Code Chunk").rect();
+        click_at(&mut h, cc_rect.center());
+        let run_all_rect = h.get_by_label("Run All Code Chunks").rect();
+        click_at(&mut h, run_all_rect.center());
+        for _ in 0..120 {
+            if h.state().session.chunks.output(chunk1).is_some() && h.state().session.chunks.output(chunk2).is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            h.app_frame();
+        }
+        assert_eq!(h.state().session.chunks.output(chunk1).map(|o| o.stdout.trim()), Some("4"));
+        assert_eq!(h.state().session.chunks.output(chunk2).map(|o| o.stdout.trim()), Some("second"));
+    }
+}

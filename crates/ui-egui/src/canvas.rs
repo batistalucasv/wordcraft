@@ -829,9 +829,9 @@ fn show_pages(app: &mut WordApp, ui: &mut Ui, layout: &Arc<DocLayout>, full: Rec
             crate::table_resize::show(app, ui, layout, body);
             crate::ink::show(app, ui, layout, body);
             crate::dialogs_smart_art::frame_button(app, ui, body.pages, layout);
-            code_chunks::paint_and_interact(app, ui, layout, body.pages);
             if let Some(pass) = body.pass {
                 ran = true;
+                code_chunks::update_screen_rects(app, layout, body.pages);
                 let response = run_page_tool(app, ui, layout, body, pass);
                 // A right click the page tool left asks for the menu: what it clicked becomes the selection first, so
                 // the menu acts on it (the page tool takes the primary button only).
@@ -986,6 +986,22 @@ fn show_pages(app: &mut WordApp, ui: &mut Ui, layout: &Arc<DocLayout>, full: Rec
     }
     balloons::balloons(app, ui, &out, layout);
     rulers::page_rulers(app, ui, &out, layout);
+    // Mount interactive code chunks after `PageRulers` so their raw egui widgets sit above
+    // `PageRulers`'s full-canvas hit box on the background layer, clipped to the page viewport
+    // inside the ruler strips.
+    let chunk_clip = view_rect.intersect(ui.clip_rect());
+    if chunk_clip.is_positive() {
+        let mut chunk_ui = ui.new_child(egui::UiBuilder::new().max_rect(view_rect));
+        chunk_ui.set_clip_rect(chunk_clip);
+        code_chunks::paint_and_interact(app, &mut chunk_ui, layout, &out.pages);
+    }
+    if app.canvas.focus_pending && !app.modal_open() {
+        let ctx = ui.ctx().clone();
+        app.canvas.focus_page(&ctx);
+        if app.canvas.code_chunks.active_chunk.is_some() {
+            ctx.request_repaint();
+        }
+    }
     // The one context-menu ask of the pass: Shift+F10 or `ui.contextMenu` (below the caret), a click on a code chunk
     // or the equation frame's options strip, then the tool host's own request by how it was asked for.
     let chunk_click = app.canvas.code_chunks.take_context_click();

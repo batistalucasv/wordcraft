@@ -886,7 +886,11 @@ impl CodeChunk {
                         let mut ro = self.code.as_str();
                         show_box(ui, &mut ro)
                     } else {
-                        show_box(ui, &mut self.code)
+                        let out = show_box(ui, &mut self.code);
+                        if self.code.contains('\r') {
+                            self.code = self.code.replace("\r\n", "\n").replace('\r', "");
+                        }
+                        out
                     };
                     outcome.changed = !read_only && out.response.changed();
                     outcome.has_focus = out.response.has_focus();
@@ -1299,6 +1303,14 @@ fn shortcut_pressed(ui: &Ui, editor: Id) -> bool {
                 true
             }
         });
+        if taken {
+            // On X11/winit, Ctrl+Enter can also emit a control-character text event (such as "\r"
+            // or "\n") in the same frame; drop it so `TextEdit` does not insert a stray glyph or
+            // mark the chunk dirty.
+            input
+                .events
+                .retain(|event| !matches!(event, egui::Event::Text(text) if !text.is_empty() && text.chars().all(|c| c == '\r' || c == '\n')));
+        }
         taken
     })
 }

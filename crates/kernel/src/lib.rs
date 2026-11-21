@@ -955,6 +955,8 @@ def _wc_capture_limits(cells=None, bytes_=None):
 def _wc_cell(value):
     if value is None:
         return "NA"
+    if isinstance(value, float) and value != value:
+        return "NA"
     if _wc_pandas is not None:
         try:
             if _wc_pandas.isna(value):
@@ -967,24 +969,90 @@ def _wc_cell(value):
     return text.encode("utf-8", "replace").decode("utf-8")
 
 
-def _wc_capture(value):
+def _wc_is_col_seq(value):
+    return isinstance(value, (list, tuple, range))
+
+
+def _wc_extract_plain(value):
+    if isinstance(value, dict):
+        items = list(value.items())[:256]
+        if not items:
+            return None
+        seq_len = None
+        cols = []
+        raw_headers = []
+        for key, col in items:
+            raw_headers.append(key)
+            if _wc_is_col_seq(col):
+                col_len = len(col)
+                if seq_len is None:
+                    seq_len = col_len
+                elif col_len != seq_len:
+                    raise ValueError("wc_table() dict columns must have the same length")
+                cols.append((col, True))
+            else:
+                cols.append((col, False))
+        total_rows = 1 if seq_len is None else seq_len
+        limit = min(total_rows, 10000)
+
+        def _iter_dict_rows():
+            for idx in range(limit):
+                yield tuple(col[idx] if is_seq else col for col, is_seq in cols)
+
+        return (raw_headers, _iter_dict_rows(), total_rows)
+
+    if isinstance(value, (list, tuple)):
+        if len(value) == 0:
+            return None
+        first = value[0]
+        if isinstance(first, dict):
+            sampled = value[:10000]
+            raw_headers = []
+            seen = set()
+            for row in sampled:
+                if not isinstance(row, dict):
+                    raise TypeError("wc_table() expects a pandas.DataFrame, dict of columns, or list of dicts/rows")
+                for key in row.keys():
+                    if key not in seen:
+                        if len(raw_headers) >= 256:
+                            break
+                        seen.add(key)
+                        raw_headers.append(key)
+            if not raw_headers:
+                return None
+
+            def _iter_record_rows():
+                for row in sampled:
+                    yield tuple(row.get(key, None) for key in raw_headers)
+
+            return (raw_headers, _iter_record_rows(), len(value))
+
+        if isinstance(first, (list, tuple)):
+            sampled = value[:10000]
+            width = 0
+            for row in sampled:
+                if not isinstance(row, (list, tuple)):
+                    raise TypeError("wc_table() expects a pandas.DataFrame, dict of columns, or list of dicts/rows")
+                if len(row) > width:
+                    width = min(len(row), 256)
+            if width == 0:
+                return None
+            raw_headers = [f"V{i + 1}" for i in range(width)]
+
+            def _iter_matrix_rows():
+                for row in sampled:
+                    yield tuple(row[i] if i < len(row) else "" for i in range(width))
+
+            return (raw_headers, _iter_matrix_rows(), len(value))
+
+    raise TypeError("wc_table() expects a pandas.DataFrame, dict of columns, or list of dicts/rows")
+
+
+def _wc_commit_rows(headers, row_iter, total_rows):
     global _wc_cells, _wc_bytes
-    if len(_wc_tables) >= 16:
-        return False
-    if _wc_pandas is None or not isinstance(value, _wc_pandas.DataFrame):
+    if len(_wc_tables) >= 16 or not headers:
         return False
     try:
-        has_labels = not (
-            isinstance(value.index, _wc_pandas.RangeIndex)
-            and value.index.equals(_wc_pandas.RangeIndex(len(value)))
-        )
-        max_cols = 255 if has_labels else 256
-        sliced = value.iloc[:10000, :max_cols]
-        headers = [_wc_json.dumps(_wc_cell(col), ensure_ascii=False) for col in sliced.columns]
-        if has_labels:
-            headers = ['""'] + headers
-        if not headers:
-            return False
         width = len(headers)
         # Cells are measured after JSON encoding, which can turn one character into six bytes, and
         # the table framing is reserved before the first row is accepted.
@@ -1000,7 +1068,7 @@ def _wc_capture(value):
         rows = []
         sizes = []
         used = 0
-        for row in sliced.itertuples(index=has_labels, name=None):
+        for row in row_iter:
             if len(rows) >= max_rows:
                 break
             converted = [_wc_json.dumps(_wc_cell(cell), ensure_ascii=False) for cell in row]
@@ -1010,7 +1078,7 @@ def _wc_capture(value):
             used += size
             rows.append(converted)
             sizes.append(size)
-        empty = not rows and len(sliced) == 0
+        empty = not rows and total_rows == 0
         if not rows and not empty:
             return False
     except Exception:
@@ -1042,6 +1110,35 @@ def _wc_capture(value):
         _wc_cells += width * keep
         _wc_bytes += framing + used
     return True
+
+
+def _wc_capture(value):
+    if len(_wc_tables) >= 16:
+        return False
+    if _wc_pandas is not None and isinstance(value, _wc_pandas.DataFrame):
+        try:
+            has_labels = not (
+                isinstance(value.index, _wc_pandas.RangeIndex)
+                and value.index.equals(_wc_pandas.RangeIndex(len(value)))
+            )
+            max_cols = 255 if has_labels else 256
+            sliced = value.iloc[:10000, :max_cols]
+            headers = [_wc_json.dumps(_wc_cell(col), ensure_ascii=False) for col in sliced.columns]
+            if has_labels:
+                headers = ['""'] + headers
+            if not headers:
+                return False
+            return _wc_commit_rows(headers, sliced.itertuples(index=has_labels, name=None), len(sliced))
+        except Exception:
+            return False
+    if isinstance(value, (dict, list, tuple)):
+        extracted = _wc_extract_plain(value)
+        if extracted is None:
+            return False
+        raw_headers, row_iter, total_rows = extracted
+        headers = [_wc_json.dumps(_wc_cell(col), ensure_ascii=False) for col in raw_headers]
+        return _wc_commit_rows(headers, row_iter, total_rows)
+    return False
 
 
 def _wc_write_tables():
@@ -1096,14 +1193,15 @@ def _wc_write_tables():
 
 def wc_table(value):
     global _wc_pandas, _wc_pending
-    if _wc_pandas is None:
-        try:
-            import pandas as _pandas
-            _wc_pandas = _pandas
-        except Exception as exc:
-            raise TypeError("wc_table() needs pandas") from exc
-    if not isinstance(value, _wc_pandas.DataFrame):
-        raise TypeError("wc_table() expects a pandas.DataFrame")
+    if not isinstance(value, (dict, list, tuple)):
+        if _wc_pandas is None:
+            try:
+                import pandas as _pandas
+                _wc_pandas = _pandas
+            except Exception as exc:
+                raise TypeError("wc_table() expects a pandas.DataFrame, dict of columns, or list of dicts/rows") from exc
+        if not isinstance(value, _wc_pandas.DataFrame):
+            raise TypeError("wc_table() expects a pandas.DataFrame, dict of columns, or list of dicts/rows")
     # Only publication takes the lock: capture commits under it too, and conversion stays outside
     # so a nested call from a cell formatter cannot deadlock the chunk.
     if _wc_capture(value):

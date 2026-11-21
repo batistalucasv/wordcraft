@@ -460,7 +460,11 @@ fn poll_pending_runs(app: &mut WordApp, ctx: &egui::Context) {
     }
     app.canvas.code_chunks.pending_runs = still_running;
     if !failed_batches.is_empty() {
+        let before = app.canvas.code_chunks.queued_runs.len();
         app.canvas.code_chunks.queued_runs.retain(|q| !failed_batches.contains(&q.batch_id));
+        if app.canvas.code_chunks.queued_runs.len() < before {
+            app.status("Stopped Run All after a code chunk failed.".to_string());
+        }
     }
     let _ = pump_queued_runs(app, Some(ctx));
     if !app.canvas.code_chunks.pending_runs.is_empty() {
@@ -805,6 +809,22 @@ impl PaintEvents {
     }
 }
 
+/// Refresh cached chunk screen rectangles for the current pass's placed pages so `PageTextTool`
+/// cursor and hit checks stay aligned before `paint_and_interact` mounts the widgets after `PageRulers`.
+pub(crate) fn update_screen_rects(app: &mut WordApp, layout: &DocLayout, pages: &[PlacedPage]) {
+    app.canvas.code_chunks.screen_rects.clear();
+    for placed in pages {
+        let Some(page) = layout.pages.get(placed.page) else { continue };
+        for it in &page.items {
+            if let Placed::Chunk { id, rect, .. } = it {
+                let min = placed.to_screen(Point::new(f64::from(rect.x), f64::from(rect.y)));
+                let max = placed.to_screen(Point::new(f64::from(rect.x + rect.w), f64::from(rect.y + rect.h)));
+                app.canvas.code_chunks.screen_rects.insert(*id, Rect::from_two_pos(min, max));
+            }
+        }
+    }
+}
+
 fn collect_visible_chunks(app: &mut WordApp, ui: &Ui, layout: &DocLayout, pages: &[PlacedPage]) -> Vec<(i64, usize, Rect, f32)> {
     app.canvas.code_chunks.screen_rects.clear();
     let view_clip = ui.clip_rect().expand(120.0);
@@ -1106,6 +1126,13 @@ pub(crate) fn paint_and_interact(app: &mut WordApp, ui: &mut Ui, layout: &DocLay
         // Measure intrinsic height cleanly without capping height to last frame's box.
         let max_rect = Rect::from_min_size(sr.min, vec2(sr.width().max(48.0), f32::INFINITY));
         let mut child_ui = ui.new_child(egui::UiBuilder::new().max_rect(max_rect));
+        // Register an interactive backdrop behind the card's controls so clicks on empty areas of
+        // the card (header background, padding, console labels) stay on a raw egui widget rather
+        // than falling through to the underlying canvas or `PageRulers`.
+        let bg_rect = sr.intersect(child_ui.clip_rect());
+        if bg_rect.is_positive() {
+            child_ui.interact(bg_rect, egui::Id::unique(("wordcraft-code-chunk-bg", id)), egui::Sense::click());
+        }
         let frame = entry.widget.show_embedded(&mut child_ui);
         if let Some(at_end) = requested_edge
             && frame.editor_has_focus

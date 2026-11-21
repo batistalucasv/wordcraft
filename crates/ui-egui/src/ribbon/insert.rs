@@ -303,8 +303,8 @@ pub(super) fn insert(row: &mut RibbonRow<'_>, app: &mut WordApp) {
                     .icon(crate::icons::id("codeChunk"))
                     .show(ui);
                 Divider::horizontal().show(ui);
-                MenuItem::command(CommandRef::with_params("code.run_all", json!({}))).label(crate::tl!("Run All Code Chunks")).show(ui);
-                MenuItem::command(CommandRef::with_params("code.restart_kernel", json!({}))).label(crate::tl!("Restart Kernel")).show(ui);
+                MenuItem::command(CommandRef::new("code.run_all")).label(crate::tl!("Run All Code Chunks")).show(ui);
+                MenuItem::command(CommandRef::new("code.restart_kernel")).label(crate::tl!("Restart Kernel")).show(ui);
             },
         );
     });

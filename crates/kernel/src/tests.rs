@@ -993,6 +993,67 @@ print("converted", _Counting.calls)
 }
 
 #[test]
+fn python_wc_table_supports_plain_dicts_and_lists_without_pandas() {
+    if !is_language_available(CodeLanguage::Python) {
+        return;
+    }
+    let code = r#"
+import sys
+sys.modules["pandas"] = None
+
+wc_table({
+    "Site": ["North", "South", "East"],
+    "Richness": [18, None, float("nan")],
+    "Region": "Atlantic",
+})
+wc_table([
+    {"Species": "A", "Count": 3},
+    {"Species": "B", "Extra": "ok"},
+])
+wc_table([["São Paulo", 10], ["Brasília", 20]])
+wc_table({"EmptyCol": []})
+"#;
+    let result = execute(&ExecutionRequest::new(CodeLanguage::Python, code)).expect("execution failed");
+    assert!(result.success, "stderr: {}", result.stderr);
+    assert_eq!(result.tables.len(), 4);
+
+    assert_eq!(result.tables[0].headers, vec!["Site", "Richness", "Region"]);
+    assert_eq!(result.tables[0].rows, vec![vec!["North", "18", "Atlantic"], vec!["South", "NA", "Atlantic"], vec!["East", "NA", "Atlantic"]]);
+
+    assert_eq!(result.tables[1].headers, vec!["Species", "Count", "Extra"]);
+    assert_eq!(result.tables[1].rows, vec![vec!["A", "3", "NA"], vec!["B", "NA", "ok"]]);
+
+    assert_eq!(result.tables[2].headers, vec!["V1", "V2"]);
+    assert_eq!(result.tables[2].rows, vec![vec!["São Paulo", "10"], vec!["Brasília", "20"]]);
+
+    assert_eq!(result.tables[3].headers, vec!["EmptyCol"]);
+    assert!(result.tables[3].rows.is_empty());
+
+    // Mismatched column lengths must raise ValueError.
+    let bad_len =
+        execute(&ExecutionRequest::new(CodeLanguage::Python, "import sys\nsys.modules['pandas'] = None\nwc_table({'a': [1, 2], 'b': [3]})\n"))
+            .expect("execution failed");
+    assert!(!bad_len.success);
+    assert!(bad_len.stderr.contains("ValueError"), "stderr: {}", bad_len.stderr);
+
+    // Non-tabular inputs must raise TypeError.
+    let bad_type = execute(&ExecutionRequest::new(CodeLanguage::Python, "import sys\nsys.modules['pandas'] = None\nwc_table([1, 2, 3])\n"))
+        .expect("execution failed");
+    assert!(!bad_type.success);
+    assert!(bad_type.stderr.contains("TypeError"), "stderr: {}", bad_type.stderr);
+
+    // Pre-serialization cell budget still caps plain-dict tables.
+    let budgeted = execute(&ExecutionRequest::new(
+        CodeLanguage::Python,
+        "import sys\nsys.modules['pandas'] = None\n_wc_capture_limits(cells=4)\nwc_table({'a': [1, 2, 3], 'b': [4, 5, 6]})\n",
+    ))
+    .expect("execution failed");
+    assert!(budgeted.success, "stderr: {}", budgeted.stderr);
+    assert_eq!(budgeted.tables.len(), 1);
+    assert_eq!(budgeted.tables[0].rows.len(), 2);
+}
+
+#[test]
 fn python_does_not_touch_matplotlib_when_plots_are_off() {
     if !is_language_available(CodeLanguage::Python) {
         return;

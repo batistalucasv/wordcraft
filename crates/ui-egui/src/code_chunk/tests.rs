@@ -649,3 +649,31 @@ fn multi_plot_selection_console_insert_and_inline_rename() {
         "Console insert must emit captured console text"
     );
 }
+
+#[test]
+fn ctrl_enter_drops_accompanying_cr_text_event_without_dirtying_code() {
+    let mut chunk = CodeChunk::new(CodeLanguage::Python, "print(1)");
+    let editor_id = chunk.editor_id();
+    let ctx = egui::Context::default();
+    crate::theme::install_fonts(&ctx);
+    // Focus editor on frame 1.
+    ctx.memory_mut(|m| m.request_focus(editor_id));
+    ctx.run_ui(egui::RawInput::default(), |ui| {
+        let _ = chunk.show_embedded(ui);
+    })
+    .drop_without_applying_deltas();
+    assert!(ctx.memory(|m| m.has_focus(editor_id)));
+
+    // Simulate X11 Ctrl+Enter arriving with an accompanying `Event::Text("\r")`.
+    let mut raw = egui::RawInput::default();
+    raw.events.push(egui::Event::Key { key: Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::COMMAND });
+    raw.events.push(egui::Event::Text("\r".to_owned()));
+    let mut frame = EmbeddedFrame::default();
+    ctx.run_ui(raw, |ui| {
+        frame = chunk.show_embedded(ui);
+    })
+    .drop_without_applying_deltas();
+    assert!(frame.run_requested, "Ctrl+Enter must still request execution");
+    assert!(!frame.dirty, "Ctrl+Enter must not mark the chunk dirty");
+    assert_eq!(chunk.code(), "print(1)", "stray CR from Ctrl+Enter must not be inserted into source");
+}
