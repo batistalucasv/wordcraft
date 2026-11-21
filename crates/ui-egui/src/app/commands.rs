@@ -145,13 +145,18 @@ impl WordApp {
         } else {
             None
         };
-        if matches!(id, "edit.undo" | "edit.redo") {
-            let _ = crate::canvas::code_chunks::flush_dirty(self);
-            if id == "edit.undo" && !self.session.can_undo() && crate::canvas::code_chunks::has_dirty_chunks(self) {
-                crate::canvas::code_chunks::revert_dirty_chunks(self);
+        if matches!(id, "edit.undo" | "edit.redo")
+            && let Err(err) = crate::canvas::code_chunks::flush_dirty(self)
+        {
+            // A refused chunk draft (e.g. containing U+FFFC) was not checkpointed into engine
+            // history: on Undo, revert it as its own step instead of consuming prior document
+            // history; on Redo (or a refusal in another window), stop and report the error.
+            if id == "edit.undo" && crate::canvas::code_chunks::revert_dirty_chunks(self) {
                 self.after_command(id);
                 return Ok(json!({"undone": true}));
             }
+            self.status(err.clone());
+            return Err(err);
         } else if matches!(id, "file.save" | "file.saveAs" | "file.exportPdf" | "file.exportPng" | "code.run_chunk" | "code.run_all")
             && let Err(err) = crate::canvas::code_chunks::flush_dirty(self)
         {
