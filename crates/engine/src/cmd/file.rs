@@ -402,6 +402,9 @@ fn save(s: &mut Session, v: &Value) -> CmdResult {
     };
     check_strict_output(p::bool(v, "strict").unwrap_or(false), &path.to_string_lossy())?;
     let is_copy = p::bool(v, "copy").unwrap_or(false);
+    if is_copy && s.path.as_deref().is_some_and(|active| crate::io::same_save_target(&path, active)) {
+        return Err(CmdError::Params("cannot save a copy over the active document; choose a different path".into()));
+    }
     let mut copy_password: Option<crate::io::Password> = None;
     if let Some(pw) = v.get("password").filter(|pw| !pw.is_null()) {
         let Some(pw) = pw.as_str().filter(|pw| !pw.is_empty()) else {
