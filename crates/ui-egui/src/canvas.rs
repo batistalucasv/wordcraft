@@ -1002,6 +1002,9 @@ fn update_canvas_focus(app: &mut WordApp, ui: &mut Ui, resp: &egui::Response, im
     let wants = app.canvas.want_focus && !app.modal_open();
     if focus_click || (wants && !resp.has_focus()) {
         resp.request_focus();
+        if app.canvas.code_chunks.active_chunk.is_some() {
+            ui.ctx().request_repaint();
+        }
     }
     if focus_click || wants {
         app.canvas.want_focus = false;

@@ -766,12 +766,41 @@ fn apply_paint_events(app: &mut WordApp, ui: &Ui, events: PaintEvents) {
     }
 
     if let Some((id, pi)) = events.newly_focused.last().copied() {
+        if let Some(prev_id) = app.canvas.code_chunks.active_chunk.filter(|&prev| prev != id)
+            && let Err(err) = flush_one(app, prev_id)
+        {
+            app.status(err);
+        }
         app.canvas.code_chunks.active_chunk = Some(id);
         app.session.page_hint = pi;
         if !chunks::chunk_at(&app.session.doc, &app.session.sel.focus).is_some_and(|r| r.chunk.id == Some(id))
             && let Some(r) = top_level_chunks(&app.session.doc).into_iter().find(|r| r.chunk.id == Some(id))
         {
             app.session.sel = wordcraft_engine::Selection::caret(r.start);
+        }
+    }
+
+    // Offscreen or Teaching-Mode-hidden chunks are not passed to `TextEdit::show`, so
+    // `editor_lost_focus` never fires for them; reconcile `active_chunk` against egui focus.
+    if let Some(active_id) = app.canvas.code_chunks.active_chunk {
+        let still_focused = !app.session.view.read_mode
+            && app.canvas.code_chunks.widgets.get(&active_id).is_some_and(|entry| {
+                let editor_id = entry.widget.editor_id();
+                if !entry.widget.show_code {
+                    if ui.ctx().memory(|m| m.has_focus(editor_id)) {
+                        ui.ctx().memory_mut(|m| m.surrender_focus(editor_id));
+                        app.canvas.want_focus = true;
+                    }
+                    false
+                } else {
+                    ui.ctx().memory(|m| m.has_focus(editor_id))
+                }
+            });
+        if !still_focused {
+            if let Err(err) = flush_one(app, active_id) {
+                app.status(err);
+            }
+            app.canvas.code_chunks.active_chunk = None;
         }
     }
 

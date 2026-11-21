@@ -6627,3 +6627,90 @@ fn transfer_in_flight_runs_remaps_batch_ids_to_prevent_collisions() {
     assert_eq!(h.state().canvas.code_chunks.pending_batch_ids_for_test(), vec![(chunk_c, target_batch)]);
     assert_eq!(h.state().canvas.code_chunks.queued_batch_ids_for_test(), vec![(chunk_d, target_batch)]);
 }
+
+#[test]
+fn canvas_caret_renders_after_offscreen_or_hidden_chunk_loses_focus() {
+    let mut a = WordApp::new(wordcraft_engine::Session::new(wordcraft_doc::Document::new()), Default::default());
+    a.run("text.insert", json!({"text": "Intro paragraph above chunk 1."})).unwrap();
+    a.run("text.newParagraph", json!({})).unwrap();
+    let chunk1_code = (1..=20).map(|i| format!("x{i} <- {i}")).collect::<Vec<_>>().join("\n");
+    let chunk1_id = a.run("code.insert_chunk", json!({"language": "r", "code": chunk1_code})).unwrap()["chunk"]["id"].as_i64().unwrap();
+    a.run("caret.docEnd", json!({})).unwrap();
+    a.run("text.newParagraph", json!({})).unwrap();
+    let chunk2_code = (1..=20).map(|i| format!("y{i} <- {i}")).collect::<Vec<_>>().join("\n");
+    a.run("code.insert_chunk", json!({"language": "r", "code": chunk2_code})).unwrap();
+    a.run("caret.docEnd", json!({})).unwrap();
+    a.run("text.newParagraph", json!({})).unwrap();
+    a.run("text.insert", json!({"text": "Target prose paragraph on page 2."})).unwrap();
+    a.run("text.newParagraph", json!({})).unwrap();
+    let chunk3_id =
+        a.run("code.insert_chunk", json!({"language": "python", "code": "val = 42\nprint(val)"})).unwrap()["chunk"]["id"].as_i64().unwrap();
+    a.session.sel = wordcraft_engine::Selection::caret(Pos::body(0, 0));
+
+    let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1280.0, 860.0)).build_ui_state(
+        |ui, app: &mut WordApp| {
+            let ctx = ui.ctx().clone();
+            app.logic(&ctx);
+            app.ui(ui);
+        },
+        a,
+    );
+    h.ctx.all_styles_mut(|s| s.animation_time = 0.1);
+    steps(&mut h, 6);
+
+    // 1. Focus chunk 1, type an edit, scroll it offscreen, and click prose on page 2.
+    h.state_mut().canvas.code_chunks.request_focus(chunk1_id, false);
+    steps(&mut h, 3);
+    assert_eq!(h.state().canvas.code_chunks.active_chunk, Some(chunk1_id));
+    h.event(egui::Event::Text("# edited\n".into()));
+    h.step();
+
+    let target_para = h
+        .state()
+        .session
+        .doc
+        .body
+        .iter()
+        .position(|b| b.as_para().is_some_and(|p| p.plain_text().contains("Target prose paragraph")))
+        .expect("target prose paragraph");
+
+    h.state_mut().canvas.scroll_request = Some(egui::vec2(0.0, 1150.0));
+    steps(&mut h, 4);
+    let layout = h.state_mut().session.layout();
+    let c_target = layout.caret(&Pos::body(target_para, 4)).expect("target prose caret");
+    let pt_target = page_to_screen(h.state_mut(), c_target.page, c_target.x, c_target.top + c_target.height / 2.0).expect("target on screen");
+
+    h.event(egui::Event::PointerMoved(pt_target));
+    h.event(egui::Event::PointerButton { pos: pt_target, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() });
+    h.step();
+    h.event(egui::Event::PointerButton { pos: pt_target, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() });
+    steps(&mut h, 4);
+
+    assert!(h.state().canvas.focused, "clicking prose must focus the canvas");
+    assert_eq!(h.state().canvas.code_chunks.active_chunk, None, "stale offscreen active_chunk must clear when canvas gains focus");
+    assert!(!crate::canvas::code_chunks::caret_in_mounted_chunk(h.state()), "canvas caret must not be suppressed in prose");
+    assert!(
+        wordcraft_engine::chunks::chunks_in(&h.state().session.doc, StoryRef::Body)[0].chunk.code.starts_with("# edited\n"),
+        "offscreen blur must still flush chunk edits to the document"
+    );
+    let glide = crate::caret_glide::state(&h.ctx);
+    let drawn = glide.drawn().expect("canvas caret must be drawn");
+    assert!(glide.opacity() > 0.0, "canvas caret must be visible");
+    assert!(drawn[0].y > 500.0, "caret must be drawn at the clicked page-2 prose position, not stale page-1 top: {drawn:?}");
+
+    // 2. Collapsing a focused chunk via Teaching Mode (`show_code = false`) must also release active_chunk
+    // so clicking back into prose immediately restores the canvas caret.
+    h.state_mut().canvas.code_chunks.request_focus(chunk3_id, false);
+    steps(&mut h, 3);
+    assert_eq!(h.state().canvas.code_chunks.active_chunk, Some(chunk3_id));
+    h.state_mut().canvas.code_chunks.widgets.get_mut(&chunk3_id).unwrap().widget.show_code = false;
+    steps(&mut h, 3);
+    assert_eq!(h.state().canvas.code_chunks.active_chunk, None, "hiding code must clear active_chunk");
+    h.event(egui::Event::PointerMoved(pt_target));
+    h.event(egui::Event::PointerButton { pos: pt_target, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() });
+    h.step();
+    h.event(egui::Event::PointerButton { pos: pt_target, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() });
+    steps(&mut h, 4);
+    assert!(!crate::canvas::code_chunks::caret_in_mounted_chunk(h.state()), "canvas caret must not be suppressed after hiding chunk code");
+    assert!(crate::caret_glide::state(&h.ctx).drawn().is_some(), "canvas caret must draw in prose after hiding chunk code");
+}
