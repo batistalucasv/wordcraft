@@ -79,7 +79,7 @@ pub fn export(ext: &str, doc: &Document) -> Option<Result<Vec<u8>, String>> {
     Some(match ext.as_str() {
         "txt" | "text" => Ok(txt::export(doc)),
         "md" | "markdown" => Ok(markdown::export(doc).into_bytes()),
-        "qmd" | "rmd" => Ok(quarto::export(doc).into_bytes()),
+        "qmd" | "rmd" => quarto::export(doc).map(String::into_bytes),
         "html" | "htm" | "xhtml" => Ok(html::export(doc).into_bytes()),
         "rtf" => Ok(rtf::export(doc).into_bytes()),
         "odt" => odt::export(doc),

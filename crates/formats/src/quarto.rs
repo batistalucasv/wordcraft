@@ -54,7 +54,48 @@ pub fn import_on(text: &str, page: &wordcraft_doc::SectionProps) -> Document {
 }
 
 /// Export `doc` as a Quarto document. A `.Rmd` file is the same text.
-pub fn export(doc: &Document) -> String {
+///
+/// Returns an error if `doc` contains code chunks that cannot be written as top-level Quarto
+/// fenced chunks without losing their executable form and options (such as chunks inside table
+/// cells, overlapping chunks, or chunks outside the document body).
+pub fn export(doc: &Document) -> Result<String, String> {
+    let refs = doc.chunk_refs(StoryRef::Body);
+    let table_cell_chunks = refs.iter().filter(|r| r.start.path.0.len() != 1 || r.end.path.0.len() != 1).count();
+    if table_cell_chunks > 0 {
+        return Err(if table_cell_chunks == 1 {
+            "Quarto export cannot preserve 1 code chunk inside a table cell: move it to the document body or save as .docx".to_string()
+        } else {
+            format!(
+                "Quarto export cannot preserve {table_cell_chunks} code chunks inside table cells: move them to the document body or save as .docx"
+            )
+        });
+    }
+    let non_body_chunks: usize = doc.parts.keys().map(|id| doc.chunk_refs(StoryRef::Part(*id)).len()).sum();
+    if non_body_chunks > 0 {
+        return Err(if non_body_chunks == 1 {
+            "Quarto export cannot preserve 1 code chunk outside the document body: move it to the document body or save as .docx".to_string()
+        } else {
+            format!(
+                "Quarto export cannot preserve {non_body_chunks} code chunks outside the document body: move them to the document body or save as .docx"
+            )
+        });
+    }
+
+    let mut starts: HashMap<usize, &wordcraft_doc::ChunkRef> = HashMap::with_capacity(refs.len());
+    let mut next_block = 0usize;
+    for r in &refs {
+        let start = r.start.path.last();
+        let end = r.end.path.last();
+        if start < next_block || end < start || end >= doc.body.len() {
+            return Err(
+                "Quarto export cannot preserve overlapping or nested code chunks: separate them into distinct top-level blocks or save as .docx"
+                    .to_string(),
+            );
+        }
+        starts.insert(start, r);
+        next_block = end.saturating_add(1);
+    }
+
     let mut out = String::with_capacity(doc_text_len(doc));
     if let Some(front_matter) = doc.custom_prop(FRONT_MATTER_PROP) {
         let front_matter = front_matter.trim();
@@ -66,9 +107,6 @@ pub fn export(doc: &Document) -> String {
             out.push('\n');
         }
     }
-    let refs = doc.chunk_refs(StoryRef::Body);
-    let starts: HashMap<usize, &wordcraft_doc::ChunkRef> =
-        refs.iter().filter(|r| r.start.path.0.len() == 1 && r.end.path.0.len() == 1).map(|r| (r.start.path.last(), r)).collect();
     let mut shell = doc.clone();
     shell.body.clear();
     shell.custom_props.clear();
@@ -76,12 +114,12 @@ pub fn export(doc: &Document) -> String {
     let mut i = 0;
     while i < doc.body.len() {
         match starts.get(&i) {
-            Some(r) if r.end.path.last() >= i => {
+            Some(r) => {
                 flush(&mut out, &mut shell, &mut run);
                 push_chunk(&mut out, &r.chunk);
                 i = r.end.path.last().saturating_add(1);
             }
-            _ => {
+            None => {
                 if let Some(block) = doc.body.get(i) {
                     run.push(block.clone());
                 }
@@ -90,7 +128,7 @@ pub fn export(doc: &Document) -> String {
         }
     }
     flush(&mut out, &mut shell, &mut run);
-    out
+    Ok(out)
 }
 
 /// A rough size for the output, so it is not reallocated as it grows.
@@ -1091,7 +1129,7 @@ print(sites)
     #[test]
     fn export_writes_the_chunks_back_with_their_options() {
         let doc = import(SOURCE);
-        let text = export(&doc);
+        let text = export(&doc).unwrap();
         assert!(text.starts_with("---\ntitle: \"Field methods\"\nformat: docx\n---\n"));
         assert!(text.contains(
             "```{r}\n#| echo: FALSE\n#| fig-cap: \"Species abundance\"\n#| label: fig-abundance\nabundance <- c(10, 25, 5)\nbarplot(abundance)\n```"
@@ -1102,8 +1140,8 @@ print(sites)
 
     #[test]
     fn export_import_is_stable() {
-        let once = export(&import(SOURCE));
-        let twice = export(&import(&once));
+        let once = export(&import(SOURCE)).unwrap();
+        let twice = export(&import(&once)).unwrap();
         assert_eq!(once, twice);
         let doc = import(&once);
         assert_eq!(doc.chunks().len(), 2);
@@ -1115,7 +1153,7 @@ print(sites)
         let source = "```{r}\na\n\nb\n```\n";
         let doc = import(source);
         assert_eq!(doc.chunks()[0].code, "a\n\nb");
-        let again = import(&export(&doc));
+        let again = import(&export(&doc).unwrap());
         assert_eq!(again.chunks()[0].code, "a\n\nb");
     }
 
@@ -1124,7 +1162,7 @@ print(sites)
         let doc = import("```{r}\n```\n");
         assert_eq!(doc.chunks().len(), 1);
         assert_eq!(doc.chunks()[0].code, "");
-        let again = import(&export(&doc));
+        let again = import(&export(&doc).unwrap());
         assert_eq!(again.chunks().len(), 1);
         assert_eq!(again.chunks()[0].code, "");
     }
@@ -1159,7 +1197,7 @@ print(sites)
         chunk.options.set("label", "x");
         let mut doc = Document::new();
         doc.push_chunk(&chunk).unwrap();
-        let out = export(&doc);
+        let out = export(&doc).unwrap();
         assert!(out.starts_with("~~~{r}") || out.starts_with("````{r}"), "{out}");
         assert_eq!(import(&out).chunks()[0].code, code);
     }
@@ -1170,7 +1208,7 @@ print(sites)
         chunk.options.set("label", "a\nb");
         let mut doc = Document::new();
         doc.push_chunk(&chunk).unwrap();
-        let out = export(&doc);
+        let out = export(&doc).unwrap();
         assert!(out.contains("#| label: a b\n"), "{out}");
     }
 
@@ -1189,7 +1227,7 @@ print(sites)
     fn front_matter_is_not_written_twice() {
         let mut doc = Document::new();
         doc.set_custom_prop(FRONT_MATTER_PROP, "---\ntitle: T\n---");
-        assert_eq!(export(&doc).matches("title: T").count(), 1);
+        assert_eq!(export(&doc).unwrap().matches("title: T").count(), 1);
     }
 
     #[test]
@@ -1213,7 +1251,7 @@ print(sites)
         assert!(chunks[0].code.contains("#| fig-cap: |"));
         assert!(chunks[0].code.contains("#|   A multi-line"));
         assert!(chunks[0].code.contains("plot(1)"));
-        let exported = export(&doc);
+        let exported = export(&doc).unwrap();
         assert!(exported.contains("```{r}\n#| label: test\n#| fig-cap: |"));
     }
 
@@ -1233,7 +1271,7 @@ print(sites)
         chunk.options.set("echo", "false");
         let mut doc = Document::new();
         doc.push_chunk(&chunk).unwrap();
-        let exported = export(&doc);
+        let exported = export(&doc).unwrap();
         let imported = import(&exported);
         let imported_chunks = imported.chunks();
         assert_eq!(imported_chunks.len(), 1);
@@ -1246,7 +1284,7 @@ print(sites)
         let chunk = CodeChunk::new("r", "#| not an option\nx <- 1");
         let mut doc = Document::new();
         doc.push_chunk(&chunk).unwrap();
-        let exported = export(&doc);
+        let exported = export(&doc).unwrap();
         let imported = import(&exported);
         let imported_chunks = imported.chunks();
         assert_eq!(imported_chunks.len(), 1);
@@ -1261,7 +1299,7 @@ print(sites)
         assert!(doc.chunks().is_empty());
         let text = text_of(&doc);
         assert!(text.contains("x = 1"));
-        let exported = export(&doc);
+        let exported = export(&doc).unwrap();
         assert!(!exported.contains("```{python}"));
     }
 
@@ -1286,7 +1324,7 @@ print(sites)
         let code = "`".repeat(300);
         let mut doc = Document::new();
         doc.push_chunk(&CodeChunk::new("python", &code)).unwrap();
-        let exported = export(&doc);
+        let exported = export(&doc).unwrap();
         let imported = import(&exported);
         assert_eq!(imported.chunks().len(), 1);
         assert_eq!(imported.chunks()[0].code, code);
@@ -1298,10 +1336,10 @@ print(sites)
         chunk.options.set("echo", "false");
         let mut doc = Document::new();
         doc.push_chunk(&chunk).unwrap();
-        let exported1 = export(&doc);
+        let exported1 = export(&doc).unwrap();
         assert!(!exported1.contains("\n\n\n#| note"), "does not add a redundant separator");
         let imported1 = import(&exported1);
-        let exported2 = export(&imported1);
+        let exported2 = export(&imported1).unwrap();
         assert_eq!(exported1, exported2, "round trips do not accumulate blank lines");
     }
 
@@ -1309,7 +1347,7 @@ print(sites)
     fn retained_yaml_cell_options_export_without_preceding_blank_line() {
         let source = "```{python}\n#| fig-cap: |\n#|   Caption\n#| eval: false\nprint(1)\n```\n";
         let doc = import(source);
-        let exported = export(&doc);
+        let exported = export(&doc).unwrap();
         assert!(exported.contains("```{python}\n#| fig-cap: |"));
         assert!(!exported.contains("```{python}\n\n#| fig-cap: |"));
     }
@@ -1319,7 +1357,7 @@ print(sites)
         let chunk = CodeChunk::new("r", "#| label: literal\n1");
         let mut doc = Document::new();
         doc.push_chunk(&chunk).unwrap();
-        let exported = export(&doc);
+        let exported = export(&doc).unwrap();
         assert!(exported.contains("```{r}\n\n#| label: literal\n1\n```"));
         let imported = import(&exported);
         let chunks = imported.chunks();
@@ -1459,10 +1497,10 @@ print(sites)
         assert_eq!(chunks[0].options.get("eval"), Some("false"));
         assert_eq!(chunks[0].code, "#| fig-cap: |\n#|   Caption\n#| eval: false\nprint(1)");
 
-        let exported = export(&doc);
+        let exported = export(&doc).unwrap();
         assert!(exported.contains("```{python}\n#| fig-cap: |\n#|   Caption\n#| eval: false\nprint(1)\n```"), "{exported}");
         assert_eq!(exported.matches("#| eval:").count(), 1, "eval must not be emitted twice: {exported}");
-        assert_eq!(export(&import(&exported)), exported, "round trip must be idempotent");
+        assert_eq!(export(&import(&exported)).unwrap(), exported, "round trip must be idempotent");
     }
 
     #[test]
@@ -1474,9 +1512,9 @@ print(sites)
         assert_eq!(chunks.len(), 1);
         assert!(chunks[0].options.eval(), "indented eval: false inside fig-cap block scalar must not disable eval");
         assert!(!chunks[0].options.echo(), "top-level echo: false after block scalar must be parsed");
-        let exported = export(&doc);
+        let exported = export(&doc).unwrap();
         assert_eq!(exported.matches("#| echo:").count(), 1, "{exported}");
-        assert_eq!(export(&import(&exported)), exported);
+        assert_eq!(export(&import(&exported)).unwrap(), exported);
 
         let nested_and_list = concat!(
             "```{r}\n",
@@ -1500,12 +1538,12 @@ print(sites)
         assert_eq!(chunks[0].options.label(), Some("fig-panels"));
         assert_eq!(chunks[0].options.get("fig-width"), Some("6"));
         assert!(!chunks[0].options.eval());
-        let exported = export(&doc);
+        let exported = export(&doc).unwrap();
         assert_eq!(exported.matches("#| label:").count(), 1, "{exported}");
         assert_eq!(exported.matches("fig.width:").count(), 1, "{exported}");
         assert_eq!(exported.matches("fig-width:").count(), 0, "alias must not duplicate as canonical key: {exported}");
         assert_eq!(exported.matches("#| eval:").count(), 1, "{exported}");
-        assert_eq!(export(&import(&exported)), exported);
+        assert_eq!(export(&import(&exported)).unwrap(), exported);
 
         let multiline_quoted = "```{python}\n#| fig-cap: \"First line\n#| eval: false\"\n#| echo: false\nprint(1)\n```\n";
         let doc = import(multiline_quoted);
@@ -1513,9 +1551,9 @@ print(sites)
         assert_eq!(chunks.len(), 1);
         assert!(chunks[0].options.eval(), "eval: false inside multiline double-quoted caption must not disable eval");
         assert!(!chunks[0].options.echo());
-        let exported = export(&doc);
+        let exported = export(&doc).unwrap();
         assert_eq!(exported.matches("#| echo:").count(), 1, "{exported}");
-        assert_eq!(export(&import(&exported)), exported);
+        assert_eq!(export(&import(&exported)).unwrap(), exported);
     }
 
     #[test]
@@ -1528,12 +1566,12 @@ print(sites)
         assert!(!chunks[0].options.eval(), "#| eval: false must override header eval=TRUE");
         assert_eq!(chunks[0].options.fig_caption(), None, "block scalar fig-cap must supersede header fig.cap");
 
-        let exported = export(&doc);
+        let exported = export(&doc).unwrap();
         assert!(exported.contains("```{r}\n#| echo: FALSE\n#| fig-cap: |\n#|   Multiline\n#|   caption\n#| eval: false\nplot(1)\n```"), "{exported}");
         assert_eq!(exported.matches("#| echo:").count(), 1, "{exported}");
         assert_eq!(exported.matches("#| eval:").count(), 1, "{exported}");
         assert_eq!(exported.matches("#| fig-cap:").count(), 1, "{exported}");
-        assert_eq!(export(&import(&exported)), exported, "second round trip must be idempotent");
+        assert_eq!(export(&import(&exported)).unwrap(), exported, "second round trip must be idempotent");
     }
 
     #[test]
@@ -1559,12 +1597,12 @@ print(sites)
         {
             run.props.bold = Some(true);
         }
-        let exported = export(&doc);
+        let exported = export(&doc).unwrap();
         assert!(exported.contains(&overlong_line), "caption must survive export after edit");
         assert!(exported.contains("```{r}\n#| echo: FALSE\n#| eval: false\n#| fig-cap:"), "retained block must stay attached to options");
         assert_eq!(exported.matches("#| eval:").count(), 1, "eval must not be duplicated");
         assert_eq!(exported.matches("#| fig-cap:").count(), 1, "fig-cap must not be duplicated");
-        assert_eq!(export(&import(&exported)), exported, "round trip must be idempotent");
+        assert_eq!(export(&import(&exported)).unwrap(), exported, "round trip must be idempotent");
 
         // Short captions and exact-limit captions still become normal ChunkOptions.
         let exact_inner = "b".repeat(wordcraft_doc::chunk::MAX_CHUNK_OPTION_CHARS - 2);
@@ -1592,12 +1630,12 @@ print(sites)
         assert!(!chunks[0].options.eval(), "eval: false must still take effect past MAX_CHUNK_OPTIONS");
         assert!(chunks[0].code.contains("#| opt-259: 259"));
 
-        let exported = export(&doc);
+        let exported = export(&doc).unwrap();
         assert!(exported.contains("#| opt-000: 0"));
         assert!(exported.contains("#| opt-259: 259"));
         assert_eq!(exported.matches("#| eval:").count(), 1);
         assert!(!exported.contains("```{r}\n\n#| opt-000:"));
-        assert_eq!(export(&import(&exported)), exported);
+        assert_eq!(export(&import(&exported)).unwrap(), exported);
 
         // Header options + #| options exceeding MAX_CHUNK_OPTIONS combined.
         let header = (0..250).map(|i| format!("h{i:03}={i}")).collect::<Vec<_>>().join(", ");
@@ -1613,14 +1651,14 @@ print(sites)
         assert!(!combined_chunks[0].options.eval(), "eval: false must still parse when header + body exceed MAX_CHUNK_OPTIONS");
         assert!(combined_chunks[0].code.contains("#| c009: 9"));
 
-        let combined_exported = export(&combined_doc);
+        let combined_exported = export(&combined_doc).unwrap();
         assert!(combined_exported.contains("#| h000: 0"));
         assert!(combined_exported.contains("#| h249: 249"));
         assert!(combined_exported.contains("#| c000: 0"));
         assert!(combined_exported.contains("#| c009: 9"));
         assert_eq!(combined_exported.matches("#| eval:").count(), 1);
         assert!(!combined_exported.contains("\n\n#| c000:"));
-        assert_eq!(export(&import(&combined_exported)), combined_exported);
+        assert_eq!(export(&import(&combined_exported)).unwrap(), combined_exported);
     }
 
     #[test]
@@ -1633,11 +1671,11 @@ print(sites)
         assert_eq!(chunks.len(), 1);
         assert!(!chunks[0].options.eval());
         assert!(chunks[0].code.contains(&huge_line));
-        let exported = export(&doc);
+        let exported = export(&doc).unwrap();
         assert!(exported.contains(&huge_line));
         assert_eq!(exported.matches("#| eval:").count(), 1);
         assert!(!exported.contains("```{r}\n\n#| fig-cap:"));
-        assert_eq!(export(&import(&exported)), exported);
+        assert_eq!(export(&import(&exported)).unwrap(), exported);
 
         // Non-YAML syntax (missing space after `:`) with an unstoreable value must still not be consumed.
         let compact_inner = "z".repeat(wordcraft_doc::chunk::MAX_CHUNK_OPTION_CHARS + 1);
@@ -1648,7 +1686,7 @@ print(sites)
         assert_eq!(compact_chunks.len(), 1);
         assert!(!compact_chunks[0].options.eval());
         assert!(compact_chunks[0].code.contains(&compact_line));
-        assert!(export(&compact_doc).contains(&compact_line));
+        assert!(export(&compact_doc).unwrap().contains(&compact_line));
     }
 
     #[test]
@@ -1691,5 +1729,105 @@ print(sites)
         for text in ["-a", "***", "1234567890. a", "1:", "a. b", "", "```{r}"] {
             assert!(!is_list_marker(text), "{text:?}");
         }
+    }
+
+    #[test]
+    fn table_cell_chunk_is_reported_as_error_on_export() {
+        use std::sync::Arc;
+        use wordcraft_doc::{Block, CharProps, ContentControl, ControlKind, InlineObject, Table, para_block};
+
+        let mut doc = Document::new();
+        doc.body = vec![para_block(Paragraph::with_text("Intro", CharProps::default()))];
+        doc.push_chunk(&CodeChunk::new("r", "x <- 1")).unwrap();
+
+        let mut cell_chunk = CodeChunk::new("python", "y = 2");
+        cell_chunk.options.set("eval", "false");
+        cell_chunk.options.set("label", "tbl-chunk");
+        let cell_blocks = doc.chunk_blocks(&cell_chunk).unwrap();
+
+        let mut table = Table::new(1, 2, 100.0);
+        table.rows[0].cells[0].blocks = cell_blocks;
+        table.rows[0].cells[1].blocks = vec![para_block(Paragraph::with_text("note", CharProps::default()))];
+        doc.body.push(Arc::new(Block::Table(table)));
+
+        assert_eq!(doc.chunks().len(), 2, "model includes both top-level and table-cell chunks");
+        let err = export(&doc).expect_err("table-cell chunk must not be silently dropped on Quarto export");
+        assert!(err.contains("1 code chunk inside a table cell"), "{err}");
+
+        for ext in ["qmd", "rmd"] {
+            let err = crate::export(ext, &doc).expect("our format").expect_err("dispatch must report the loss");
+            assert!(err.contains("table cell"), "{ext}: {err}");
+            let err = crate::export_with(ext, &doc, &crate::ExportOptions { comments: true })
+                .expect("our format")
+                .expect_err("export_with must propagate the error");
+            assert!(err.contains("table cell"), "{ext}: {err}");
+        }
+
+        // Multiple chunks across nested tables are all counted.
+        let nested_blocks = doc.chunk_blocks(&CodeChunk::new("r", "z <- 3")).unwrap();
+        let mut inner = Table::new(1, 1, 50.0);
+        inner.rows[0].cells[0].blocks = nested_blocks;
+        let mut outer = Table::new(1, 1, 100.0);
+        outer.rows[0].cells[0].blocks = vec![Arc::new(Block::Table(inner))];
+        doc.body.push(Arc::new(Block::Table(outer)));
+
+        let err = export(&doc).expect_err("nested table chunks must be reported");
+        assert!(err.contains("2 code chunks inside table cells"), "{err}");
+
+        // Ordinary tables (even with non-chunk content controls) alongside top-level chunks still export cleanly.
+        let mut plain_doc = Document::new();
+        plain_doc.body = vec![para_block(Paragraph::with_text("Intro", CharProps::default()))];
+        plain_doc.push_chunk(&CodeChunk::new("r", "x <- 1")).unwrap();
+        let mut ctrl = ContentControl::new(ControlKind::RichText);
+        ctrl.id = Some(42);
+        ctrl.tag = "ordinary:control".to_string();
+        ctrl.block = true;
+        let mut cell_para = Paragraph::with_text("plain cell", CharProps::default());
+        let mark = CharProps::default();
+        cell_para.insert_object(0, InlineObject::ControlStart { control: Box::new(ctrl) }, &mark).unwrap();
+        cell_para.insert_object(cell_para.len(), InlineObject::ControlEnd, &mark).unwrap();
+        let mut plain_table = Table::new(1, 1, 100.0);
+        plain_table.rows[0].cells[0].blocks = vec![para_block(cell_para)];
+        plain_doc.body.push(Arc::new(Block::Table(plain_table)));
+
+        let exported = export(&plain_doc).expect("plain table with top-level chunk should export");
+        assert!(exported.contains("```{r}\nx <- 1\n```"), "{exported}");
+        assert!(exported.contains("plain cell"), "{exported}");
+    }
+
+    #[test]
+    fn non_body_and_overlapping_chunks_are_reported_as_error_on_export() {
+        use wordcraft_doc::{CharProps, ContentControl, ControlKind, InlineObject, Part, PartKind, para_block};
+
+        // A chunk stored in a non-body story (e.g. a header part) cannot be represented in Quarto.
+        let mut part_doc = Document::new();
+        let part_blocks = part_doc.chunk_blocks(&CodeChunk::new("r", "hdr <- 1")).unwrap();
+        part_doc.parts.insert(1, Part { kind: PartKind::Header, blocks: part_blocks, ..Default::default() });
+        let err = export(&part_doc).expect_err("non-body chunk must not be silently dropped");
+        assert!(err.contains("1 code chunk outside the document body"), "{err}");
+
+        // Overlapping / nested top-level chunks cannot both be emitted as flat fenced blocks.
+        let mut nested_doc = Document::new();
+        let mark = CharProps::default();
+        let mut outer = ContentControl::new(ControlKind::RichText);
+        outer.id = Some(1);
+        outer.tag = "wordcraft:chunk:r?".to_string();
+        outer.block = true;
+        let mut inner = ContentControl::new(ControlKind::RichText);
+        inner.id = Some(2);
+        inner.tag = "wordcraft:chunk:python?".to_string();
+        inner.block = true;
+
+        let mut p0 = Paragraph::with_text("outer <- 1", CharProps::default());
+        p0.insert_object(0, InlineObject::ControlStart { control: Box::new(outer) }, &mark).unwrap();
+        let mut p1 = Paragraph::with_text("inner = 2", CharProps::default());
+        p1.insert_object(0, InlineObject::ControlStart { control: Box::new(inner) }, &mark).unwrap();
+        p1.insert_object(p1.len(), InlineObject::ControlEnd, &mark).unwrap();
+        p1.insert_object(p1.len(), InlineObject::ControlEnd, &mark).unwrap();
+        nested_doc.body = vec![para_block(p0), para_block(p1)];
+
+        assert_eq!(nested_doc.chunk_refs(StoryRef::Body).len(), 2);
+        let err = export(&nested_doc).expect_err("overlapping top-level chunks must not silently drop the inner chunk");
+        assert!(err.contains("overlapping"), "{err}");
     }
 }
