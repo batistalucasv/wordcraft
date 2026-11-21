@@ -1360,7 +1360,7 @@ fn which_binary_skips_non_executable_candidates() {
 
 #[test]
 fn captures_multiple_plots_in_creation_order() {
-    if is_language_available(CodeLanguage::Python) {
+    if is_language_available(CodeLanguage::Python) && matplotlib_available() {
         let py_code = r#"
 import matplotlib.pyplot as plt
 fig1, ax1 = plt.subplots()
@@ -1370,10 +1370,6 @@ ax2.plot([0, 1], [1, 0])
 "#;
         let res = execute(&ExecutionRequest::new(CodeLanguage::Python, py_code).with_plot_format(PlotFormat::Both)).expect("python execute");
         assert!(res.success, "stderr: {}", res.stderr);
-        if res.plots.is_empty() {
-            // Skip plot count assertions if matplotlib is absent in the Python environment.
-            return;
-        }
         assert_eq!(res.plots.len(), 2, "must capture both Python figures");
         assert!(res.plots[0].png.is_some() && res.plots[0].svg.is_some());
         assert!(res.plots[1].png.is_some() && res.plots[1].svg.is_some());
@@ -1387,5 +1383,61 @@ ax2.plot([0, 1], [1, 0])
         assert_eq!(res.plots.len(), 2, "must capture both R plots");
         assert!(res.plots[0].png.is_some() && res.plots[1].png.is_some());
         assert_eq!(res.plot_png.as_ref(), res.plots[0].png.as_ref());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn captures_multiple_plots_skips_python_without_matplotlib_and_runs_r() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let Some(real_python) = which_binary(CodeLanguage::Python) else {
+        return;
+    };
+    let real_python = std::path::absolute(&real_python).expect("absolute python path");
+    let real_r = which_binary(CodeLanguage::R).map(|path| std::path::absolute(&path).expect("absolute R path"));
+
+    let (dir, _guard) = test_scratch_dir("wc-no-matplotlib");
+    let dir = std::path::absolute(&dir).expect("absolute scratch dir");
+    let py_marker = dir.join("python-calls");
+    let py_shim = dir.join(CodeLanguage::Python.binary_name());
+    fs::write(&py_shim, b"#!/bin/sh\nprintf 'call\\n' >> \"$WC_TEST_PY_MARKER\"\nexec \"$WC_TEST_REAL_PYTHON\" -I -S \"$@\"\n")
+        .expect("write python shim");
+    fs::set_permissions(&py_shim, fs::Permissions::from_mode(0o755)).expect("chmod python shim");
+
+    let r_marker = dir.join("r-calls");
+    if real_r.is_some() {
+        let r_shim = dir.join(CodeLanguage::R.binary_name());
+        fs::write(&r_shim, b"#!/bin/sh\nprintf 'call\\n' >> \"$WC_TEST_R_MARKER\"\nexec \"$WC_TEST_REAL_R\" \"$@\"\n").expect("write R shim");
+        fs::set_permissions(&r_shim, fs::Permissions::from_mode(0o755)).expect("chmod R shim");
+    }
+
+    let existing_path = std::env::var_os("PATH").unwrap_or_default();
+    let mut path_entries = vec![dir.clone()];
+    path_entries.extend(std::env::split_paths(&existing_path));
+    let shim_path = std::env::join_paths(path_entries).expect("join shim PATH");
+
+    let test_bin = std::env::current_exe().expect("current test executable");
+    let mut cmd = Command::new(test_bin);
+    cmd.args(["--exact", "tests::captures_multiple_plots_in_creation_order", "--nocapture"])
+        .env("PATH", shim_path)
+        .env("WC_TEST_REAL_PYTHON", &real_python)
+        .env("WC_TEST_PY_MARKER", &py_marker);
+    if let Some(real_r) = &real_r {
+        cmd.env("WC_TEST_REAL_R", real_r).env("WC_TEST_R_MARKER", &r_marker);
+    }
+
+    let output = cmd.output().expect("run captures_multiple_plots_in_creation_order without matplotlib");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "test must pass when Python lacks matplotlib\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(stdout.contains("1 passed"), "expected exact test to execute\nstdout:\n{stdout}\nstderr:\n{stderr}");
+
+    let py_calls = fs::read_to_string(&py_marker).expect("python probe must have run").lines().count();
+    assert_eq!(py_calls, 1, "only matplotlib_available() should invoke python3 when matplotlib is absent");
+
+    if real_r.is_some() {
+        let r_calls = fs::read_to_string(&r_marker).expect("R branch must still run when matplotlib is absent").lines().count();
+        assert_eq!(r_calls, 1, "R multi-plot branch must run independently of matplotlib availability");
     }
 }
