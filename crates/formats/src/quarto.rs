@@ -179,8 +179,7 @@ fn push_chunk(out: &mut String, chunk: &CodeChunk) {
         }
         out.push('\n');
     }
-    let first_line = chunk.code.lines().next().unwrap_or("");
-    if first_line.trim_start().starts_with("#|") && retained.is_none() {
+    if retained.is_none() && first_nonblank_is_hash_pipe(chunk.code.split('\n')) {
         out.push('\n');
     }
     out.push_str(&chunk.code);
@@ -189,6 +188,16 @@ fn push_chunk(out: &mut String, chunk: &CodeChunk) {
     }
     out.push_str(&fence);
     out.push_str("\n\n");
+}
+
+/// Whether the first non-blank line in `lines` starts with `#|` (ignoring leading whitespace).
+///
+/// Export prepends one empty separator line whenever non-retained chunk code matches this
+/// predicate, and import removes one leading empty line under the same predicate. Shifting a
+/// leading run of `k >= 0` blank lines to `k + 1` on export and back to `k` on import distinguishes
+/// the inserted separator from source blank lines and prevents blank-line accumulation.
+fn first_nonblank_is_hash_pipe<'a>(mut lines: impl Iterator<Item = &'a str>) -> bool {
+    lines.find(|line| !line.trim().is_empty()).is_some_and(|line| line.trim_start().starts_with("#|"))
 }
 
 /// Top-level option entry seen inside a retained leading `#|` YAML block.
@@ -763,6 +772,9 @@ fn chunk_open(line: &str) -> Option<(char, usize, &str)> {
         return None;
     }
     let rest = t.get(len..)?;
+    if ch == '`' && rest.contains('`') {
+        return None;
+    }
     let inner = rest.strip_prefix('{')?;
     let end = find_chunk_header_end(inner)?;
     let info = inner.get(..end)?;
@@ -814,6 +826,9 @@ fn find_chunk_header_end(s: &str) -> Option<usize> {
 }
 
 /// Whether `line` opens an ordinary Markdown code fence (at least 3 backticks or tildes).
+///
+/// Per CommonMark, a backtick fence's info string cannot contain backticks; otherwise an inline
+/// code span at the start of a line (such as `` ```code``` ``) would be mistaken for a fence.
 fn fence_open(line: &str) -> Option<(char, usize)> {
     let (indent, t) = leading_indent_cols(line);
     if indent >= 4 {
@@ -825,6 +840,9 @@ fn fence_open(line: &str) -> Option<(char, usize)> {
     }
     let len = t.chars().take_while(|c| *c == ch).count();
     if len < 3 {
+        return None;
+    }
+    if ch == '`' && t.get(len..).is_some_and(|info| info.contains('`')) {
         return None;
     }
     Some((ch, len))
@@ -1013,8 +1031,8 @@ fn strip_option_lines(body: &str, mut options: ChunkOptions) -> (String, ChunkOp
         start += 1;
     }
     if let Some(sep) = lines.get(start)
-        && sep.trim().is_empty()
-        && lines.get(start + 1).is_some_and(|l| l.trim_start().starts_with("#|"))
+        && sep.is_empty()
+        && lines.get(start + 1..).is_some_and(|rest| first_nonblank_is_hash_pipe(rest.iter().copied()))
     {
         start += 1;
     }
@@ -1331,16 +1349,75 @@ print(sites)
     }
 
     #[test]
-    fn source_comments_with_existing_blank_line_do_not_accumulate_blank_lines() {
-        let mut chunk = CodeChunk::new("r", "\n#| note\n1");
-        chunk.options.set("echo", "false");
-        let mut doc = Document::new();
-        doc.push_chunk(&chunk).unwrap();
-        let exported1 = export(&doc).unwrap();
-        assert!(!exported1.contains("\n\n\n#| note"), "does not add a redundant separator");
-        let imported1 = import(&exported1);
-        let exported2 = export(&imported1).unwrap();
-        assert_eq!(exported1, exported2, "round trips do not accumulate blank lines");
+    fn source_comments_with_existing_blank_line_preserve_exact_source_and_do_not_accumulate() {
+        let mut exports = Vec::new();
+        for (code, with_option) in [
+            ("#| note\n1", true),
+            ("\n#| note\n1", true),
+            ("\n\n#| note\n1", true),
+            ("  \n#| note\n1", true),
+            ("\n#| note\n1", false),
+            ("\nx <- 1", true),
+        ] {
+            let mut chunk = CodeChunk::new("r", code);
+            if with_option {
+                chunk.options.set("echo", "false");
+            }
+            let mut doc = Document::new();
+            doc.push_chunk(&chunk).unwrap();
+
+            let exported1 = export(&doc).unwrap();
+            let imported1 = import(&exported1);
+            let chunks1 = imported1.chunks();
+            assert_eq!(chunks1.len(), 1, "code={code:?} with_option={with_option}");
+            assert_eq!(chunks1[0].code, code, "imported source must match exactly for {code:?}");
+            assert_eq!(chunks1[0].options.get("echo"), with_option.then_some("false"));
+
+            let exported2 = export(&imported1).unwrap();
+            assert_eq!(exported1, exported2, "round trips must not accumulate blank lines for {code:?}");
+            let imported2 = import(&exported2);
+            assert_eq!(imported2.chunks()[0].code, code, "second import must preserve {code:?}");
+
+            if with_option && matches!(code, "#| note\n1" | "\n#| note\n1") {
+                exports.push(exported1);
+            }
+        }
+        assert_ne!(exports[0], exports[1], "exported form must distinguish a source blank line from an inserted separator");
+    }
+
+    #[test]
+    fn backtick_line_with_backticks_in_info_string_does_not_open_fence() {
+        let prose_then_chunk = "```inline``` starts a paragraph.\n\n```{r}\nx <- 1\n```\n";
+        let doc = import(prose_then_chunk);
+        let chunks = doc.chunks();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].code, "x <- 1");
+
+        let chunk_span_in_prose = "```{r}``` opens an R chunk.\n\n```{r}\ny <- 2\n```\n";
+        let doc = import(chunk_span_in_prose);
+        let chunks = doc.chunks();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].code, "y <- 2");
+
+        let four_backticks_span = "```` ```{r} ```` opens an R chunk.\n\n  ```code``` indented prose.\n\n```{r}\nz <- 3\n```\n";
+        let doc = import(four_backticks_span);
+        let chunks = doc.chunks();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].code, "z <- 3");
+
+        // An inline code span at column 0 is a lazy continuation of a list item, not a fence that ends it.
+        let list_with_inline_span = "- Item\n```inline```\n\n  ```{r}\n  x <- 1\n  ```\n";
+        let doc = import(list_with_inline_span);
+        assert!(doc.chunks().is_empty());
+        assert_eq!(doc.body, crate::markdown::import(list_with_inline_span).body);
+
+        // Valid ordinary fences (including tilde fences with backticks in their info string) still shield examples.
+        for shielded in
+            ["````markdown\n```{r}\nx <- 1\n```\n````\n", "````\n```{r}\nx <- 1\n```\n````\n", "~~~markdown `example`\n```{r}\nx <- 1\n```\n~~~\n"]
+        {
+            let doc = import(shielded);
+            assert!(doc.chunks().is_empty(), "{shielded:?}");
+        }
     }
 
     #[test]
