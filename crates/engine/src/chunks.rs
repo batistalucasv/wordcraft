@@ -6,7 +6,7 @@
 //! notebook's kernel output, and forgotten by `code.clear_output`, `code.restart_kernel`, another
 //! run, or opening another document.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::hash::{Hash, Hasher};
 
 use serde_json::{Value, json};
@@ -24,8 +24,20 @@ pub const MAX_TIMEOUT_MS: u64 = 600_000;
 pub const MAX_CHUNK_BYTES: usize = wordcraft_doc::chunk::MAX_CHUNK_CODE_BYTES;
 
 /// Longest stdout, stderr or SVG text reported in a command's JSON, in bytes. A runaway script
-/// can print more; the rest stays in memory for the front end but is not echoed to an agent.
+/// can print more; the rest stays in memory (within [`MAX_RETAINED_OUTPUT_BYTES`]) for the front
+/// end but is not echoed to an agent.
 const MAX_REPORTED_TEXT: usize = 256 * 1024;
+
+/// Maximum combined retained chunk output bytes kept in memory per open document (64 MiB).
+///
+/// When storing a new chunk output would exceed this budget, the oldest retained outputs for
+/// the document are evicted and [`ChunkState::rev`] advances so mounted widgets drop stale
+/// copies. A single output larger than this budget is not retained.
+pub const MAX_RETAINED_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
+
+/// Maximum number of distinct chunk outputs retained per open document, bounding map overhead
+/// even when outputs have empty payloads.
+const MAX_RETAINED_OUTPUTS: usize = 4_096;
 
 /// Whether `p` is inside the chunk `range` (between its markers, either edge included).
 fn contains(range: &ChunkRef, p: &Pos) -> bool {
@@ -130,6 +142,41 @@ impl ChunkOutput {
         }
         out
     }
+
+    /// Approximate heap memory retained by this output, in bytes.
+    pub fn retained_bytes(&self) -> usize {
+        let mut bytes = self.stdout.len().saturating_add(self.stderr.len());
+        if let Some(png) = &self.plot_png {
+            bytes = bytes.saturating_add(png.len());
+        }
+        if let Some(svg) = &self.plot_svg {
+            bytes = bytes.saturating_add(svg.len());
+        }
+        bytes = bytes.saturating_add(self.plots.len().saturating_mul(std::mem::size_of::<PlotOutput>()));
+        for plot in &self.plots {
+            if let Some(png) = &plot.png {
+                bytes = bytes.saturating_add(png.len());
+            }
+            if let Some(svg) = &plot.svg {
+                bytes = bytes.saturating_add(svg.len());
+            }
+        }
+        bytes = bytes.saturating_add(self.tables.len().saturating_mul(std::mem::size_of::<TabularOutput>()));
+        for table in &self.tables {
+            bytes = bytes.saturating_add(table.headers.len().saturating_mul(std::mem::size_of::<String>()));
+            for header in &table.headers {
+                bytes = bytes.saturating_add(header.len());
+            }
+            bytes = bytes.saturating_add(table.rows.len().saturating_mul(std::mem::size_of::<Vec<String>>()));
+            for row in &table.rows {
+                bytes = bytes.saturating_add(row.len().saturating_mul(std::mem::size_of::<String>()));
+                for cell in row {
+                    bytes = bytes.saturating_add(cell.len());
+                }
+            }
+        }
+        bytes
+    }
 }
 
 /// `s`, cut at a character boundary when it is longer than the report limit, plus whether it was cut.
@@ -181,16 +228,36 @@ struct StoredOutput {
     output: ChunkOutput,
     fingerprint: Option<ChunkFingerprint>,
     rev: u64,
+    bytes: usize,
 }
 
 /// Per-document chunk outputs, mounted heights, and kernel generation, swapped with [`DocState`].
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct DocChunkOutputs {
     outputs: BTreeMap<i64, StoredOutput>,
+    /// Insertion/update order `(chunk_id, entry_rev)` for FIFO eviction when the budget is exceeded.
+    order: VecDeque<(i64, u64)>,
+    retained_bytes: usize,
+    max_retained_bytes: usize,
     heights: BTreeMap<i64, u32>,
     generation: u64,
     rev: u64,
     heights_rev: u64,
+}
+
+impl Default for DocChunkOutputs {
+    fn default() -> Self {
+        Self {
+            outputs: BTreeMap::new(),
+            order: VecDeque::new(),
+            retained_bytes: 0,
+            max_retained_bytes: MAX_RETAINED_OUTPUT_BYTES,
+            heights: BTreeMap::new(),
+            generation: 0,
+            rev: 0,
+            heights_rev: 0,
+        }
+    }
 }
 
 /// The kernel's transient state in a session: the active document's last chunk outputs and
@@ -212,16 +279,87 @@ impl ChunkState {
         (self.runner)(request)
     }
 
-    /// Keep `output` as the last output of chunk `id`.
+    /// Keep `output` as the last output of chunk `id`, evicting the oldest outputs in the active
+    /// document if retaining it would exceed [`Self::max_retained_bytes`].
     pub fn store(&mut self, id: i64, output: ChunkOutput) {
-        self.doc.rev = self.doc.rev.wrapping_add(1);
-        self.doc.outputs.insert(id, StoredOutput { output, fingerprint: None, rev: self.doc.rev });
+        self.insert_output(id, None, output);
     }
 
-    /// Keep `output` as the last output of chunk `id`, bound to its `language` and `code`.
+    /// Keep `output` as the last output of chunk `id`, bound to its `language` and `code`,
+    /// evicting the oldest outputs in the active document if retaining it would exceed
+    /// [`Self::max_retained_bytes`].
     pub fn store_for(&mut self, id: i64, language: &str, code: &str, output: ChunkOutput) {
+        self.insert_output(id, Some(ChunkFingerprint::new(language, code)), output);
+    }
+
+    /// Combined bytes currently retained across all stored chunk outputs in the active document.
+    pub fn retained_bytes(&self) -> usize {
+        self.doc.retained_bytes
+    }
+
+    /// Maximum combined output bytes retained in memory for the active document.
+    pub fn max_retained_bytes(&self) -> usize {
+        self.doc.max_retained_bytes
+    }
+
+    /// Update the active document's retained output budget, immediately evicting the oldest
+    /// entries and advancing [`Self::rev`] if current outputs exceed `limit`.
+    pub fn set_max_retained_bytes(&mut self, limit: usize) {
+        self.doc.max_retained_bytes = limit;
+        let before = self.doc.outputs.len();
+        self.evict_for(0, 0);
+        if self.doc.outputs.len() != before {
+            self.doc.rev = self.doc.rev.wrapping_add(1);
+            self.compact_order_if_needed();
+        }
+    }
+
+    fn insert_output(&mut self, id: i64, fingerprint: Option<ChunkFingerprint>, output: ChunkOutput) {
+        let bytes = output.retained_bytes();
+        if let Some(prev) = self.doc.outputs.remove(&id) {
+            self.doc.retained_bytes = self.doc.retained_bytes.saturating_sub(prev.bytes);
+        }
         self.doc.rev = self.doc.rev.wrapping_add(1);
-        self.doc.outputs.insert(id, StoredOutput { output, fingerprint: Some(ChunkFingerprint::new(language, code)), rev: self.doc.rev });
+        if bytes > self.doc.max_retained_bytes {
+            self.compact_order_if_needed();
+            return;
+        }
+        self.evict_for(bytes, 1);
+        let rev = self.doc.rev;
+        self.doc.outputs.insert(id, StoredOutput { output, fingerprint, rev, bytes });
+        self.doc.retained_bytes = self.doc.retained_bytes.saturating_add(bytes);
+        self.doc.order.push_back((id, rev));
+        self.compact_order_if_needed();
+    }
+
+    fn evict_one_oldest(&mut self) -> bool {
+        while let Some((evict_id, evict_rev)) = self.doc.order.pop_front() {
+            if self.doc.outputs.get(&evict_id).is_some_and(|e| e.rev == evict_rev)
+                && let Some(removed) = self.doc.outputs.remove(&evict_id)
+            {
+                self.doc.retained_bytes = self.doc.retained_bytes.saturating_sub(removed.bytes);
+                return true;
+            }
+        }
+        false
+    }
+
+    fn evict_for(&mut self, incoming_bytes: usize, incoming_entries: usize) {
+        while self.doc.retained_bytes.saturating_add(incoming_bytes) > self.doc.max_retained_bytes
+            || self.doc.outputs.len().saturating_add(incoming_entries) > MAX_RETAINED_OUTPUTS
+        {
+            if !self.evict_one_oldest() {
+                break;
+            }
+        }
+    }
+
+    fn compact_order_if_needed(&mut self) {
+        let threshold = self.doc.outputs.len().saturating_mul(2).max(64);
+        if self.doc.order.len() > threshold {
+            let outputs = &self.doc.outputs;
+            self.doc.order.retain(|&(id, rev)| outputs.get(&id).is_some_and(|e| e.rev == rev));
+        }
     }
 
     /// The last output of chunk `id`, if it ran since the last clear.
@@ -261,12 +399,15 @@ impl ChunkState {
 
     /// Forget chunk `id`'s last output; whether it had one.
     pub fn clear(&mut self, id: i64) -> bool {
-        let removed = self.doc.outputs.remove(&id).is_some();
-        let height_removed = self.doc.heights.remove(&id).is_some();
-        if removed {
+        let removed = if let Some(entry) = self.doc.outputs.remove(&id) {
+            self.doc.retained_bytes = self.doc.retained_bytes.saturating_sub(entry.bytes);
             self.doc.rev = self.doc.rev.wrapping_add(1);
-        }
-        if height_removed {
+            self.compact_order_if_needed();
+            true
+        } else {
+            false
+        };
+        if self.doc.heights.remove(&id).is_some() {
             self.doc.heights_rev = self.doc.heights_rev.wrapping_add(1);
         }
         removed
@@ -276,6 +417,8 @@ impl ChunkState {
     pub fn clear_all(&mut self) -> usize {
         let n = self.doc.outputs.len();
         self.doc.outputs.clear();
+        self.doc.order.clear();
+        self.doc.retained_bytes = 0;
         if n > 0 {
             self.doc.rev = self.doc.rev.wrapping_add(1);
         }
@@ -308,6 +451,9 @@ impl ChunkState {
             entry.fingerprint.as_ref().is_none_or(|fp| fp.matches(language, code))
         });
         if self.doc.outputs.len() != o_before {
+            self.doc.retained_bytes = self.doc.outputs.values().fold(0usize, |acc, entry| acc.saturating_add(entry.bytes));
+            let outputs = &self.doc.outputs;
+            self.doc.order.retain(|&(id, rev)| outputs.get(&id).is_some_and(|e| e.rev == rev));
             self.doc.rev = self.doc.rev.wrapping_add(1);
         }
     }
@@ -426,7 +572,108 @@ mod tests {
         state.store(2, ChunkOutput::default());
         assert_eq!(state.restart(), 2);
         assert!(state.output(1).is_none());
+        assert_eq!(state.retained_bytes(), 0);
         assert_eq!(state.generation(), 1);
         assert_eq!(state.clear_all(), 0);
+    }
+
+    #[test]
+    fn retained_output_budget_evicts_oldest_entries_and_bumps_rev() {
+        let mut state = ChunkState::default();
+        state.set_max_retained_bytes(100);
+
+        state.store(1, ChunkOutput { stdout: "a".repeat(40), ..Default::default() });
+        state.store(2, ChunkOutput { stdout: "b".repeat(40), ..Default::default() });
+        let rev_after_two = state.rev();
+        assert_eq!(state.retained_bytes(), 80);
+
+        // Refreshing chunk 1 makes chunk 2 the oldest entry without evicting it yet.
+        state.store(1, ChunkOutput { stdout: "a".repeat(50), ..Default::default() });
+        assert_eq!(state.retained_bytes(), 90);
+        assert!(state.output(1).is_some());
+        assert!(state.output(2).is_some());
+        let rev_after_refresh = state.rev();
+        assert!(rev_after_refresh > rev_after_two);
+
+        // Storing chunk 3 overflows the 100-byte budget and evicts chunk 2 (now oldest).
+        state.store(3, ChunkOutput { stdout: "c".repeat(40), ..Default::default() });
+        assert!(state.retained_bytes() <= state.max_retained_bytes());
+        assert_eq!(state.retained_bytes(), 90);
+        assert!(state.output(2).is_none(), "oldest untouched chunk must be evicted");
+        assert!(state.output_with_rev(2).is_none());
+        assert!(state.output(1).is_some());
+        assert!(state.output(3).is_some());
+        assert!(state.rev() > rev_after_refresh, "eviction must advance rev so mounted widgets clear stale copies");
+
+        // Shrinking the budget immediately evicts older entries and advances rev.
+        let rev_before_shrink = state.rev();
+        state.set_max_retained_bytes(50);
+        assert!(state.retained_bytes() <= 50);
+        assert!(state.output(1).is_none());
+        assert!(state.output(3).is_some());
+        assert!(state.rev() > rev_before_shrink);
+    }
+
+    #[test]
+    fn single_output_exceeding_budget_drops_prior_entry_and_bumps_rev() {
+        let mut state = ChunkState::default();
+        state.set_max_retained_bytes(100);
+
+        state.store(1, ChunkOutput { stdout: "a".repeat(40), ..Default::default() });
+        state.store(2, ChunkOutput { stdout: "b".repeat(40), ..Default::default() });
+        let rev_before = state.rev();
+
+        // An oversized update to chunk 1 must not retain stale output for 1 or exceed budget,
+        // while keeping unrelated chunk 2 within budget and bumping rev.
+        state.store(1, ChunkOutput { stdout: "x".repeat(120), ..Default::default() });
+        assert!(state.output(1).is_none());
+        assert!(state.output(2).is_some());
+        assert_eq!(state.retained_bytes(), 40);
+        assert!(state.rev() > rev_before);
+
+        // An oversized store for a new chunk id also advances rev even when nothing was replaced.
+        let rev_before_new = state.rev();
+        state.store(3, ChunkOutput { stdout: "y".repeat(120), ..Default::default() });
+        assert!(state.output(3).is_none());
+        assert_eq!(state.retained_bytes(), 40);
+        assert!(state.rev() > rev_before_new);
+    }
+
+    #[test]
+    fn retained_bytes_tracks_plots_tables_and_reclaims_on_clear_and_invalidation() {
+        use wordcraft_doc::CodeChunk;
+
+        let plot_and_table = ChunkOutput {
+            stdout: "out".into(),
+            stderr: "err".into(),
+            plot_png: Some(vec![1; 32]),
+            plot_svg: Some("<svg/>".into()),
+            plots: vec![PlotOutput { png: Some(vec![2; 16]), svg: Some("<svg></svg>".into()) }],
+            tables: vec![TabularOutput { headers: vec!["h".into(), String::new()], rows: vec![vec![String::new(), "v".into()]] }],
+            ..Default::default()
+        };
+        assert!(plot_and_table.retained_bytes() > 3 + 3 + 32 + 6 + 16 + 11 + 2);
+
+        let mut doc = Document::new();
+        let id1 = doc.push_chunk(&CodeChunk::new("r", "1")).unwrap();
+        let id2 = doc.push_chunk(&CodeChunk::new("r", "2")).unwrap();
+
+        let mut state = ChunkState::default();
+        state.set_max_retained_bytes(100);
+        state.store_for(id1, "r", "1", ChunkOutput { stdout: "a".repeat(60), ..Default::default() });
+        assert_eq!(state.retained_bytes(), 60);
+        assert!(state.clear(id1));
+        assert_eq!(state.retained_bytes(), 0);
+
+        state.store_for(id1, "r", "1", ChunkOutput { stdout: "a".repeat(60), ..Default::default() });
+        state.store_for(id2, "r", "2", ChunkOutput { stdout: "b".repeat(40), ..Default::default() });
+        assert_eq!(state.retained_bytes(), 100);
+
+        // Changing chunk 1 invalidates its cached output and reclaims its bytes.
+        doc.update_chunk(id1, "r", "1 + 1").unwrap();
+        state.invalidate_for_document(&doc);
+        assert!(state.output(id1).is_none());
+        assert!(state.output(id2).is_some());
+        assert_eq!(state.retained_bytes(), 40);
     }
 }

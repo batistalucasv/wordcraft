@@ -1081,3 +1081,58 @@ fn insert_output_into_empty_paragraph_preserves_section_break_and_output_style()
     assert_eq!(ordinary.props.style.as_deref(), Some(wordcraft_doc::chunk::CODE_OUTPUT_STYLE));
     assert!(ordinary.section.is_none());
 }
+
+#[test]
+fn run_all_bounds_retained_output_memory_per_document() {
+    let mut s = s();
+    let per_chunk_bytes = 10 * 1024 * 1024;
+    let total_chunks = (chunks::MAX_RETAINED_OUTPUT_BYTES / per_chunk_bytes) + 3;
+    let mut ids = Vec::with_capacity(total_chunks);
+    for i in 0..total_chunks {
+        ids.push(chunk_id(&run(&mut s, "code.insert_chunk", json!({"code": format!("chunk_{i}")}))));
+    }
+
+    s.chunks.set_runner(Box::new(move |request: &ExecutionRequest| {
+        let mut stdout = String::with_capacity(per_chunk_bytes);
+        stdout.push_str(&request.code);
+        stdout.push('\n');
+        let fill = per_chunk_bytes.saturating_sub(stdout.len());
+        stdout.extend(std::iter::repeat_n('x', fill));
+        Ok(ExecutionResult { stdout, ..ok("") })
+    }));
+
+    let rev_before = s.chunks.rev();
+    let out = run(&mut s, "code.run_all", json!({}));
+    assert_eq!(out["success"], true);
+    assert_eq!(out["chunks"].as_array().map(Vec::len), Some(total_chunks));
+    assert!(
+        s.chunks.retained_bytes() <= chunks::MAX_RETAINED_OUTPUT_BYTES,
+        "retained output bytes {} must stay within document budget {}",
+        s.chunks.retained_bytes(),
+        chunks::MAX_RETAINED_OUTPUT_BYTES
+    );
+
+    let max_retained = chunks::MAX_RETAINED_OUTPUT_BYTES / per_chunk_bytes;
+    let evicted_count = total_chunks - max_retained;
+    for &evicted_id in &ids[..evicted_count] {
+        assert!(s.chunks.output(evicted_id).is_none(), "oldest chunk {evicted_id} must be evicted");
+        assert!(s.chunks.output_with_rev(evicted_id).is_none());
+    }
+    for &kept_id in &ids[evicted_count..] {
+        assert!(s.chunks.output(kept_id).is_some(), "newest chunk {kept_id} must stay retained");
+    }
+    assert!(s.chunks.rev() >= rev_before + total_chunks as u64, "output rev must advance across runs and evictions");
+
+    // A second open document in the same session tracks its own independent budget.
+    let home = s.document_id();
+    let other = s.add_document(wordcraft_doc::Document::new());
+    assert_eq!(s.chunks.retained_bytes(), 0);
+    let other_id = chunk_id(&run(&mut s, "code.insert_chunk", json!({"code": "other"})));
+    run(&mut s, "code.run_chunk", json!({"chunkId": other_id}));
+    assert_eq!(s.chunks.retained_bytes(), per_chunk_bytes);
+
+    s.activate(home).unwrap();
+    assert_eq!(s.chunks.retained_bytes(), max_retained * per_chunk_bytes);
+    s.activate(other).unwrap();
+    assert_eq!(s.chunks.retained_bytes(), per_chunk_bytes);
+}
