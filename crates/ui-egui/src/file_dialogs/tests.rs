@@ -923,3 +923,43 @@ fn many_failed_fonts_end_with_a_count() {
     a.add_fonts(fonts).unwrap();
     assert_eq!(status_text(&a), "Added 0 fonts; 5 couldn't be read: f0.ttf, f1.ttf, f2.ttf and 2 more");
 }
+
+#[test]
+fn documents_filter_includes_uppercase_rmd() {
+    assert!(DOCUMENTS.contains(&"Rmd"));
+    assert!(DOCUMENTS.contains(&"rmd"));
+    let filters = open_filters("document");
+    let (name, exts) = filters[0];
+    assert_eq!(name, "Documents");
+    assert!(exts.contains(&"Rmd"));
+    let path = std::path::Path::new("analysis.Rmd");
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap();
+    assert!(exts.contains(&ext));
+}
+
+#[test]
+fn export_markdown_to_quarto_or_rmd_preserves_path_and_dirty() {
+    let dir = scratch("export-md-quarto");
+    let original = dir.join("notes.md");
+    std::fs::write(&original, "# Header\n\nSome notes.").unwrap();
+    let (mut a, _shown) = async_app();
+    a.run("file.open", json!({"path": original.to_string_lossy()})).unwrap();
+    a.run("text.insert", json!({"text": "Edited "})).unwrap();
+    assert!(a.session.dirty);
+    assert_eq!(a.session.path.as_deref(), Some(original.as_path()));
+
+    let exported_qmd = dir.join("exported.qmd");
+    a.finish_pick(AfterPick::Export { ext: "qmd".into() }, Some(exported_qmd.to_string_lossy().into_owned())).unwrap();
+
+    assert!(exported_qmd.exists());
+    assert!(a.session.dirty, "session remains dirty after export");
+    assert_eq!(a.session.path.as_deref(), Some(original.as_path()), "session path remains notes.md");
+
+    let exported_rmd = dir.join("exported.Rmd");
+    a.finish_pick(AfterPick::Export { ext: "rmd".into() }, Some(exported_rmd.to_string_lossy().into_owned())).unwrap();
+
+    assert!(exported_rmd.exists());
+    assert!(a.session.dirty, "session remains dirty after export");
+    assert_eq!(a.session.path.as_deref(), Some(original.as_path()), "session path remains notes.md");
+    let _ = std::fs::remove_dir_all(dir);
+}
