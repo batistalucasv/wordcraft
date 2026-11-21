@@ -728,3 +728,31 @@ fn table_shading_split_keeps_palette_and_apply_separate() {
     h.state_mut().run("edit.undo", json!({})).unwrap();
     assert_eq!(first_cell_shading(h.state()), Some(red), "No Color is undone in one step");
 }
+
+/// #7310: unimplemented stub ribbon buttons (Dictate, Ink to Math, Translate, Block Authors)
+/// resolve disabled in the ribbon UI and are known to the command catalog without warnings.
+#[test]
+fn unimplemented_stub_ribbon_buttons_are_disabled() {
+    use egui::accesskit::Role;
+
+    let cases = [
+        ("Home", "Dictate", "tools.dictate"),
+        ("Draw", "Ink to Math", "draw.inkToMath"),
+        ("Review", "Translate", "review.translate"),
+        ("Review", "Block Authors", "review.blockAuthors"),
+    ];
+
+    for (tab, expected_label, id) in cases {
+        let app = WordApp::new(Session::new(wordcraft_doc::Document::from_text("Text")), crate::Services::default());
+        let h = tab_harness(app, tab);
+
+        let keymap = craft::ui::runtime::commands::keymap(&h.ctx).expect("command board has a keymap");
+        assert!(keymap.catalog().iter().any(|def| def.command.id == id), "{tab}: stub command {id} should be registered in the app catalog");
+
+        let button = h
+            .query_all(By::new().role(Role::Button))
+            .find(|n| n.accesskit_node().label().is_some_and(|l| l.split_whitespace().collect::<Vec<_>>().join(" ") == expected_label))
+            .unwrap_or_else(|| panic!("{tab}: ribbon button '{expected_label}' should exist"));
+        assert!(button.accesskit_node().is_disabled(), "{tab}: stub button {:?} ({id}) must be disabled", button.accesskit_node().label());
+    }
+}
