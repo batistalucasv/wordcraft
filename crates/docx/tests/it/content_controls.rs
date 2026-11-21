@@ -392,3 +392,90 @@ fn range_toc_without_control_stays_unwrapped_and_section_break_toc_control_hands
     let xml_sect = document_xml(&write(&d_sect).unwrap());
     assert!(xml_sect.contains("Chapter One") && xml_sect.contains("Section"), "{xml_sect}");
 }
+
+/// A code chunk (`wordcraft:chunk:<language>`) is an ordinary content control to Word: the tag is
+/// plain text, the content is ordinary paragraphs, and the options live in custom properties
+/// (`docProps/custom.xml`), which Word keeps. Everything must survive a save and reload.
+#[test]
+fn code_chunks_round_trip_as_tagged_content_controls() {
+    use wordcraft_doc::{CodeChunk, chunk::chunk_prop_name};
+
+    let mut chunk = CodeChunk::new("r", "x <- 1\nplot(x)");
+    chunk.options.set("echo", "FALSE");
+    chunk.options.set("fig-cap", "\"A plot\"");
+    let mut d = Document::new();
+    let id = d.push_chunk(&chunk).unwrap();
+
+    let bytes = write(&d).unwrap();
+    let xml = document_xml(&bytes);
+    assert!(xml.contains(r#"<w:tag w:val="wordcraft:chunk:r?"#), "{xml}");
+    assert!(xml.contains("<w:sdt>") && xml.contains("<w:sdtContent>"), "{xml}");
+
+    let back = read(&bytes).unwrap();
+    let chunks = back.chunks();
+    assert_eq!(chunks.len(), 1, "a chunk reads back whole");
+    assert_eq!(chunks[0].language, "r");
+    assert_eq!(chunks[0].code, "x <- 1\nplot(x)");
+    assert_eq!(chunks[0].options.get("echo"), Some("FALSE"));
+    assert_eq!(chunks[0].options.fig_caption().as_deref(), Some("A plot"));
+    assert_eq!(chunks[0].id, Some(id));
+    assert!(back.custom_props.iter().any(|p| p.name == chunk_prop_name(id)), "the options property stays with the control");
+
+    let again = read(&write(&back).unwrap()).unwrap();
+    assert_eq!(again.chunks(), back.chunks());
+}
+
+/// A chunk whose code is empty is still a control, and still reads back empty rather than vanishing.
+#[test]
+fn an_empty_code_chunk_round_trips() {
+    let mut d = Document::new();
+    d.push_chunk(&wordcraft_doc::CodeChunk::new("python", "")).unwrap();
+    let back = read(&write(&d).unwrap()).unwrap();
+    assert_eq!(back.chunks().len(), 1);
+    assert_eq!(back.chunks()[0].code, "");
+    assert_eq!(back.chunks()[0].language, "python");
+}
+
+/// Copying a chunk in Word gives the pasted control a new `w:id` with no matching
+/// `wordcraft.chunk.<new_id>` custom property. Because the options travel in `w:tag`, saving and
+/// reloading preserves `eval: false` and the rest of the chunk's options.
+#[test]
+fn copied_chunk_with_fresh_id_and_no_property_survives_docx_round_trip() {
+    use wordcraft_doc::{CodeChunk, chunk::chunk_prop_name};
+
+    let mut chunk = CodeChunk::new("r", "unlink('data.csv')");
+    chunk.options.set("eval", "false");
+    chunk.options.set("echo", "FALSE");
+    chunk.options.set("fig-cap", "\"Copied plot\"");
+    chunk.options.set("label", "fig-copy");
+    let mut d = Document::new();
+    let original_id = d.push_chunk(&chunk).unwrap();
+    let copied_id = original_id + 777;
+
+    let bytes = write(&d).unwrap();
+    let mut z = craft_zip::Archive::open(&bytes, craft_zip::Limits { max_entries: 10_000, max_total_bytes: 64 << 20 }).unwrap();
+    let names: Vec<String> = z.names().map(|n| n.into_owned()).collect();
+    let mut zw = craft_zip::Writer::new();
+    for name in names {
+        let mut entry = z.read(&name, 16 << 20).unwrap().unwrap();
+        if name == "word/document.xml" {
+            let xml = String::from_utf8(entry).unwrap();
+            let old_id_xml = format!(r#"<w:id w:val="{original_id}"/>"#);
+            let new_id_xml = format!(r#"<w:id w:val="{copied_id}"/>"#);
+            assert!(xml.contains(&old_id_xml), "{xml}");
+            entry = xml.replace(&old_id_xml, &new_id_xml).into_bytes();
+        }
+        zw.add(&name, &entry, craft_zip::Compression::Deflated).unwrap();
+    }
+    let copied_bytes = zw.finish().unwrap();
+
+    let back = read(&copied_bytes).unwrap();
+    assert!(!back.custom_props.iter().any(|p| p.name == chunk_prop_name(copied_id)));
+    let chunks = back.chunks();
+    assert_eq!(chunks.len(), 1);
+    assert_eq!(chunks[0].id, Some(copied_id));
+    assert!(!chunks[0].options.eval());
+    assert!(!chunks[0].options.echo());
+    assert_eq!(chunks[0].options.fig_caption().as_deref(), Some("Copied plot"));
+    assert_eq!(chunks[0].options.label(), Some("fig-copy"));
+}
