@@ -203,6 +203,7 @@ fn group_icon(title: &str) -> &'static str {
         "Voice" => "dictate",
         "Tables" => "table",
         "Links" => "link",
+        "Code" => "codeChunk",
         _ => "more",
     }
 }
@@ -233,6 +234,9 @@ pub fn command_icon(id: &str) -> &str {
         ("edit.repeat", "redo"),
         ("file.new", "blankPage"),
         ("tools.customizeRibbon", "more"),
+        ("code.insert_chunk", "codeChunk"),
+        ("code.run_chunk", "codeChunk"),
+        ("code.run_all", "codeChunk"),
     ];
     ICONS.iter().find(|(c, _)| *c == id).map_or_else(|| id.rsplit('.').next().unwrap_or(id), |(_, icon)| *icon)
 }

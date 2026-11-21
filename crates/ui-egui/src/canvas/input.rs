@@ -135,6 +135,12 @@ fn route_pointer_targets(app: &mut WordApp, ui: &Ui, resp: &egui::Response, rect
     if crate::table_mouse::pointer(app, ui, resp, rects, layout, scale) {
         return None;
     }
+    if !app.canvas.dragging
+        && let Some(at) = pointer
+        && app.canvas.code_chunks.hit(at).is_some()
+    {
+        return None;
+    }
     pointer
 }
 

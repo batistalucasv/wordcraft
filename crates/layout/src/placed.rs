@@ -110,6 +110,13 @@ pub enum Placed {
         /// Empty for anything else.
         group_boxes: Vec<(Rect, u32)>,
     },
+    /// Space reserved for an interactive code chunk control spanning body blocks `first..=last`.
+    Chunk {
+        id: i64,
+        rect: Rect,
+        first: usize,
+        last: usize,
+    },
 }
 
 impl Placed {
@@ -123,7 +130,8 @@ impl Placed {
             | Placed::Image { rect, .. }
             | Placed::Shape { rect, .. }
             | Placed::Graphic { rect, .. }
-            | Placed::Cell { rect, .. } => {
+            | Placed::Cell { rect, .. }
+            | Placed::Chunk { rect, .. } => {
                 rect.x += dx;
                 rect.y += dy;
             }
@@ -177,7 +185,8 @@ impl Placed {
             | Placed::Graphic { rect, .. }
             | Placed::Clip { rect, .. }
             | Placed::Cell { rect, .. }
-            | Placed::Object { rect, .. } => (rect.y, rect.y + rect.h),
+            | Placed::Object { rect, .. }
+            | Placed::Chunk { rect, .. } => (rect.y, rect.y + rect.h),
             Placed::Rule { y0, y1, .. } => (y0.min(*y1), y0.max(*y1)),
         }
     }
@@ -201,7 +210,8 @@ impl Placed {
             | Placed::Image { rect, .. }
             | Placed::Shape { rect, .. }
             | Placed::Graphic { rect, .. }
-            | Placed::Cell { rect, .. } => {
+            | Placed::Cell { rect, .. }
+            | Placed::Chunk { rect, .. } => {
                 *rect = turn_rect(turn, x, y, *rect);
             }
             Placed::Object { rect, origin, group_boxes, .. } => {

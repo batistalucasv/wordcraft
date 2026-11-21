@@ -654,6 +654,92 @@ impl Document {
         self.body.extend(blocks);
         Ok(id.unwrap_or(before))
     }
+
+    /// Replace the language and code of chunk `id` in the body, keeping its control properties,
+    /// custom options, existing `CodeChunk` style, and any section break on its last paragraph.
+    /// Returns `Ok(true)` if the chunk changed, `Ok(false)` if unchanged or not found.
+    pub fn update_chunk(&mut self, id: i64, language: &str, code: &str) -> Result<bool> {
+        if code.len() > MAX_CHUNK_CODE_BYTES {
+            return Err(DocError::Invalid(format!("code chunk is larger than {MAX_CHUNK_CODE_BYTES} bytes")));
+        }
+        let line_count = code.bytes().filter(|b| *b == b'\n').count() + 1;
+        if line_count > MAX_CHUNK_LINES {
+            return Err(DocError::Invalid(format!("code chunk has more than {MAX_CHUNK_LINES} lines")));
+        }
+        if code.contains(OBJ) {
+            return Err(DocError::Invalid("code chunk contains U+FFFC, which is reserved for inline objects".to_string()));
+        }
+
+        let Some(found) = self.chunk_refs(StoryRef::Body).into_iter().find(|r| r.chunk.id == Some(id)) else {
+            return Ok(false);
+        };
+        let norm_lang = normalize_language(language);
+        let effective_lang = if norm_lang.is_empty() { "text" } else { norm_lang.as_str() };
+        if found.chunk.language == effective_lang && found.chunk.code == code {
+            return Ok(false);
+        }
+
+        if found.start.story != found.end.story || found.start.path.parent() != found.end.path.parent() {
+            return Ok(false);
+        }
+        let Some(container) = self.container(found.start.story, &found.start.path) else {
+            return Ok(false);
+        };
+        let first = found.start.path.last();
+        let last = found.end.path.last();
+        if last < first || last >= container.len() {
+            return Ok(false);
+        }
+
+        let Some(first_para) = container.get(first).and_then(|b| b.as_para()) else {
+            return Ok(false);
+        };
+        let Some(mut control) = first_para.objects.iter().find_map(|o| match o {
+            InlineObject::ControlStart { control } if control.id == Some(id) => Some((**control).clone()),
+            _ => None,
+        }) else {
+            return Ok(false);
+        };
+
+        let new_tag =
+            if control.tag.contains('?') { encode_control_tag(effective_lang, &found.chunk.options) } else { format!("{CHUNK_TAG}{effective_lang}") };
+        control.tag = new_tag;
+        let mut updated = CodeChunk::new(effective_lang, code);
+        updated.options = found.chunk.options.clone();
+        control.title = updated.alias();
+
+        let trailing_section = container.get(last).and_then(|b| b.as_para()).and_then(|p| p.section.clone());
+        let first_ppr = first_para.props.clone();
+
+        if self.styles.get(CHUNK_STYLE).is_none() {
+            Arc::make_mut(&mut self.styles).upsert(chunk_style());
+        }
+
+        let lines: Vec<&str> = code.split('\n').collect();
+        let last_line = lines.len().saturating_sub(1);
+        let mut blocks = Vec::with_capacity(lines.len());
+        let mark = CharProps::default();
+        for (i, line) in lines.iter().enumerate() {
+            let mut p = Paragraph::with_text(line, CharProps::default()).styled(CHUNK_STYLE);
+            if i == 0 {
+                p.props.page_break_before = first_ppr.page_break_before;
+                p.props.keep_next = first_ppr.keep_next;
+                p.props.keep_lines = first_ppr.keep_lines;
+                p.insert_object(0, InlineObject::ControlStart { control: Box::new(control.clone()) }, &mark)?;
+            }
+            if i == last_line {
+                if let Some(sect) = &trailing_section {
+                    p.section = Some(sect.clone());
+                }
+                p.insert_object(p.len(), InlineObject::ControlEnd, &mark)?;
+            }
+            blocks.push(para_block(p));
+        }
+
+        let container = self.container_mut(found.start.story, &found.start.path)?;
+        container.splice(first..=last, blocks);
+        Ok(true)
+    }
 }
 
 /// The style a chunk's code is set in: a light code box, readable in Word without anything else.
@@ -914,6 +1000,67 @@ mod tests {
     }
 
     #[test]
+    fn update_chunk_replaces_code_and_language_without_losing_options() {
+        let mut doc = Document::new();
+        let mut opts = ChunkOptions::new();
+        opts.set("eval", "false");
+        let mut chunk = CodeChunk::new("r", "a <- 1\nb <- 2");
+        chunk.options = opts.clone();
+        let id = doc.push_chunk(&chunk).unwrap();
+        assert!(!doc.update_chunk(id, "r", "a <- 1\nb <- 2").unwrap());
+        assert!(doc.update_chunk(id, "python", "x = 42").unwrap());
+        let chunks = doc.chunks();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].id, Some(id));
+        assert_eq!(chunks[0].language, "python");
+        assert_eq!(chunks[0].code, "x = 42");
+        assert_eq!(chunks[0].options, opts);
+    }
+
+    #[test]
+    fn update_chunk_rejects_invalid_input_without_mutating() {
+        let mut doc = Document::new();
+        let id = doc.push_chunk(&CodeChunk::new("python", "x = 1")).unwrap();
+        let err = doc.update_chunk(id, "python", &format!("a{OBJ}b"));
+        assert!(matches!(err, Err(DocError::Invalid(_))));
+        let too_many_lines = "\n".repeat(MAX_CHUNK_LINES + 1);
+        assert!(matches!(doc.update_chunk(id, "python", &too_many_lines), Err(DocError::Invalid(_))));
+        assert_eq!(doc.chunks()[0].code, "x = 1");
+    }
+
+    #[test]
+    fn update_chunk_updates_nested_table_cell_chunk_without_touching_body_block_zero() {
+        use crate::{Block, Path, Table};
+
+        let mut doc = Document::from_text("body intro");
+        let cell_blocks = doc.chunk_blocks(&CodeChunk::new("r", "a <- 1")).unwrap();
+        let id = doc.chunk_refs(StoryRef::Body).first().and_then(|r| r.chunk.id).unwrap_or_else(|| match &*cell_blocks[0] {
+            Block::Para(p) => match &p.objects[0] {
+                InlineObject::ControlStart { control } => control.id.unwrap(),
+                _ => panic!("expected control start"),
+            },
+            _ => panic!("expected para"),
+        });
+        let mut table = Table::new(1, 1, 200.0);
+        table.rows[0].cells[0].blocks = cell_blocks;
+        doc.body.push(Arc::new(Block::Table(table)));
+
+        assert!(doc.update_chunk(id, "python", "x = 99").unwrap());
+        assert_eq!(doc.para(StoryRef::Body, &Path::top(0)).unwrap().plain_text(), "body intro");
+        let updated = doc.chunk_refs(StoryRef::Body).into_iter().find(|r| r.chunk.id == Some(id)).unwrap();
+        assert_eq!(updated.chunk.language, "python");
+        assert_eq!(updated.chunk.code, "x = 99");
+        assert_eq!(updated.start.path.0, vec![1, 0, 0, 0]);
+    }
+
+    #[test]
+    fn update_chunk_treats_empty_language_on_text_chunk_as_noop() {
+        let mut doc = Document::new();
+        let id = doc.push_chunk(&CodeChunk::new("", "plain")).unwrap();
+        assert!(!doc.update_chunk(id, "", "plain").unwrap());
+    }
+
+    #[test]
     fn copied_chunk_with_fresh_id_and_no_property_keeps_options_from_tag() {
         let mut doc = Document::new();
         let mut c = CodeChunk::new("r", "unlink('important')");
@@ -1032,5 +1179,42 @@ mod tests {
             panic!("expected Complete");
         };
         assert_eq!(opts.get("k"), Some("\u{FFFD} v"));
+    }
+
+    #[test]
+    fn update_chunk_preserves_missing_options_on_legacy_chunk() {
+        let mut doc = Document::new();
+        let chunk = CodeChunk::new("python", "x = 1");
+        let id = doc.push_chunk(&chunk).unwrap();
+        // Turn into a legacy chunk: strip tag query and custom property.
+        let range = &doc.control_ranges(StoryRef::Body)[0];
+        let start = range.start.clone();
+        doc.control_mut(&start).unwrap().tag = "wordcraft:chunk:python".to_string();
+        doc.remove_custom_prop(&chunk_prop_name(id));
+
+        let refs = doc.chunk_refs(StoryRef::Body);
+        assert!(doc.chunk_options_missing(&refs[0]));
+
+        let updated = doc.update_chunk(id, "r", "y = 2").unwrap();
+        assert!(updated);
+
+        let after_refs = doc.chunk_refs(StoryRef::Body);
+        assert_eq!(after_refs[0].chunk.language, "r");
+        assert_eq!(after_refs[0].chunk.code, "y = 2");
+        assert!(doc.chunk_options_missing(&after_refs[0]), "legacy chunk without options query or property must retain missing options status");
+
+        // Updating a queried chunk re-encodes tag within MAX_CONTROL_TEXT.
+        let mut doc2 = Document::new();
+        let mut chunk2 = CodeChunk::new("python", "a = 1");
+        chunk2.options.set("eval", "false");
+        let id2 = doc2.push_chunk(&chunk2).unwrap();
+        let updated2 = doc2.update_chunk(id2, "r", "b = 2").unwrap();
+        assert!(updated2);
+        let refs2 = doc2.chunk_refs(StoryRef::Body);
+        assert_eq!(refs2[0].chunk.language, "r");
+        assert_eq!(refs2[0].chunk.options.get("eval"), Some("false"));
+        let range2 = &doc2.control_ranges(StoryRef::Body)[0];
+        assert!(range2.control.tag.starts_with("wordcraft:chunk:r?"));
+        assert!(range2.control.tag.chars().count() <= MAX_CONTROL_TEXT);
     }
 }

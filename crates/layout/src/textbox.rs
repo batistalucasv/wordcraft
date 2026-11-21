@@ -181,7 +181,8 @@ fn extent(items: &[Placed]) -> f32 {
             | Placed::Graphic { rect, .. }
             | Placed::Clip { rect, .. }
             | Placed::Cell { rect, .. }
-            | Placed::Object { rect, .. } => rect.bottom(),
+            | Placed::Object { rect, .. }
+            | Placed::Chunk { rect, .. } => rect.bottom(),
         };
         if b.is_finite() {
             bottom = bottom.max(b);

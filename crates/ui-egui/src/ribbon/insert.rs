@@ -231,6 +231,20 @@ pub(super) fn insert(app: &mut WordApp, ui: &mut Ui) {
             mi(ui, app, "More Symbols…", "ui.dialog", json!({"name": "symbol"}));
         });
     });
+    group(ui, "Code", None, app, |ui, app| {
+        menu_button(
+            ui,
+            app,
+            crate::widgets::MenuButtonOptions::new("codeChunk", Some("Code\nChunk"), "Code Chunk", true, "code.insert_chunk"),
+            |ui, app| {
+                mi_icon(ui, app, "codeChunk", "Python Code Chunk", "code.insert_chunk", json!({"language": "python"}));
+                mi_icon(ui, app, "codeChunk", "R Code Chunk", "code.insert_chunk", json!({"language": "r"}));
+                ui.separator();
+                mi(ui, app, "Run All Code Chunks", "code.run_all", json!({}));
+                mi(ui, app, "Restart Kernel", "code.restart_kernel", json!({}));
+            },
+        );
+    });
 }
 
 /// What a Drop Cap menu choice sends: the position, and `keep` so each selected paragraph that has

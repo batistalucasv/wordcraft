@@ -732,6 +732,13 @@ fn paint_draw_to_review(pen: &Pen, name: &str) -> bool {
             pen.line_c(&[(10.0, 16.5), (10.0, 13.0)], a);
             pen.line_c(&[(8.0, 14.5), (10.0, 13.0), (12.0, 14.5)], a);
         }
+        "codeChunk" => {
+            // Rounded code-chunk box with angle brackets `</>` and an accent run triangle.
+            pen.rect(2.5, 3.0, 17.5, 17.0, c);
+            pen.line_c(&[(7.0, 8.5), (4.5, 11.0), (7.0, 13.5)], a);
+            pen.line_c(&[(12.5, 8.5), (15.0, 11.0), (12.5, 13.5)], a);
+            pen.line_c(&[(10.8, 7.5), (8.8, 14.5)], c);
+        }
         "position" | "wrapText" => {
             pen.lines(3.0, 17.0, &[3.0, 17.0]);
             pen.lines(3.0, 6.0, &[7.0, 10.0, 13.0]);

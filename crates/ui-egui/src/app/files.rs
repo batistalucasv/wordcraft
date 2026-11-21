@@ -152,7 +152,12 @@ impl WordApp {
             }
             match outcome {
                 // Only when nothing changed since and no later save of it is still unconfirmed.
-                async_saves::SaveOutcome::Saved if !self.session.dirty && self.session.rev() == wait.rev && !self.save_unconfirmed() => {
+                async_saves::SaveOutcome::Saved
+                    if !self.document_unsaved_by_id(wait.document)
+                        && !self.session.dirty
+                        && self.session.rev() == wait.rev
+                        && !self.save_unconfirmed() =>
+                {
                     // A failed open was already reported by name in `execute_user`.
                     let is_open = wait.then == "file.open";
                     if let Err(e) = self.execute_held_back(&wait.then, wait.params)
@@ -207,9 +212,10 @@ impl WordApp {
         if !self.has_unsaved_documents() {
             return true;
         }
-        // A comment draft the document refuses is an unsaved change: the prompt can drop it.
+        // A comment or chunk draft the document refuses is an unsaved change: the prompt can drop it.
         if self.has_document() {
             let _ = panes::flush_comment_drafts(self);
+            let _ = crate::canvas::code_chunks::flush_dirty(self);
         }
         if !self.has_unsaved_documents() {
             return true;

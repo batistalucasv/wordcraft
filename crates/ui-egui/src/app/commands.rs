@@ -36,6 +36,7 @@ impl WordApp {
         // close, New or Open counts it as a change (#1348). A draft the document refuses is not
         // part of it: saving and exporting go on without it (the refusal stays on the status
         // line), and replacing the document asks Save / Don't Save / Cancel about it.
+        let chunk_refused = if flushes_comment_drafts(id, &params) { crate::canvas::code_chunks::flush_dirty(self).err() } else { None };
         let refused = if flushes_comment_drafts(id, &params) { panes::flush_comment_drafts(self).err() } else { None };
         if id == "file.recover" && params.as_object().is_none_or(|p| p.is_empty()) {
             self.ui.backstage = true;
@@ -50,7 +51,10 @@ impl WordApp {
         }
         // The same unsaved work the control channel's refusal covers, so the prompt and the
         // refusal can't drift apart (#3274).
-        if (self.document_unsaved() || refused.is_some()) && discards_document(id, &params) && !self.closes_only_its_window(id, &params) {
+        if (self.document_unsaved() || refused.is_some() || chunk_refused.is_some())
+            && discards_document(id, &params)
+            && !self.closes_only_its_window(id, &params)
+        {
             let name = self.prompt_name();
             self.dialog = Some(dialogs::Dialog::SaveChanges {
                 name,
@@ -60,6 +64,13 @@ impl WordApp {
                 message: String::new(),
             });
             return Ok(json!({"pending": "saveChanges"}));
+        }
+        if !discards_document(id, &params)
+            && id != "file.open"
+            && let Some(err) = chunk_refused
+        {
+            self.status(err.clone());
+            return Err(err);
         }
         // The ribbon and context-menu Paste commands send no text: read the system clipboard's, as
         // Ctrl+V's paste event carries it (#584), and its HTML and RTF, which egui's paste event
@@ -112,6 +123,46 @@ impl WordApp {
     /// Run a command for a script or an agent (control channel, MCP bridge): never asks first.
     /// UI-level commands (`ui.*`) are handled here, the rest by the engine.
     pub fn execute(&mut self, id: &str, params: Value) -> Result<Value, String> {
+        let mut params = params;
+        let delete_target = if id == "code.delete_chunk" {
+            if params.get("chunkId").is_none_or(Value::is_null) {
+                let target = self
+                    .canvas
+                    .code_chunks
+                    .active_chunk
+                    .or_else(|| wordcraft_engine::chunks::chunk_at(&self.session.doc, &self.session.sel.focus).and_then(|r| r.chunk.id));
+                if let Some(target_id) = target {
+                    if let Value::Object(ref mut map) = params {
+                        map.insert("chunkId".to_string(), json!(target_id));
+                    } else {
+                        params = json!({ "chunkId": target_id });
+                    }
+                }
+                target
+            } else {
+                params.get("chunkId").and_then(Value::as_i64).filter(|&n| n > 0)
+            }
+        } else {
+            None
+        };
+        if matches!(id, "edit.undo" | "edit.redo") {
+            let _ = crate::canvas::code_chunks::flush_dirty(self);
+            if id == "edit.undo" && !self.session.can_undo() && crate::canvas::code_chunks::has_dirty_chunks(self) {
+                crate::canvas::code_chunks::revert_dirty_chunks(self);
+                self.after_command(id);
+                return Ok(json!({"undone": true}));
+            }
+        } else if matches!(id, "file.save" | "file.saveAs" | "file.exportPdf" | "file.exportPng" | "code.run_chunk" | "code.run_all")
+            && let Err(err) = crate::canvas::code_chunks::flush_dirty(self)
+        {
+            self.status(err.clone());
+            return Err(err);
+        } else if id == "code.delete_chunk"
+            && let Err(err) = crate::canvas::code_chunks::flush_dirty_except(self, delete_target)
+        {
+            self.status(err.clone());
+            return Err(err);
+        }
         self.clear_command_targets(id);
         if let Some(error) = self.document_required_error(id) {
             return Err(error);
@@ -156,6 +207,12 @@ impl WordApp {
         } else {
             self.session.run(id, &params).map_err(|e| e.to_string())
         };
+        if id == "code.delete_chunk"
+            && r.is_ok()
+            && let Some(tid) = delete_target
+        {
+            self.canvas.code_chunks.discard_draft(tid);
+        }
         if self.session.ime_body_epoch() != body_epoch {
             self.canvas.ime_interrupted_preedit |= composing_before;
             // The body (or the whole document) was replaced under the same id — setText, a
@@ -379,7 +436,37 @@ impl WordApp {
         // Opening a file, or a new document from a template, reads a file that may be protected.
         let retry = matches!(id, "file.open" | "file.newFromTemplate").then(|| params.clone());
         let retry_path = retry.clone();
-        let r = self.execute(id, params);
+        let r = if id == "code.run_chunk" {
+            if let Err(err) = crate::canvas::code_chunks::flush_dirty(self) {
+                self.status(err.clone());
+                Err(err)
+            } else {
+                let res = crate::canvas::code_chunks::run_chunk_async(self, &params, self.ctx.clone().as_ref());
+                if let Err(err) = &res {
+                    self.status(err.clone());
+                }
+                res
+            }
+        } else if id == "code.run_all" {
+            if let Err(err) = crate::canvas::code_chunks::flush_dirty(self) {
+                self.status(err.clone());
+                Err(err)
+            } else {
+                let res = crate::canvas::code_chunks::run_all_async(self, &params, self.ctx.clone().as_ref());
+                if let Err(err) = &res {
+                    self.status(err.clone());
+                }
+                res
+            }
+        } else {
+            self.execute(id, params)
+        };
+        if id == "code.insert_chunk"
+            && let Ok(v) = &r
+            && let Some(cid) = v.pointer("/chunk/id").and_then(Value::as_i64)
+        {
+            self.canvas.code_chunks.request_focus(cid, false);
+        }
         if let (Err(e), Some(params)) = (&r, retry)
             && wordcraft_engine::io::needs_password(e)
         {

@@ -524,6 +524,9 @@ fn key_press(app: &mut WordApp, ctx: &egui::Context, key: Key, modifiers: Modifi
     if leave_full_screen(app, ctx, key, modifiers, true) {
         return;
     }
+    if crate::canvas::code_chunks::maybe_enter_from_canvas_arrow(app, key, modifiers) {
+        return;
+    }
     app.canvas.swallow_text = dispatch(app, key, modifiers) && modifiers.alt;
 }
 

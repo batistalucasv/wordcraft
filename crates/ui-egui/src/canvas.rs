@@ -15,6 +15,7 @@ use crate::WordApp;
 use crate::theme::{Tokens, regular, semibold};
 
 mod balloons;
+pub(crate) mod code_chunks;
 mod column_ruler;
 mod context_menu;
 #[cfg(test)]
@@ -247,8 +248,11 @@ pub struct CanvasState {
     pub(crate) balloon_reply: bool,
     /// The selected balloon's height last frame (screen points), for its click area.
     balloon_h: f32,
+    /// Text frames / balloons.
     /// Screen rects of the comment balloons last frame (for the control channel and tests).
     pub balloon_rects: Vec<(u32, Rect)>,
+    /// Mounted interactive code chunks on the canvas (`control_id -> CodeChunk` widget + sync state).
+    pub(crate) code_chunks: code_chunks::CodeChunksState,
     /// A paste event arrived since the last Mod+V release (see `keys::canvas_events`).
     pub(crate) pasted: bool,
     /// A V (or Paste key) press reached the canvas since its last release. egui-winit keeps Mod+V
@@ -354,6 +358,7 @@ impl CanvasState {
             last_font_color: old.last_font_color,
             last_shading: old.last_shading,
             ime_faces: old.ime_faces,
+            code_chunks: code_chunks::CodeChunksState::with_restored_drafts(old.code_chunks.restored_drafts),
             tab_kind: old.tab_kind,
             scale: old.scale,
             canvas_rect: old.canvas_rect,
@@ -481,6 +486,7 @@ impl Default for CanvasState {
             balloon_reply: false,
             balloon_h: 0.0,
             balloon_rects: Vec::new(),
+            code_chunks: Default::default(),
             table_tool: None,
             table_stroke: None,
             table_resize: None,
@@ -1461,12 +1467,27 @@ fn finish_canvas_frame(finish: CanvasFinish<'_>, out: egui::scroll_area::ScrollA
         crate::content_controls::clicks(app, &resp);
     }
     let secondary_clicked = resp.secondary_clicked() && !middle_gesture;
-    handle_secondary_selection(app, &resp, &rects, layout, geo, secondary_clicked);
     // Shift+F10 opens the same menu below the caret, for the selection or the word there (#821).
     let from_keys = std::mem::take(&mut app.canvas.context_menu_from_keys);
+    let chunk_context_click = app.canvas.code_chunks.take_context_click();
+    if let Some((cid, _)) = chunk_context_click {
+        app.canvas.code_chunks.context_chunk = Some(cid);
+    } else if from_keys {
+        app.canvas.code_chunks.context_chunk = None;
+    } else if secondary_clicked {
+        app.canvas.code_chunks.context_chunk = resp.interact_pointer_pos().and_then(|p| app.canvas.code_chunks.hit(p));
+    }
+    if app.canvas.code_chunks.context_chunk.is_none() {
+        handle_secondary_selection(app, &resp, &rects, layout, geo, secondary_clicked);
+    } else {
+        app.canvas.context_issue = None;
+        app.canvas.context_synonyms = None;
+    }
     // A click on the equation frame's options strip opens the equation's menu below the strip.
     let eq_strip = app.canvas.eq_options.map(|f| f.strip).filter(|r| resp.clicked() && resp.interact_pointer_pos().is_some_and(|p| r.contains(p)));
-    if from_keys {
+    if let Some((_, pos)) = chunk_context_click {
+        app.canvas.context_menu_at = Some(pos);
+    } else if from_keys {
         context_suggestions(app);
         app.canvas.context_menu_at = caret_screen(app).map(|(p, h)| p + egui::vec2(0.0, h));
     } else if let Some(r) = eq_strip {
@@ -1477,7 +1498,7 @@ fn finish_canvas_frame(finish: CanvasFinish<'_>, out: egui::scroll_area::ScrollA
     // Keep the parent independently of egui's one memory popup: the toolbar's font, size and
     // colour controls use that slot for their own lists (as in a collapsed ribbon group).
     let mut open = app.canvas.context_menu_open;
-    if secondary_clicked || from_keys || eq_strip.is_some() {
+    if secondary_clicked || chunk_context_click.is_some() || from_keys || eq_strip.is_some() {
         egui::Popup::close_all(ui.ctx());
         open = true;
     } else if open && ui.input(|i| i.pointer.any_click()) {
@@ -1493,7 +1514,7 @@ fn finish_canvas_frame(finish: CanvasFinish<'_>, out: egui::scroll_area::ScrollA
     }
     let menu = crate::rtl::menu(&resp).open_bool(&mut shown);
     let menu = menu.at_position(app.canvas.context_menu_at.unwrap_or(out.inner_rect.left_top()));
-    let with_toolbar = crate::mini_toolbar::context_menu_visible(app);
+    let with_toolbar = app.canvas.code_chunks.context_chunk.is_none() && crate::mini_toolbar::context_menu_visible(app);
     let menu = if with_toolbar { menu.frame(egui::Frame::NONE).close_behavior(egui::PopupCloseBehavior::IgnoreClicks) } else { menu };
     menu.show(|ui| {
         if with_toolbar {
@@ -1521,9 +1542,13 @@ fn finish_canvas_frame(finish: CanvasFinish<'_>, out: egui::scroll_area::ScrollA
     }
     // The standalone selection toolbar stands down while the context popup owns the pointer.
     app.canvas.context_menu_open = shown;
+    if !shown {
+        app.canvas.code_chunks.context_chunk = None;
+    }
+    let over_mounted_chunk = ui.input(|i| i.pointer.latest_pos()).is_some_and(|p| app.canvas.code_chunks.hit(p).is_some());
     if let Some(c) = crate::ink::cursor(app).filter(|_| resp.hovered() || app.canvas.ink.is_some()) {
         ui.ctx().set_cursor_icon(c);
-    } else if resp.hovered() || app.canvas.obj_drag.is_some() {
+    } else if !over_mounted_chunk && (resp.hovered() || app.canvas.obj_drag.is_some()) {
         let latest = ui.input(|i| i.pointer.latest_pos());
         let over_object = latest.and_then(|p| crate::objects::cursor(app, layout, &rects, geo.scale, p));
         // The selection bar: Word shows a right-pointing arrow there; egui has none, so the
@@ -1547,6 +1572,7 @@ fn finish_canvas_frame(finish: CanvasFinish<'_>, out: egui::scroll_area::ScrollA
     crate::table_pen::cursor(app, ui, &resp);
     // Windows' I-beam is lost on white paper there: draw one that shows (#1746).
     if app.canvas.drawn_ibeam
+        && !over_mounted_chunk
         && (resp.hovered() || resp.dragged())
         && let Some(p) = ui.input(|i| i.pointer.latest_pos())
     {
@@ -1646,6 +1672,7 @@ fn live_selection_screen_rects(app: &mut WordApp, rects: &[Rect], scale: f32) ->
 pub fn show(app: &mut WordApp, ui: &mut Ui) {
     let t = Tokens::get(ui.ctx());
     let full = ui.available_rect_before_wrap();
+    code_chunks::sync_before_layout(app, ui);
     let layout = prepare_layout(app, ui, full);
     let view = prepare_view(app, ui, full, &layout);
     let scroll_target = if hold_scroll_for_preview(app) { None } else { update_caret_scroll(app, &view) };
@@ -1785,6 +1812,7 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
         // Content controls: the frame of the one the caret is in (all of them in Design Mode).
         crate::content_controls::paint(app, &painter, &t, &layout, &rects, geo.scale);
         paint_read_aloud_highlight(app, &painter, &layout, &rects, &geo, &t);
+        code_chunks::paint_and_interact(app, ui, &layout, &rects, geo.scale);
         // Caret.
         let focused = resp.has_focus() || app.canvas.focused;
         // After an automatic change the web's text agent starts afresh
@@ -1865,6 +1893,7 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
             }
         }
         if !math_caret
+            && !code_chunks::caret_in_mounted_chunk(app)
             && let Some(c) = layout.caret_on(&preview_sel(app).unwrap_or(&app.session.sel).focus, app.session.page_hint)
             && let Some(pr) = rects.get(c.page)
         {

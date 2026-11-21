@@ -199,6 +199,63 @@ impl Windows {
         ids
     }
 
+    /// Whether any non-shown window displaying `doc` holds unapplied code chunk drafts.
+    pub(crate) fn has_dirty_chunks_for(&self, doc: u64) -> bool {
+        self.open.iter().any(|w| w.doc == doc && w.ui.as_ref().is_some_and(|ui| ui.canvas.code_chunks.has_dirty()))
+    }
+
+    /// Flush any unapplied code chunk drafts in non-shown windows displaying `doc_id`.
+    pub(crate) fn flush_dirty_chunks_for(&mut self, session: &mut wordcraft_engine::Session, doc_id: u64, except: Option<i64>) -> Result<(), String> {
+        for w in &mut self.open {
+            if w.doc == doc_id
+                && let Some(ui) = w.ui.as_mut()
+            {
+                let mut ids: Vec<i64> =
+                    ui.canvas.code_chunks.widgets.iter().filter(|(id, e)| e.dirty && Some(**id) != except).map(|(id, _)| *id).collect();
+                ids.sort_unstable();
+                for id in ids {
+                    let (lang, code) = {
+                        let Some(entry) = ui.canvas.code_chunks.widgets.get(&id) else { continue };
+                        (entry.widget.language(), entry.widget.code().to_string())
+                    };
+                    session
+                        .run(
+                            "code.update_chunk",
+                            &serde_json::json!({
+                                "chunkId": id,
+                                "language": lang.as_str(),
+                                "code": code,
+                            }),
+                        )
+                        .map_err(|e| e.to_string())?;
+                    if let Some(entry) = ui.canvas.code_chunks.widgets.get_mut(&id) {
+                        entry.dirty = false;
+                        entry.last_synced_lang = lang;
+                        entry.last_synced_code = code;
+                        entry.last_edit_time = None;
+                    }
+                }
+                let mut parked_ids: Vec<i64> = ui.canvas.code_chunks.restored_drafts.keys().filter(|id| Some(**id) != except).copied().collect();
+                parked_ids.sort_unstable();
+                for id in parked_ids {
+                    let Some((lang, code)) = ui.canvas.code_chunks.restored_drafts.get(&id).cloned() else { continue };
+                    session
+                        .run(
+                            "code.update_chunk",
+                            &serde_json::json!({
+                                "chunkId": id,
+                                "language": lang.as_str(),
+                                "code": code,
+                            }),
+                        )
+                        .map_err(|e| e.to_string())?;
+                    ui.canvas.code_chunks.restored_drafts.remove(&id);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// The title View › Window › Switch Windows gives the window, as the frame started.
     fn menu_title(&self, key: u64) -> Option<&str> {
         self.menu.title(self.get(key)?.id?)
@@ -464,6 +521,37 @@ impl WordApp {
         if !self.enter_window(to) {
             return;
         }
+        // Preserve any unapplied chunk drafts and in-flight runs from the closing window by
+        // transferring them to a surviving window for the same document.
+        if let Some(mut closing_ui) = self.windows.open.iter_mut().find(|w| w.key == closing).and_then(|w| w.ui.take()) {
+            let closing_doc = closing_ui.shown_document;
+            let mut drafts = Vec::new();
+            for (id, (lang, code)) in &closing_ui.canvas.code_chunks.restored_drafts {
+                drafts.push((*id, *lang, code.clone()));
+            }
+            for (id, entry) in &closing_ui.canvas.code_chunks.widgets {
+                if entry.dirty {
+                    drafts.push((*id, entry.widget.language(), entry.widget.code().to_string()));
+                }
+            }
+            if self.shown_document == closing_doc {
+                for (id, lang, code) in drafts {
+                    self.canvas.code_chunks.restored_drafts.insert(id, (lang, code));
+                }
+                closing_ui.canvas.code_chunks.transfer_in_flight_runs_to(&mut self.canvas.code_chunks);
+            } else if let Some(surviving) = self.windows.open.iter_mut().find(|w| w.key != closing && w.doc == closing_doc)
+                && let Some(surviving_ui) = surviving.ui.as_mut()
+            {
+                for (id, lang, code) in drafts {
+                    surviving_ui.canvas.code_chunks.restored_drafts.insert(id, (lang, code));
+                }
+                closing_ui.canvas.code_chunks.transfer_in_flight_runs_to(&mut surviving_ui.canvas.code_chunks);
+            } else if let Some(parked) = self.parked.get_mut(&closing_doc) {
+                for (id, lang, code) in drafts {
+                    parked.chunk_drafts.insert(id, (lang, code));
+                }
+            }
+        }
         self.windows.open.retain(|w| w.key != closing);
         self.focus_window(to);
     }
@@ -615,7 +703,8 @@ impl WordApp {
         let mut name = self.windows.menu_title(self.windows.shown).map(str::to_string).unwrap_or_else(|| self.title_stem());
         // X11 converts window titles to C strings, which cannot contain NUL (#3634).
         name.retain(|c| c != '\0');
-        title(&name, self.session.dirty)
+        let doc_id = self.session.document_id();
+        title(&name, self.document_unsaved_by_id(doc_id))
     }
 
     /// Draw every window, each in its viewport (see the module documentation).
@@ -713,7 +802,7 @@ impl WordApp {
         WindowMenu::new(list, |_, key| {
             let doc = doc_of.get(key).copied().unwrap_or_default();
             match docs.iter().find(|d| d.id == doc) {
-                Some(d) => Document { key: doc, name: documents::display_title(d), dirty: d.dirty },
+                Some(d) => Document { key: doc, name: documents::display_title(d), dirty: self.document_unsaved_by_id(d.id) },
                 None => Document { key: doc, name: String::new(), dirty: false },
             }
         })

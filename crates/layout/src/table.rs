@@ -1153,6 +1153,7 @@ fn split_row_with(row: &RowLayout, cut: f32, whole_cells: bool) -> Option<(RowLa
                         }
                     }
                 }
+                Placed::Chunk { .. } => {}
             }
         }
         parts.push(CellPart { top: c.top, items: start..b.len(), end: end.map(|e| e - shift), align: None });
