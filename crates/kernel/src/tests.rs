@@ -409,29 +409,46 @@ fn capture_stops_draining_at_the_deadline() {
     assert_eq!(sink.snapshot().bytes.len(), 1024);
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn process_is_running(pid: i32) -> std::io::Result<bool> {
-    let stat = match fs::read_to_string(format!("/proc/{pid}/stat")) {
-        Ok(stat) => stat,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(error),
-    };
-    let Some((_, rest)) = stat.rsplit_once(')') else {
-        return Err(std::io::Error::new(ErrorKind::InvalidData, "unexpected /proc/<pid>/stat format"));
-    };
-    Ok(!rest.trim_start().starts_with('Z'))
+    process_tree::is_pid_running(pid)
 }
 
-#[cfg(all(unix, not(target_os = "linux")))]
-fn process_is_running(pid: i32) -> std::io::Result<bool> {
-    use nix::errno::Errno;
-    use nix::sys::signal::kill;
-    use nix::unistd::Pid;
-    match kill(Pid::from_raw(pid), None) {
-        Ok(()) => Ok(true),
-        Err(Errno::ESRCH) => Ok(false),
-        Err(error) => Err(std::io::Error::other(error.to_string())),
+/// Fallback cleanup guard used only when a test fails, so an assertion panic never leaks a helper.
+#[cfg(unix)]
+struct TestPidGuard(Option<i32>);
+
+#[cfg(unix)]
+impl TestPidGuard {
+    fn new(pid: i32) -> Self {
+        Self(Some(pid))
     }
+
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+#[cfg(unix)]
+impl Drop for TestPidGuard {
+    fn drop(&mut self) {
+        if let Some(pid) = self.0.take() {
+            use nix::sys::signal::{Signal, kill};
+            use nix::unistd::Pid;
+            let _ = kill(Pid::from_raw(pid), Signal::SIGKILL);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn assert_runner_terminated_pid(pid: i32, context: &str) {
+    let mut guard = TestPidGuard::new(pid);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while process_is_running(pid).expect("liveness probe") {
+        assert!(Instant::now() < deadline, "{context}");
+        thread::sleep(Duration::from_millis(20));
+    }
+    guard.disarm();
 }
 
 #[cfg(unix)]
@@ -455,11 +472,7 @@ time.sleep(30)
     assert!(result.timed_out);
     assert!(started.elapsed() < Duration::from_secs(8), "timeout must not wait for the descendant");
     let pid: i32 = result.stdout.trim().parse().expect("descendant pid");
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while process_is_running(pid).expect("liveness probe") {
-        assert!(Instant::now() < deadline, "the timed-out group must not leave a descendant");
-        thread::sleep(Duration::from_millis(20));
-    }
+    assert_runner_terminated_pid(pid, "the timed-out group must not leave a descendant");
 }
 
 #[cfg(unix)]
@@ -485,9 +498,101 @@ time.sleep(30)
     assert!(started.elapsed() < Duration::from_secs(8), "an escaped descendant must not delay the chunk");
 
     let pid: i32 = result.stdout.split_whitespace().next().and_then(|value| value.parse().ok()).expect("escaped pid");
-    use nix::sys::signal::{Signal, kill};
-    use nix::unistd::Pid;
-    let _ = kill(Pid::from_raw(pid), Signal::SIGKILL);
+    assert_runner_terminated_pid(pid, "the runner must terminate helpers that escape the original process group");
+}
+
+#[cfg(unix)]
+#[test]
+fn python_normal_exit_kills_escaped_descendant() {
+    if !is_language_available(CodeLanguage::Python) {
+        return;
+    }
+
+    let code = r#"
+import subprocess
+import sys
+child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], start_new_session=True)
+print(f"{child.pid} finished", flush=True)
+"#;
+    let started = Instant::now();
+    let result = execute(&ExecutionRequest::new(CodeLanguage::Python, code).with_plot_capture(false).with_timeout(10_000)).expect("execution failed");
+
+    assert!(result.success, "stderr: {}", result.stderr);
+    assert_eq!(result.exit_code, Some(0));
+    assert!(!result.timed_out);
+    assert!(result.stdout.contains("finished"), "stdout: {}", result.stdout);
+    assert!(started.elapsed() < Duration::from_secs(5), "an escaped descendant must not delay normal exit");
+
+    let pid: i32 = result.stdout.split_whitespace().next().and_then(|value| value.parse().ok()).expect("escaped pid");
+    assert_runner_terminated_pid(pid, "normal exit must terminate escaped helpers");
+}
+
+#[cfg(unix)]
+#[test]
+fn python_timeout_kills_escaped_descendant_with_cleared_env() {
+    if !is_language_available(CodeLanguage::Python) {
+        return;
+    }
+
+    let code = r#"
+import subprocess
+import sys
+import time
+child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], start_new_session=True, env={})
+print(f"{child.pid} started", flush=True)
+time.sleep(30)
+"#;
+    let started = Instant::now();
+    let result = execute(&ExecutionRequest::new(CodeLanguage::Python, code).with_plot_capture(false).with_timeout(2_000)).expect("execution failed");
+
+    assert!(result.timed_out);
+    assert!(result.stdout.contains("started"), "stdout: {}", result.stdout);
+    assert!(started.elapsed() < Duration::from_secs(8), "an escaped helper with cleared env must not delay timeout");
+
+    let pid: i32 = result.stdout.split_whitespace().next().and_then(|value| value.parse().ok()).expect("escaped pid");
+    assert_runner_terminated_pid(pid, "timeout cleanup must terminate escaped helpers even when env is cleared");
+}
+
+#[cfg(unix)]
+#[test]
+fn python_double_forked_descendant_is_terminated() {
+    if !is_language_available(CodeLanguage::Python) {
+        return;
+    }
+
+    let code = r#"
+import os
+import time
+r_fd, w_fd = os.pipe()
+pid = os.fork()
+if pid == 0:
+    os.close(r_fd)
+    os.setsid()
+    pid2 = os.fork()
+    if pid2 == 0:
+        os.write(w_fd, f"{os.getpid()}\n".encode())
+        os.close(w_fd)
+        time.sleep(30)
+        os._exit(0)
+    os.close(w_fd)
+    os._exit(0)
+os.close(w_fd)
+os.waitpid(pid, 0)
+grandchild_pid = os.read(r_fd, 64).decode().strip()
+os.close(r_fd)
+print(f"{grandchild_pid} detached", flush=True)
+"#;
+    let started = Instant::now();
+    let result = execute(&ExecutionRequest::new(CodeLanguage::Python, code).with_plot_capture(false).with_timeout(10_000)).expect("execution failed");
+
+    assert!(result.success, "stderr: {}", result.stderr);
+    assert_eq!(result.exit_code, Some(0));
+    assert!(!result.timed_out);
+    assert!(result.stdout.contains("detached"), "stdout: {}", result.stdout);
+    assert!(started.elapsed() < Duration::from_secs(5), "a double-forked helper must not delay exit");
+
+    let pid: i32 = result.stdout.split_whitespace().next().and_then(|value| value.parse().ok()).expect("grandchild pid");
+    assert_runner_terminated_pid(pid, "double-forked descendants must be terminated by the runner");
 }
 
 #[test]

@@ -9298,8 +9298,10 @@ name = "wordcraft-kernel"
 version = "0.18.1"
 dependencies = [
  "command-group",
+ "getrandom 0.3.4",
  "nix 0.27.1",
  "proptest",
+ "rustix 1.1.5",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
