@@ -901,3 +901,61 @@ fn insert_at_caret_insert_output_and_chunk_label_commands() {
         "second plot must insert at the current caret paragraph outside the chunk"
     );
 }
+
+#[test]
+fn insert_output_into_empty_paragraph_preserves_section_break_and_output_style() {
+    let mut s = s();
+    let landscape = wordcraft_doc::SectionProps { landscape: true, ..Default::default() };
+    s.doc.body = vec![
+        std::sync::Arc::new(wordcraft_doc::Block::Table(wordcraft_doc::Table::new(1, 1, 468.0))),
+        wordcraft_doc::para_block(wordcraft_doc::Paragraph::new()),
+        wordcraft_doc::para_block(wordcraft_doc::Paragraph::with_text("Next section", Default::default())),
+    ];
+    s.sel = Selection::caret(wordcraft_doc::Pos::body(1, 0));
+    let id = chunk_id(&run(&mut s, "code.insert_chunk", json!({"language": "python", "code": "b = 2"})));
+    let range = chunks::chunks_in(&s.doc, StoryRef::Body).into_iter().find(|r| r.chunk.id == Some(id)).expect("chunk");
+    let first = range.start.path.last();
+    let end_block = range.end.path.last();
+    if let Some(wordcraft_doc::Block::Para(p)) = s.doc.body.get_mut(end_block).map(std::sync::Arc::make_mut) {
+        p.section = Some(Box::new(landscape.clone()));
+    }
+
+    // Deleting a section-ending chunk after a table leaves an empty paragraph carrying the break.
+    run(&mut s, "code.delete_chunk", json!({"chunkId": id}));
+    assert_eq!(s.sel.focus, wordcraft_doc::Pos::body(first, 0));
+    assert_eq!(s.doc.sections().len(), 2);
+
+    // Single-line output into that empty paragraph keeps both the section break and output style.
+    run(&mut s, "code.insert_output", json!({"text": "single output"}));
+    let p = s.doc.para(StoryRef::Body, &wordcraft_doc::Path::top(first)).expect("single output paragraph");
+    assert_eq!(p.text, "single output");
+    assert_eq!(p.props.style.as_deref(), Some(wordcraft_doc::chunk::CODE_OUTPUT_STYLE));
+    assert_eq!(p.section.as_deref(), Some(&landscape), "section break must survive replacing the empty paragraph");
+    assert_eq!(s.doc.sections().len(), 2, "surrounding sections must not merge");
+    assert_eq!(s.doc.section_index_of(first), 0);
+    assert_eq!(s.doc.section_index_of(first + 1), 1);
+
+    // Multi-line output keeps every output line in the original section before the break.
+    run(&mut s, "edit.undo", json!({}));
+    run(&mut s, "code.insert_output", json!({"text": "line 1\nline 2"}));
+    let line1 = s.doc.para(StoryRef::Body, &wordcraft_doc::Path::top(first)).expect("first output line");
+    let line2 = s.doc.para(StoryRef::Body, &wordcraft_doc::Path::top(first + 1)).expect("second output line");
+    assert_eq!(line1.text, "line 1");
+    assert_eq!(line1.props.style.as_deref(), Some(wordcraft_doc::chunk::CODE_OUTPUT_STYLE));
+    assert!(line1.section.is_none(), "break must not split multi-line output across sections");
+    assert_eq!(line2.text, "line 2");
+    assert_eq!(line2.props.style.as_deref(), Some(wordcraft_doc::chunk::CODE_OUTPUT_STYLE));
+    assert_eq!(line2.section.as_deref(), Some(&landscape), "last output line must carry the preserved section break");
+    assert_eq!(s.doc.sections().len(), 2);
+    assert_eq!(s.doc.section_index_of(first), 0);
+    assert_eq!(s.doc.section_index_of(first + 1), 0);
+    assert_eq!(s.doc.section_index_of(first + 2), 1);
+
+    // Ordinary empty paragraphs without a section break still take the output style and stay break-free.
+    let mut plain = super::s();
+    run(&mut plain, "code.insert_output", json!({"text": "plain output"}));
+    let ordinary = plain.doc.para(StoryRef::Body, &wordcraft_doc::Path::top(0)).expect("ordinary output paragraph");
+    assert_eq!(ordinary.text, "plain output");
+    assert_eq!(ordinary.props.style.as_deref(), Some(wordcraft_doc::chunk::CODE_OUTPUT_STYLE));
+    assert!(ordinary.section.is_none());
+}
