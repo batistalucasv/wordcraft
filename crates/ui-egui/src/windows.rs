@@ -521,12 +521,10 @@ impl WordApp {
         if !self.enter_window(to) {
             return;
         }
-        // Preserve any unapplied or rejected chunk drafts from the closing window by
+        // Preserve any unapplied chunk drafts and in-flight runs from the closing window by
         // transferring them to a surviving window for the same document.
-        if let Some(closing_w) = self.windows.open.iter().find(|w| w.key == closing)
-            && let Some(ref closing_ui) = closing_w.ui
-        {
-            let closing_doc = closing_w.doc;
+        if let Some(mut closing_ui) = self.windows.open.iter_mut().find(|w| w.key == closing).and_then(|w| w.ui.take()) {
+            let closing_doc = closing_ui.shown_document;
             let mut drafts = Vec::new();
             for (id, (lang, code)) in &closing_ui.canvas.code_chunks.restored_drafts {
                 drafts.push((*id, *lang, code.clone()));
@@ -536,21 +534,21 @@ impl WordApp {
                     drafts.push((*id, entry.widget.language(), entry.widget.code().to_string()));
                 }
             }
-            if !drafts.is_empty() {
-                if self.shown_document == closing_doc {
-                    for (id, lang, code) in drafts {
-                        self.canvas.code_chunks.restored_drafts.insert(id, (lang, code));
-                    }
-                } else if let Some(surviving) = self.windows.open.iter_mut().find(|w| w.key != closing && w.doc == closing_doc)
-                    && let Some(surviving_ui) = surviving.ui.as_mut()
-                {
-                    for (id, lang, code) in drafts {
-                        surviving_ui.canvas.code_chunks.restored_drafts.insert(id, (lang, code));
-                    }
-                } else if let Some(parked) = self.parked.get_mut(&closing_doc) {
-                    for (id, lang, code) in drafts {
-                        parked.chunk_drafts.insert(id, (lang, code));
-                    }
+            if self.shown_document == closing_doc {
+                for (id, lang, code) in drafts {
+                    self.canvas.code_chunks.restored_drafts.insert(id, (lang, code));
+                }
+                closing_ui.canvas.code_chunks.transfer_in_flight_runs_to(&mut self.canvas.code_chunks);
+            } else if let Some(surviving) = self.windows.open.iter_mut().find(|w| w.key != closing && w.doc == closing_doc)
+                && let Some(surviving_ui) = surviving.ui.as_mut()
+            {
+                for (id, lang, code) in drafts {
+                    surviving_ui.canvas.code_chunks.restored_drafts.insert(id, (lang, code));
+                }
+                closing_ui.canvas.code_chunks.transfer_in_flight_runs_to(&mut surviving_ui.canvas.code_chunks);
+            } else if let Some(parked) = self.parked.get_mut(&closing_doc) {
+                for (id, lang, code) in drafts {
+                    parked.chunk_drafts.insert(id, (lang, code));
                 }
             }
         }

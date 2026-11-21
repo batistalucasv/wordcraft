@@ -123,6 +123,26 @@ impl WordApp {
     /// Run a command for a script or an agent (control channel, MCP bridge): never asks first.
     /// UI-level commands (`ui.*`) are handled here, the rest by the engine.
     pub fn execute(&mut self, id: &str, params: Value) -> Result<Value, String> {
+        let mut params = params;
+        let delete_target = if id == "code.delete_chunk" {
+            let target = params
+                .get("chunkId")
+                .and_then(Value::as_i64)
+                .or(self.canvas.code_chunks.active_chunk)
+                .or_else(|| wordcraft_engine::chunks::chunk_at(&self.session.doc, &self.session.sel.focus).and_then(|r| r.chunk.id));
+            if let Some(target_id) = target
+                && params.get("chunkId").is_none()
+            {
+                if let Value::Object(ref mut map) = params {
+                    map.insert("chunkId".to_string(), json!(target_id));
+                } else {
+                    params = json!({ "chunkId": target_id });
+                }
+            }
+            target
+        } else {
+            None
+        };
         if matches!(id, "edit.undo" | "edit.redo") {
             let _ = crate::canvas::code_chunks::flush_dirty(self);
             if id == "edit.undo" && !self.session.can_undo() && crate::canvas::code_chunks::has_dirty_chunks(self) {
@@ -135,16 +155,11 @@ impl WordApp {
         {
             self.status(err.clone());
             return Err(err);
-        } else if id == "code.delete_chunk" {
-            let delete_target = params
-                .get("chunkId")
-                .and_then(Value::as_i64)
-                .or(self.canvas.code_chunks.active_chunk)
-                .or_else(|| wordcraft_engine::chunks::chunk_at(&self.session.doc, &self.session.sel.focus).and_then(|r| r.chunk.id));
-            if let Err(err) = crate::canvas::code_chunks::flush_dirty_except(self, delete_target) {
-                self.status(err.clone());
-                return Err(err);
-            }
+        } else if id == "code.delete_chunk"
+            && let Err(err) = crate::canvas::code_chunks::flush_dirty_except(self, delete_target)
+        {
+            self.status(err.clone());
+            return Err(err);
         }
         self.clear_command_targets(id);
         if let Some(error) = self.document_required_error(id) {
@@ -185,15 +200,6 @@ impl WordApp {
         let math_session = self.session.math.as_ref().map(|m| m.session);
         let composing_before = !self.canvas.ime_preedit.is_empty();
         let old_path = self.session.path.clone();
-        let delete_target = if id == "code.delete_chunk" {
-            params
-                .get("chunkId")
-                .and_then(Value::as_i64)
-                .or(self.canvas.code_chunks.active_chunk)
-                .or_else(|| wordcraft_engine::chunks::chunk_at(&self.session.doc, &self.session.sel.focus).and_then(|r| r.chunk.id))
-        } else {
-            None
-        };
         let r = if self.ime_origin {
             self.session.run_ime(id, &params).map_err(|e| e.to_string())
         } else {

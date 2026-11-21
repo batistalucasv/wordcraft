@@ -111,6 +111,19 @@ impl CodeChunksState {
         }
     }
 
+    pub(crate) fn transfer_in_flight_runs_to(&mut self, target: &mut CodeChunksState) {
+        for run in self.pending_runs.drain(..) {
+            if !target.pending_runs.iter().any(|r| r.chunk_id == run.chunk_id) {
+                target.pending_runs.push(run);
+            }
+        }
+        for run in self.queued_runs.drain(..) {
+            if !target.queued_runs.iter().any(|r| r.chunk_id == run.chunk_id) {
+                target.queued_runs.push_back(run);
+            }
+        }
+    }
+
     fn has_in_flight_run(&self, id: i64) -> bool {
         self.pending_runs.iter().any(|r| r.chunk_id == id)
             || self.queued_runs.iter().any(|r| r.chunk_id == id)

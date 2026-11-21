@@ -403,14 +403,21 @@ fn place_chunk(ctx: &mut Ctx, pb: &mut PageBuilder, id: i64, first: usize, last:
         ctx.fields.page = pb.number;
     }
     let mut top_gap = if pb.at_top() { 0.0 } else { 4.0 };
-    while !pb.fresh() && pb.y + top_gap + h > pb.bottom + 0.5 {
+    while (!pb.fresh() || pb.balance.is_some_and(|(pg, _)| pb.pages.len() <= pg + 1)) && pb.y + top_gap + h > pb.bottom + 0.5 {
         pb.advance(first, body_top);
         ctx.fields.page = pb.number;
         top_gap = 0.0;
+        if pb.balance.is_some_and(|(pg, _)| pb.pages.len() > pg + 1) {
+            break;
+        }
     }
     let y = pb.y + top_gap;
-    let max_h = (pb.bottom - y).max(24.0);
-    let placed_h = h.min(max_h);
+    let placed_h = if pb.balance.is_some() {
+        h
+    } else {
+        let max_h = (pb.bottom - y).max(24.0);
+        h.min(max_h)
+    };
     let rect = wordcraft_geom::Rect::new(pb.col_x(), y, pb.col_w(), placed_h);
     if let Some(pg) = pb.page() {
         pg.items.push(Placed::Chunk { id, rect, first, last });

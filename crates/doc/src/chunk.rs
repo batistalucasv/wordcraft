@@ -701,10 +701,8 @@ impl Document {
             return Ok(false);
         };
 
-        let new_tag = match control.tag.split_once('?') {
-            Some((_, suffix)) => format!("{CHUNK_TAG}{effective_lang}?{suffix}"),
-            None => format!("{CHUNK_TAG}{effective_lang}"),
-        };
+        let new_tag =
+            if control.tag.contains('?') { encode_control_tag(effective_lang, &found.chunk.options) } else { format!("{CHUNK_TAG}{effective_lang}") };
         control.tag = new_tag;
         let mut updated = CodeChunk::new(effective_lang, code);
         updated.options = found.chunk.options.clone();
@@ -1204,5 +1202,19 @@ mod tests {
         assert_eq!(after_refs[0].chunk.language, "r");
         assert_eq!(after_refs[0].chunk.code, "y = 2");
         assert!(doc.chunk_options_missing(&after_refs[0]), "legacy chunk without options query or property must retain missing options status");
+
+        // Updating a queried chunk re-encodes tag within MAX_CONTROL_TEXT.
+        let mut doc2 = Document::new();
+        let mut chunk2 = CodeChunk::new("python", "a = 1");
+        chunk2.options.set("eval", "false");
+        let id2 = doc2.push_chunk(&chunk2).unwrap();
+        let updated2 = doc2.update_chunk(id2, "r", "b = 2").unwrap();
+        assert!(updated2);
+        let refs2 = doc2.chunk_refs(StoryRef::Body);
+        assert_eq!(refs2[0].chunk.language, "r");
+        assert_eq!(refs2[0].chunk.options.get("eval"), Some("false"));
+        let range2 = &doc2.control_ranges(StoryRef::Body)[0];
+        assert!(range2.control.tag.starts_with("wordcraft:chunk:r?"));
+        assert!(range2.control.tag.chars().count() <= MAX_CONTROL_TEXT);
     }
 }
