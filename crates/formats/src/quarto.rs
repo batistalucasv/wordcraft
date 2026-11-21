@@ -501,6 +501,11 @@ fn prepare(text: &str) -> (String, Vec<Pending>) {
     let lines: Vec<&str> = text.split_inclusive('\n').collect();
     let mut i = 0;
     let mut in_fence: Option<(char, usize)> = None;
+    // Whether a list item may still be open. A chunk fence indented under a list item belongs to
+    // that item; replacing it with a sentinel fence at column zero would end the list, so such a
+    // fence is left as written. Unsure cases count as open: the fence then stays ordinary code.
+    let mut in_list = false;
+    let mut prev_blank = true;
     let tag = format!("{:x}", (text.as_ptr() as usize) ^ text.len());
 
     while i < lines.len() {
@@ -510,11 +515,25 @@ fn prepare(text: &str) -> (String, Vec<Pending>) {
             if closes(line, f_ch, f_len) {
                 in_fence = None;
             }
+            prev_blank = false;
             i += 1;
             continue;
         }
 
-        let Some((ch, len, info)) = chunk_open(line) else {
+        let (indent, rest) = leading_indent_cols(line);
+        let blank = line.trim().is_empty();
+        if !blank {
+            if indent < 4 && is_list_marker(rest) {
+                in_list = true;
+            } else if indent == 0 && (prev_blank || fence_open(line).is_some()) {
+                // An unindented line ends the list after a blank line; a fence ends it at once,
+                // since a fence is never a lazy continuation line.
+                in_list = false;
+            }
+        }
+        prev_blank = blank;
+        let open = if in_list && indent > 0 { None } else { chunk_open(line) };
+        let Some((ch, len, info)) = open else {
             if let Some((f_ch, f_len)) = fence_open(line) {
                 in_fence = Some((f_ch, f_len));
             }
@@ -529,7 +548,8 @@ fn prepare(text: &str) -> (String, Vec<Pending>) {
             if closes(line, ch, len) {
                 break;
             }
-            body.push_str(line);
+            // CommonMark removes up to the opening fence's indentation from each content line.
+            body.push_str(strip_spaces(line, indent));
             j += 1;
         }
         if j >= lines.len() {
@@ -670,7 +690,27 @@ fn leading_indent_cols(line: &str) -> (usize, &str) {
     (cols, line.get(rest_idx..).unwrap_or(""))
 }
 
-/// Whether `line` opens an executable chunk: an unindented fence with `{language …}`.
+/// `line` without up to `n` leading spaces.
+fn strip_spaces(line: &str, n: usize) -> &str {
+    let spaces = line.bytes().take(n).take_while(|b| *b == b' ').count();
+    line.get(spaces..).unwrap_or(line)
+}
+
+/// Whether `rest` (a line after its indentation) starts with a Markdown list item marker:
+/// `-`, `*` or `+`, or one to nine digits and `.` or `)`, followed by a space, a tab or the end.
+fn is_list_marker(rest: &str) -> bool {
+    let rest = rest.trim_end_matches(['\r', '\n']);
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    let after = match rest.as_bytes().first() {
+        Some(b'-' | b'*' | b'+') => 1,
+        Some(_) if (1..=9).contains(&digits) && matches!(rest.as_bytes().get(digits), Some(b'.' | b')')) => digits + 1,
+        _ => return false,
+    };
+    matches!(rest.as_bytes().get(after), None | Some(b' ' | b'\t'))
+}
+
+/// Whether `line` opens an executable chunk: a fence indented less than four columns with
+/// `{language …}`.
 fn chunk_open(line: &str) -> Option<(char, usize, &str)> {
     let (indent, t) = leading_indent_cols(line);
     if indent >= 4 {
@@ -1609,5 +1649,47 @@ print(sites)
         assert!(!compact_chunks[0].options.eval());
         assert!(compact_chunks[0].code.contains(&compact_line));
         assert!(export(&compact_doc).contains(&compact_line));
+    }
+
+    #[test]
+    fn chunk_fence_inside_a_list_item_stays_in_the_list() {
+        for source in [
+            "- Analysis\n\n  ```{r}\n  x <- 1\n  ```\n\n- Next\n",
+            "- Analysis\n  ```{r}\n  x <- 1\n  ```\n- Next\n",
+            "1. Analysis\ncontinued lazily\n\n   ```{python}\n   x = 1\n   ```\n\n2. Next\n",
+            "- Analysis\n\n  More about it.\n\n  ```{r}\n  x <- 1\n  ```\n",
+        ] {
+            let doc = import(source);
+            assert!(doc.chunks().is_empty(), "{source:?}");
+            // Left as written: the Markdown importer sees exactly the list it would without chunks.
+            assert_eq!(doc.body, crate::markdown::import(source).body, "{source:?}");
+        }
+    }
+
+    #[test]
+    fn chunk_fence_outside_a_list_is_a_chunk_without_the_fence_indent() {
+        let doc = import("Intro\n\n  ```{python}\n  if x:\n      y = 1\n   z\n  ```\n");
+        assert_eq!(doc.chunks().len(), 1);
+        assert_eq!(doc.chunks()[0].code, "if x:\n    y = 1\n z");
+
+        // An unindented fence ends a list, so it is a chunk even right after an item.
+        let doc = import("- Analysis\n```{r}\nx <- 1\n```\n");
+        assert_eq!(doc.chunks().len(), 1);
+        assert_eq!(doc.chunks()[0].code, "x <- 1");
+
+        // A list closed by an unindented paragraph does not hold a later indented fence.
+        let doc = import("- Analysis\n\nAfter the list.\n\n  ```{r}\n  x <- 1\n  ```\n");
+        assert_eq!(doc.chunks().len(), 1);
+        assert_eq!(doc.chunks()[0].code, "x <- 1");
+    }
+
+    #[test]
+    fn list_markers_are_recognised() {
+        for marker in ["- a", "* a", "+ a", "-", "1. a", "123456789) a", "1.\ta", "2.\n"] {
+            assert!(is_list_marker(marker), "{marker:?}");
+        }
+        for text in ["-a", "***", "1234567890. a", "1:", "a. b", "", "```{r}"] {
+            assert!(!is_list_marker(text), "{text:?}");
+        }
     }
 }
