@@ -28,6 +28,10 @@ const MAX_CHUNKS: usize = 4_096;
 const MAX_CHUNK_BYTES: usize = wordcraft_doc::chunk::MAX_CHUNK_CODE_BYTES;
 /// Longest `#|` option line read, in bytes; longer lines stay in the code.
 const MAX_OPTION_LINE: usize = 8 * 1024;
+/// Most options the document model keeps per chunk.
+const MAX_CHUNK_OPTIONS: usize = wordcraft_doc::chunk::MAX_CHUNK_OPTIONS;
+/// Longest option name or value the document model keeps, in characters.
+const MAX_CHUNK_OPTION_CHARS: usize = wordcraft_doc::chunk::MAX_CHUNK_OPTION_CHARS;
 
 /// Import a Quarto or R Markdown file onto the default page.
 pub fn import(text: &str) -> Document {
@@ -118,7 +122,7 @@ fn push_chunk(out: &mut String, chunk: &CodeChunk) {
     out.push_str(if chunk.language.is_empty() { "text" } else { chunk.language.as_str() });
     out.push('}');
     out.push('\n');
-    let retained = inspect_retained_yaml(&chunk.code);
+    let retained = inspect_retained_yaml(&chunk.code, &chunk.options);
     for (key, value) in chunk.options.iter() {
         if !option_name_ok(key) {
             continue;
@@ -307,10 +311,12 @@ fn multiline_value_state(value: &str, lines: &[&str], next_idx: usize) -> Option
 }
 
 /// Inspect leading `#|` lines for complex YAML (block scalars, sequences, nested mappings,
-/// multiline quoted scalars/flow collections). When complex YAML is present, returns the
-/// top-level scalar options and top-level keys so the block can stay verbatim in `code` while
-/// WordCraft still sees scalar options like `eval: false` and export avoids duplicating them.
-fn inspect_retained_yaml(text: &str) -> Option<RetainedYamlBlock> {
+/// multiline quoted scalars/flow collections) or options that exceed the document model's limits
+/// (`MAX_OPTION_LINE`, `MAX_CHUNK_OPTION_CHARS`, or `MAX_CHUNK_OPTIONS` combined with `existing`).
+/// When any such entry is present, returns the top-level scalar options and top-level keys so the
+/// block can stay verbatim in `code` while WordCraft still sees scalar options like `eval: false`
+/// and export avoids duplicating them.
+fn inspect_retained_yaml(text: &str, existing: &ChunkOptions) -> Option<RetainedYamlBlock> {
     let lines: Vec<&str> = text.lines().take_while(|l| l.trim_start().starts_with("#|")).collect();
     if lines.is_empty() {
         return None;
@@ -318,7 +324,7 @@ fn inspect_retained_yaml(text: &str) -> Option<RetainedYamlBlock> {
 
     let mut entries = Vec::new();
     let mut top_level_keys = HashSet::new();
-    let mut has_complex = false;
+    let mut must_retain = false;
     let mut state = YamlScanState::TopLevel;
 
     let mut i = 0;
@@ -379,7 +385,7 @@ fn inspect_retained_yaml(text: &str) -> Option<RetainedYamlBlock> {
             continue;
         }
         if is_indented || is_yaml_sequence_item(yaml) {
-            has_complex = true;
+            must_retain = true;
             i += 1;
             continue;
         }
@@ -395,7 +401,7 @@ fn inspect_retained_yaml(text: &str) -> Option<RetainedYamlBlock> {
         let value = raw_value.trim();
         if !option_name_ok(raw_key) {
             if raw_key.starts_with('"') || raw_key.starts_with('\'') {
-                has_complex = true;
+                must_retain = true;
                 if let Some(next_state) = multiline_value_state(value, &lines, i + 1) {
                     state = next_state;
                 }
@@ -412,10 +418,13 @@ fn inspect_retained_yaml(text: &str) -> Option<RetainedYamlBlock> {
         top_level_keys.insert(key.clone());
 
         if let Some(next_state) = multiline_value_state(value, &lines, i + 1) {
-            has_complex = true;
+            must_retain = true;
             entries.push(RetainedYamlEntry::Complex(key));
             state = next_state;
-        } else if wordcraft_doc::chunk::strip_yaml_comment(value).is_empty() || line.len() > MAX_OPTION_LINE {
+        } else if line.len() > MAX_OPTION_LINE || key.chars().count() > MAX_CHUNK_OPTION_CHARS || value.chars().count() > MAX_CHUNK_OPTION_CHARS {
+            must_retain = true;
+            entries.push(RetainedYamlEntry::Complex(key));
+        } else if wordcraft_doc::chunk::strip_yaml_comment(value).is_empty() {
             entries.push(RetainedYamlEntry::Complex(key));
         } else {
             entries.push(RetainedYamlEntry::Scalar(key, value.to_string()));
@@ -423,7 +432,12 @@ fn inspect_retained_yaml(text: &str) -> Option<RetainedYamlBlock> {
         i += 1;
     }
 
-    has_complex.then_some(RetainedYamlBlock { entries, top_level_keys })
+    let extra_keys = top_level_keys.iter().filter(|k| !existing.contains_key(k)).count();
+    if existing.len().saturating_add(extra_keys) > MAX_CHUNK_OPTIONS {
+        must_retain = true;
+    }
+
+    must_retain.then_some(RetainedYamlBlock { entries, top_level_keys })
 }
 
 /// Whether an option name can be written as a `#|` line (names come from files).
@@ -853,15 +867,30 @@ fn parse_option(part: &str, options: &mut ChunkOptions) {
 
 /// Strip the leading `#| key: value` lines, returning the code and the options they set.
 fn strip_option_lines(body: &str, mut options: ChunkOptions) -> (String, ChunkOptions) {
-    // Keep complex YAML blocks verbatim in `code` for export, while still reading top-level
-    // scalar options from that same block so WordCraft honours flags such as `eval: false`.
-    if let Some(retained) = inspect_retained_yaml(body) {
+    // Keep complex or unstoreable YAML blocks verbatim in `code` for export, while still reading
+    // top-level scalar options from that same block so WordCraft honours flags such as `eval: false`.
+    if let Some(retained) = inspect_retained_yaml(body, &options) {
+        const PRIORITY_KEYS: &[&str] = &["eval", "echo", "include", "label"];
+        for entry in &retained.entries {
+            match entry {
+                RetainedYamlEntry::Scalar(key, value) if PRIORITY_KEYS.contains(&key.as_str()) => {
+                    options.set(key.clone(), value.clone());
+                }
+                RetainedYamlEntry::Complex(key) if PRIORITY_KEYS.contains(&key.as_str()) => {
+                    options.remove(key);
+                }
+                _ => {}
+            }
+        }
         for entry in retained.entries {
             match entry {
-                RetainedYamlEntry::Scalar(key, value) => options.set(key, value),
-                RetainedYamlEntry::Complex(key) => {
+                RetainedYamlEntry::Scalar(key, value) if !PRIORITY_KEYS.contains(&key.as_str()) => {
+                    options.set(key, value);
+                }
+                RetainedYamlEntry::Complex(key) if !PRIORITY_KEYS.contains(&key.as_str()) => {
                     options.remove(&key);
                 }
+                _ => {}
             }
         }
         return (body.to_string(), options);
@@ -899,7 +928,10 @@ fn strip_option_lines(body: &str, mut options: ChunkOptions) -> (String, ChunkOp
                 break;
             }
         }
-        options.set(key, value);
+        options.set(key.clone(), value);
+        if options.get(&key) != Some(value) {
+            break;
+        }
         start += 1;
     }
     if let Some(sep) = lines.get(start)
@@ -1462,5 +1494,120 @@ print(sites)
         assert_eq!(exported.matches("#| eval:").count(), 1, "{exported}");
         assert_eq!(exported.matches("#| fig-cap:").count(), 1, "{exported}");
         assert_eq!(export(&import(&exported)), exported, "second round trip must be idempotent");
+    }
+
+    #[test]
+    fn overlong_caption_option_is_retained_instead_of_consumed_while_short_captions_stay_options() {
+        let overlong_inner = "a".repeat(wordcraft_doc::chunk::MAX_CHUNK_OPTION_CHARS - 1);
+        let overlong_value = format!("\"{overlong_inner}\"");
+        assert_eq!(overlong_value.chars().count(), wordcraft_doc::chunk::MAX_CHUNK_OPTION_CHARS + 1);
+        let overlong_line = format!("#| fig-cap: {overlong_value}");
+        assert!(overlong_line.len() <= MAX_OPTION_LINE, "test input must fit the 8 KiB line limit");
+
+        let source = format!("Intro paragraph.\n\n```{{r, echo=FALSE, fig.cap=\"Header\"}}\n#| eval: false\n{overlong_line}\nplot(1)\n```\n");
+        let mut doc = import(&source);
+        let chunks = doc.chunks();
+        assert_eq!(chunks.len(), 1);
+        assert!(!chunks[0].options.echo(), "header echo=FALSE must be preserved");
+        assert!(!chunks[0].options.eval(), "eval: false alongside an unstoreable caption must still parse");
+        assert_eq!(chunks[0].options.fig_caption(), None, "overlong #| fig-cap must supersede header fig.cap");
+        assert!(chunks[0].code.contains(&overlong_line), "rejected option line must stay in chunk code instead of being consumed");
+
+        // Simulate a formatted edit on surrounding prose before exporting.
+        if let Some(wordcraft_doc::Block::Para(p)) = doc.body.first_mut().map(std::sync::Arc::make_mut)
+            && let Some(run) = p.runs.first_mut()
+        {
+            run.props.bold = Some(true);
+        }
+        let exported = export(&doc);
+        assert!(exported.contains(&overlong_line), "caption must survive export after edit");
+        assert!(exported.contains("```{r}\n#| echo: FALSE\n#| eval: false\n#| fig-cap:"), "retained block must stay attached to options");
+        assert_eq!(exported.matches("#| eval:").count(), 1, "eval must not be duplicated");
+        assert_eq!(exported.matches("#| fig-cap:").count(), 1, "fig-cap must not be duplicated");
+        assert_eq!(export(&import(&exported)), exported, "round trip must be idempotent");
+
+        // Short captions and exact-limit captions still become normal ChunkOptions.
+        let exact_inner = "b".repeat(wordcraft_doc::chunk::MAX_CHUNK_OPTION_CHARS - 2);
+        for caption in ["Short caption", exact_inner.as_str()] {
+            let normal = format!("```{{r}}\n#| fig-cap: \"{caption}\"\nplot(1)\n```\n");
+            let normal_doc = import(&normal);
+            let normal_chunks = normal_doc.chunks();
+            assert_eq!(normal_chunks.len(), 1);
+            assert_eq!(normal_chunks[0].options.fig_caption().as_deref(), Some(caption));
+            assert_eq!(normal_chunks[0].code, "plot(1)");
+        }
+    }
+
+    #[test]
+    fn option_count_overflow_retains_raw_options_without_dropping_lines() {
+        let mut body_opts = String::new();
+        for i in 0..(wordcraft_doc::chunk::MAX_CHUNK_OPTIONS + 4) {
+            body_opts.push_str(&format!("#| opt-{i:03}: {i}\n"));
+        }
+        body_opts.push_str("#| eval: false\n");
+        let source = format!("```{{r}}\n{body_opts}x <- 1\n```\n");
+        let doc = import(&source);
+        let chunks = doc.chunks();
+        assert_eq!(chunks.len(), 1);
+        assert!(!chunks[0].options.eval(), "eval: false must still take effect past MAX_CHUNK_OPTIONS");
+        assert!(chunks[0].code.contains("#| opt-259: 259"));
+
+        let exported = export(&doc);
+        assert!(exported.contains("#| opt-000: 0"));
+        assert!(exported.contains("#| opt-259: 259"));
+        assert_eq!(exported.matches("#| eval:").count(), 1);
+        assert!(!exported.contains("```{r}\n\n#| opt-000:"));
+        assert_eq!(export(&import(&exported)), exported);
+
+        // Header options + #| options exceeding MAX_CHUNK_OPTIONS combined.
+        let header = (0..250).map(|i| format!("h{i:03}={i}")).collect::<Vec<_>>().join(", ");
+        let mut cell_opts = String::new();
+        for i in 0..10 {
+            cell_opts.push_str(&format!("#| c{i:03}: {i}\n"));
+        }
+        cell_opts.push_str("#| eval: false\n");
+        let combined = format!("```{{r, {header}}}\n{cell_opts}x <- 1\n```\n");
+        let combined_doc = import(&combined);
+        let combined_chunks = combined_doc.chunks();
+        assert_eq!(combined_chunks.len(), 1);
+        assert!(!combined_chunks[0].options.eval(), "eval: false must still parse when header + body exceed MAX_CHUNK_OPTIONS");
+        assert!(combined_chunks[0].code.contains("#| c009: 9"));
+
+        let combined_exported = export(&combined_doc);
+        assert!(combined_exported.contains("#| h000: 0"));
+        assert!(combined_exported.contains("#| h249: 249"));
+        assert!(combined_exported.contains("#| c000: 0"));
+        assert!(combined_exported.contains("#| c009: 9"));
+        assert_eq!(combined_exported.matches("#| eval:").count(), 1);
+        assert!(!combined_exported.contains("\n\n#| c000:"));
+        assert_eq!(export(&import(&combined_exported)), combined_exported);
+    }
+
+    #[test]
+    fn oversized_option_line_over_8kib_and_non_yaml_rejected_line_are_not_consumed() {
+        let huge_inner = "x".repeat(MAX_OPTION_LINE + 64);
+        let huge_line = format!("#| fig-cap: \"{huge_inner}\"");
+        let huge_source = format!("```{{r}}\n{huge_line}\n#| eval: false\nplot(1)\n```\n");
+        let doc = import(&huge_source);
+        let chunks = doc.chunks();
+        assert_eq!(chunks.len(), 1);
+        assert!(!chunks[0].options.eval());
+        assert!(chunks[0].code.contains(&huge_line));
+        let exported = export(&doc);
+        assert!(exported.contains(&huge_line));
+        assert_eq!(exported.matches("#| eval:").count(), 1);
+        assert!(!exported.contains("```{r}\n\n#| fig-cap:"));
+        assert_eq!(export(&import(&exported)), exported);
+
+        // Non-YAML syntax (missing space after `:`) with an unstoreable value must still not be consumed.
+        let compact_inner = "z".repeat(wordcraft_doc::chunk::MAX_CHUNK_OPTION_CHARS + 1);
+        let compact_line = format!("#| fig-cap:\"{compact_inner}\"");
+        let compact_source = format!("```{{r}}\n#| eval: false\n{compact_line}\nplot(1)\n```\n");
+        let compact_doc = import(&compact_source);
+        let compact_chunks = compact_doc.chunks();
+        assert_eq!(compact_chunks.len(), 1);
+        assert!(!compact_chunks[0].options.eval());
+        assert!(compact_chunks[0].code.contains(&compact_line));
+        assert!(export(&compact_doc).contains(&compact_line));
     }
 }
