@@ -18,6 +18,7 @@ pub mod mathml;
 pub mod mht;
 pub mod model;
 pub mod odt;
+pub mod quarto;
 pub mod rtf;
 pub mod sheet;
 pub mod txt;
@@ -30,7 +31,7 @@ pub const MAX_ZIP_ENTRIES: u64 = 20_000;
 
 /// Extensions this crate handles.
 pub const EXTENSIONS: &[&str] =
-    &["txt", "text", "md", "markdown", "html", "htm", "xhtml", "mht", "mhtml", "rtf", "odt", "ott", "fodt", "tex", "latex", "ltx"];
+    &["txt", "text", "md", "markdown", "qmd", "rmd", "html", "htm", "xhtml", "mht", "mhtml", "rtf", "odt", "ott", "fodt", "tex", "latex", "ltx"];
 
 /// Import `bytes` in the format named by `ext` (no dot, any case). `None` = not our format.
 pub fn import(ext: &str, bytes: &[u8]) -> Option<Result<Document, String>> {
@@ -38,6 +39,7 @@ pub fn import(ext: &str, bytes: &[u8]) -> Option<Result<Document, String>> {
     let r = match ext.as_str() {
         "txt" | "text" => Ok(txt::import(bytes)),
         "md" | "markdown" => Ok(markdown::import(&txt::decode(bytes))),
+        "qmd" | "rmd" => Ok(quarto::import(&txt::decode(bytes))),
         "html" | "htm" | "xhtml" => Ok(html::import_page(&html::decode(bytes), &|_| None)),
         "mht" | "mhtml" => Ok(mht::import(bytes)),
         "rtf" => rtf::import(bytes),
@@ -62,6 +64,7 @@ pub fn import_on(ext: &str, bytes: &[u8], page: &wordcraft_doc::SectionProps) ->
         "fodt" => return Some(odt::import_flat_on(bytes, page)),
         "txt" | "text" => txt::import_on(bytes, page),
         "md" | "markdown" => markdown::import_on(&txt::decode(bytes), page),
+        "qmd" | "rmd" => quarto::import_on(&txt::decode(bytes), page),
         "html" | "htm" | "xhtml" => html::import_on(&html::decode(bytes), &|_| None, page),
         "mht" | "mhtml" => mht::import_on(bytes, page),
         _ => return import(&ext, bytes),
@@ -76,6 +79,7 @@ pub fn export(ext: &str, doc: &Document) -> Option<Result<Vec<u8>, String>> {
     Some(match ext.as_str() {
         "txt" | "text" => Ok(txt::export(doc)),
         "md" | "markdown" => Ok(markdown::export(doc).into_bytes()),
+        "qmd" | "rmd" => quarto::export(doc).map(String::into_bytes),
         "html" | "htm" | "xhtml" => Ok(html::export(doc).into_bytes()),
         "rtf" => Ok(rtf::export(doc).into_bytes()),
         "odt" => odt::export(doc),
