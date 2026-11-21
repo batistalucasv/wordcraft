@@ -9,7 +9,7 @@ use std::fmt;
 use std::fs;
 use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::{Command, Stdio};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -18,19 +18,19 @@ use std::time::{Duration, Instant};
 
 #[cfg(target_family = "wasm")]
 mod process_group;
+mod process_tree;
 
 #[cfg(target_family = "wasm")]
-use crate::process_group::{CommandGroup, GroupChild};
+use crate::process_group::CommandGroup;
+use crate::process_tree::{ProcessTreeGuard, RunContainment};
 #[cfg(not(target_family = "wasm"))]
-use command_group::{CommandGroup, GroupChild};
+use command_group::CommandGroup;
 use serde::{Deserialize, Serialize};
 
 static SCRIPT_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 /// Attempts to create a unique scratch directory before giving up.
 const MAX_SCRATCH_DIR_ATTEMPTS: u64 = 10;
-/// How long to wait for a killed process group to be reaped.
-const PROCESS_GROUP_REAP_TIMEOUT: Duration = Duration::from_secs(2);
 /// Most bytes retained from each stream; the rest is drained and discarded.
 const MAX_CAPTURED_BYTES: usize = 10 * 1024 * 1024;
 /// Maximum size of a captured plot artifact (PNG or SVG) read back from disk.
@@ -365,11 +365,15 @@ pub fn execute(request: &ExecutionRequest) -> Result<ExecutionResult, KernelErro
     let wrapped_code = prepare_wrapped_code(request.language, request.capture_plots, request.plot_format, captured);
     fs::write(&script_file, wrapped_code.as_bytes()).map_err(|e| KernelError::ScriptPreparation(format!("write {}: {e}", script_file.display())))?;
 
+    let containment =
+        RunContainment::new(&temp_dir, request.working_dir.is_none()).map_err(|e| KernelError::Io(format!("prepare process containment: {e}")))?;
+
     let mut cmd = Command::new(&binary);
     cmd.arg(&script_file);
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
+    containment.configure_command(&mut cmd);
 
     if let Some(ref dir) = request.working_dir {
         cmd.current_dir(dir);
@@ -378,22 +382,19 @@ pub fn execute(request: &ExecutionRequest) -> Result<ExecutionResult, KernelErro
     }
 
     let start_time = Instant::now();
-    let mut child = cmd.group_spawn().map_err(|e| KernelError::Io(format!("spawn {}: {e}", binary.display())))?;
+    let child = cmd.group_spawn().map_err(|e| KernelError::Io(format!("spawn {}: {e}", binary.display())))?;
+    let mut process_guard = ProcessTreeGuard::new(child, containment);
 
-    let (stdout_reader, stderr_reader) = match spawn_capture_pair(&mut child, MAX_CAPTURED_BYTES) {
-        Ok(readers) => readers,
-        Err(error) => {
-            terminate_process_group(&mut child);
-            return Err(KernelError::Io(format!("start output capture: {error}")));
-        }
-    };
+    let (stdout_reader, stderr_reader) =
+        spawn_capture_pair(&mut process_guard, MAX_CAPTURED_BYTES).map_err(|error| KernelError::Io(format!("start output capture: {error}")))?;
 
-    let (exit_status, timed_out) = wait_with_timeout(&mut child, Duration::from_millis(request.timeout_ms));
+    let timed_out = process_guard.wait_with_timeout(Duration::from_millis(request.timeout_ms));
     let duration_ms = start_time.elapsed().as_millis().min(u64::MAX as u128) as u64;
 
-    // Kill the whole group first: descendants may outlive the interpreter and
-    // keep the pipes open. The readers are then stopped without losing bytes.
-    terminate_process_group(&mut child);
+    // Terminate the original process group and any escaped descendants before stopping the pipe
+    // readers so pipe inodes stay pinned during containment and queued bytes are still drained.
+    let reaped_status = process_guard.terminate_and_reap();
+    let exit_status = if timed_out { None } else { reaped_status };
     let stdout = stdout_reader.map(CaptureReader::stop).unwrap_or_default();
     let stderr = stderr_reader.map(CaptureReader::stop).unwrap_or_default();
     let output_truncated = stdout.truncated || stderr.truncated;
@@ -544,10 +545,11 @@ fn capture_into<R: Read>(mut pipe: R, sink: &CaptureSink, cancel: &AtomicBool, l
     }
 }
 
-/// Take both pipes and start their readers.
-fn spawn_capture_pair(child: &mut GroupChild, limit: usize) -> std::io::Result<(Option<CaptureReader>, Option<CaptureReader>)> {
-    let stdout = child.inner().stdout.take();
-    let stderr = child.inner().stderr.take();
+/// Take both pipes, register them with containment, and start their bounded readers.
+fn spawn_capture_pair(guard: &mut ProcessTreeGuard, limit: usize) -> std::io::Result<(Option<CaptureReader>, Option<CaptureReader>)> {
+    let stdout = guard.child_mut().inner().stdout.take();
+    let stderr = guard.child_mut().inner().stderr.take();
+    guard.register_pipes(stdout.as_ref(), stderr.as_ref());
     #[cfg(unix)]
     {
         if let Some(pipe) = &stdout {
@@ -582,39 +584,6 @@ fn set_pipe_nonblocking(pipe: &impl std::os::fd::AsRawFd) -> std::io::Result<()>
     let flags = fcntl(pipe.as_raw_fd(), FcntlArg::F_GETFL).map_err(std::io::Error::other)?;
     let flags = OFlag::from_bits_truncate(flags) | OFlag::O_NONBLOCK;
     fcntl(pipe.as_raw_fd(), FcntlArg::F_SETFL(flags)).map(|_| ()).map_err(std::io::Error::other)
-}
-
-/// Kill the whole process group and reap it, so no descendant outlives the chunk.
-fn terminate_process_group(child: &mut GroupChild) {
-    let _ = child.kill();
-    let deadline = Instant::now() + PROCESS_GROUP_REAP_TIMEOUT;
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) | Err(_) => return,
-            Ok(None) if Instant::now() >= deadline => return,
-            Ok(None) => thread::sleep(Duration::from_millis(10)),
-        }
-    }
-}
-
-/// Wait for the interpreter with a timeout. The caller terminates the group afterwards.
-fn wait_with_timeout(child: &mut GroupChild, timeout: Duration) -> (Option<ExitStatus>, bool) {
-    let start = Instant::now();
-    let step = Duration::from_millis(20);
-
-    loop {
-        // Wait for the direct child only: descendants are cleaned up afterwards.
-        match child.inner().try_wait() {
-            Ok(Some(status)) => return (Some(status), false),
-            Ok(None) => {
-                if start.elapsed() >= timeout {
-                    return (None, true);
-                }
-                thread::sleep(step);
-            }
-            Err(_) => return (None, false),
-        }
-    }
 }
 
 /// A PNG is complete only when both its signature and its IEND chunk are present.

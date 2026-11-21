@@ -17,7 +17,9 @@ thiserror = { workspace = true }
 command-group = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
+getrandom = { workspace = true }
 nix = { version = "0.27", features = ["fs", "signal"] }
+rustix = { version = "1", features = ["process"] }
 
 [dev-dependencies]
 proptest = { workspace = true }
