@@ -207,6 +207,10 @@ pub struct Session {
     pub windows: crate::cmd::view::Windows,
     /// Read Aloud player (Review › Speech).
     pub read_aloud: crate::speech::ReadAloud,
+    /// The last output of each code chunk (Insert › Code), outside document undo. Parked per open
+    /// document across switches between open documents and restored when a document becomes active
+    /// again; cleared when the active document is replaced (`Session::set_document`).
+    pub chunks: crate::chunks::ChunkState,
     /// Preferences the front end saves between runs.
     pub prefs: Prefs,
     /// The system region (#838): the paper a new blank document starts on, the default

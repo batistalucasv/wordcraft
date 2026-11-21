@@ -16,6 +16,8 @@ pub const OPEN_EXTS: &[&str] = &[
     "txt",
     "md",
     "markdown",
+    "qmd",
+    "rmd",
     "html",
     "htm",
     "mht",
@@ -33,7 +35,7 @@ pub const OPEN_EXTS: &[&str] = &[
 ];
 /// Formats WordCraft saves (Save As).
 pub const SAVE_EXTS: &[&str] =
-    &["docx", "docm", "dotx", "dotm", "pdf", "txt", "md", "html", "rtf", "odt", "ott", "fodt", "tex", "png", "json", "xml"];
+    &["docx", "docm", "dotx", "dotm", "pdf", "txt", "md", "qmd", "rmd", "html", "rtf", "odt", "ott", "fodt", "tex", "png", "json", "xml"];
 
 /// Magic number for ZIP package signatures (used by .docx/.docm/.dotx/.dotm).
 const ZIP_SIG: &[u8] = b"PK\x03\x04";
@@ -51,6 +53,8 @@ fn ext_of(name: &str) -> String {
 pub fn is_word_package(ext: &str) -> bool {
     wordcraft_docx::Flavor::from_ext(ext).is_some()
 }
+
+pub use wordcraft_docx::check_password;
 
 /// How a copy in another format is written.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -137,6 +141,116 @@ pub(crate) fn canonical(path: &std::path::Path) -> Option<std::path::PathBuf> {
 #[cfg(target_arch = "wasm32")]
 pub(crate) fn canonical(_path: &std::path::Path) -> Option<std::path::PathBuf> {
     None
+}
+
+/// Whether `destination` resolves to the same file as `active`, including path aliases such as
+/// `.`/`..`, relative spellings, symbolic links, and (on Unix) hard links.
+///
+/// Used before writing a copy (`file.save` / `file.saveAs` with `copy: true`) so a copy cannot
+/// overwrite the active document in place.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn same_save_target(destination: &std::path::Path, active: &std::path::Path) -> bool {
+    if destination == active {
+        return true;
+    }
+    let dest_allowed = crate::file_access::check_write(&destination.to_string_lossy()).is_ok();
+    let active_allowed =
+        crate::file_access::check_read(&active.to_string_lossy()).is_ok() || crate::file_access::check_write(&active.to_string_lossy()).is_ok();
+    if !dest_allowed || !active_allowed {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let (Ok(dest_meta), Ok(active_meta)) = (std::fs::metadata(destination), std::fs::metadata(active))
+            && dest_meta.dev() == active_meta.dev()
+            && dest_meta.ino() == active_meta.ino()
+        {
+            return true;
+        }
+    }
+    match (resolve_target_path(destination), resolve_target_path(active)) {
+        (Some(a), Some(b)) => same_resolved_path(&a, &b),
+        _ => false,
+    }
+}
+
+/// Resolve `path` to an absolute canonical path, falling back to canonicalizing the nearest
+/// existing ancestor and appending the remaining normal components when the file does not exist.
+#[cfg(not(target_arch = "wasm32"))]
+fn resolve_target_path(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    if path.as_os_str().is_empty() {
+        return None;
+    }
+    if let Ok(canon) = std::fs::canonicalize(path) {
+        return Some(canon);
+    }
+    let absolute = std::path::absolute(path).ok()?;
+    let mut missing: Vec<std::ffi::OsString> = Vec::new();
+    let mut at = absolute.as_path();
+    loop {
+        if let Ok(mut found) = std::fs::canonicalize(at) {
+            found.extend(missing.iter().rev());
+            return Some(found);
+        }
+        match (at.components().next_back(), at.parent()) {
+            (Some(std::path::Component::Normal(name)), Some(parent)) => {
+                missing.push(name.to_os_string());
+                at = parent;
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// Compare two resolved paths, matching component case insensitively on Windows.
+#[cfg(not(target_arch = "wasm32"))]
+fn same_resolved_path(a: &std::path::Path, b: &std::path::Path) -> bool {
+    if a == b {
+        return true;
+    }
+    if !cfg!(windows) {
+        return false;
+    }
+    let mut ac = a.components();
+    let mut bc = b.components();
+    loop {
+        match (ac.next(), bc.next()) {
+            (None, None) => return true,
+            (Some(x), Some(y)) if x == y => continue,
+            (Some(x), Some(y)) => match (x.as_os_str().to_str(), y.as_os_str().to_str()) {
+                (Some(xs), Some(ys)) if xs.to_lowercase() == ys.to_lowercase() => continue,
+                _ => return false,
+            },
+            _ => return false,
+        }
+    }
+}
+
+/// [`same_save_target`]: on the web compare paths lexically without touching the filesystem.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn same_save_target(destination: &std::path::Path, active: &std::path::Path) -> bool {
+    destination == active || lexical_normalize(destination) == lexical_normalize(active)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn lexical_normalize(path: &std::path::Path) -> std::path::PathBuf {
+    use std::path::Component;
+    let mut out: Vec<Component<'_>> = Vec::new();
+    for comp in path.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => match out.last() {
+                Some(Component::Normal(_)) => {
+                    out.pop();
+                }
+                Some(Component::RootDir) => {}
+                _ => out.push(comp),
+            },
+            other => out.push(other),
+        }
+    }
+    out.iter().collect()
 }
 
 /// Can files with this extension be saved with a password (Word's packages, ODT)?
@@ -935,16 +1049,28 @@ pub fn save_path(path: &std::path::Path, doc: &Document) -> Result<(), String> {
 }
 
 /// [`save_path`], encrypted with `password` as [`save_bytes_with`] does.
-#[cfg(not(target_arch = "wasm32"))]
 pub fn save_path_with(path: &std::path::Path, doc: &Document, password: Option<&str>, opts: &ExportOptions) -> Result<(), String> {
+    save_path_with_bytes(path, doc, password, opts).map(|_| ())
+}
+
+/// [`save_path_with`], returning the exact bytes written so callers can compare them against the
+/// file's original bytes without serialising or reading back a second time.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn save_path_with_bytes(path: &std::path::Path, doc: &Document, password: Option<&str>, opts: &ExportOptions) -> Result<Vec<u8>, String> {
     crate::file_access::check_write(&path.to_string_lossy())?;
     let bytes = save_bytes_with(&path.to_string_lossy(), doc, password, opts)?;
-    safe_save::write(path, &bytes).map_err(|e| format!("{}: {e}", path.display()))
+    safe_save::write(path, &bytes).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(bytes)
 }
 
 /// Saves a document to `path` with optional password and export options on web targets.
 #[cfg(target_arch = "wasm32")]
-pub fn save_path_with(path: &std::path::Path, _doc: &Document, _password: Option<&str>, _opts: &ExportOptions) -> Result<(), String> {
+pub(crate) fn save_path_with_bytes(
+    path: &std::path::Path,
+    _doc: &Document,
+    _password: Option<&str>,
+    _opts: &ExportOptions,
+) -> Result<Vec<u8>, String> {
     Err(format!("{}: files are saved through the browser on the web", path.display()))
 }
 

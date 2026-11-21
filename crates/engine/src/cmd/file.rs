@@ -94,9 +94,9 @@ pub fn specs() -> Vec<CommandSpec> {
             .pure(),
         CommandSpec::new("file.save", "Save", "File", save)
             .key("Mod+S / Shift+F12 / Alt+Shift+F2")
-            .params(r#"{"path"?: string, "password"?: string (encrypt this and later saves with it, as file.encrypt does), "markup"?: bool (Print Markup for a PDF, PNG, HTML, Markdown or text copy: comments shown; default file.printMarkup), "format"?: "wordml2003" (an .xml file as a Word 2003 XML Document) | "flatopc" (as a Word XML Document, the default; saving over a Word 2003 XML file keeps that format), "strict"?: bool (a .pdf or .png only: refuse, writing nothing, if a character can't be drawn or a picture is missing; see file.strictReport)}"#)
+            .params(r#"{"path"?: string, "password"?: string (encrypt this and later saves, as file.encrypt does; with copy: true, encrypt only this copy without changing the active document's password), "markup"?: bool (Print Markup for a PDF, PNG, HTML, Markdown or text copy: comments shown; default file.printMarkup), "format"?: "wordml2003" (an .xml file as a Word 2003 XML Document) | "flatopc" (as a Word XML Document, the default; saving over a Word 2003 XML file keeps that format), "strict"?: bool (a .pdf or .png only: refuse, writing nothing, if a character can't be drawn or a picture is missing; see file.strictReport), "copy"?: bool}"#)
             .pure(),
-        CommandSpec::new("file.saveAs", "Save As", "File", save_as).key(super::mac_or("F12 / Mod+Shift+S", "F12 / Alt+F2")).params(r#"{"path": string, "password"?: string, "markup"?: bool, "format"?: string (as file.save), "strict"?: bool (as file.save)}"#).pure(),
+        CommandSpec::new("file.saveAs", "Save As", "File", save_as).key(super::mac_or("F12 / Mod+Shift+S", "F12 / Alt+F2")).params(r#"{"path": string, "password"?: string (as file.save), "markup"?: bool, "format"?: string (as file.save), "strict"?: bool (as file.save), "copy"?: bool}"#).pure(),
         // Pure: the password must not land in Repeat or a recorded macro, and it isn't an edit
         // to undo; it marks the document as changed itself.
         CommandSpec::new("file.encrypt", "Encrypt with Password", "File › Info › Protect Document", encrypt)
@@ -256,8 +256,9 @@ fn open(s: &mut Session, v: &Value) -> CmdResult {
         );
     }
     let password = p::str(v, "password");
+    let keep_source = super::md_source::keeps_file_text(std::path::Path::new(path));
     // An empty file opens as a new blank document that saves back to it (#1384).
-    let (doc, encrypted) = read_document(s, path, v)?;
+    let (doc, encrypted, md_file) = read_document(s, path, v, keep_source)?;
     match s.used_because() {
         None => s.set_document(doc),
         Some(why) => {
@@ -269,10 +270,8 @@ fn open(s: &mut Session, v: &Value) -> CmdResult {
         super::view::restore_zoom(s, z);
     }
     s.path = Some(path.into());
-    // A Markdown file's own text, for the view to show and Save to write back as it is.
-    if super::md_source::is_markdown_file(std::path::Path::new(path)) {
-        s.md_file = markdown_file_text(path, v);
-    }
+    // A Markdown or Quarto file's own text, for Save (and Markdown Source view) to keep as it is.
+    s.md_file = md_file;
     // Like Word, a document opened with a password is saved with it again.
     if encrypted {
         s.password = password.map(crate::io::Password::new);
@@ -282,26 +281,38 @@ fn open(s: &mut Session, v: &Value) -> CmdResult {
     )
 }
 
-/// A Markdown file's own text as `file.open` finds it: the bytes the caller hands over (base64 in
-/// `data`, the same ones `read_document` decodes), else the head of the file at `path`.
-/// `FileText::from_bytes` keeps it only when it can be written back as it is.
-fn markdown_file_text(path: &str, v: &Value) -> super::md_source::FileText {
-    if let Some(data) = p::str(v, "data") {
-        // `read_document` has already refused a text it cannot decode.
-        return super::insert::base64_decode(data).map(|bytes| super::md_source::FileText::from_bytes(&bytes)).unwrap_or_default();
+/// Reads a document from `path` on disk. When `keep_source` is true, reads the bytes once so
+/// [`super::md_source::FileText::from_bytes`] inspects the exact full bytes that were parsed
+/// (including oversized Markdown/Quarto files above `MAX_SOURCE_BYTES`).
+#[cfg(not(target_arch = "wasm32"))]
+fn read_path_document(
+    s: &Session,
+    path: &str,
+    password: Option<&str>,
+    keep_source: bool,
+) -> Result<(Document, bool, super::md_source::FileText), CmdError> {
+    if keep_source {
+        let bytes = crate::io::read_document(std::path::Path::new(path)).map_err(CmdError::Failed)?;
+        let md_file = super::md_source::FileText::from_bytes(&bytes);
+        if bytes.is_empty() {
+            return Ok((normal_document(s), false, md_file));
+        }
+        let (doc, encrypted) = crate::io::open_bytes_in(path, &bytes, password, &s.region()).map_err(CmdError::Failed)?;
+        return Ok((doc, encrypted, md_file));
     }
-    // Without `data`, the file's own bytes; not reachable on the web, where a file only arrives
-    // as `data`.
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        let max = u64::try_from(super::md_source::MAX_SOURCE_BYTES).unwrap_or(u64::MAX).saturating_add(1);
-        crate::io::read_file_head(path, max).map(|bytes| super::md_source::FileText::from_bytes(&bytes)).unwrap_or_default()
-    }
-    #[cfg(target_arch = "wasm32")]
-    {
-        let _ = path;
-        super::md_source::FileText::default()
-    }
+    let (doc, encrypted) = crate::io::open_path_in(std::path::Path::new(path), password, &s.region()).map_err(CmdError::Failed)?;
+    Ok((doc, encrypted, super::md_source::FileText::default()))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn read_path_document(
+    s: &Session,
+    path: &str,
+    password: Option<&str>,
+    _keep_source: bool,
+) -> Result<(Document, bool, super::md_source::FileText), CmdError> {
+    let (doc, encrypted) = crate::io::open_path_in(std::path::Path::new(path), password, &s.region()).map_err(CmdError::Failed)?;
+    Ok((doc, encrypted, super::md_source::FileText::default()))
 }
 
 /// The document the file at `path` holds (or its bytes, base64 in `data`, with `path` only
@@ -309,27 +320,29 @@ fn markdown_file_text(path: &str, v: &Value) -> super::md_source::FileText {
 /// `file.newFromTemplate` read. An empty file (File Explorer's New › Microsoft Word Document makes
 /// one) is a new blank document (#1384). Plain text and Markdown carry no language, so they are
 /// in the editing language.
-fn read_document(s: &Session, path: &str, v: &Value) -> Result<(Document, bool), CmdError> {
+fn read_document(s: &Session, path: &str, v: &Value, keep_source: bool) -> Result<(Document, bool, super::md_source::FileText), CmdError> {
     let password = p::str(v, "password");
-    let (mut doc, encrypted) = if let Some(data) = p::str(v, "data") {
+    let (mut doc, encrypted, md_file) = if let Some(data) = p::str(v, "data") {
         let bytes = super::insert::base64_decode(data).ok_or_else(|| CmdError::Params("bad base64".into()))?;
+        let md_file = if keep_source { super::md_source::FileText::from_bytes(&bytes) } else { super::md_source::FileText::default() };
         if bytes.is_empty() {
-            (normal_document(s), false)
+            (normal_document(s), false, md_file)
         } else {
-            crate::io::open_bytes_in(path, &bytes, password, &s.region()).map_err(CmdError::Failed)?
+            let (doc, encrypted) = crate::io::open_bytes_in(path, &bytes, password, &s.region()).map_err(CmdError::Failed)?;
+            (doc, encrypted, md_file)
         }
     } else if crate::io::is_empty_file(std::path::Path::new(path)) {
-        (normal_document(s), false)
+        (normal_document(s), false, super::md_source::FileText::default())
     } else {
-        crate::io::open_path_in(std::path::Path::new(path), password, &s.region()).map_err(CmdError::Failed)?
+        read_path_document(s, path, password, keep_source)?
     };
     let ext = std::path::Path::new(path).extension().and_then(std::ffi::OsStr::to_str).unwrap_or("").to_ascii_lowercase();
     if let Some(lang) = s.prefs.default_language.as_ref().or(s.editing_lang.as_ref())
-        && matches!(ext.as_str(), "txt" | "text" | "md" | "markdown")
+        && matches!(ext.as_str(), "txt" | "text" | "md" | "markdown" | "qmd" | "rmd")
     {
         Arc::make_mut(&mut doc.styles).default_chr.lang = Some(lang.clone());
     }
-    Ok((doc, encrypted))
+    Ok((doc, encrypted, md_file))
 }
 
 /// File › New from a template (#2852): a new, untitled document with the template's content,
@@ -340,7 +353,7 @@ fn read_document(s: &Session, path: &str, v: &Value) -> Result<(Document, bool),
 /// saving it asks where to write, and a protected template's password doesn't come along.
 pub(crate) fn new_from_template(s: &mut Session, v: &Value) -> CmdResult {
     let path = p::req_str(v, "path")?;
-    let (mut doc, _) = read_document(s, path, v)?;
+    let (mut doc, _, _) = read_document(s, path, v, false)?;
     doc.settings.attached_template = Some(path.to_string());
     if p::bool(v, "replaceBlank") == Some(true) && s.used_because().is_none() {
         s.set_document(doc);
@@ -401,6 +414,11 @@ fn save(s: &mut Session, v: &Value) -> CmdResult {
         }
     };
     check_strict_output(p::bool(v, "strict").unwrap_or(false), &path.to_string_lossy())?;
+    let is_copy = p::bool(v, "copy").unwrap_or(false);
+    if is_copy && s.path.as_deref().is_some_and(|active| crate::io::same_save_target(&path, active)) {
+        return Err(CmdError::Params("cannot save a copy over the active document; choose a different path".into()));
+    }
+    let mut copy_password: Option<crate::io::Password> = None;
     if let Some(pw) = v.get("password").filter(|pw| !pw.is_null()) {
         let Some(pw) = pw.as_str().filter(|pw| !pw.is_empty()) else {
             return Err(CmdError::Params("`password` must be a non-empty string (file.encrypt removes a password)".into()));
@@ -411,8 +429,12 @@ fn save(s: &mut Session, v: &Value) -> CmdResult {
             ));
         }
         wordcraft_docx::check_password(pw).map_err(|e| CmdError::Params(e.to_string()))?;
-        s.clear_recovery_before_password()?;
-        s.password = Some(crate::io::Password::new(pw));
+        if is_copy {
+            copy_password = Some(crate::io::Password::new(pw));
+        } else {
+            s.clear_recovery_before_password()?;
+            s.password = Some(crate::io::Password::new(pw));
+        }
     }
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
     let mut opts = export_options(s, v);
@@ -432,16 +454,38 @@ fn save(s: &mut Session, v: &Value) -> CmdResult {
     let before_stamp =
         (s.doc.settings.zoom, s.doc.core.last_modified_by.clone(), s.doc.core.created.clone(), s.doc.core.modified.clone(), s.doc.core.revision);
     s.stamp_save();
-    let password = s.password.as_ref().map(crate::io::Password::as_str);
+    let password = if is_copy && copy_password.is_some() {
+        copy_password.as_ref().map(crate::io::Password::as_str)
+    } else {
+        s.password.as_ref().map(crate::io::Password::as_str)
+    };
     // A header/footer just made and left empty isn't saved (#960).
     let copy = super::insert::saved_copy(s);
-    // A Markdown file's own text goes back as it is while it still says what the document holds;
-    // once it doesn't (an edit in the formatted view), the document is written out again.
+    // A Markdown or Quarto file's own text goes back as it is while it still says what the
+    // document holds; once it doesn't (an edit in the formatted view), the document is written out
+    // again.
+    let keeps_text = super::md_source::keeps_file_text(&path);
     let exact = super::md_source::text_to_save(s, &path, opts.markup);
-    let rewritten = exact.is_none() && !s.md_file.is_empty() && super::md_source::is_markdown_file(&path);
-    let written = match &exact {
-        Some(text) => crate::io::save_text_path(&path, text),
-        None => crate::io::save_path_with(&path, copy.as_ref().unwrap_or(&s.doc), password, &opts),
+    let doc_to_save = copy.as_ref().unwrap_or(&s.doc);
+    let (written, rewritten) = match &exact {
+        Some(text) => {
+            let res = crate::io::save_text_path(&path, text);
+            let rewritten = keeps_text && s.md_file.is_rewritten(true, text.as_bytes());
+            (res, rewritten)
+        }
+        None if keeps_text && s.md_file.needs_bytes_for_rewrite_check() => match crate::io::save_path_with_bytes(&path, doc_to_save, password, &opts)
+        {
+            Ok(bytes) => {
+                let rewritten = s.md_file.is_rewritten(false, &bytes);
+                (Ok(()), rewritten)
+            }
+            Err(e) => (Err(e), false),
+        },
+        None => {
+            let res = crate::io::save_path_with(&path, doc_to_save, password, &opts);
+            let rewritten = keeps_text && s.md_file.is_rewritten(false, &[]);
+            (res, rewritten)
+        }
     };
     if let Err(e) = written {
         (s.doc.settings.zoom, s.doc.core.last_modified_by, s.doc.core.created, s.doc.core.modified, s.doc.core.revision) = before_stamp;
@@ -451,16 +495,36 @@ fn save(s: &mut Session, v: &Value) -> CmdResult {
     // A save in a format that doesn't keep everything (plain text, Markdown, a page image) is a
     // copy, except over the document's own file: a note.txt opened and saved is saved (#2376).
     // A Markdown file saved as another one loses nothing its own save wouldn't: it moves there.
+    // Quarto / R Markdown files transfer ownership only when the destination preserves Quarto
+    // front matter and chunk options (.qmd, .Rmd); saving .qmd as .md remains a copy.
     let own_file = s.path.as_deref() == Some(path.as_path());
-    let markdown_to_markdown = super::md_source::is_markdown_file(&path) && s.path.as_deref().is_some_and(super::md_source::is_markdown_file);
-    if own_file || markdown_to_markdown || ["docx", "docm", "dotx", "dotm", "odt", "ott", "fodt", "rtf", "json", "xml"].contains(&ext.as_str()) {
+    let can_transfer_ownership = !is_copy
+        && (own_file
+            || text_to_text(s.path.as_deref(), &path)
+            || ["docx", "docm", "dotx", "dotm", "odt", "ott", "fodt", "rtf", "json", "xml"].contains(&ext.as_str()));
+    if can_transfer_ownership {
         s.path = Some(path.clone());
         s.dirty = false;
-        s.relayout();
+        super::md_source::close_if_ineligible(s);
         // What the file holds now.
-        s.md_file = super::md_source::FileText::saved(exact.filter(|_| super::md_source::is_markdown_file(&path)));
+        s.md_file = super::md_source::FileText::saved(exact.filter(|_| keeps_text));
+        s.relayout();
     }
     Ok(json!({"saved": true, "path": path.to_string_lossy(), "encrypted": encrypted, "rewritten": rewritten}))
+}
+
+/// Whether saving from `src` to `dest` preserves all features of the source text format.
+fn text_to_text(src: Option<&std::path::Path>, dest: &std::path::Path) -> bool {
+    let Some(src) = src else { return false };
+    if super::md_source::is_quarto_file(src) {
+        // A .qmd / .Rmd source transfers ownership only when the destination preserves
+        // Quarto front matter and chunk options (.qmd or .Rmd); saving to .md remains a copy.
+        super::md_source::is_quarto_file(dest)
+    } else if super::md_source::is_markdown_file(src) {
+        super::md_source::is_markdown_file(dest) || super::md_source::is_quarto_file(dest)
+    } else {
+        false
+    }
 }
 
 /// Does `path` hold a Word 2003 XML Document already (so a plain save keeps that format)?
