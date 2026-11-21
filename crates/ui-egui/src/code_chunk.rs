@@ -476,7 +476,7 @@ impl CodeChunk {
         self.tab = OutputTab::Console;
         self.pending = Some(rx);
         self.pending_source = None;
-        self.started_ms = Some(crate::clock::now_ms());
+        self.started_ms = Some(craft::platform::clock::monotonic_ms());
     }
 
     fn clear_plot_cache(&mut self) {
@@ -653,7 +653,7 @@ impl CodeChunk {
                     if !self.read_only {
                         badge.clone().on_hover_text(crate::tl!("Choose the chunk's language"));
                         if !self.is_running() {
-                            crate::rtl::menu(&badge).show(|ui| {
+                            egui::Popup::menu(&badge).show(|ui| {
                                 for language in [CodeLanguage::R, CodeLanguage::Python] {
                                     if ui.selectable_label(current == language, language_name(language)).clicked() {
                                         picked = Some(language);
@@ -664,8 +664,7 @@ impl CodeChunk {
                         }
                     }
 
-                    let arrow = if self.show_code { "▾" } else { "▸" };
-                    if ui.add(egui::Button::new(RichText::new(arrow).color(t.text_dim)).frame(false)).clicked() {
+                    if disclosure_triangle(ui, self.show_code, t.text_dim, crate::tl!("Toggle code")).clicked() {
                         toggle_code = true;
                     }
                     let committed_label = self.header_title(ui, t);
@@ -701,7 +700,7 @@ impl CodeChunk {
 
                         let run_button = ui.add_enabled(
                             !self.read_only && !self.is_running() && self.available,
-                            egui::Button::new(RichText::new(format!("▶ {}", crate::tl!("Run"))).color(t.on_accent))
+                            egui::Button::new(RichText::new(crate::tl!("Run")).color(t.on_accent))
                                 .fill(t.accent)
                                 .corner_radius(CornerRadius::same(4)),
                         );
@@ -729,7 +728,7 @@ impl CodeChunk {
                         } else if self.is_running() {
                             ui.add(egui::Spinner::new().size(14.0));
                             let secs = self.started_ms.map_or(0.0, |started| {
-                                let elapsed = (crate::clock::now_ms() - started) / 1000.0;
+                                let elapsed = (craft::platform::clock::monotonic_ms() - started) / 1000.0;
                                 if elapsed.is_finite() { elapsed.max(0.0) as f32 } else { 0.0 }
                             });
                             ui.label(RichText::new(format!("{} {secs:.1} s", crate::tl!("Running…"))).color(t.text_dim).size(11.5));
@@ -915,11 +914,13 @@ impl CodeChunk {
     }
 
     fn drawer(&mut self, ui: &mut Ui, t: &Tokens, action: &mut Option<CodeChunkAction>) {
-        let arrow = if self.output_open { "▾" } else { "▸" };
         let mut toggle = false;
         ui.horizontal(|ui| {
-            let text = format!("{arrow} {}", crate::tl!("Output"));
-            if ui.add(egui::Button::new(RichText::new(text).color(t.text).size(12.0)).frame(false)).clicked() {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            if disclosure_triangle(ui, self.output_open, t.text_dim, crate::tl!("Toggle output")).clicked() {
+                toggle = true;
+            }
+            if ui.add(egui::Button::new(RichText::new(crate::tl!("Output")).color(t.text).size(12.0)).frame(false)).clicked() {
                 toggle = true;
             }
         });
@@ -1233,7 +1234,7 @@ impl CodeChunk {
         }
         let secs = output.duration_ms as f64 / 1000.0;
         if output.success {
-            Some((format!("✓ {secs:.2} s"), StatusKind::Ok))
+            Some((format!("OK {secs:.2} s"), StatusKind::Ok))
         } else {
             let code = output.exit_code.map_or_else(|| "—".to_owned(), |code| code.to_string());
             Some((format!("× {} {code}", crate::tl!("Exit")), StatusKind::Fail))
@@ -1298,6 +1299,24 @@ fn interpreter_available(language: CodeLanguage) -> bool {
     {
         wordcraft_kernel::is_language_available(language)
     }
+}
+
+/// Paints a crisp vector disclosure triangle (pointing down when `open`, right when collapsed)
+/// without depending on Unicode triangle glyphs in UI fonts.
+fn disclosure_triangle(ui: &mut Ui, open: bool, color: Color32, label: &str) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(vec2(14.0, 16.0), egui::Sense::click());
+    let response = response.on_hover_text(label);
+    if ui.is_rect_visible(rect) {
+        let c = rect.center();
+        let r = 3.5;
+        let pts = if open {
+            vec![pos2(c.x - r, c.y - r * 0.6), pos2(c.x + r, c.y - r * 0.6), pos2(c.x, c.y + r * 0.8)]
+        } else {
+            vec![pos2(c.x - r * 0.6, c.y - r), pos2(c.x + r * 0.8, c.y), pos2(c.x - r * 0.6, c.y + r)]
+        };
+        ui.painter().add(egui::Shape::convex_polygon(pts, color, Stroke::NONE));
+    }
+    response
 }
 
 fn language_name(language: CodeLanguage) -> &'static str {

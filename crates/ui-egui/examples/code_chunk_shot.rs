@@ -40,7 +40,7 @@ fn main() {
         move |ui, demo: &mut Demo| {
             if !demo.fonts {
                 ui.ctx().set_visuals(egui::Visuals::light());
-                wordcraft_ui_egui::theme::install_fonts_for(ui.ctx(), false);
+                wordcraft_ui_egui::theme::install_fonts(ui.ctx());
                 demo.fonts = true;
             }
             ui.set_width(820.0);

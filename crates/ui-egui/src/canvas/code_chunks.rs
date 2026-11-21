@@ -3,7 +3,9 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::mpsc::Receiver;
 
-use egui::{Pos2, Rect, Ui, pos2, vec2};
+use craft::behavior::kurbo::Point;
+use craft::pages::ui::PlacedPage;
+use egui::{Pos2, Rect, Ui, vec2};
 use serde_json::{Value, json};
 use wordcraft_doc::StoryRef;
 use wordcraft_engine::chunks::{self, ChunkOutput as EngineOutput};
@@ -13,7 +15,6 @@ use wordcraft_kernel::{CodeLanguage, PlotFormat};
 use wordcraft_layout::{DocLayout, Placed};
 
 use crate::WordApp;
-use crate::canvas::pages::page_screen_scale;
 use crate::code_chunk::{ChunkOutput as WidgetOutput, CodeChunk, CodeChunkAction, CompletedRun};
 
 const DEBOUNCE_SECS: f64 = 0.5;
@@ -427,6 +428,11 @@ pub(crate) fn sync_before_layout(app: &mut WordApp, ui: &Ui) {
     let now = ui.input(|i| i.time);
     poll_pending_runs(app, ctx);
 
+    let read_mode = app.session.view.read_mode;
+    if read_mode {
+        app.canvas.code_chunks.pending_focus = None;
+        app.canvas.code_chunks.active_chunk = None;
+    }
     let refs = top_level_chunks(&app.session.doc);
     let mut live_ids = HashSet::with_capacity(refs.len());
     for r in &refs {
@@ -436,6 +442,7 @@ pub(crate) fn sync_before_layout(app: &mut WordApp, ui: &Ui) {
 
         let label = r.chunk.options.label().unwrap_or("");
         if let Some(entry) = app.canvas.code_chunks.widgets.get_mut(&id) {
+            entry.widget.read_only = read_mode;
             // Reconcile external document edits (e.g. Undo/Redo/MCP) before flushing drafts.
             reconcile_entry(entry, lang, &r.chunk.code);
             if !entry.widget.is_editing_label() && entry.widget.label() != label {
@@ -443,6 +450,7 @@ pub(crate) fn sync_before_layout(app: &mut WordApp, ui: &Ui) {
             }
         } else {
             let mut widget = CodeChunk::new(lang, r.chunk.code.clone());
+            widget.read_only = read_mode;
             widget.set_label(label);
             let applied_output_rev = if let Some((out, out_rev)) = app.session.chunks.output_with_rev(id) {
                 widget.set_output(to_widget_output(out));
@@ -742,19 +750,21 @@ impl PaintEvents {
     }
 }
 
-fn collect_visible_chunks(app: &mut WordApp, ui: &Ui, layout: &DocLayout, rects: &[Rect], scale: f32) -> Vec<(i64, usize, Rect, f32)> {
+fn collect_visible_chunks(app: &mut WordApp, ui: &Ui, layout: &DocLayout, pages: &[PlacedPage]) -> Vec<(i64, usize, Rect, f32)> {
     app.canvas.code_chunks.screen_rects.clear();
     let view_clip = ui.clip_rect().expand(120.0);
     let mut visible = Vec::new();
-    for (pi, page) in layout.pages.iter().enumerate() {
-        let Some(pr) = rects.get(pi) else { continue };
-        let pscale = page_screen_scale(*pr, page, scale);
+    for placed in pages {
+        let Some(page) = layout.pages.get(placed.page) else { continue };
+        let pscale = placed.scale as f32;
         for it in &page.items {
             if let Placed::Chunk { id, rect, .. } = it {
-                let sr = Rect::from_min_size(pos2(pr.min.x + rect.x * pscale, pr.min.y + rect.y * pscale), vec2(rect.w * pscale, rect.h * pscale));
+                let min = placed.to_screen(Point::new(f64::from(rect.x), f64::from(rect.y)));
+                let max = placed.to_screen(Point::new(f64::from(rect.x + rect.w), f64::from(rect.y + rect.h)));
+                let sr = Rect::from_two_pos(min, max);
                 app.canvas.code_chunks.screen_rects.insert(*id, sr);
                 if sr.intersects(view_clip) || app.canvas.code_chunks.pending_focus.is_some_and(|(fid, _)| fid == *id) {
-                    visible.push((*id, pi, sr, pscale));
+                    visible.push((*id, placed.page, sr, pscale));
                 }
             }
         }
@@ -794,19 +804,23 @@ fn apply_paint_events(app: &mut WordApp, ui: &Ui, events: PaintEvents) {
     // Offscreen or Teaching-Mode-hidden chunks are not passed to `TextEdit::show`, so
     // `editor_lost_focus` never fires for them; reconcile `active_chunk` against egui focus.
     if let Some(active_id) = app.canvas.code_chunks.active_chunk {
+        let mut focus_canvas = false;
         let still_focused = !app.session.view.read_mode
             && app.canvas.code_chunks.widgets.get(&active_id).is_some_and(|entry| {
                 let editor_id = entry.widget.editor_id();
                 if !entry.widget.show_code {
                     if ui.ctx().memory(|m| m.has_focus(editor_id)) {
                         ui.ctx().memory_mut(|m| m.surrender_focus(editor_id));
-                        app.canvas.want_focus = true;
+                        focus_canvas = true;
                     }
                     false
                 } else {
                     ui.ctx().memory(|m| m.has_focus(editor_id))
                 }
             });
+        if focus_canvas {
+            app.canvas.focus_page(ui.ctx());
+        }
         if !still_focused {
             if let Err(err) = flush_one(app, active_id) {
                 app.status(err);
@@ -871,9 +885,9 @@ fn apply_paint_events(app: &mut WordApp, ui: &Ui, events: PaintEvents) {
 }
 
 /// Draw mounted `Placed::Chunk` widgets inside the scroll viewport and handle all interactions.
-pub(crate) fn paint_and_interact(app: &mut WordApp, ui: &mut Ui, layout: &DocLayout, rects: &[Rect], scale: f32) {
+pub(crate) fn paint_and_interact(app: &mut WordApp, ui: &mut Ui, layout: &DocLayout, pages: &[PlacedPage]) {
     let now = ui.input(|i| i.time);
-    let mounted_positions = collect_visible_chunks(app, ui, layout, rects, scale);
+    let mounted_positions = collect_visible_chunks(app, ui, layout, pages);
 
     let read_mode = app.session.view.read_mode;
     let pending_focus = if read_mode {
@@ -930,7 +944,7 @@ fn dispatch_chunk_action(app: &mut WordApp, chunk_id: i64, action: CodeChunkActi
         CodeChunkAction::InsertPlot { png, svg } => {
             if chunk_output_stale(app, chunk_id) {
                 app.status("the code chunk changed since its last run; run the chunk again before inserting its plot".to_string());
-                app.canvas.want_focus = true;
+                app.canvas.focus_pending = true;
                 return;
             }
             if let Some(bytes) = png {
@@ -946,7 +960,7 @@ fn dispatch_chunk_action(app: &mut WordApp, chunk_id: i64, action: CodeChunkActi
             let _ = flush_one(app, chunk_id);
             if chunk_output_stale(app, chunk_id) {
                 app.status("table output is stale; run the chunk again".to_string());
-                app.canvas.want_focus = true;
+                app.canvas.focus_pending = true;
                 return;
             }
             app.run("code.insert_table", json!({ "chunkId": chunk_id, "headers": headers, "rows": rows, "atCaret": true }))
@@ -955,7 +969,7 @@ fn dispatch_chunk_action(app: &mut WordApp, chunk_id: i64, action: CodeChunkActi
             let _ = flush_one(app, chunk_id);
             if chunk_output_stale(app, chunk_id) {
                 app.status("console output is stale; run the chunk again".to_string());
-                app.canvas.want_focus = true;
+                app.canvas.focus_pending = true;
                 return;
             }
             app.run("code.insert_output", json!({ "chunkId": chunk_id, "text": text, "atCaret": true }))
@@ -964,8 +978,8 @@ fn dispatch_chunk_action(app: &mut WordApp, chunk_id: i64, action: CodeChunkActi
     if let Err(err) = result {
         app.status(err);
     }
-    app.canvas.want_focus = true;
-    app.canvas.caret_visible_since = crate::now_ms();
+    app.canvas.focus_pending = true;
+    app.canvas.glide.restart(craft::platform::clock::monotonic_ms());
 }
 
 fn first_table_para_pos(doc: &wordcraft_doc::Document, target_block: usize) -> Option<wordcraft_doc::Pos> {
@@ -1017,7 +1031,7 @@ fn exit_chunk_to_canvas(app: &mut WordApp, id: i64, dir: i32) {
     app.canvas.code_chunks.active_chunk = None;
     let refs = top_level_chunks(&app.session.doc);
     let Some(idx) = refs.iter().position(|r| r.chunk.id == Some(id)) else {
-        app.canvas.want_focus = true;
+        app.canvas.focus_pending = true;
         return;
     };
     let current = &refs[idx];
@@ -1027,7 +1041,7 @@ fn exit_chunk_to_canvas(app: &mut WordApp, id: i64, dir: i32) {
     if dir < 0 {
         if first_block == 0 {
             app.session.sel = wordcraft_engine::Selection::caret(current.start.clone());
-            app.canvas.want_focus = true;
+            app.canvas.focus_pending = true;
             return;
         }
         let target_block = first_block - 1;
@@ -1044,10 +1058,10 @@ fn exit_chunk_to_canvas(app: &mut WordApp, id: i64, dir: i32) {
             wordcraft_doc::Block::Table(_) => last_table_para_pos(&app.session.doc, target_block),
         }) {
             app.session.sel = wordcraft_engine::Selection::caret(pos);
-            app.canvas.want_focus = true;
+            app.canvas.focus_pending = true;
         } else if app.session.doc.body.get(target_block).is_some() {
             app.session.sel = wordcraft_engine::Selection::caret(app.session.doc.clamp(&wordcraft_doc::Pos::body(target_block, 0)));
-            app.canvas.want_focus = true;
+            app.canvas.focus_pending = true;
         }
     } else {
         let target_block = last_block + 1;
@@ -1069,8 +1083,8 @@ fn exit_chunk_to_canvas(app: &mut WordApp, id: i64, dir: i32) {
         } else {
             app.session.sel = wordcraft_engine::Selection::caret(current.end.clone());
         }
-        app.canvas.want_focus = true;
-        app.canvas.caret_visible_since = crate::now_ms();
+        app.canvas.focus_pending = true;
+        app.canvas.glide.restart(craft::platform::clock::monotonic_ms());
     }
 }
 
@@ -1130,8 +1144,8 @@ pub(crate) fn try_click_below_trailing_chunk(
     }
     app.session.page_hint = page;
     app.canvas.dragging = false;
-    app.canvas.want_focus = true;
-    app.canvas.caret_visible_since = crate::now_ms();
+    app.canvas.focus_page(ctx);
+    app.canvas.glide.restart(craft::platform::clock::monotonic_ms());
     true
 }
 
@@ -1425,38 +1439,35 @@ pub(crate) fn caret_in_mounted_chunk(app: &WordApp) -> bool {
 
 /// Draw the right-click context menu for mounted code chunk `id`.
 pub(crate) fn chunk_context_menu(app: &mut WordApp, ui: &mut egui::Ui, id: i64) {
+    use craft::keymap::CommandRef;
+    use craft::ui::contract::{Props as _, Show as _};
+    use craft::ui::display::Divider;
+    use craft::ui::menu::MenuItem;
+
     let writable = !app.session.view.read_mode;
     let show_code = app.canvas.code_chunks.widgets.get(&id).is_none_or(|e| e.widget.show_code);
-    let item = |ui: &mut egui::Ui, label: &str, shortcut: &str, enabled: bool| -> bool {
-        ui.add_enabled(enabled, crate::rtl::menu_item(ui, label, shortcut, 0.0)).clicked()
-    };
 
-    let run_sc = crate::widgets::shortcut_text(app, "code.run_chunk");
-    let run_on = writable && crate::widgets::enabled(app, "code.run_chunk");
-    if item(ui, crate::tl!("Run Chunk"), &run_sc, run_on) {
-        let _ = app.run("code.run_chunk", json!({ "chunkId": id }));
-        ui.close();
-    }
+    let _ = MenuItem::new(crate::tl!("Run Chunk").to_string())
+        .command(CommandRef::with_params("code.run_chunk", json!({ "chunkId": id })))
+        .enabled(writable && app.session.why_disabled("code.run_chunk").is_none())
+        .show(ui);
     let toggle_label = if show_code { crate::tl!("Hide Code (Teaching Mode)") } else { crate::tl!("Show Code") };
-    if item(ui, toggle_label, "", true) {
-        if let Some(entry) = app.canvas.code_chunks.widgets.get_mut(&id) {
-            entry.widget.show_code = !entry.widget.show_code;
-        }
-        ui.close();
+    if MenuItem::new(toggle_label.to_string()).show(ui).ran
+        && let Some(entry) = app.canvas.code_chunks.widgets.get_mut(&id)
+    {
+        entry.widget.show_code = !entry.widget.show_code;
     }
     let has_output = app.canvas.code_chunks.widgets.get(&id).is_some_and(|e| e.widget.output().is_some()) || app.session.chunks.output(id).is_some();
-    if item(ui, crate::tl!("Clear Output"), "", writable && has_output) {
+    if MenuItem::new(crate::tl!("Clear Output").to_string()).enabled(writable && has_output).show(ui).ran {
         clear_chunk_output(app, id);
-        ui.close();
     }
-    if item(ui, crate::tl!("Restart Kernel"), "", writable) {
-        let _ = app.run("code.restart_kernel", json!({}));
-        ui.close();
-    }
-    ui.separator();
-    if item(ui, crate::tl!("Delete Code Chunk"), "", writable) {
+    let _ = MenuItem::new(crate::tl!("Restart Kernel").to_string())
+        .command(CommandRef::with_params("code.restart_kernel", json!({})))
+        .enabled(writable)
+        .show(ui);
+    let _ = Divider::horizontal().show(ui);
+    if MenuItem::new(crate::tl!("Delete Code Chunk").to_string()).enabled(writable).show(ui).ran {
         let _ = app.run("code.delete_chunk", json!({ "chunkId": id }));
-        app.canvas.want_focus = true;
-        ui.close();
+        app.canvas.focus_page(ui.ctx());
     }
 }

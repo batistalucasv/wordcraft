@@ -54,7 +54,7 @@ fn harness(chunk: CodeChunk) -> egui_kittest::Harness<'static, Fixture> {
     egui_kittest::Harness::builder().with_size(egui::vec2(760.0, 620.0)).build_ui_state(
         move |ui, fixture: &mut Fixture| {
             if !fonts {
-                crate::theme::install_fonts_for(ui.ctx(), false);
+                crate::theme::install_fonts(ui.ctx());
                 fonts = true;
             }
             ui.add_space(8.0);
@@ -213,7 +213,7 @@ fn the_console_shows_stdout() {
     let mut harness = harness(chunk);
     steps(&mut harness, 3);
     assert!(harness.query_by_label_contains("hello from the chunk").is_some(), "stdout is in the drawer");
-    assert!(harness.query_by_label_contains("✓ 0.01 s").is_some(), "the header says it succeeded");
+    assert!(harness.query_by_label_contains("OK 0.01 s").is_some(), "the header says it succeeded");
 }
 
 #[test]
@@ -357,7 +357,7 @@ fn set_language_updates_in_read_mode_and_poll_carries_completed_output() {
     let (tx, rx) = mpsc::channel();
     chunk.pending = Some(rx);
     chunk.pending_source = Some((CodeLanguage::R, "1 + 1".into()));
-    chunk.started_ms = Some(crate::clock::now_ms());
+    chunk.started_ms = Some(craft::platform::clock::monotonic_ms());
     tx.send(Ok(result("[1] 2", None))).unwrap();
 
     let completed = chunk.poll(&ctx).expect("completed run record");
@@ -376,7 +376,7 @@ fn embedded_chunk_emits_run_and_clear_requests_and_explains_svg_only_plot() {
     let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(760.0, 620.0)).build_ui_state(
         move |ui, (chunk, saw_run, saw_clear): &mut (CodeChunk, bool, bool)| {
             if !fonts {
-                crate::theme::install_fonts_for(ui.ctx(), false);
+                crate::theme::install_fonts(ui.ctx());
                 fonts = true;
             }
             ui.set_width(720.0);
@@ -394,7 +394,7 @@ fn embedded_chunk_emits_run_and_clear_requests_and_explains_svg_only_plot() {
         "SVG-only fallback must tell users to rerun with PNG or both formats"
     );
 
-    h.get_by_label("▶ Run").click();
+    h.get_by_label("Run").click();
     h.step();
     assert!(h.state().1, "embedded Run button must emit run_requested without starting directly");
     assert!(!h.state().0.is_running());
@@ -427,13 +427,13 @@ fn attach_run_uses_monotonic_clock_and_renders_elapsed_time() {
     let mut chunk = python();
     chunk.attach_run(rx);
     assert!(chunk.started_ms.is_some());
-    chunk.started_ms = Some(crate::clock::now_ms() - 1500.0);
+    chunk.started_ms = Some(craft::platform::clock::monotonic_ms() - 1500.0);
 
     let mut harness = harness(chunk);
     steps(&mut harness, 2);
     assert!(harness.query_by_label_contains("Running…").is_some(), "running spinner and elapsed time are shown");
 
-    harness.state_mut().chunk.started_ms = Some(crate::clock::now_ms() + 5000.0);
+    harness.state_mut().chunk.started_ms = Some(craft::platform::clock::monotonic_ms() + 5000.0);
     steps(&mut harness, 1);
     assert!(harness.query_by_label_contains("0.0 s").is_some(), "clock skew clamps elapsed time cleanly");
 }
