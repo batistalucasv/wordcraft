@@ -43,6 +43,7 @@ impl WordApp {
         // close, New or Open counts it as a change (#1348). A draft the document refuses is not
         // part of it: saving and exporting go on without it (the refusal stays on the status
         // line), and replacing the document asks Save / Don't Save / Cancel about it.
+        let chunk_refused = if flushes_comment_drafts(id, &params) { crate::canvas::code_chunks::flush_dirty(self).err() } else { None };
         let refused = if flushes_comment_drafts(id, &params) { panes::flush_comment_drafts(self).err() } else { None };
         if id == "file.recover" && params.as_object().is_none_or(|p| p.is_empty()) {
             self.ui.backstage = true;
@@ -57,9 +58,19 @@ impl WordApp {
         }
         // The same unsaved work the control channel's refusal covers, so the prompt and the
         // refusal can't drift apart (#3274).
-        if (self.document_unsaved() || refused.is_some()) && discards_document(id, &params) && !self.closes_only_its_window(id, &params) {
+        if (self.document_unsaved() || refused.is_some() || chunk_refused.is_some())
+            && discards_document(id, &params)
+            && !self.closes_only_its_window(id, &params)
+        {
             // PLAN: assumed shell-w8's `begin_closing(scope, documents, then, params) -> Result<Value, String>` opens the prompt.
             return self.begin_closing(CloseScope::Close, vec![self.session.document_id()], id.to_string(), params);
+        }
+        if !discards_document(id, &params)
+            && id != "file.open"
+            && let Some(err) = chunk_refused
+        {
+            self.status(err.clone());
+            return Err(err);
         }
         // The ribbon and context-menu Paste commands send no text: read the system clipboard's, as
         // Ctrl+V's paste event carries it (#584), and its HTML and RTF, which egui's paste event
@@ -112,6 +123,51 @@ impl WordApp {
     /// Run a command for a script or an agent (control channel, MCP bridge): never asks first.
     /// UI-level commands (`ui.*`) are handled here, the rest by the engine.
     pub fn execute(&mut self, id: &str, params: Value) -> Result<Value, String> {
+        let mut params = params;
+        let delete_target = if id == "code.delete_chunk" {
+            if params.get("chunkId").is_none_or(Value::is_null) {
+                let target = self
+                    .canvas
+                    .code_chunks
+                    .active_chunk
+                    .or_else(|| wordcraft_engine::chunks::chunk_at(&self.session.doc, &self.session.sel.focus).and_then(|r| r.chunk.id));
+                if let Some(target_id) = target {
+                    if let Value::Object(ref mut map) = params {
+                        map.insert("chunkId".to_string(), json!(target_id));
+                    } else {
+                        params = json!({ "chunkId": target_id });
+                    }
+                }
+                target
+            } else {
+                params.get("chunkId").and_then(Value::as_i64).filter(|&n| n > 0)
+            }
+        } else {
+            None
+        };
+        if matches!(id, "edit.undo" | "edit.redo")
+            && let Err(err) = crate::canvas::code_chunks::flush_dirty(self)
+        {
+            // A refused chunk draft (e.g. containing U+FFFC) was not checkpointed into engine
+            // history: on Undo, revert it as its own step instead of consuming prior document
+            // history; on Redo (or a refusal in another window), stop and report the error.
+            if id == "edit.undo" && crate::canvas::code_chunks::revert_dirty_chunks(self) {
+                self.after_command(id);
+                return Ok(json!({"undone": true}));
+            }
+            self.status(err.clone());
+            return Err(err);
+        } else if matches!(id, "file.save" | "file.saveAs" | "file.exportPdf" | "file.exportPng" | "code.run_chunk" | "code.run_all")
+            && let Err(err) = crate::canvas::code_chunks::flush_dirty(self)
+        {
+            self.status(err.clone());
+            return Err(err);
+        } else if id == "code.delete_chunk"
+            && let Err(err) = crate::canvas::code_chunks::flush_dirty_except(self, delete_target)
+        {
+            self.status(err.clone());
+            return Err(err);
+        }
         self.clear_command_targets(id);
         if let Some(error) = self.document_required_error(id) {
             return Err(error);
@@ -144,86 +200,7 @@ impl WordApp {
         }
         // Web: saving and exporting become downloads.
         if self.browser_saves() && matches!(id, "file.save" | "file.saveAs" | "file.exportPdf" | "file.exportPng") {
-            let name = params.get("path").and_then(Value::as_str).map(str::to_string).unwrap_or_else(|| self.web_save_name(id));
-            // Inspect only the suffix bytes: no full-name allocation or UTF-8 slicing.
-            let has_pdf_suffix = name.as_bytes().last_chunk::<4>().is_some_and(|suffix| suffix.eq_ignore_ascii_case(b".pdf"));
-            let name = if id == "file.exportPdf" && !has_pdf_suffix { format!("{name}.pdf") } else { name };
-            // A save with a password encrypts this and later saves (`file.save`'s `password`).
-            if matches!(id, "file.save" | "file.saveAs")
-                && let Some(pw) = params.get("password").filter(|v| !v.is_null())
-            {
-                if !wordcraft_engine::io::can_encrypt(&name) || pw.as_str().is_none_or(str::is_empty) {
-                    return Err("only Word documents (.docx, .docm, .dotx, .dotm) and OpenDocument text files (.odt, .ott) can be saved with a password, and it can't be empty".into());
-                }
-                self.session.run("file.encrypt", &json!({"password": pw})).map_err(|e| e.to_string())?;
-            }
-            // Like a failed native save, a failed serialization or delivery keeps the save stamps.
-            let dirty_before = self.session.dirty;
-            let before_stamp = (
-                self.session.doc.settings.zoom,
-                self.session.doc.core.last_modified_by.clone(),
-                self.session.doc.core.created.clone(),
-                self.session.doc.core.modified.clone(),
-                self.session.doc.core.revision,
-            );
-            // A save is a save, download or not: advance the revision and modified stamp (#262).
-            if matches!(id, "file.save" | "file.saveAs") {
-                self.session.stamp_save();
-            }
-            // Word documents are encrypted with the document's password, if it has one.
-            let password =
-                if matches!(id, "file.save" | "file.saveAs") { self.session.password.as_ref().map(wordcraft_engine::Password::as_str) } else { None };
-            let opts = wordcraft_engine::cmd::file::export_options(&self.session, &params);
-            let bytes = match wordcraft_engine::io::save_bytes_with(&name, &self.session.doc, password, &opts) {
-                Ok(bytes) => bytes,
-                Err(error) => {
-                    (
-                        self.session.doc.settings.zoom,
-                        self.session.doc.core.last_modified_by,
-                        self.session.doc.core.created,
-                        self.session.doc.core.modified,
-                        self.session.doc.core.revision,
-                    ) = before_stamp;
-                    return Err(error);
-                }
-            };
-            // An export is a copy, and so is a save in a format that doesn't keep everything (a
-            // page image, plain text): the document itself still has unsaved changes.
-            let marked_saved = matches!(id, "file.save" | "file.saveAs") && keeps_everything(&name);
-            // The ticket's answer may be a failure: what the save stamped is put back then (`settle_saves`).
-            let undo_stamp: Option<Box<dyn FnOnce(&mut wordcraft_engine::Session)>> = matches!(id, "file.save" | "file.saveAs").then(|| {
-                let dirty = dirty_before;
-                Box::new(move |session: &mut wordcraft_engine::Session| {
-                    (
-                        session.doc.settings.zoom,
-                        session.doc.core.last_modified_by,
-                        session.doc.core.created,
-                        session.doc.core.modified,
-                        session.doc.core.revision,
-                    ) = before_stamp;
-                    session.dirty = dirty;
-                }) as Box<dyn FnOnce(&mut wordcraft_engine::Session)>
-            });
-            // Save As tells the host page the document is now this file, which it only is when the
-            // save marks it saved. A Save under a name the page never sent (an untitled document,
-            // an imported .doc saved as .docx) is a new file too, never an overwrite.
-            let opened_name = self.session.path.as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().to_string());
-            let new_file = id == "file.saveAs" || opened_name.as_deref() != Some(name.as_str());
-            let len = bytes.len();
-            // PLAN: assumed `self.host.files()` is the app's `craft::host::Files`.
-            let request = PickRequest::save("document").file_name(name.clone()).save_as(marked_saved && new_file);
-            let ticket = self.host.files().save(request, bytes);
-            if marked_saved {
-                self.session.dirty = false;
-                // PLAN(shell-w8): `settle_saves` sets `session.path` when the answer's `records_file()` is true (S-L159).
-            }
-            // The browser's picker writes the file later (#1315): until it says how that went
-            // (`settle_saves` reads the ticket), the document's save isn't confirmed.
-            let document = self.session.document_id();
-            let rev = self.session.rev();
-            let pending = ticket.0;
-            self.saves_in_flight.push(SaveInFlight { ticket, name: name.clone(), document, marked_saved, rev, undo_stamp });
-            return Ok(json!({"downloaded": name, "bytes": len, "pendingSave": pending}));
+            return self.execute_browser_save(id, &params);
         }
         let document = self.session.document_id();
         let body_epoch = self.session.ime_body_epoch();
@@ -235,6 +212,12 @@ impl WordApp {
         } else {
             self.session.run(id, &params).map_err(|e| e.to_string())
         };
+        if id == "code.delete_chunk"
+            && r.is_ok()
+            && let Some(tid) = delete_target
+        {
+            self.canvas.code_chunks.discard_draft(tid);
+        }
         if self.session.ime_body_epoch() != body_epoch {
             self.canvas.ime_interrupted_preedit |= composing_before;
             // The body (or the whole document) was replaced under the same id — setText, a
@@ -309,6 +292,103 @@ impl WordApp {
         r
     }
 
+    /// Web: saving and exporting become browser downloads.
+    fn execute_browser_save(&mut self, id: &str, params: &Value) -> Result<Value, String> {
+        let name = params.get("path").and_then(Value::as_str).map(str::to_string).unwrap_or_else(|| self.web_save_name(id));
+        // Inspect only the suffix bytes: no full-name allocation or UTF-8 slicing.
+        let has_pdf_suffix = name.as_bytes().last_chunk::<4>().is_some_and(|suffix| suffix.eq_ignore_ascii_case(b".pdf"));
+        let name = if id == "file.exportPdf" && !has_pdf_suffix { format!("{name}.pdf") } else { name };
+        let is_copy = params.get("copy").and_then(Value::as_bool).unwrap_or(false);
+        let mut copy_password: Option<&str> = None;
+        // A save with a password encrypts this and later saves (`file.save`'s `password`).
+        if matches!(id, "file.save" | "file.saveAs")
+            && let Some(pw) = params.get("password").filter(|v| !v.is_null())
+        {
+            let Some(pw_str) = pw.as_str().filter(|s| !s.is_empty()) else {
+                return Err("`password` must be a non-empty string (file.encrypt removes a password)".into());
+            };
+            if !wordcraft_engine::io::can_encrypt(&name) {
+                return Err("only Word documents (.docx, .docm, .dotx, .dotm) and OpenDocument text files (.odt, .ott) can be saved with a password, and it can't be empty".into());
+            }
+            wordcraft_engine::io::check_password(pw_str).map_err(|e| e.to_string())?;
+            if is_copy {
+                copy_password = Some(pw_str);
+            } else {
+                self.session.run("file.encrypt", &json!({"password": pw})).map_err(|e| e.to_string())?;
+            }
+        }
+        // Like a failed native save, a failed serialization or delivery keeps the save stamps.
+        let dirty_before = self.session.dirty;
+        let before_stamp = (
+            self.session.doc.settings.zoom,
+            self.session.doc.core.last_modified_by.clone(),
+            self.session.doc.core.created.clone(),
+            self.session.doc.core.modified.clone(),
+            self.session.doc.core.revision,
+        );
+        // A save is a save, download or not: advance the revision and modified stamp (#262).
+        if matches!(id, "file.save" | "file.saveAs") {
+            self.session.stamp_save();
+        }
+        // Word documents are encrypted with the document's password, if it has one.
+        let password = if matches!(id, "file.save" | "file.saveAs") {
+            if is_copy && copy_password.is_some() { copy_password } else { self.session.password.as_ref().map(wordcraft_engine::Password::as_str) }
+        } else {
+            None
+        };
+        let opts = wordcraft_engine::cmd::file::export_options(&self.session, params);
+        let bytes = match wordcraft_engine::io::save_bytes_with(&name, &self.session.doc, password, &opts) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                (
+                    self.session.doc.settings.zoom,
+                    self.session.doc.core.last_modified_by,
+                    self.session.doc.core.created,
+                    self.session.doc.core.modified,
+                    self.session.doc.core.revision,
+                ) = before_stamp;
+                return Err(error);
+            }
+        };
+        // An export is a copy, and so is a save in a format that doesn't keep everything (a
+        // page image, plain text): the document itself still has unsaved changes.
+        let marked_saved = !is_copy && matches!(id, "file.save" | "file.saveAs") && keeps_everything(&name);
+        // The ticket's answer may be a failure: what the save stamped is put back then (`settle_saves`).
+        let undo_stamp: Option<Box<dyn FnOnce(&mut wordcraft_engine::Session)>> = matches!(id, "file.save" | "file.saveAs").then(|| {
+            let dirty = dirty_before;
+            Box::new(move |session: &mut wordcraft_engine::Session| {
+                (
+                    session.doc.settings.zoom,
+                    session.doc.core.last_modified_by,
+                    session.doc.core.created,
+                    session.doc.core.modified,
+                    session.doc.core.revision,
+                ) = before_stamp;
+                session.dirty = dirty;
+            }) as Box<dyn FnOnce(&mut wordcraft_engine::Session)>
+        });
+        // Save As tells the host page the document is now this file, which it only is when the
+        // save marks it saved. A Save under a name the page never sent (an untitled document,
+        // an imported .doc saved as .docx) is a new file too, never an overwrite.
+        let opened_name = self.session.path.as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().to_string());
+        let new_file = id == "file.saveAs" || opened_name.as_deref() != Some(name.as_str());
+        let len = bytes.len();
+        // PLAN: assumed `self.host.files()` is the app's `craft::host::Files`.
+        let request = PickRequest::save("document").file_name(name.clone()).save_as(marked_saved && new_file);
+        let ticket = self.host.files().save(request, bytes);
+        if marked_saved {
+            self.session.dirty = false;
+            // PLAN(shell-w8): `settle_saves` sets `session.path` when the answer's `records_file()` is true (S-L159).
+        }
+        // The browser's picker writes the file later (#1315): until it says how that went
+        // (`settle_saves` reads the ticket), the document's save isn't confirmed.
+        let document = self.session.document_id();
+        let rev = self.session.rev();
+        let pending = ticket.0;
+        self.saves_in_flight.push(SaveInFlight { ticket, name: name.clone(), document, marked_saved, rev, undo_stamp });
+        Ok(json!({"downloaded": name, "bytes": len, "pendingSave": pending}))
+    }
+
     /// Web: store a font added from bytes, or forget the removed ones ([`Services::store_font`]).
     fn keep_web_font(&self, id: &str, params: &Value, result: &Value) {
         match id {
@@ -353,7 +433,37 @@ impl WordApp {
         // Opening a file, or a new document from a template, reads a file that may be protected.
         let retry = matches!(id, "file.open" | "file.newFromTemplate").then(|| params.clone());
         let retry_path = retry.clone();
-        let r = self.execute(id, params);
+        let r = if id == "code.run_chunk" {
+            if let Err(err) = crate::canvas::code_chunks::flush_dirty(self) {
+                self.status(err.clone());
+                Err(err)
+            } else {
+                let res = crate::canvas::code_chunks::run_chunk_async(self, &params, self.ctx.clone().as_ref());
+                if let Err(err) = &res {
+                    self.status(err.clone());
+                }
+                res
+            }
+        } else if id == "code.run_all" {
+            if let Err(err) = crate::canvas::code_chunks::flush_dirty(self) {
+                self.status(err.clone());
+                Err(err)
+            } else {
+                let res = crate::canvas::code_chunks::run_all_async(self, &params, self.ctx.clone().as_ref());
+                if let Err(err) = &res {
+                    self.status(err.clone());
+                }
+                res
+            }
+        } else {
+            self.execute(id, params)
+        };
+        if id == "code.insert_chunk"
+            && let Ok(v) = &r
+            && let Some(cid) = v.pointer("/chunk/id").and_then(Value::as_i64)
+        {
+            self.canvas.code_chunks.request_focus(cid, false);
+        }
         if let (Err(e), Some(params)) = (&r, retry)
             && wordcraft_engine::io::needs_password(e)
         {

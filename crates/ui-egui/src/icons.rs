@@ -68,6 +68,7 @@ static WORDCRAFT_ICONS_TABLE: &[(&str, &[u8])] = &[
     ("clear", include_bytes!("../icons/clear.svg")),
     ("wordcraft.close", include_bytes!("../icons/close.svg")),
     ("closeOutline", include_bytes!("../icons/closeOutline.svg")),
+    ("codeChunk", include_bytes!("../icons/codeChunk.svg")),
     ("colWidth", include_bytes!("../icons/colWidth.svg")),
     ("colors", include_bytes!("../icons/colors.svg")),
     ("columns", include_bytes!("../icons/columns.svg")),
@@ -393,6 +394,9 @@ pub fn id(name: &'static str) -> IconId {
 pub fn for_command(id: &str) -> IconSpec<'static> {
     const ICONS: &[(&str, &str)] = &[
         ("arrange.wrap", "wrapText"),
+        ("code.insert_chunk", "codeChunk"),
+        ("code.run_chunk", "codeChunk"),
+        ("code.run_all", "codeChunk"),
         ("draw.highlighter", "highlight"),
         ("format.border", "charborder"),
         ("format.color", "fontcolor"),

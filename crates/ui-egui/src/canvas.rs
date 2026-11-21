@@ -29,6 +29,7 @@ use crate::WordApp;
 
 mod balloons;
 mod caret;
+pub(crate) mod code_chunks;
 mod column_ruler;
 pub(crate) mod context_menu;
 #[cfg(test)]
@@ -205,6 +206,8 @@ pub struct CanvasState {
     pub(crate) sync_out: f32,
     /// Screen rects of the comment balloons last frame (for the control channel and tests).
     pub balloon_rects: Vec<(u32, Rect)>,
+    /// Mounted interactive code chunks on the canvas (`control_id -> CodeChunk` widget + sync state).
+    pub(crate) code_chunks: code_chunks::CodeChunksState,
     /// Draw Table or Eraser is on (`table_pen`): presses draw instead of moving the caret.
     pub table_tool: Option<crate::table_pen::TableTool>,
     /// The Draw Table stroke (or eraser press) in progress, written during one gesture and cleared on release
@@ -267,6 +270,7 @@ impl CanvasState {
             last_highlight: old.last_highlight,
             last_font_color: old.last_font_color,
             last_shading: old.last_shading,
+            code_chunks: code_chunks::CodeChunksState::with_restored_drafts(old.code_chunks.restored_drafts),
             tab_kind: old.tab_kind,
             // The window's page is the same widget, and keeps the keyboard it had: without its id the page would
             // count as unfocused for the pass that shows the new document, and report no editor to the input method.
@@ -430,6 +434,7 @@ impl Default for CanvasState {
             sync_in: 0.0,
             sync_out: 0.0,
             balloon_rects: Vec::new(),
+            code_chunks: Default::default(),
             table_tool: None,
             table_stroke: None,
             ime_join_text: None,
@@ -656,11 +661,11 @@ fn laid_rects(out: &craft::pages::ui::PageViewOutput) -> Vec<Rect> {
 
 /// What the page body decided about the scroll position, applied after the pass.
 #[derive(Clone, Copy, Debug, Default)]
-struct ScrollFix {
+pub(super) struct ScrollFix {
     /// Move the offset by this much (screen points).
-    delta: (f64, f64),
+    pub(super) delta: (f64, f64),
     /// Bring this page, with this fraction of its height, to the top.
-    go_to: Option<(usize, f64)>,
+    pub(super) go_to: Option<(usize, f64)>,
 }
 
 /// How far a caret rect `target` lies outside `view` on one axis: negative above/left, positive below/right.
@@ -686,7 +691,7 @@ fn run_page_tool(app: &mut WordApp, ui: &Ui, layout: &Arc<DocLayout>, body: &Pag
     if let Some(mut tool) = crate::table_pen::active_tool(app, body) {
         return host.run(ui, pass, &mut tool);
     }
-    let mut tool = input::PageTextTool::new(app, layout.clone(), body, Env::of(ui).view().shell());
+    let mut tool = input::PageTextTool::new(app, ui.ctx().clone(), layout.clone(), body, Env::of(ui).view().shell());
     host.run(ui, pass, &mut tool)
 }
 
@@ -732,6 +737,7 @@ fn show_reading(app: &mut WordApp, ui: &mut Ui, layout: &Arc<DocLayout>, full: R
 pub fn show(app: &mut WordApp, ui: &mut Ui) {
     let full = ui.available_rect_before_wrap();
     let Some(metrics) = reading_metrics::read(ui) else { return };
+    code_chunks::sync_before_layout(app, ui);
     let layout = prepare_layout(app, full, &metrics, Env::of(ui).tokens.size.rail.width, ui.ctx());
     if app.session.view.read_mode {
         show_reading(app, ui, &layout, full, &metrics);
@@ -823,12 +829,15 @@ fn show_pages(app: &mut WordApp, ui: &mut Ui, layout: &Arc<DocLayout>, full: Rec
             crate::table_resize::show(app, ui, layout, body);
             crate::ink::show(app, ui, layout, body);
             crate::dialogs_smart_art::frame_button(app, ui, body.pages, layout);
+            code_chunks::paint_and_interact(app, ui, layout, body.pages);
             if let Some(pass) = body.pass {
                 ran = true;
                 let response = run_page_tool(app, ui, layout, body, pass);
                 // A right click the page tool left asks for the menu: what it clicked becomes the selection first, so
                 // the menu acts on it (the page tool takes the primary button only).
-                if let Some(request) = response.context.filter(|r| !matches!(r.source, ContextSource::Key)) {
+                if let Some(request) = response.context.filter(|r| !matches!(r.source, ContextSource::Key))
+                    && app.canvas.code_chunks.hit(request.at).is_none()
+                {
                     input::handle_secondary_selection(app, body, layout, request.at);
                 }
                 tool_response = Some(response);
@@ -899,6 +908,7 @@ fn show_pages(app: &mut WordApp, ui: &mut Ui, layout: &Arc<DocLayout>, full: Rec
     } else if ran && fix.go_to.is_none() {
         app.canvas.scroll_to_caret = false;
     }
+    code_chunks::apply_pending_focus_scroll(app, ui.ctx(), held, (&out.pages, &laid_rects(&out)), body_rect, &mut fix);
 
     // The scroll position the body asked for takes effect on the state the pass stored.
     let moved_by_user = state.offset.1 - started_at;
@@ -957,6 +967,9 @@ fn show_pages(app: &mut WordApp, ui: &mut Ui, layout: &Arc<DocLayout>, full: Rec
     if app.canvas.focus_pending && !app.modal_open() {
         let ctx = ui.ctx().clone();
         app.canvas.focus_page(&ctx);
+        if app.canvas.code_chunks.active_chunk.is_some() {
+            ctx.request_repaint();
+        }
     }
     app.canvas.resident_pictures = out.resident_pictures();
     app.canvas.view = state;
@@ -973,16 +986,32 @@ fn show_pages(app: &mut WordApp, ui: &mut Ui, layout: &Arc<DocLayout>, full: Rec
     }
     balloons::balloons(app, ui, &out, layout);
     rulers::page_rulers(app, ui, &out, layout);
-    // The one context-menu ask of the pass: Shift+F10 or `ui.contextMenu` (below the caret), a click on the equation
-    // frame's options strip, then the tool host's own request by how it was asked for.
-    let ask = app.canvas.context_request.take().or_else(|| strip_click.map(ContextAsk::AtPointer));
-    let ask = ask.or_else(|| {
-        let request = tool_response.as_ref()?.context?;
-        Some(match request.source {
-            ContextSource::Key => ContextAsk::AtCaret,
-            _ => ContextAsk::AtPointer(request.at),
-        })
-    });
+    // The one context-menu ask of the pass: Shift+F10 or `ui.contextMenu` (below the caret), a click on a code chunk
+    // or the equation frame's options strip, then the tool host's own request by how it was asked for.
+    let chunk_click = app.canvas.code_chunks.take_context_click();
+    let ask = if let Some((cid, pos)) = chunk_click {
+        app.canvas.code_chunks.context_chunk = Some(cid);
+        Some(ContextAsk::AtPointer(pos))
+    } else if let Some(req) = app.canvas.context_request.take() {
+        app.canvas.code_chunks.context_chunk = None;
+        Some(req)
+    } else if let Some(pos) = strip_click {
+        app.canvas.code_chunks.context_chunk = None;
+        Some(ContextAsk::AtPointer(pos))
+    } else if let Some(request) = tool_response.as_ref().and_then(|r| r.context) {
+        match request.source {
+            ContextSource::Key => {
+                app.canvas.code_chunks.context_chunk = None;
+                Some(ContextAsk::AtCaret)
+            }
+            _ => {
+                app.canvas.code_chunks.context_chunk = app.canvas.code_chunks.hit(request.at);
+                Some(ContextAsk::AtPointer(request.at))
+            }
+        }
+    } else {
+        None
+    };
     context_menu::show(app, ui, &out.canvas.response, ask);
 }
 

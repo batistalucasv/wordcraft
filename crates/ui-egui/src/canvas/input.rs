@@ -61,6 +61,7 @@ fn apply_format_painter(app: &mut WordApp) {
 /// pass's placement, never the last pass's record.
 pub(crate) struct PageTextTool<'a> {
     app: &'a mut WordApp,
+    ctx: egui::Context,
     layout: Arc<DocLayout>,
     body: &'a PageBody<'a>,
     /// The Windows shell draws its own I-beam.
@@ -96,10 +97,10 @@ impl<'a> PageTextTool<'a> {
     /// The tool for this pass over `app`'s document. The shell facts say whether the I-beam is
     /// drawn (Windows, native: on the web the host OS is the browser's) and which key follows a link.
     // PLAN: the sheet's `pass` and `ctx` parameters are not taken: the page's keys run from `run_page_tool` (S-L240) and the tip goes through `ToolContext::tip`; canvas-w9 drops both from its call.
-    pub(crate) fn new(app: &'a mut WordApp, layout: Arc<DocLayout>, body: &'a PageBody<'a>, shell: &ShellInfo) -> Self {
+    pub(crate) fn new(app: &'a mut WordApp, ctx: egui::Context, layout: Arc<DocLayout>, body: &'a PageBody<'a>, shell: &ShellInfo) -> Self {
         let draws_ibeam = shell.os == Os::Windows && shell.runtime == Runtime::Native;
         let link_key = if shell.os == Os::Mac { "⌘" } else { "Ctrl" };
-        PageTextTool { app, layout, body, draws_ibeam, link_key }
+        PageTextTool { app, ctx, layout, body, draws_ibeam, link_key }
     }
 
     fn pointer_at(&self, pos: Pos2, clicks: u32) -> Option<(usize, f32, f32, u8)> {
@@ -184,6 +185,9 @@ impl CanvasTool for PageTextTool<'_> {
                 return ToolAction::Claimed;
             }
         }
+        if !over_text && !self.app.canvas.dragging && self.app.canvas.code_chunks.hit(pointer.pos).is_some() {
+            return ToolAction::Ignored;
+        }
         let ended = || if over_text { ToolAction::Claimed } else { ToolAction::Done };
         let Some((page, x, y, clicks)) = self.pointer_at(pointer.pos, pointer.clicks) else {
             return if over_text { ToolAction::Claimed } else { ToolAction::Ignored };
@@ -197,7 +201,7 @@ impl CanvasTool for PageTextTool<'_> {
         }
         let hf_zone = self.hf_zone(page, y);
         let hf_enter = enters_header_footer(self.app, story, hf_zone);
-        handle_primary_press(self.app, &pp, mods, hf_zone, hf_enter);
+        handle_primary_press(self.app, &self.ctx, &pp, mods, hf_zone, hf_enter);
         // A press in the header or footer band keeps the gesture: its release decides a double-click there
         // (`handle_completed_click` enters the header or footer), and a tool that is done gets no release.
         if over_text || self.app.canvas.dragging || hf_zone.is_some() { ToolAction::Claimed } else { ToolAction::Done }
@@ -271,6 +275,9 @@ impl CanvasTool for PageTextTool<'_> {
         if let Some(c) = ObjectGesture::cursor(&*self.app, &self.layout, self.body, pointer.pos, pointer.mods) {
             return c;
         }
+        if self.app.canvas.code_chunks.hit(pointer.pos).is_some() {
+            return Cursor::System(CursorIcon::Default);
+        }
         let Some((page, x, y)) = page_of(self.body.pages, pointer.pos) else { return Cursor::System(CursorIcon::Default) };
         // The selection bar keeps its arrow.
         if self.app.session.sel.focus.story == StoryRef::Body && !pointer.mods.alt && self.layout.selection_bar_at(page, x, y).is_some() {
@@ -342,6 +349,7 @@ pub(crate) fn handle_secondary_selection(app: &mut WordApp, body: &PageBody<'_>,
 /// A press. `true` when it was handled and the pointer is done.
 fn handle_primary_press(
     app: &mut WordApp,
+    ctx: &egui::Context,
     pointer: &PagePointer<'_>,
     mods: egui::Modifiers,
     hf_zone: Option<(Option<StoryRef>, bool)>,
@@ -431,6 +439,14 @@ fn handle_primary_press(
         };
         app.canvas.unit_drag = Some(UnitDrag { unit, clicks, start, end, last: line });
         app.canvas.dragging = true;
+        return true;
+    }
+    if clicks == 1
+        && !mods.alt
+        && !mods.command
+        && !mods.shift
+        && crate::canvas::code_chunks::try_click_below_trailing_chunk(app, ctx, layout, page, (x, y), story)
+    {
         return true;
     }
     let Some(pos) = layout.hit(page, x, y, story) else { return true };

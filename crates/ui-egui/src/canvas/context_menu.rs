@@ -46,6 +46,7 @@ pub(crate) fn show(app: &mut WordApp, ui: &mut Ui, opener: &Response, ask: Optio
     let mut open = app.canvas.context_menu_open;
     match ask {
         Some(ContextAsk::AtCaret) => {
+            app.canvas.code_chunks.context_chunk = None;
             context_suggestions(app);
             if let Some((p, h)) = super::cursor::caret_screen(app) {
                 app.canvas.context_menu_at = Some(p + vec2(0.0, h));
@@ -54,8 +55,11 @@ pub(crate) fn show(app: &mut WordApp, ui: &mut Ui, opener: &Response, ask: Optio
         }
         Some(ContextAsk::AtPointer(p)) => {
             app.canvas.context_menu_at = Some(p);
-            // The equation strip's menu is the equation's own: it has no proofing rows.
-            if app.session.math.is_none() {
+            // The equation strip's and code chunk's menus have no proofing rows.
+            if app.canvas.code_chunks.context_chunk.is_some() {
+                app.canvas.context_issue = None;
+                app.canvas.context_synonyms = None;
+            } else if app.session.math.is_none() {
                 if wordcraft_engine::cmd::objects::selected(&app.session).is_some() {
                     app.canvas.context_issue = None;
                     app.canvas.context_synonyms = None;
@@ -70,12 +74,17 @@ pub(crate) fn show(app: &mut WordApp, ui: &mut Ui, opener: &Response, ask: Optio
     if !open {
         app.canvas.context_menu_open = false;
         app.canvas.context_menu_at = None;
+        app.canvas.code_chunks.context_chunk = None;
         return;
     }
     let at = app.canvas.context_menu_at.unwrap_or(opener.rect.left_top());
     let menu = Menu::new(tl!("Context Menu").to_string()).opened_by(opener, Trigger::Manual).anchor(Anchor::Point(at)).open(Bind::bound(&mut open));
 
-    if app.session.math.is_some() {
+    if let Some(chunk_id) = app.canvas.code_chunks.context_chunk {
+        let _ = menu.show(ui, |ui, _cx| {
+            crate::canvas::code_chunks::chunk_context_menu(app, ui, chunk_id);
+        });
+    } else if app.session.math.is_some() {
         let rows = super::equation_frame::equation_menu_rows(app);
         let pick = menu.pick(ui, &rows);
         if let Some(act) = pick.picked {
@@ -101,6 +110,7 @@ pub(crate) fn show(app: &mut WordApp, ui: &mut Ui, opener: &Response, ask: Optio
     app.canvas.context_menu_open = open;
     if !open {
         app.canvas.context_menu_at = None;
+        app.canvas.code_chunks.context_chunk = None;
     }
 }
 

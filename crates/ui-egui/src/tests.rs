@@ -2088,6 +2088,67 @@ fn the_host_hears_about_edits_made_while_drawing() {
     assert_eq!(reported.get(), Some(true), "the host was told before the frame ended");
 }
 
+/// Switching to a clean document parks any unapplied code-chunk draft from the first document.
+/// The host leave-page guard (`on_dirty`) must stay true while that parked draft exists.
+#[test]
+fn the_host_keeps_dirty_true_when_a_parked_document_has_an_unapplied_chunk_draft() {
+    let reported = std::rc::Rc::new(std::cell::Cell::new(None));
+    let mut a = app();
+    a.windows.single();
+    let chunk_id = a.run("code.insert_chunk", json!({"language": "python", "code": "x = 1"})).expect("insert code chunk")["chunk"]["id"]
+        .as_i64()
+        .expect("chunk id");
+    // Reset undo history and dirty state so only the unapplied chunk draft makes doc A unsaved.
+    let clean_doc = a.session.doc.clone();
+    a.session.set_document(clean_doc);
+    let doc_a = a.session.document_id();
+    let seen = reported.clone();
+    a.services.on_dirty = Some(Box::new(move |d| seen.set(Some(d))));
+
+    let mut h = crate::test_harness::builder().with_size(egui::vec2(1280.0, 860.0)).build_ui_state(
+        |ui, app: &mut WordApp| {
+            let ctx = ui.ctx().clone();
+            crate::test_harness::driver_logic(&ctx, app);
+            app.ui(ui);
+        },
+        a,
+    );
+    for _ in 0..4 {
+        h.step();
+    }
+    assert_eq!(reported.get(), Some(false), "clean document starts non-dirty");
+
+    // Type into the chunk widget so doc A has an unapplied draft before debounce expires.
+    h.state_mut().canvas.code_chunks.request_focus(chunk_id, true);
+    for _ in 0..2 {
+        h.step();
+    }
+    h.event(egui::Event::Text(" + 1".into()));
+    h.step();
+    assert!(!h.state().session.dirty, "unapplied chunk draft must not mark session dirty");
+    assert!(crate::canvas::code_chunks::has_dirty_chunks(h.state()), "active document has unapplied chunk draft");
+    assert_eq!(reported.get(), Some(true), "active unapplied chunk draft must report dirty");
+
+    // Switch to a clean document B: doc A's draft moves to `parked`.
+    h.state_mut().run("file.new", json!({})).expect("open clean document B");
+    let doc_b = h.state().session.document_id();
+    assert_ne!(doc_b, doc_a);
+    for _ in 0..2 {
+        h.step();
+    }
+    assert!(!h.state().session.dirty, "active document B is clean");
+    assert!(!h.state().session.document_dirty(doc_a), "doc A itself has no committed dirty changes");
+    assert!(!crate::canvas::code_chunks::has_dirty_chunks(h.state()), "doc B has no active chunk drafts");
+    assert!(h.state().document_unsaved_by_id(doc_a), "doc A remains unsaved via its parked chunk draft");
+    assert_eq!(reported.get(), Some(true), "host leave-page guard must stay dirty while doc A has a parked chunk draft");
+
+    // Closing doc A discards its parked draft and clears the host dirty flag while clean doc B stays open.
+    h.state_mut().run("file.closeDocument", json!({"id": doc_a, "force": true})).expect("close parked doc A");
+    h.step();
+    assert_eq!(h.state().session.document_id(), doc_b);
+    assert_eq!(reported.get(), Some(false), "dirty clears once the parked document is closed");
+}
+
 #[test]
 fn paragraph_alignment_keeps_the_canvas_focused_for_typing() {
     use wordcraft_doc::Align;
@@ -2316,6 +2377,39 @@ fn web_downloads_that_drop_content_leave_the_document_unsaved() {
         a.execute("file.saveAs", json!({"path": name})).unwrap();
         assert!(!a.session.dirty, "{name}");
     }
+}
+
+#[test]
+fn web_save_copy_with_password_encrypts_download_without_changing_session_password() {
+    let files = Arc::new(ScriptedFiles::new().in_browser().saving_suggested());
+    let mut a = app_with_files(files.clone());
+    a.run("text.insert", json!({"text": UNSAVED})).unwrap();
+
+    let res = a
+        .execute(
+            "file.saveAs",
+            json!({
+                "path": "copy.docx",
+                "password": "Password123!",
+                "copy": true,
+            }),
+        )
+        .unwrap();
+    assert_eq!(res["downloaded"], "copy.docx");
+    assert!(a.session.password.is_none(), "session password must remain None for a copy");
+
+    let (_, bytes) = saved(&files).into_iter().next().expect("downloaded copy");
+    assert!(!bytes.is_empty());
+    assert!(wordcraft_engine::io::open_bytes_with("copy.docx", &bytes, None).is_err());
+    let (doc, encrypted) = wordcraft_engine::io::open_bytes_with("copy.docx", &bytes, Some("Password123!")).unwrap();
+    assert!(encrypted);
+    assert_eq!(doc.plain_text(wordcraft_doc::StoryRef::Body), a.session.doc.plain_text(wordcraft_doc::StoryRef::Body));
+
+    a.execute("file.saveAs", json!({"path": "normal.docx"})).unwrap();
+    assert!(a.session.password.is_none());
+    let (_, normal_bytes) = saved(&files).into_iter().last().expect("normal download");
+    let (_, normal_encrypted) = wordcraft_engine::io::open_bytes_with("normal.docx", &normal_bytes, None).unwrap();
+    assert!(!normal_encrypted);
 }
 
 /// Web inside a page that keeps the files: the app with `host_save` recording each file it

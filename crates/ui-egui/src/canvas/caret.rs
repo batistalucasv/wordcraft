@@ -184,7 +184,7 @@ pub(crate) fn paint_caret(app: &mut WordApp, ui: &mut Ui, pass: &ToolPass, body:
     };
     let ink = |app: &mut WordApp| caret_color_at(app, &doc, pl.page, pl.probe.0, pl.probe.1, zoom_key, dim_body);
 
-    let shown = pl.collapsed && focused;
+    let shown = pl.collapsed && focused && !super::code_chunks::caret_in_mounted_chunk(app);
     let mut bars: Vec<(Bar, Color32)> = Vec::new();
     let mut composition = None;
     if focused && !pl.in_equation && !app.canvas.ime_preedit.is_empty() {

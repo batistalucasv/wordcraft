@@ -284,6 +284,30 @@ pub(super) fn insert(row: &mut RibbonRow<'_>, app: &mut WordApp) {
             },
         );
     });
+    row.group(RibbonGroup::new("Code", crate::tl!("Code"), IconSpec::from(crate::icons::id("codeChunk"))), |ui| {
+        menu_button(
+            ui,
+            Button::new(crate::tl!("Code Chunk"))
+                .icon(crate::icons::id("codeChunk"))
+                .tooltip(crate::tl!("Code Chunk"))
+                .arrangement(Arrangement::Stacked),
+            crate::tl!("Code Chunk"),
+            Some("code.insert_chunk"),
+            |ui, _| {
+                MenuItem::command(CommandRef::with_params("code.insert_chunk", json!({"language": "python"})))
+                    .label(crate::tl!("Python Code Chunk"))
+                    .icon(crate::icons::id("codeChunk"))
+                    .show(ui);
+                MenuItem::command(CommandRef::with_params("code.insert_chunk", json!({"language": "r"})))
+                    .label(crate::tl!("R Code Chunk"))
+                    .icon(crate::icons::id("codeChunk"))
+                    .show(ui);
+                Divider::horizontal().show(ui);
+                MenuItem::command(CommandRef::with_params("code.run_all", json!({}))).label(crate::tl!("Run All Code Chunks")).show(ui);
+                MenuItem::command(CommandRef::with_params("code.restart_kernel", json!({}))).label(crate::tl!("Restart Kernel")).show(ui);
+            },
+        );
+    });
 }
 
 /// The recent and common characters as a grid of six per row; a click inserts the character, remembers it and closes

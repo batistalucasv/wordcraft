@@ -9402,6 +9402,7 @@ dependencies = [
  "wordcraft-engine",
  "wordcraft-fonts",
  "wordcraft-geom",
+ "wordcraft-kernel",
  "wordcraft-layout",
  "wordcraft-render",
  "wordcraft-zotero",
