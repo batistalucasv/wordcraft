@@ -132,6 +132,7 @@ pub(super) fn modify_style(s: &mut Session, v: &Value) -> CmdResult {
     }
     if let Some(pp) = para {
         st.para.overlay(&pp);
+        st.para.cancel_char_indents(pp.indent_left.is_some(), pp.indent_right.is_some(), pp.indent_first.is_some());
     }
     if let Some(n) = next {
         st.next = Some(n);
