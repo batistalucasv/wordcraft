@@ -661,11 +661,11 @@ fn laid_rects(out: &craft::pages::ui::PageViewOutput) -> Vec<Rect> {
 
 /// What the page body decided about the scroll position, applied after the pass.
 #[derive(Clone, Copy, Debug, Default)]
-struct ScrollFix {
+pub(super) struct ScrollFix {
     /// Move the offset by this much (screen points).
-    delta: (f64, f64),
+    pub(super) delta: (f64, f64),
     /// Bring this page, with this fraction of its height, to the top.
-    go_to: Option<(usize, f64)>,
+    pub(super) go_to: Option<(usize, f64)>,
 }
 
 /// How far a caret rect `target` lies outside `view` on one axis: negative above/left, positive below/right.
@@ -908,6 +908,7 @@ fn show_pages(app: &mut WordApp, ui: &mut Ui, layout: &Arc<DocLayout>, full: Rec
     } else if ran && fix.go_to.is_none() {
         app.canvas.scroll_to_caret = false;
     }
+    code_chunks::apply_pending_focus_scroll(app, ui.ctx(), held, (&out.pages, &laid_rects(&out)), body_rect, &mut fix);
 
     // The scroll position the body asked for takes effect on the state the pass stored.
     let moved_by_user = state.offset.1 - started_at;

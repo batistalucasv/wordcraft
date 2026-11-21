@@ -3328,3 +3328,113 @@ fn refused_chunk_checkpoint_reverts_draft_on_undo_blocks_redo_and_preserves_vali
     assert_eq!(wordcraft_engine::chunks::chunks_in(&h.state().session.doc, StoryRef::Body)[0].chunk.code, "x = 1\ny = 2");
     assert_eq!(h.state().canvas.code_chunks.widgets[&chunk_id].widget.code(), "x = 1\ny = 2");
 }
+
+#[test]
+fn arrow_into_chunk_on_unplaced_page_keeps_focus_request_scrolls_and_focuses_editor() {
+    let mut a = WordApp::new(wordcraft_engine::Session::new(wordcraft_doc::Document::new()), Default::default());
+    // Build page 0 with enough paragraphs to fill the page, then place a code chunk on page 1.
+    for i in 0..38 {
+        if i > 0 {
+            a.run("text.newParagraph", json!({})).unwrap();
+        }
+        a.run("text.insert", json!({"text": format!("Page 1 filler paragraph {i}")})).unwrap();
+    }
+    let last_p0_block = a.session.doc.body.len() - 1;
+    let chunk_p1 =
+        a.run("code.insert_chunk", json!({"language": "python", "code": "page_two = 2\nprint(page_two)"})).unwrap()["chunk"]["id"].as_i64().unwrap();
+    let end_p1 = wordcraft_engine::chunks::chunks_in(&a.session.doc, StoryRef::Body)[0].end.path.last();
+    a.session.doc.body.truncate(end_p1 + 1);
+    let below_p1_block = a.session.doc.body.len();
+    a.session.doc.body.push(wordcraft_doc::para_block(wordcraft_doc::Paragraph::with_text("Paragraph below page 2 chunk", Default::default())));
+
+    // Start at the top of page 0 with no initial chunk focus pending so page 1 is below the viewport and unplaced.
+    a.canvas.code_chunks.pending_focus = None;
+    a.session.sel = wordcraft_engine::Selection::caret(Pos::body(0, 0));
+    a.session.page_hint = 0;
+
+    let mut h = crate::test_harness::builder().with_size(egui::vec2(1280.0, 680.0)).build_ui_state(
+        |ui, app: &mut WordApp| {
+            let ctx = ui.ctx().clone();
+            crate::test_harness::driver_logic(&ctx, app);
+            app.ui(ui);
+        },
+        a,
+    );
+    steps(&mut h, 6);
+
+    let layout = h.state_mut().session.layout();
+    let (chunk_page, _) = crate::canvas::code_chunks::chunk_placement(&layout, chunk_p1).expect("chunk must have a placement");
+    assert_eq!(chunk_page, 1, "chunk must be laid out on page 1");
+    assert!(
+        h.state().canvas.shown.pages.iter().all(|p| p.page != chunk_page),
+        "page 1 must initially be unplaced while viewing top of page 0: {:?}",
+        h.state().canvas.shown.pages
+    );
+
+    // 1. Place the caret on the last paragraph of page 0 while keeping page 1 unplaced, then press ArrowDown.
+    h.state_mut().session.sel = wordcraft_engine::Selection::caret(Pos::body(last_p0_block, 0));
+    h.state_mut().session.page_hint = 0;
+    h.state_mut().canvas.scroll_to_caret = false;
+    h.state_mut().canvas.code_chunks.active_chunk = None;
+    let ctx = h.ctx.clone();
+    h.state_mut().canvas.focus_page(&ctx);
+
+    assert!(
+        crate::canvas::code_chunks::maybe_enter_from_canvas_arrow(h.state_mut(), egui::Key::ArrowDown, egui::Modifiers::NONE),
+        "ArrowDown at bottom of page 0 must enter the chunk on page 1"
+    );
+    assert_eq!(h.state().canvas.code_chunks.pending_focus, Some((chunk_p1, false)));
+
+    // A paint pass that only visits placed page 0 must NOT clear `pending_focus`, and must scroll toward page 1.
+    let page0_only: Vec<_> = h.state().canvas.shown.pages.iter().filter(|p| p.page == 0).copied().collect();
+    assert!(!page0_only.is_empty());
+    let offset_before = h.state().canvas.view.offset.1;
+    let mut raw_out = ctx.run_ui(egui::RawInput::default(), |ui| {
+        crate::canvas::code_chunks::paint_and_interact(h.state_mut(), ui, &layout, &page0_only);
+    });
+    raw_out.textures_delta.clear();
+    assert_eq!(
+        h.state().canvas.code_chunks.pending_focus,
+        Some((chunk_p1, false)),
+        "paint pass visiting only placed page 0 must retain pending_focus for unplaced page 1"
+    );
+    assert!(
+        h.state().canvas.view.offset.1 > offset_before,
+        "paint pass with unplaced target page must scroll down toward the target placement ({offset_before} -> {})",
+        h.state().canvas.view.offset.1
+    );
+    // Reset offset to 0 to also verify the full canvas pass end-to-end from the unplaced state.
+    h.state_mut().canvas.view.offset.1 = offset_before;
+
+    steps(&mut h, 3);
+
+    let editor_id = h.state().canvas.code_chunks.widgets[&chunk_p1].widget.editor_id();
+    assert!(
+        h.state().canvas.shown.pages.iter().any(|p| p.page == chunk_page),
+        "canvas must scroll so page 1 becomes placed: {:?}",
+        h.state().canvas.shown.pages
+    );
+    assert_eq!(h.state().canvas.code_chunks.pending_focus, None, "pending_focus must clear after the editor takes focus");
+    assert_eq!(h.state().canvas.code_chunks.active_chunk, Some(chunk_p1), "chunk on page 1 must become active_chunk");
+    assert!(h.ctx.memory(|m| m.has_focus(editor_id)), "chunk editor on page 1 must hold egui focus");
+    assert_ne!(h.state().session.sel.focus, Pos::body(last_p0_block, 0), "document caret must move off the previous line into the focused chunk");
+    assert_eq!(
+        wordcraft_engine::chunks::chunk_at(&h.state().session.doc, &h.state().session.sel.focus).and_then(|r| r.chunk.id),
+        Some(chunk_p1),
+        "document caret must sit inside the focused chunk"
+    );
+
+    // 2. While page 1 is already placed, focusing the chunk on page 1 must still hand off immediately in a single paint pass.
+    h.state_mut().canvas.focus_page(&ctx);
+    h.state_mut().canvas.code_chunks.active_chunk = None;
+    h.state_mut().session.sel = wordcraft_engine::Selection::caret(Pos::body(below_p1_block, 0));
+    assert!(
+        crate::canvas::code_chunks::maybe_enter_from_canvas_arrow(h.state_mut(), egui::Key::ArrowUp, egui::Modifiers::NONE),
+        "ArrowUp below chunk must request focus at chunk end"
+    );
+    assert_eq!(h.state().canvas.code_chunks.pending_focus, Some((chunk_p1, true)));
+    h.app_frame();
+    assert_eq!(h.state().canvas.code_chunks.pending_focus, None, "chunk on a placed page must take focus immediately on the next pass");
+    assert_eq!(h.state().canvas.code_chunks.active_chunk, Some(chunk_p1));
+    assert!(h.ctx.memory(|m| m.has_focus(editor_id)));
+}

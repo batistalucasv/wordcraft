@@ -110,6 +110,9 @@ impl CodeChunksState {
         if self.active_chunk == Some(id) {
             self.active_chunk = None;
         }
+        if self.pending_focus.is_some_and(|(fid, _)| fid == id) {
+            self.pending_focus = None;
+        }
     }
 
     fn allocate_batch_id(&mut self) -> u64 {
@@ -524,6 +527,9 @@ pub(crate) fn sync_before_layout(app: &mut WordApp, ui: &Ui) {
     if app.canvas.code_chunks.context_chunk.is_some_and(|id| !live_ids.contains(&id)) {
         app.canvas.code_chunks.context_chunk = None;
     }
+    if app.canvas.code_chunks.pending_focus.is_some_and(|(id, _)| !live_ids.contains(&id)) {
+        app.canvas.code_chunks.pending_focus = None;
+    }
 
     // Flush any editor whose typing debounce expired after external document changes reconciled.
     let mut expired: Vec<i64> = app
@@ -809,6 +815,7 @@ fn apply_paint_events(app: &mut WordApp, ui: &Ui, events: PaintEvents) {
             app.status(err);
         }
         app.canvas.code_chunks.active_chunk = Some(id);
+        app.canvas.focus_pending = false;
         app.session.page_hint = pi;
         if !chunks::chunk_at(&app.session.doc, &app.session.sel.focus).is_some_and(|r| r.chunk.id == Some(id))
             && let Some(r) = top_level_chunks(&app.session.doc).into_iter().find(|r| r.chunk.id == Some(id))
@@ -900,6 +907,144 @@ fn apply_paint_events(app: &mut WordApp, ui: &Ui, events: PaintEvents) {
     }
 }
 
+/// Locate a mounted chunk's page index and page-space rectangle in `layout`.
+pub(crate) fn chunk_placement(layout: &DocLayout, chunk_id: i64) -> Option<(usize, wordcraft_geom::Rect)> {
+    layout.pages.iter().enumerate().find_map(|(pi, page)| {
+        page.items.iter().find_map(|it| match it {
+            Placed::Chunk { id, rect, .. } if *id == chunk_id => Some((pi, *rect)),
+            _ => None,
+        })
+    })
+}
+
+fn overshoot_axis(target: (f32, f32), view: (f32, f32)) -> f64 {
+    if target.0 < view.0 {
+        f64::from(target.0 - view.0)
+    } else if target.1 > view.1 {
+        f64::from(target.1 - view.1)
+    } else {
+        0.0
+    }
+}
+
+/// Vertical screen-space band `(y_min, y_max)` of `chunk_sr` to bring inside `view_rect` when focusing a chunk.
+pub(crate) fn chunk_focus_band_y(chunk_sr: Rect, view_rect: Rect, at_end: bool) -> (f32, f32) {
+    let view_h = view_rect.height().max(48.0);
+    let margin = 24.0_f32.min(view_h * 0.25);
+    if chunk_sr.height() + 2.0 * margin <= view_h {
+        (chunk_sr.min.y - margin, chunk_sr.max.y + margin)
+    } else {
+        let band_h = (view_h * 0.5).max(48.0).min(view_h);
+        if at_end {
+            let bottom = chunk_sr.max.y + margin.min(view_h - band_h);
+            ((bottom - band_h).max(chunk_sr.min.y), bottom)
+        } else {
+            let top = chunk_sr.min.y - margin.min(view_h - band_h);
+            (top, (top + band_h).min(chunk_sr.max.y))
+        }
+    }
+}
+
+fn scroll_to_pending_chunk(
+    app: &mut WordApp,
+    ui: &Ui,
+    layout: &DocLayout,
+    pages: &[PlacedPage],
+    target_page: usize,
+    target_rect: wordcraft_geom::Rect,
+    at_end: bool,
+) {
+    app.session.page_hint = target_page;
+    let view_rect = if app.canvas.shown.view.is_positive() { app.canvas.shown.view } else { ui.clip_rect() };
+    let page_h = layout.pages.get(target_page).map_or(1.0, |p| p.h.max(1.0));
+    let chunk_sr = if let Some(placed) = pages.iter().find(|p| p.page == target_page) {
+        let min = placed.to_screen(Point::new(f64::from(target_rect.x), f64::from(target_rect.y)));
+        let max = placed.to_screen(Point::new(f64::from(target_rect.x + target_rect.w), f64::from(target_rect.y + target_rect.h)));
+        Some(Rect::from_two_pos(min, max))
+    } else if let Some(&page_rect) = app.canvas.shown.laid.get(target_page) {
+        let shift = pages.first().and_then(|p| app.canvas.shown.laid.get(p.page).map(|laid| p.rect.min - laid.min)).unwrap_or(egui::Vec2::ZERO);
+        let page_rect = page_rect.translate(shift);
+        let s = page_rect.height() / page_h;
+        let min = page_rect.min + vec2(target_rect.x * s, target_rect.y * s);
+        let max = page_rect.min + vec2((target_rect.x + target_rect.w) * s, (target_rect.y + target_rect.h) * s);
+        Some(Rect::from_two_pos(min, max))
+    } else if let Some(anchor) = pages.first() {
+        let s = anchor.scale as f32;
+        let dy_pages: f32 = if target_page >= anchor.page {
+            (anchor.page..target_page).filter_map(|p| layout.pages.get(p)).map(|p| p.h * s).sum()
+        } else {
+            -(target_page..anchor.page).filter_map(|p| layout.pages.get(p)).map(|p| p.h * s).sum::<f32>()
+        };
+        let page_min = anchor.rect.min + vec2(0.0, dy_pages);
+        let min = page_min + vec2(target_rect.x * s, target_rect.y * s);
+        let max = page_min + vec2((target_rect.x + target_rect.w) * s, (target_rect.y + target_rect.h) * s);
+        Some(Rect::from_two_pos(min, max))
+    } else {
+        None
+    };
+
+    if let Some(sr) = chunk_sr {
+        let band = chunk_focus_band_y(sr, view_rect, at_end);
+        let dy = overshoot_axis(band, (view_rect.min.y, view_rect.max.y));
+        if dy != 0.0 {
+            app.canvas.view.offset.1 += dy;
+        }
+    } else {
+        let edge_y = if at_end { target_rect.bottom() } else { target_rect.y };
+        let frac = f64::from((edge_y / page_h).clamp(0.0, 1.0));
+        app.canvas.view.go_to = Some((target_page, frac));
+        app.canvas.view.current = target_page;
+    }
+    ui.ctx().request_repaint();
+}
+
+/// Resolve scroll adjustments in [`super::show_pages`] when a chunk focus request is pending or scrolled an overhanging chunk.
+pub(crate) fn apply_pending_focus_scroll(
+    app: &mut WordApp,
+    ctx: &egui::Context,
+    held: bool,
+    (placed_pages, laid_pages): (&[PlacedPage], &[Rect]),
+    body_rect: Rect,
+    fix: &mut super::ScrollFix,
+) {
+    if held {
+        return;
+    }
+    let layout = app.session.layout();
+    if let Some((fid, at_end)) = app.canvas.code_chunks.pending_focus
+        && let Some((page, rect)) = chunk_placement(&layout, fid)
+    {
+        app.session.page_hint = page;
+        let page_h = layout.pages.get(page).map_or(1.0, |p| p.h.max(1.0));
+        let chunk_sr = if let Some(placed) = placed_pages.iter().find(|p| p.page == page) {
+            let min = placed.to_screen(Point::new(f64::from(rect.x), f64::from(rect.y)));
+            let max = placed.to_screen(Point::new(f64::from(rect.x + rect.w), f64::from(rect.y + rect.h)));
+            Some(Rect::from_two_pos(min, max))
+        } else if let Some(page_rect) = laid_pages.get(page).copied() {
+            let s = page_rect.height() / page_h;
+            let min = page_rect.min + vec2(rect.x * s, rect.y * s);
+            let max = page_rect.min + vec2((rect.x + rect.w) * s, (rect.y + rect.h) * s);
+            Some(Rect::from_two_pos(min, max))
+        } else {
+            None
+        };
+        match chunk_sr {
+            Some(sr) => {
+                let band = chunk_focus_band_y(sr, body_rect, at_end);
+                fix.delta = (0.0, overshoot_axis(band, (body_rect.min.y, body_rect.max.y)));
+                fix.go_to = None;
+            }
+            None => {
+                let edge_y = if at_end { rect.bottom() } else { rect.y };
+                fix.go_to = Some((page, f64::from((edge_y / page_h).clamp(0.0, 1.0))));
+            }
+        }
+        ctx.request_repaint();
+    } else if app.canvas.view.offset != (0.0, 0.0) {
+        fix.delta = app.canvas.view.offset;
+    }
+}
+
 /// Draw mounted `Placed::Chunk` widgets inside the scroll viewport and handle all interactions.
 pub(crate) fn paint_and_interact(app: &mut WordApp, ui: &mut Ui, layout: &DocLayout, pages: &[PlacedPage]) {
     let now = ui.input(|i| i.time);
@@ -911,16 +1056,15 @@ pub(crate) fn paint_and_interact(app: &mut WordApp, ui: &mut Ui, layout: &DocLay
         app.canvas.code_chunks.active_chunk = None;
         None
     } else {
-        app.canvas.code_chunks.pending_focus.take()
+        app.canvas.code_chunks.pending_focus
     };
     let mut events = PaintEvents::default();
 
     for (id, pi, sr, pscale) in mounted_positions {
         let Some(entry) = app.canvas.code_chunks.widgets.get_mut(&id) else { continue };
         entry.widget.read_only = read_mode;
-        if let Some((fid, at_end)) = pending_focus
-            && fid == id
-        {
+        let requested_edge = if !read_mode { pending_focus.filter(|(fid, _)| *fid == id).map(|(_, at_end)| at_end) } else { None };
+        if let Some(at_end) = requested_edge {
             entry.widget.focus_edge(at_end);
             app.session.page_hint = pi;
         }
@@ -929,6 +1073,18 @@ pub(crate) fn paint_and_interact(app: &mut WordApp, ui: &mut Ui, layout: &DocLay
         let max_rect = Rect::from_min_size(sr.min, vec2(sr.width().max(48.0), f32::INFINITY));
         let mut child_ui = ui.new_child(egui::UiBuilder::new().max_rect(max_rect));
         let frame = entry.widget.show_embedded(&mut child_ui);
+        if let Some(at_end) = requested_edge
+            && frame.editor_has_focus
+        {
+            app.canvas.code_chunks.pending_focus = None;
+            let view_rect = if app.canvas.shown.view.is_positive() { app.canvas.shown.view } else { ui.clip_rect() };
+            let band = chunk_focus_band_y(sr, view_rect, at_end);
+            let dy = overshoot_axis(band, (view_rect.min.y, view_rect.max.y));
+            if dy != 0.0 {
+                app.canvas.view.offset.1 += dy;
+                ui.ctx().request_repaint();
+            }
+        }
 
         let measured_pt = (child_ui.min_rect().height() / pscale.max(0.01)).clamp(24.0, 20000.0);
         let new_centipts = (measured_pt * 100.0).round() as u32;
@@ -945,6 +1101,16 @@ pub(crate) fn paint_and_interact(app: &mut WordApp, ui: &mut Ui, layout: &DocLay
     }
 
     apply_paint_events(app, ui, events);
+
+    if let Some((fid, at_end)) = app.canvas.code_chunks.pending_focus {
+        if app.canvas.code_chunks.is_mounted(fid)
+            && let Some((target_page, target_rect)) = chunk_placement(layout, fid)
+        {
+            scroll_to_pending_chunk(app, ui, layout, pages, target_page, target_rect, at_end);
+        } else {
+            app.canvas.code_chunks.pending_focus = None;
+        }
+    }
 }
 
 fn chunk_output_stale(app: &WordApp, chunk_id: i64) -> bool {
