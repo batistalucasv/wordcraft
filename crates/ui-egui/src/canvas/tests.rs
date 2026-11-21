@@ -6524,3 +6524,106 @@ fn embedded_header_run_validates_draft_and_clear_removes_session_output() {
     assert!(!h.state().canvas.code_chunks.widgets[&chunk_id].widget.is_running(), "refused draft must not start interpreter");
     assert!(h.state().status_msg.as_ref().is_some_and(|(m, _)| m.contains("U+FFFC")));
 }
+
+#[test]
+fn delete_chunk_with_null_chunk_id_targets_active_chunk_and_discards_its_draft() {
+    let mut a = WordApp::new(wordcraft_engine::Session::new(wordcraft_doc::Document::new()), Default::default());
+    let chunk_a = a.run("code.insert_chunk", json!({"language": "python", "code": "a = 1"})).unwrap()["chunk"]["id"].as_i64().unwrap();
+    let chunk_b = a.run("code.insert_chunk", json!({"language": "python", "code": "b = 2"})).unwrap()["chunk"]["id"].as_i64().unwrap();
+
+    let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1280.0, 860.0)).build_ui_state(
+        |ui, app: &mut WordApp| {
+            let ctx = ui.ctx().clone();
+            app.logic(&ctx);
+            app.ui(ui);
+        },
+        a,
+    );
+    steps(&mut h, 4);
+
+    // Put an unapplied rejected draft on chunk A and mark chunk A active, while document selection sits inside chunk B.
+    let entry_a = h.state_mut().canvas.code_chunks.widgets.get_mut(&chunk_a).unwrap();
+    entry_a.widget.set_code("a = \u{FFFC}");
+    entry_a.mark_dirty_for_test();
+    h.state_mut().canvas.code_chunks.active_chunk = Some(chunk_a);
+    let ref_b =
+        wordcraft_engine::chunks::chunks_in(&h.state().session.doc, StoryRef::Body).into_iter().find(|r| r.chunk.id == Some(chunk_b)).unwrap();
+    h.state_mut().session.sel = wordcraft_engine::Selection::caret(ref_b.start);
+
+    // `{"chunkId": null}` must normalize to the resolved active chunk (chunk A), deleting chunk A and discarding its draft while keeping chunk B.
+    let res = h.state_mut().execute("code.delete_chunk", json!({"chunkId": null})).unwrap();
+    assert_eq!(res["chunkId"], json!(chunk_a));
+    let remaining: Vec<Option<i64>> =
+        wordcraft_engine::chunks::chunks_in(&h.state().session.doc, StoryRef::Body).into_iter().map(|r| r.chunk.id).collect();
+    assert_eq!(remaining, vec![Some(chunk_b)]);
+    assert!(!crate::canvas::code_chunks::has_dirty_chunks(h.state()));
+}
+
+#[test]
+fn transfer_in_flight_runs_remaps_batch_ids_to_prevent_collisions() {
+    let mut a = WordApp::new(wordcraft_engine::Session::new(wordcraft_doc::Document::new()), Default::default());
+    let chunk_a = a.run("code.insert_chunk", json!({"language": "python", "code": "a = 1"})).unwrap()["chunk"]["id"].as_i64().unwrap();
+    let chunk_b = a.run("code.insert_chunk", json!({"language": "python", "code": "b = 2"})).unwrap()["chunk"]["id"].as_i64().unwrap();
+    let chunk_c = a.run("code.insert_chunk", json!({"language": "python", "code": "c = 3"})).unwrap()["chunk"]["id"].as_i64().unwrap();
+    let chunk_d = a.run("code.insert_chunk", json!({"language": "python", "code": "d = 4"})).unwrap()["chunk"]["id"].as_i64().unwrap();
+
+    let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1280.0, 860.0)).build_ui_state(
+        |ui, app: &mut WordApp| {
+            let ctx = ui.ctx().clone();
+            app.logic(&ctx);
+            app.ui(ui);
+        },
+        a,
+    );
+    steps(&mut h, 4);
+
+    let gen_now = h.state().session.chunks.generation();
+    let (tx_a, rx_a) = std::sync::mpsc::channel();
+    let (_tx_c, rx_c) = std::sync::mpsc::channel();
+
+    // Surviving canvas already owns batch 1 (pending chunk C + queued chunk D).
+    let target_batch = h.state_mut().canvas.code_chunks.allocate_batch_id_for_test();
+    assert_eq!(target_batch, 1);
+    h.state_mut().canvas.code_chunks.push_pending_for_test(
+        chunk_c,
+        wordcraft_kernel::CodeLanguage::Python,
+        "c = 3",
+        (gen_now, target_batch, true),
+        rx_c,
+    );
+    h.state_mut().canvas.code_chunks.queue_for_test(chunk_d, wordcraft_kernel::CodeLanguage::Python, "d = 4", gen_now, target_batch, true);
+
+    // Closing canvas also has batch 1 (pending chunk A + queued chunk B).
+    let mut closing = crate::canvas::code_chunks::CodeChunksState::default();
+    let closing_batch = closing.allocate_batch_id_for_test();
+    assert_eq!(closing_batch, 1);
+    closing.push_pending_for_test(chunk_a, wordcraft_kernel::CodeLanguage::Python, "a = 1", (gen_now, closing_batch, true), rx_a);
+    closing.queue_for_test(chunk_b, wordcraft_kernel::CodeLanguage::Python, "b = 2", gen_now, closing_batch, true);
+
+    closing.transfer_in_flight_runs_to(&mut h.state_mut().canvas.code_chunks);
+
+    let pending_batches = h.state().canvas.code_chunks.pending_batch_ids_for_test();
+    let queued_batches = h.state().canvas.code_chunks.queued_batch_ids_for_test();
+    let a_batch = pending_batches.iter().find(|(id, _)| *id == chunk_a).map(|(_, b)| *b).unwrap();
+    let b_batch = queued_batches.iter().find(|(id, _)| *id == chunk_b).map(|(_, b)| *b).unwrap();
+    let c_batch = pending_batches.iter().find(|(id, _)| *id == chunk_c).map(|(_, b)| *b).unwrap();
+    let d_batch = queued_batches.iter().find(|(id, _)| *id == chunk_d).map(|(_, b)| *b).unwrap();
+    assert_eq!(a_batch, b_batch, "transferred pending and queued records must keep a shared remapped batch_id");
+    assert_eq!(c_batch, target_batch);
+    assert_eq!(d_batch, target_batch);
+    assert_ne!(a_batch, target_batch, "transferred batch must not collide with surviving canvas batch");
+
+    let future_batch = h.state_mut().canvas.code_chunks.allocate_batch_id_for_test();
+    assert_ne!(future_batch, a_batch);
+    assert_ne!(future_batch, target_batch);
+
+    // Failing transferred chunk A must cancel only its paired queued chunk B, leaving target's batch (C/D) untouched.
+    tx_a.send(Err("boom".into())).unwrap();
+    let ctx = h.ctx.clone();
+    let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+        crate::canvas::code_chunks::sync_before_layout(h.state_mut(), ui);
+    });
+    out.textures_delta.clear();
+    assert_eq!(h.state().canvas.code_chunks.pending_batch_ids_for_test(), vec![(chunk_c, target_batch)]);
+    assert_eq!(h.state().canvas.code_chunks.queued_batch_ids_for_test(), vec![(chunk_d, target_batch)]);
+}

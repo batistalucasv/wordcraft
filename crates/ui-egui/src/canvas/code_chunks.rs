@@ -74,7 +74,6 @@ pub(crate) struct CodeChunksState {
     pub(crate) restored_drafts: ChunkDrafts,
     last_outputs_rev: Option<u64>,
     last_generation: Option<u64>,
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     next_batch_id: u64,
 }
 
@@ -111,14 +110,36 @@ impl CodeChunksState {
         }
     }
 
+    fn allocate_batch_id(&mut self) -> u64 {
+        let limit = self.pending_runs.len().saturating_add(self.queued_runs.len());
+        for _ in 0..=limit {
+            self.next_batch_id = self.next_batch_id.wrapping_add(1).max(1);
+            let candidate = self.next_batch_id;
+            if !self.pending_runs.iter().any(|r| r.batch_id == candidate) && !self.queued_runs.iter().any(|r| r.batch_id == candidate) {
+                return candidate;
+            }
+        }
+        self.next_batch_id = self.next_batch_id.wrapping_add(1).max(1);
+        self.next_batch_id
+    }
+
     pub(crate) fn transfer_in_flight_runs_to(&mut self, target: &mut CodeChunksState) {
-        for run in self.pending_runs.drain(..) {
+        let mut batch_map: HashMap<u64, u64> = HashMap::new();
+        let mut remap = |target: &mut CodeChunksState, batch_id: u64, stop_on_error: bool| -> u64 {
+            if batch_id == 0 && !stop_on_error {
+                return 0;
+            }
+            *batch_map.entry(batch_id).or_insert_with(|| target.allocate_batch_id())
+        };
+        for mut run in self.pending_runs.drain(..) {
             if !target.pending_runs.iter().any(|r| r.chunk_id == run.chunk_id) {
+                run.batch_id = remap(target, run.batch_id, run.stop_on_error);
                 target.pending_runs.push(run);
             }
         }
-        for run in self.queued_runs.drain(..) {
-            if !target.queued_runs.iter().any(|r| r.chunk_id == run.chunk_id) {
+        for mut run in self.queued_runs.drain(..) {
+            if !target.queued_runs.iter().any(|r| r.chunk_id == run.chunk_id) && !target.pending_runs.iter().any(|r| r.chunk_id == run.chunk_id) {
+                run.batch_id = remap(target, run.batch_id, run.stop_on_error);
                 target.queued_runs.push_back(run);
             }
         }
@@ -165,6 +186,21 @@ impl CodeChunksState {
     #[cfg(test)]
     pub(crate) fn queued_len_for_test(&self) -> usize {
         self.queued_runs.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_batch_ids_for_test(&self) -> Vec<(i64, u64)> {
+        self.pending_runs.iter().map(|r| (r.chunk_id, r.batch_id)).collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn queued_batch_ids_for_test(&self) -> Vec<(i64, u64)> {
+        self.queued_runs.iter().map(|r| (r.chunk_id, r.batch_id)).collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn allocate_batch_id_for_test(&mut self) -> u64 {
+        self.allocate_batch_id()
     }
 }
 
@@ -1188,8 +1224,7 @@ pub(crate) fn run_all_async(app: &mut WordApp, params: &Value, ctx: Option<&egui
         Some(_) => return Err("stopOnError: expected a boolean".into()),
     };
     let generation = app.session.chunks.generation();
-    app.canvas.code_chunks.next_batch_id = app.canvas.code_chunks.next_batch_id.wrapping_add(1).max(1);
-    let batch_id = app.canvas.code_chunks.next_batch_id;
+    let batch_id = app.canvas.code_chunks.allocate_batch_id();
     let mut batch = Vec::new();
     let mut seen_ids = HashSet::new();
     for r in ranges {

@@ -790,6 +790,39 @@ fn balance_pass<'a>(
     pb.pages.len() == page + 1 && pb.content_bottom <= top + h + 0.5
 }
 
+/// Lay out `first..end` again from `snap` with ordinary (unbalanced) column heights.
+/// Used when even a full-height balancing pass cannot fit every block on `page` (for example,
+/// an oversized chunk that ordinary placement clamps to the column height).
+fn replay_unbalanced<'a>(
+    ctx: &mut Ctx,
+    pb: &mut PageBuilder<'a>,
+    snap: &Snap<'a>,
+    (first, end): (usize, usize),
+    body_top: f32,
+    chunks: &HashMap<usize, (i64, usize, f32)>,
+) {
+    snap.restore(pb, ctx);
+    pb.balance = None;
+    pb.cap_columns();
+    let mut block = first;
+    while block < end {
+        pb.mark_block();
+        if let Some(&(id, chunk_last, ch)) = chunks.get(&block)
+            && chunk_last < end
+        {
+            place_chunk(ctx, pb, id, block, chunk_last, ch, body_top);
+            block = chunk_last + 1;
+        } else {
+            match ctx.doc.body.get(block).map(|b| &**b) {
+                Some(Block::Para(p)) => place_para(ctx, pb, p, block, body_top),
+                Some(Block::Table(t)) => place_table(ctx, pb, t, block, body_top),
+                None => break,
+            }
+            block += 1;
+        }
+    }
+}
+
 /// Balancing lays out at most this many pages again per pass (a block reaching the last page
 /// from further back is left unbalanced), so its cost stays a small multiple of one page.
 const BALANCE_MAX_PAGES: usize = 16;
@@ -857,11 +890,18 @@ fn balance_columns<'a>(
         last = Some((mid, ok));
     }
     // End on the best height (the full column, as laid out first, when none was shorter).
+    // If even the full column spills in balance mode (e.g. an oversized chunk that ordinary
+    // placement clamps), replay the unbalanced pass so no trailing blocks are dropped.
     if last != Some((hi, true)) {
         thrown = discard(ctx);
-        if !pass(ctx, pb, hi) && hi < full {
+        let ok = pass(ctx, pb, hi)
+            || (hi < full && {
+                thrown = discard(ctx);
+                pass(ctx, pb, full)
+            });
+        if !ok {
             thrown = discard(ctx);
-            pass(ctx, pb, full);
+            replay_unbalanced(ctx, pb, snap, blocks, body_top, chunks);
         }
     }
     thrown

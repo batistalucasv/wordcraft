@@ -125,21 +125,23 @@ impl WordApp {
     pub fn execute(&mut self, id: &str, params: Value) -> Result<Value, String> {
         let mut params = params;
         let delete_target = if id == "code.delete_chunk" {
-            let target = params
-                .get("chunkId")
-                .and_then(Value::as_i64)
-                .or(self.canvas.code_chunks.active_chunk)
-                .or_else(|| wordcraft_engine::chunks::chunk_at(&self.session.doc, &self.session.sel.focus).and_then(|r| r.chunk.id));
-            if let Some(target_id) = target
-                && params.get("chunkId").is_none()
-            {
-                if let Value::Object(ref mut map) = params {
-                    map.insert("chunkId".to_string(), json!(target_id));
-                } else {
-                    params = json!({ "chunkId": target_id });
+            if params.get("chunkId").is_none_or(Value::is_null) {
+                let target = self
+                    .canvas
+                    .code_chunks
+                    .active_chunk
+                    .or_else(|| wordcraft_engine::chunks::chunk_at(&self.session.doc, &self.session.sel.focus).and_then(|r| r.chunk.id));
+                if let Some(target_id) = target {
+                    if let Value::Object(ref mut map) = params {
+                        map.insert("chunkId".to_string(), json!(target_id));
+                    } else {
+                        params = json!({ "chunkId": target_id });
+                    }
                 }
+                target
+            } else {
+                params.get("chunkId").and_then(Value::as_i64).filter(|&n| n > 0)
             }
-            target
         } else {
             None
         };

@@ -16489,3 +16489,66 @@ fn oversized_chunk_taller_than_page_clamped_to_page_height_without_endless_advan
         laid.pages[chunk_page].body.bottom()
     );
 }
+
+#[test]
+fn balanced_columns_with_oversized_chunk_preserves_following_blocks() {
+    use wordcraft_doc::section::Columns;
+    use wordcraft_doc::{CodeChunk, Document, Paragraph, para_block};
+
+    // 1. Oversized chunk in a balanced 2-column section must fall back cleanly instead of
+    //    dropping blocks after the chunk when the final balancing trial spills.
+    let mut doc = Document::new();
+    doc.body.clear();
+    let chunk_id = doc.push_chunk(&CodeChunk::new("python", "x = 1")).unwrap();
+    let after_idx = doc.body.len();
+    doc.body.push(para_block(Paragraph::with_text("After oversized chunk", Default::default())));
+    doc.last_section.page_h = 792.0;
+    doc.last_section.margin_top = 72.0;
+    doc.last_section.margin_bottom = 72.0;
+    doc.last_section.columns = Columns { count: 2, space: 24.0, separator: false, widths: Vec::new() };
+    doc.last_section.balance_columns = Some(true);
+
+    let mut opts = LayoutOptions::default();
+    opts.chunk_heights.insert(chunk_id, 100_000); // 1000 pt > 648 pt printable height
+    let laid = layout(&doc, &mut LayoutCache::new(), &opts);
+
+    let chunk_placed = laid
+        .pages
+        .iter()
+        .enumerate()
+        .find_map(|(pi, page)| {
+            page.items.iter().find_map(|it| match it {
+                Placed::Chunk { id, rect, .. } if *id == chunk_id => Some((pi, *rect)),
+                _ => None,
+            })
+        })
+        .expect("oversized chunk must remain placed in balanced section");
+    assert!(
+        chunk_placed.1.bottom() <= laid.pages[chunk_placed.0].body.bottom() + 0.5,
+        "oversized chunk bottom ({}) must stay within page body ({})",
+        chunk_placed.1.bottom(),
+        laid.pages[chunk_placed.0].body.bottom()
+    );
+    let after_placed = laid.pages.iter().flat_map(|p| &p.items).any(|it| matches!(it, Placed::Lines { path, .. } if path.0 == [after_idx as u32]));
+    assert!(after_placed, "paragraph following an oversized chunk in a balanced section must not be dropped");
+
+    // 2. A normal-sized chunk in a balanced 2-column section must keep its full measured height
+    //    alongside all following paragraphs.
+    let mut normal_opts = LayoutOptions::default();
+    normal_opts.chunk_heights.insert(chunk_id, 20_000); // 200 pt
+    let normal = layout(&doc, &mut LayoutCache::new(), &normal_opts);
+    let normal_rect = normal
+        .pages
+        .iter()
+        .flat_map(|p| &p.items)
+        .find_map(|it| match it {
+            Placed::Chunk { id, rect, .. } if *id == chunk_id => Some(*rect),
+            _ => None,
+        })
+        .expect("normal chunk must be placed");
+    assert!((normal_rect.h - 200.0).abs() < 0.5, "balanced column must not shrink normal chunk: got {}", normal_rect.h);
+    assert!(
+        normal.pages.iter().flat_map(|p| &p.items).any(|it| matches!(it, Placed::Lines { path, .. } if path.0 == [after_idx as u32])),
+        "paragraph following normal chunk must remain placed"
+    );
+}
