@@ -981,18 +981,19 @@ fn insert_at_caret_insert_output_and_chunk_label_commands() {
     assert_eq!(chunks::chunks_in(&s.doc, StoryRef::Body)[0].chunk.options.label(), Some("Tabela de Dados"));
     assert_eq!(s.doc.control_ranges(StoryRef::Body)[0].control.title, "R code chunk (Tabela de Dados)");
 
-    // Cache console output + two plots on chunk.
-    let png1 = vec![
-        0x89u8, b'P', b'N', b'G', b'\r', b'\n', 0x1A, b'\n', 0, 0, 0, 13, b'I', b'H', b'D', b'R', 0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0, 0, 0, 0x1F, 0x15,
-        0xC4, 0x89, 0, 0, 0, 10, b'I', b'D', b'A', b'T', 0x78, 0x9C, 0x63, 0, 1, 0, 0, 5, 0, 1, 0x0D, 0x0A, 0x2D, 0xB4, 0, 0, 0, 0, b'I', b'E', b'N',
-        b'D', 0xAE, 0x42, 0x60, 0x82,
-    ];
+    // Cache console output + two distinguishable plots on chunk.
+    let make_png = |rgba: [u8; 4]| -> Vec<u8> {
+        let img = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(1, 1, image::Rgba(rgba)));
+        let mut bytes = Vec::new();
+        img.write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Png).expect("encode test PNG");
+        bytes
+    };
+    let png1 = make_png([255, 0, 0, 255]);
+    let png2 = make_png([0, 0, 255, 255]);
+    assert_ne!(png1, png2, "test plots must have distinct PNG bytes");
     let mut out = crate::chunks::ChunkOutput::from_result(ExecutionResult {
         stdout: "ok\nline2\n".into(),
-        plots: vec![
-            wordcraft_kernel::PlotOutput { png: Some(png1.clone()), svg: None },
-            wordcraft_kernel::PlotOutput { png: Some(png1.clone()), svg: None },
-        ],
+        plots: vec![wordcraft_kernel::PlotOutput { png: Some(png1), svg: None }, wordcraft_kernel::PlotOutput { png: Some(png2.clone()), svg: None }],
         ..ok("ok\nline2\n")
     });
     out.stdout = "ok\nline2\n".into();
@@ -1017,7 +1018,12 @@ fn insert_at_caret_insert_output_and_chunk_label_commands() {
 
     // Second plot via `plotIndex: 1` at caret outside chunk.
     let plot_res = run(&mut s, "code.insert_plot", json!({"chunkId": cid, "plotIndex": 1, "atCaret": true}));
-    assert!(plot_res["media"].as_str().is_some());
+    let media_key = plot_res["media"].as_str().expect("inserted plot media key");
+    assert_eq!(
+        s.doc.media.get(media_key).map(|bytes| bytes.as_slice()),
+        Some(png2.as_slice()),
+        "plotIndex: 1 must insert the second plot's PNG bytes, not plot 0"
+    );
     assert!(
         s.doc.para(StoryRef::Body, &s.sel.focus.path).is_some_and(|p| !p.objects.is_empty()),
         "second plot must insert at the current caret paragraph outside the chunk"

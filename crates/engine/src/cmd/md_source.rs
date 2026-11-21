@@ -237,11 +237,9 @@ fn is_markdown_path(s: &Session) -> bool {
     s.path.as_deref().is_some_and(is_markdown_file)
 }
 
-/// Checks whether the Markdown Source view can currently be toggled in `s`.
-fn can_toggle(s: &Session) -> Option<&'static str> {
-    if s.md_source.is_some() {
-        None
-    } else if !is_markdown_path(s) {
+/// Checks whether the Markdown Source view can currently be entered in `s`.
+fn can_enter(s: &Session) -> Option<&'static str> {
+    if !is_markdown_path(s) {
         Some("only for Markdown (.md) files")
     } else if s.view.read_mode {
         Some("not in Read Mode")
@@ -251,6 +249,26 @@ fn can_toggle(s: &Session) -> Option<&'static str> {
         Some("not in a protected document")
     } else {
         None
+    }
+}
+
+/// Checks whether the Markdown Source view can currently be toggled in `s`.
+fn can_toggle(s: &Session) -> Option<&'static str> {
+    if s.md_source.is_some() { None } else { can_enter(s) }
+}
+
+/// Closes Markdown Source view if the session can no longer enter it (for example, after Save As
+/// transfers ownership to a non-Markdown path such as `.qmd` or `.docx`).
+pub(crate) fn close_if_ineligible(s: &mut Session) {
+    if s.md_source.is_none() || can_enter(s).is_none() {
+        return;
+    }
+    apply(s);
+    if let Some(src) = s.md_source.take()
+        && (src.has_step || src.text != *src.entry_text)
+    {
+        let block = block_of_caret(&src.text, src.caret, &s.doc, &src.block_lines);
+        s.sel = Selection::caret(block);
     }
 }
 
@@ -1253,5 +1271,73 @@ mod tests {
         s.run("file.open", &json!({"path": path.to_string_lossy()})).unwrap();
         assert!(s.md_file.is_empty());
         assert_eq!(save(&mut s)["rewritten"], false);
+    }
+
+    #[test]
+    fn save_as_to_non_markdown_closes_source_view_only_when_ownership_transfers() {
+        for (tag, dest_name) in [("to-qmd", "moved.qmd"), ("to-rmd", "moved.Rmd"), ("to-docx", "moved.docx")] {
+            let dir = ScratchDir::new(&format!("save-as-close-{tag}"));
+            let md_path = dir.0.join("notes.md");
+            let dest_path = dir.0.join(dest_name);
+            std::fs::write(&md_path, SAMPLE.as_bytes()).unwrap();
+
+            let mut s = Session::new(Document::from_text(""));
+            s.run("file.open", &json!({"path": md_path.to_string_lossy()})).unwrap();
+            let before = s.doc.clone();
+            let depth = s.undo_depth();
+
+            s.run(TOGGLE, &json!({})).unwrap();
+            assert!(s.md_source.is_some(), "{tag}: Markdown Source opened");
+            set_text(&mut s, "# Moved Heading\n\nUpdated paragraph.\n");
+
+            s.run("file.saveAs", &json!({"path": dest_path.to_string_lossy()})).unwrap();
+            assert_eq!(s.path.as_deref(), Some(dest_path.as_path()), "{tag}: ownership moved to destination");
+            assert!(!s.dirty, "{tag}: saved");
+            assert!(s.md_source.is_none(), "{tag}: Markdown Source must close after moving to a non-Markdown path");
+            assert!(
+                matches!(s.run(TOGGLE, &json!({})), Err(CmdError::Disabled(_))),
+                "{tag}: Markdown Source must stay disabled on the new non-Markdown path"
+            );
+            assert!(
+                matches!(s.run(TEXT, &json!({"text": "# Still open?\n"})), Err(CmdError::Disabled(_))),
+                "{tag}: markdownSourceText must be disabled after closing"
+            );
+            assert!(body_text(&s).contains("Moved Heading"), "{tag}: pending source edits were applied");
+
+            // Normal editing works immediately and undo reverts the source visit cleanly.
+            s.run("text.insert", &json!({"text": "Prefix "})).unwrap();
+            assert!(body_text(&s).contains("Prefix "));
+            s.run("edit.undo", &json!({})).unwrap();
+            assert_eq!(s.undo_depth(), depth + 1, "{tag}: source visit kept as a single undo step");
+            s.run("edit.undo", &json!({})).unwrap();
+            assert!(s.doc.same_content(&before), "{tag}: undoing source visit restores original document");
+        }
+
+        // Saving a copy (`copy: true`) or saving to a non-ownership format (`.txt`) keeps ownership
+        // on the `.md` file and leaves Markdown Source open.
+        let dir = ScratchDir::new("save-as-copy-keeps-source");
+        let md_path = dir.0.join("notes.md");
+        std::fs::write(&md_path, SAMPLE.as_bytes()).unwrap();
+        let mut s = Session::new(Document::from_text(""));
+        s.run("file.open", &json!({"path": md_path.to_string_lossy()})).unwrap();
+        s.run(TOGGLE, &json!({})).unwrap();
+        set_text(&mut s, "# Still Markdown\n");
+
+        for (name, params) in [
+            ("qmd-copy", json!({"path": dir.0.join("copy.qmd").to_string_lossy(), "copy": true})),
+            ("docx-copy", json!({"path": dir.0.join("copy.docx").to_string_lossy(), "copy": true})),
+            ("txt-copy", json!({"path": dir.0.join("copy.txt").to_string_lossy()})),
+        ] {
+            s.run("file.saveAs", &params).unwrap();
+            assert_eq!(s.path.as_deref(), Some(md_path.as_path()), "{name}: ownership stayed on .md");
+            assert!(s.md_source.is_some(), "{name}: Markdown Source must stay open for copy saves");
+        }
+
+        // Moving to another `.md` path transfers ownership and keeps Markdown Source open.
+        let other_md = dir.0.join("other.md");
+        s.run("file.saveAs", &json!({"path": other_md.to_string_lossy()})).unwrap();
+        assert_eq!(s.path.as_deref(), Some(other_md.as_path()));
+        assert!(!s.dirty);
+        assert!(s.md_source.is_some(), "Save As to another .md path keeps Markdown Source open");
     }
 }
