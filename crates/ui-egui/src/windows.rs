@@ -184,6 +184,63 @@ impl Windows {
     fn viewport(&self, ctx: &egui::Context, key: u64) -> Option<ViewportId> {
         self.viewport_of(ctx, self.id_of(key)?)
     }
+
+    /// Whether any non-shown window displaying `doc` holds unapplied code chunk drafts.
+    pub(crate) fn has_dirty_chunks_for(&self, doc: u64) -> bool {
+        self.list.iter().any(|(_, w)| w.doc == doc && w.ui.as_ref().is_some_and(|ui| ui.canvas.code_chunks.has_dirty()))
+    }
+
+    /// Flush any unapplied code chunk drafts in non-shown windows displaying `doc_id`.
+    pub(crate) fn flush_dirty_chunks_for(&mut self, session: &mut wordcraft_engine::Session, doc_id: u64, except: Option<i64>) -> Result<(), String> {
+        for (_, w) in self.list.iter_mut() {
+            if w.doc == doc_id
+                && let Some(ui) = w.ui.as_mut()
+            {
+                let mut ids: Vec<i64> =
+                    ui.canvas.code_chunks.widgets.iter().filter(|(id, e)| e.dirty && Some(**id) != except).map(|(id, _)| *id).collect();
+                ids.sort_unstable();
+                for id in ids {
+                    let (lang, code) = {
+                        let Some(entry) = ui.canvas.code_chunks.widgets.get(&id) else { continue };
+                        (entry.widget.language(), entry.widget.code().to_string())
+                    };
+                    session
+                        .run(
+                            "code.update_chunk",
+                            &serde_json::json!({
+                                "chunkId": id,
+                                "language": lang.as_str(),
+                                "code": code,
+                            }),
+                        )
+                        .map_err(|e| e.to_string())?;
+                    if let Some(entry) = ui.canvas.code_chunks.widgets.get_mut(&id) {
+                        entry.dirty = false;
+                        entry.last_synced_lang = lang;
+                        entry.last_synced_code = code;
+                        entry.last_edit_time = None;
+                    }
+                }
+                let mut parked_ids: Vec<i64> = ui.canvas.code_chunks.restored_drafts.keys().filter(|id| Some(**id) != except).copied().collect();
+                parked_ids.sort_unstable();
+                for id in parked_ids {
+                    let Some((lang, code)) = ui.canvas.code_chunks.restored_drafts.get(&id).cloned() else { continue };
+                    session
+                        .run(
+                            "code.update_chunk",
+                            &serde_json::json!({
+                                "chunkId": id,
+                                "language": lang.as_str(),
+                                "code": code,
+                            }),
+                        )
+                        .map_err(|e| e.to_string())?;
+                    ui.canvas.code_chunks.restored_drafts.remove(&id);
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 impl WordApp {
@@ -316,6 +373,37 @@ impl WordApp {
         if !self.enter_window(to) {
             return;
         }
+        // Preserve any unapplied chunk drafts and in-flight runs from the closing window by
+        // transferring them to a surviving window for the same document.
+        if let Some(mut closing_ui) = self.windows.list.get_mut(closing).and_then(|w| w.ui.take()) {
+            let closing_doc = closing_ui.shown_document;
+            let mut drafts = Vec::new();
+            for (id, (lang, code)) in &closing_ui.canvas.code_chunks.restored_drafts {
+                drafts.push((*id, *lang, code.clone()));
+            }
+            for (id, entry) in &closing_ui.canvas.code_chunks.widgets {
+                if entry.dirty {
+                    drafts.push((*id, entry.widget.language(), entry.widget.code().to_string()));
+                }
+            }
+            if self.shown_document == closing_doc {
+                for (id, lang, code) in drafts {
+                    self.canvas.code_chunks.restored_drafts.insert(id, (lang, code));
+                }
+                closing_ui.canvas.code_chunks.transfer_in_flight_runs_to(&mut self.canvas.code_chunks);
+            } else if let Some((_, surviving)) = self.windows.list.iter_mut().find(|(id, w)| *id != closing && w.doc == closing_doc)
+                && let Some(surviving_ui) = surviving.ui.as_mut()
+            {
+                for (id, lang, code) in drafts {
+                    surviving_ui.canvas.code_chunks.restored_drafts.insert(id, (lang, code));
+                }
+                closing_ui.canvas.code_chunks.transfer_in_flight_runs_to(&mut surviving_ui.canvas.code_chunks);
+            } else if let Some(parked) = self.parked.get_mut(&closing_doc) {
+                for (id, lang, code) in drafts {
+                    parked.chunk_drafts.insert(id, (lang, code));
+                }
+            }
+        }
         self.windows.list.close(closing);
         self.focus_window(to);
     }
@@ -445,7 +533,7 @@ impl WordApp {
     fn window_menu(&self) -> WindowMenu {
         let docs = self.session.documents();
         WindowMenu::new(&self.windows.list, |_, w| match docs.iter().find(|d| d.id == w.doc) {
-            Some(d) => Document { key: w.doc, name: documents::display_title(d), dirty: d.dirty },
+            Some(d) => Document { key: w.doc, name: documents::display_title(d), dirty: self.document_unsaved_by_id(d.id) },
             None => Document { key: w.doc, name: String::new(), dirty: false },
         })
     }
@@ -472,7 +560,8 @@ impl WordApp {
             return "WordCraft".to_string();
         }
         let name = self.window_menu().title(self.windows.shown).map(str::to_string).unwrap_or_else(|| self.title_stem());
-        title(&name, self.session.dirty)
+        let doc_id = self.session.document_id();
+        title(&name, self.document_unsaved_by_id(doc_id))
     }
 
     /// The title of window `id` as `menu` gives it; `WordCraft` for a window with no document.

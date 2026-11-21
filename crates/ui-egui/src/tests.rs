@@ -2318,6 +2318,39 @@ fn web_downloads_that_drop_content_leave_the_document_unsaved() {
     }
 }
 
+#[test]
+fn web_save_copy_with_password_encrypts_download_without_changing_session_password() {
+    let files = Arc::new(ScriptedFiles::new().in_browser().saving_suggested());
+    let mut a = app_with_files(files.clone());
+    a.run("text.insert", json!({"text": UNSAVED})).unwrap();
+
+    let res = a
+        .execute(
+            "file.saveAs",
+            json!({
+                "path": "copy.docx",
+                "password": "Password123!",
+                "copy": true,
+            }),
+        )
+        .unwrap();
+    assert_eq!(res["downloaded"], "copy.docx");
+    assert!(a.session.password.is_none(), "session password must remain None for a copy");
+
+    let (_, bytes) = saved(&files).into_iter().next().expect("downloaded copy");
+    assert!(!bytes.is_empty());
+    assert!(wordcraft_engine::io::open_bytes_with("copy.docx", &bytes, None).is_err());
+    let (doc, encrypted) = wordcraft_engine::io::open_bytes_with("copy.docx", &bytes, Some("Password123!")).unwrap();
+    assert!(encrypted);
+    assert_eq!(doc.plain_text(wordcraft_doc::StoryRef::Body), a.session.doc.plain_text(wordcraft_doc::StoryRef::Body));
+
+    a.execute("file.saveAs", json!({"path": "normal.docx"})).unwrap();
+    assert!(a.session.password.is_none());
+    let (_, normal_bytes) = saved(&files).into_iter().last().expect("normal download");
+    let (_, normal_encrypted) = wordcraft_engine::io::open_bytes_with("normal.docx", &normal_bytes, None).unwrap();
+    assert!(!normal_encrypted);
+}
+
 /// Web inside a page that keeps the files: the app with `host_save` recording each file it
 /// is handed (name, Save As, size).
 fn host_app(fail: bool) -> (WordApp, HostSaves) {

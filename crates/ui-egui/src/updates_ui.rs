@@ -102,7 +102,11 @@ pub(crate) fn run(app: &mut WordApp) {
     #[cfg(not(target_arch = "wasm32"))]
     {
         // An update starts, and a ready one asks the app to close, only while no work is unsaved.
-        let can_start = !(app.session.dirty || app.save_unconfirmed() || app.printing.busy() || crate::panes::has_comment_drafts(app));
+        let can_start = !(app.session.dirty
+            || app.save_unconfirmed()
+            || app.printing.busy()
+            || crate::panes::has_comment_drafts(app)
+            || crate::canvas::code_chunks::has_dirty_chunks(app));
         let action = app.updates_rt.updater.run(&mut app.dialog_host, can_start);
         match action {
             Action::OpenUrl(url) => {

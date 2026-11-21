@@ -110,6 +110,7 @@ pub(crate) fn env_hash(doc: &Document, opts: &LayoutOptions) -> u64 {
     // Output shows page references the editor leaves stored (a missing bookmark's error too).
     opts.output_page_refs.hash(&mut h);
     opts.bookmark_error.hash(&mut h);
+    opts.chunk_heights.hash(&mut h);
     h.finish()
 }
 

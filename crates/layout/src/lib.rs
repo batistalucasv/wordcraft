@@ -242,6 +242,9 @@ pub struct LayoutOptions {
     /// "Error! Bookmark not defined." in its interface language. `None` is the English text,
     /// [`fields::BOOKMARK_NOT_DEFINED`].
     pub bookmark_error: Option<Arc<str>>,
+    /// UI-measured rendered heights in hundredths of a point for mounted top-level body code
+    /// chunks (`control_id -> round(height_pt * 100)`). Empty for headless/PDF layout.
+    pub chunk_heights: std::collections::BTreeMap<i64, u32>,
 }
 
 /// The word being typed ([`LayoutOptions::typing_word`]): the paragraph by its revision

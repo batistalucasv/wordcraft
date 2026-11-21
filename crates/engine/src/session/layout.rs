@@ -29,7 +29,7 @@ impl Session {
         let shown = (self.view.marks || self.prefs.marks.hidden, self.view.field_codes);
         // A dictionary or Language pack installed, removed or edited (in this document's window or
         // any other) proofs it again, open or parked.
-        let rev = (self.rev, wordcraft_proof::dictionary_generation());
+        let rev = (self.rev, wordcraft_proof::dictionary_generation().wrapping_add(self.chunks.heights_rev().rotate_left(32)));
         let (proofing, numeral) = (self.view.proofing, self.view.numeral);
         let fits = |e: &Option<LayoutEntry>| {
             e.as_ref().is_some_and(|(r, w, h, m, sp, _, pf, o, hd, n, t, sh)| {
@@ -77,6 +77,7 @@ impl Session {
             // The editor shows a body page reference as stored until fields are updated.
             output_page_refs: false,
             bookmark_error: None,
+            chunk_heights: self.chunks.chunk_heights().clone(),
         };
         let l = Arc::new(wordcraft_layout::layout(&self.doc, &mut self.cache, &opts));
         let [newest, _] = std::mem::take(&mut self.layout);
@@ -145,6 +146,7 @@ impl Session {
         copy.last_highlight = self.last_highlight;
         copy.system_region = self.system_region.clone();
         copy.editing_lang = self.editing_lang.clone();
+        copy.set_chunk_heights(self.chunks.chunk_heights().clone());
         // The copy shares the paragraph layouts, so only what the command changed is laid out.
         std::mem::swap(&mut copy.cache, &mut self.cache);
         let layout = copy.run(id, params).is_ok().then(|| {
@@ -208,6 +210,16 @@ impl Session {
     pub fn relayout(&mut self) {
         self.layout = Default::default();
         self.cache.clear();
+    }
+
+    /// Update mounted code-chunk widget heights (`control_id -> round(pt * 100)`) and invalidate
+    /// cached layouts if anything changed so the next [`Session::layout`] reflows around them.
+    pub fn set_chunk_heights(&mut self, heights: std::collections::BTreeMap<i64, u32>) -> bool {
+        if !self.chunks.set_chunk_heights(heights) {
+            return false;
+        }
+        self.layout = Default::default();
+        true
     }
 
     /// Set the language new documents are written in ([`Session::editing_lang`]; `None` or a

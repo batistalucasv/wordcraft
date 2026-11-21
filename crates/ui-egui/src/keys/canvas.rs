@@ -541,10 +541,13 @@ fn handle_input(app: &mut WordApp, ctx: &egui::Context, pass: &ToolPass, e: &Edi
 
 fn move_input(app: &mut WordApp, mv: NavMove, m: MoveMods) {
     let mods = Modifiers { shift: m.extend, command: m.lead, ..Modifiers::NONE };
-    if let Some(key) = move_key(mv)
-        && crate::objects::key(app, key, mods)
-    {
-        return;
+    if let Some(key) = move_key(mv) {
+        if crate::objects::key(app, key, mods) {
+            return;
+        }
+        if crate::canvas::code_chunks::maybe_enter_from_canvas_arrow(app, key, mods) {
+            return;
+        }
     }
     if let Some(id) = move_command(mv, m.by) {
         let _ = app.run(id, json!({"extend": m.extend}));

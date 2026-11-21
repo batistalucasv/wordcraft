@@ -16,6 +16,8 @@ pub const OPEN_EXTS: &[&str] = &[
     "txt",
     "md",
     "markdown",
+    "qmd",
+    "rmd",
     "html",
     "htm",
     "mht",
@@ -33,7 +35,7 @@ pub const OPEN_EXTS: &[&str] = &[
 ];
 /// Formats WordCraft saves (Save As).
 pub const SAVE_EXTS: &[&str] =
-    &["docx", "docm", "dotx", "dotm", "pdf", "txt", "md", "html", "rtf", "odt", "ott", "fodt", "tex", "png", "json", "xml"];
+    &["docx", "docm", "dotx", "dotm", "pdf", "txt", "md", "qmd", "rmd", "html", "rtf", "odt", "ott", "fodt", "tex", "png", "json", "xml"];
 
 /// Magic number for ZIP package signatures (used by .docx/.docm/.dotx/.dotm).
 const ZIP_SIG: &[u8] = b"PK\x03\x04";
@@ -51,6 +53,8 @@ fn ext_of(name: &str) -> String {
 pub fn is_word_package(ext: &str) -> bool {
     wordcraft_docx::Flavor::from_ext(ext).is_some()
 }
+
+pub use wordcraft_docx::check_password;
 
 /// How a copy in another format is written.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
