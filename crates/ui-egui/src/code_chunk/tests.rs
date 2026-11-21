@@ -371,6 +371,7 @@ fn set_language_updates_in_read_mode_and_poll_carries_completed_output() {
 #[test]
 fn embedded_chunk_emits_run_and_clear_requests_and_explains_svg_only_plot() {
     let mut chunk = python();
+    chunk.available = true;
     chunk.set_output(ChunkOutput { plot_svg: Some("<svg xmlns=\"http://www.w3.org/2000/svg\"/>".into()), success: true, ..ChunkOutput::default() });
     let mut fonts = false;
     let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(760.0, 620.0)).build_ui_state(
@@ -406,6 +407,51 @@ fn embedded_chunk_emits_run_and_clear_requests_and_explains_svg_only_plot() {
     h.get_by_label("Clear output").click();
     h.step();
     assert!(h.state().2, "embedded header Clear output must emit clear_requested");
+}
+
+#[test]
+fn embedded_chunk_run_button_test_passes_without_python_on_path() {
+    let mut chunk = python();
+    chunk.available = false;
+    let mut fonts = false;
+    let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(760.0, 620.0)).build_ui_state(
+        move |ui, (chunk, saw_run): &mut (CodeChunk, bool)| {
+            if !fonts {
+                crate::theme::install_fonts(ui.ctx());
+                fonts = true;
+            }
+            ui.set_width(720.0);
+            let frame = chunk.show_embedded(ui);
+            *saw_run |= frame.run_requested;
+        },
+        (chunk, false),
+    );
+    for _ in 0..2 {
+        h.step();
+    }
+    h.get_by_label("Run").click();
+    h.step();
+    assert!(!h.state().1, "Run button stays disabled when chunk.available is false");
+
+    let bin = CodeLanguage::Python.binary_name();
+    let bin_exe = format!("{bin}.exe");
+    let stripped_path = std::env::var_os("PATH")
+        .map(|path_var| {
+            let dirs = std::env::split_paths(&path_var).filter(|dir| !dir.join(bin).exists() && !dir.join(&bin_exe).exists());
+            std::env::join_paths(dirs).expect("join stripped PATH")
+        })
+        .unwrap_or_default();
+
+    let test_bin = std::env::current_exe().expect("current test executable");
+    let output = std::process::Command::new(test_bin)
+        .args(["--exact", "code_chunk::tests::embedded_chunk_emits_run_and_clear_requests_and_explains_svg_only_plot", "--nocapture"])
+        .env("PATH", stripped_path)
+        .output()
+        .expect("run embedded_chunk_emits_run_and_clear_requests_and_explains_svg_only_plot without Python on PATH");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "embedded chunk Run-button test must pass without Python on PATH\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(stdout.contains("1 passed"), "expected exact test to execute\nstdout:\n{stdout}\nstderr:\n{stderr}");
 }
 
 #[test]
