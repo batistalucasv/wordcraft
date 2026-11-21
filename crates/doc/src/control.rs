@@ -754,6 +754,7 @@ pub fn walk_controls(bl: &Blocks, f: &mut dyn FnMut(&ContentControl)) {
             return;
         }
         for b in bl {
+            crate::work::steps(1);
             match &**b {
                 Block::Para(p) => {
                     for o in &p.objects {

@@ -317,6 +317,7 @@ fn apply_chunks(doc: &mut Document, mut chunks: Vec<Pending>) {
     for pending in chunks.drain(..) {
         by_sentinel.insert(pending.sentinel, pending.chunk);
     }
+    let mut ids = doc.control_id_allocator();
     let old = std::mem::take(&mut doc.body);
     doc.body = Vec::with_capacity(old.len());
     let mut i = 0;
@@ -358,7 +359,7 @@ fn apply_chunks(doc: &mut Document, mut chunks: Vec<Pending>) {
                 i += 1;
                 continue;
             };
-            match doc.chunk_blocks(&chunk) {
+            match doc.chunk_blocks_with_ids(&chunk, &mut ids) {
                 Ok(blocks) => {
                     doc.body.extend(blocks);
                     i = end;
@@ -1045,5 +1046,95 @@ print(sites)
         let doc = import(&source);
         assert!(doc.chunks().is_empty(), "oversized chunk should not be kept as a CodeChunk control");
         assert!(!doc.body.is_empty(), "fallback paragraphs should remain in doc.body");
+    }
+
+    #[test]
+    fn importing_many_chunks_scales_linearly() {
+        let make_source = |n: usize| {
+            let mut s = String::with_capacity(n * 24);
+            for i in 0..n {
+                s.push_str(&format!("```{{r}}\nx <- {i}\n```\n\n"));
+            }
+            s
+        };
+        let small = make_source(64);
+        let big = make_source(512);
+        let mut small_doc = Document::new();
+        let mut big_doc = Document::new();
+        let s = wordcraft_doc::work::count(|| small_doc = import(&small));
+        let b = wordcraft_doc::work::count(|| big_doc = import(&big));
+
+        let small_ids: std::collections::HashSet<i64> = small_doc.control_ranges(StoryRef::Body).iter().filter_map(|r| r.control.id).collect();
+        let big_ids: std::collections::HashSet<i64> = big_doc.control_ranges(StoryRef::Body).iter().filter_map(|r| r.control.id).collect();
+        assert_eq!(small_ids.len(), 64);
+        assert_eq!(big_ids.len(), 512);
+        assert!(big_ids.iter().all(|&id| id > 0));
+        assert_eq!(big_doc.custom_props.len(), 512);
+
+        let ratio = b as f64 / s.max(1) as f64;
+        assert!(s > 0, "no steps counted for chunk import");
+        assert!(ratio <= 12.0, "8x the chunks cost {ratio:.1}x the steps ({s} -> {b})");
+
+        // Full MAX_CHUNKS import produces distinct positive IDs and matching properties.
+        let full = make_source(MAX_CHUNKS);
+        let full_doc = import(&full);
+        let full_ids: std::collections::HashSet<i64> = full_doc.control_ranges(StoryRef::Body).iter().filter_map(|r| r.control.id).collect();
+        assert_eq!(full_ids.len(), MAX_CHUNKS);
+        assert!(full_ids.iter().all(|&id| id > 0));
+        assert_eq!(full_doc.custom_props.len(), MAX_CHUNKS);
+    }
+
+    #[test]
+    fn apply_chunks_preserves_existing_control_and_property_ids() {
+        use wordcraft_doc::{CharProps, ContentControl, ControlKind, InlineObject, Part, PartKind, para_block};
+
+        let mut doc = Document::new();
+        let mark = CharProps::default();
+
+        // Pre-existing control id = 1 in doc.body.
+        let mut body_ctrl = ContentControl::new(ControlKind::RichText);
+        body_ctrl.id = Some(1);
+        let mut body_para = Paragraph::with_text("intro", CharProps::default());
+        body_para.insert_object(0, InlineObject::ControlStart { control: Box::new(body_ctrl) }, &mark).unwrap();
+        body_para.insert_object(body_para.len(), InlineObject::ControlEnd, &mark).unwrap();
+
+        // Pre-existing control id = 2 in a header part.
+        let mut part_ctrl = ContentControl::new(ControlKind::RichText);
+        part_ctrl.id = Some(2);
+        let mut part_para = Paragraph::with_text("header", CharProps::default());
+        part_para.insert_object(0, InlineObject::ControlStart { control: Box::new(part_ctrl) }, &mark).unwrap();
+        part_para.insert_object(part_para.len(), InlineObject::ControlEnd, &mark).unwrap();
+        doc.parts.insert(1, Part { kind: PartKind::Header, blocks: vec![para_block(part_para)], ..Default::default() });
+
+        // Pre-existing chunk properties (mixed and lowercase) reserving ids 3 and 4.
+        doc.set_custom_prop("WORDCRAFT.CHUNK.3", "{\"eval\":\"false\"}");
+        doc.set_custom_prop("wordcraft.chunk.4", "{\"label\":\"keep\"}");
+
+        let s1 = "wordcraft-chunk-sentinel-test-0".to_string();
+        let s2 = "wordcraft-chunk-sentinel-test-1".to_string();
+        doc.body = vec![
+            para_block(body_para),
+            para_block(Paragraph::with_text(&s1, CharProps::default())),
+            para_block(Paragraph::with_text("x <- 1", CharProps::default())),
+            para_block(Paragraph::with_text(&s2, CharProps::default())),
+            para_block(Paragraph::with_text("y = 2", CharProps::default())),
+        ];
+
+        let mut c1 = CodeChunk::new("r", "x <- 1");
+        c1.options.set("label", "first");
+        let mut c2 = CodeChunk::new("python", "y = 2");
+        c2.id = Some(2); // collides with header part control
+        c2.options.set("label", "second");
+
+        apply_chunks(&mut doc, vec![Pending { sentinel: s1, chunk: c1 }, Pending { sentinel: s2, chunk: c2 }]);
+
+        let chunks = doc.chunks();
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].id, Some(5));
+        assert_eq!(chunks[0].options.label(), Some("first"));
+        assert_eq!(chunks[1].id, Some(6));
+        assert_eq!(chunks[1].options.label(), Some("second"));
+        assert_eq!(doc.custom_prop("WORDCRAFT.CHUNK.3"), Some("{\"eval\":\"false\"}"));
+        assert_eq!(doc.custom_prop("wordcraft.chunk.4"), Some("{\"label\":\"keep\"}"));
     }
 }

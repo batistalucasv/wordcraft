@@ -15,7 +15,7 @@
 //! The kernel crate executes the code; this model only stores it, which keeps the document model
 //! free of process handling and lets `.qmd` files be read and written without R or Python.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use crate::control::{ContentControl, ControlKind, MAX_CONTROL_TEXT, walk_controls};
 use crate::para::OBJ;
 use crate::props::{Border, BorderStyle, Borders, CharProps, ParaProps, Rgb};
-use crate::{Block, Blocks, DocError, Document, InlineObject, Paragraph, Pos, Result, StoryRef, Style, StyleKind, para_block};
+use crate::{Block, Blocks, CustomProp, DocError, Document, InlineObject, Paragraph, Pos, Result, StoryRef, Style, StyleKind, para_block};
 
 /// Tag prefix of a code chunk's content control.
 pub const CHUNK_TAG: &str = "wordcraft:chunk:";
@@ -544,6 +544,69 @@ fn chunk_from_range(doc: &Document, range: &crate::ControlRange) -> Option<CodeC
     Some(CodeChunk { id: range.control.id, language, code, options })
 }
 
+/// Tracks reserved content-control ids across a batch of chunk insertions so each
+/// chunk allocates a collision-free id without rescanning stories or custom properties.
+#[derive(Clone, Debug)]
+pub struct ControlIdAllocator {
+    used: HashSet<i64>,
+    max_id: Option<i64>,
+    next_free: i64,
+    custom_props_len: usize,
+}
+
+impl ControlIdAllocator {
+    fn new(custom_props_len: usize) -> Self {
+        Self { used: HashSet::new(), max_id: None, next_free: 1, custom_props_len }
+    }
+
+    fn insert_existing(&mut self, id: i64) {
+        self.used.insert(id);
+        self.max_id = Some(self.max_id.map_or(id, |m| m.max(id)));
+    }
+
+    fn absorb_custom_props(&mut self, custom_props: &[CustomProp]) {
+        for prop in custom_props {
+            crate::work::steps(1);
+            if let Some(prefix) = prop.name.get(..CHUNK_PROP.len())
+                && prefix.eq_ignore_ascii_case(CHUNK_PROP)
+                && let Some(suffix) = prop.name.get(CHUNK_PROP.len()..)
+                && let Ok(id) = suffix.parse::<i64>()
+            {
+                self.insert_existing(id);
+            }
+        }
+    }
+
+    /// Reserve `preferred` when positive and unused; otherwise allocate one past the highest
+    /// reserved id (or the lowest free positive id when [`i64::MAX`] is already in use).
+    ///
+    /// Returns `(id, inserted)` where `inserted` is `true` when `id` was freshly reserved.
+    fn reserve(&mut self, preferred: Option<i64>) -> (i64, bool) {
+        if let Some(id) = preferred
+            && id > 0
+            && self.used.insert(id)
+        {
+            self.max_id = Some(self.max_id.map_or(id, |m| m.max(id)));
+            return (id, true);
+        }
+        if let Some(next) = self.max_id.and_then(|m| m.checked_add(1))
+            && next > 0
+            && self.used.insert(next)
+        {
+            self.max_id = Some(next);
+            return (next, true);
+        }
+        while self.next_free < i64::MAX && self.used.contains(&self.next_free) {
+            self.next_free = self.next_free.saturating_add(1);
+        }
+        let free = self.next_free;
+        let inserted = self.used.insert(free);
+        self.max_id = Some(self.max_id.map_or(free, |m| m.max(free)));
+        self.next_free = self.next_free.saturating_add(1);
+        (free, inserted)
+    }
+}
+
 impl Document {
     /// Every chunk in every story, in document order (the body first).
     pub fn chunks(&self) -> Vec<CodeChunk> {
@@ -577,49 +640,32 @@ impl Document {
         options_of(self, control).1
     }
 
-    /// `w:id`s in use anywhere in the document (including reserved chunk properties).
-    fn control_ids(&self) -> BTreeSet<i64> {
-        let mut ids = BTreeSet::new();
+    /// Collect every content-control id currently in use across all stories and reserved
+    /// `wordcraft.chunk.<id>` custom properties into an allocator for batch chunk insertion.
+    ///
+    /// Pass the allocator to [`Document::chunk_blocks_with_ids`] to avoid rescanning the
+    /// document and its custom properties for every chunk. Do not add new controls or
+    /// `wordcraft.chunk.*` custom properties to the document outside the allocator while
+    /// reusing it.
+    pub fn control_id_allocator(&self) -> ControlIdAllocator {
+        let mut allocator = ControlIdAllocator::new(self.custom_props.len());
         let stories = std::iter::once(StoryRef::Body).chain(self.parts.keys().map(|k| StoryRef::Part(*k)));
         for story in stories {
             if let Some(blocks) = self.story(story) {
                 walk_controls(blocks, &mut |c| {
                     if let Some(id) = c.id {
-                        ids.insert(id);
+                        allocator.insert_existing(id);
                     }
                 });
             }
         }
-        for prop in &self.custom_props {
-            if let Some(prefix) = prop.name.get(..CHUNK_PROP.len())
-                && prefix.eq_ignore_ascii_case(CHUNK_PROP)
-                && let Some(suffix) = prop.name.get(CHUNK_PROP.len()..)
-                && let Ok(id) = suffix.parse::<i64>()
-            {
-                ids.insert(id);
-            }
-        }
-        ids
+        allocator.absorb_custom_props(&self.custom_props);
+        allocator
     }
 
     /// The next free content control id (one past the highest used, never [`i64::MAX`] twice).
     pub fn next_control_id(&self) -> i64 {
-        let ids = self.control_ids();
-        let candidate = ids.last().copied().and_then(|id| id.checked_add(1));
-        match candidate {
-            Some(next) if next > 0 && !ids.contains(&next) => next,
-            _ => {
-                let mut free = 1i64;
-                for &id in &ids {
-                    if id == free {
-                        free = free.saturating_add(1);
-                    } else if id > free {
-                        break;
-                    }
-                }
-                free
-            }
-        }
+        self.control_id_allocator().reserve(None).0
     }
 
     /// The blocks that hold `chunk` as a block-level content control, ready to put in a story.
@@ -627,6 +673,14 @@ impl Document {
     /// The chunk gets a fresh control id unless its own is unused, and its options go into the
     /// custom property beside that id. The [`CHUNK_STYLE`] style is added when missing.
     pub fn chunk_blocks(&mut self, chunk: &CodeChunk) -> Result<Blocks> {
+        let mut ids = self.control_id_allocator();
+        self.chunk_blocks_with_ids(chunk, &mut ids)
+    }
+
+    /// Like [`Document::chunk_blocks`], reserving the chunk's control id from a pre-collected
+    /// [`ControlIdAllocator`] so bulk imports do not rescan the document or custom properties
+    /// per chunk.
+    pub fn chunk_blocks_with_ids(&mut self, chunk: &CodeChunk, ids: &mut ControlIdAllocator) -> Result<Blocks> {
         if chunk.code.len() > MAX_CHUNK_CODE_BYTES {
             return Err(DocError::Invalid(format!("code chunk is larger than {MAX_CHUNK_CODE_BYTES} bytes")));
         }
@@ -637,23 +691,17 @@ impl Document {
         if chunk.code.contains(OBJ) {
             return Err(DocError::Invalid("code chunk contains U+FFFC, which is reserved for inline objects".to_string()));
         }
-        let id = match chunk.id {
-            Some(id) if id > 0 && !self.control_ids().contains(&id) => id,
-            _ => self.next_control_id(),
-        };
+        let props_unchanged = self.custom_props.len() == ids.custom_props_len;
+        if !props_unchanged {
+            ids.absorb_custom_props(&self.custom_props);
+        }
+        let (id, inserted) = ids.reserve(chunk.id);
         let language = normalize_language(&chunk.language);
         let mut control = ContentControl::new(ControlKind::RichText);
         control.id = Some(id);
         control.tag = encode_control_tag(&language, &chunk.options);
         control.title = chunk.alias();
         control.block = true;
-        if self.styles.get(CHUNK_STYLE).is_none() {
-            Arc::make_mut(&mut self.styles).upsert(chunk_style());
-        }
-
-        let prop = chunk_prop_name(id);
-        let json = serde_json::to_string(&chunk.options).unwrap_or_else(|_| "{}".to_string());
-        self.set_custom_prop(&prop, &json);
 
         let lines: Vec<&str> = chunk.code.split('\n').collect();
         let last = lines.len().saturating_sub(1);
@@ -669,6 +717,20 @@ impl Document {
             }
             blocks.push(para_block(p));
         }
+
+        if self.styles.get(CHUNK_STYLE).is_none() {
+            Arc::make_mut(&mut self.styles).upsert(chunk_style());
+        }
+        let prop = chunk_prop_name(id);
+        let json = serde_json::to_string(&chunk.options).unwrap_or_else(|_| "{}".to_string());
+        if props_unchanged && inserted {
+            self.custom_props.push(CustomProp { name: prop, kind: "lpwstr".into(), value: json, ..Default::default() });
+            ids.custom_props_len = self.custom_props.len();
+        } else {
+            self.set_custom_prop(&prop, &json);
+            ids.custom_props_len = self.custom_props.len();
+        }
+
         Ok(blocks)
     }
 
@@ -1792,5 +1854,73 @@ mod tests {
         let cleared = existing_doc.chunks();
         assert_eq!(cleared[0].options.label(), None);
         assert_eq!(cleared[0].options.len(), MAX_CHUNK_OPTIONS - 1);
+    }
+
+    #[test]
+    fn chunk_blocks_with_ids_avoids_collisions_and_handles_overflow() {
+        use crate::{Part, PartKind};
+
+        let mut doc = Document::new();
+        let mark = CharProps::default();
+
+        // Body control with id = 1.
+        let mut c1 = ContentControl::new(ControlKind::RichText);
+        c1.id = Some(1);
+        let mut p1 = Paragraph::with_text("existing", CharProps::default());
+        p1.insert_object(0, InlineObject::ControlStart { control: Box::new(c1) }, &mark).unwrap();
+        p1.insert_object(p1.len(), InlineObject::ControlEnd, &mark).unwrap();
+        doc.body = vec![para_block(p1)];
+
+        // Part control with id = 2.
+        let mut c2 = ContentControl::new(ControlKind::RichText);
+        c2.id = Some(2);
+        let mut p2 = Paragraph::with_text("header", CharProps::default());
+        p2.insert_object(0, InlineObject::ControlStart { control: Box::new(c2) }, &mark).unwrap();
+        p2.insert_object(p2.len(), InlineObject::ControlEnd, &mark).unwrap();
+        doc.parts.insert(1, Part { kind: PartKind::Header, blocks: vec![para_block(p2)], ..Default::default() });
+
+        // Case-insensitive reserved property id = 3 and overflowing id = i64::MAX.
+        doc.set_custom_prop("WORDCRAFT.CHUNK.3", "{\"eval\":\"false\"}");
+        doc.set_custom_prop(&chunk_prop_name(i64::MAX), "{}");
+
+        let mut ids = doc.control_id_allocator();
+        let block_id = |blocks: &Blocks| {
+            blocks.first().and_then(|b| b.as_para()).and_then(|p| p.objects.first()).and_then(|o| match o {
+                InlineObject::ControlStart { control } => control.id,
+                _ => None,
+            })
+        };
+
+        // Colliding preferred id (1) gets the lowest free positive id (4) since i64::MAX is used.
+        let mut colliding = CodeChunk::new("r", "a <- 1");
+        colliding.id = Some(1);
+        let b_a = doc.chunk_blocks_with_ids(&colliding, &mut ids).unwrap();
+        assert_eq!(block_id(&b_a), Some(4));
+
+        // Unused preferred id (10) is kept.
+        let mut preferred = CodeChunk::new("r", "b <- 2");
+        preferred.id = Some(10);
+        let b_b = doc.chunk_blocks_with_ids(&preferred, &mut ids).unwrap();
+        assert_eq!(block_id(&b_b), Some(10));
+
+        // Next auto-allocated id continues at 5 without repeating i64::MAX.
+        let b_c = doc.chunk_blocks_with_ids(&CodeChunk::new("r", "c <- 3"), &mut ids).unwrap();
+        assert_eq!(block_id(&b_c), Some(5));
+
+        // Invalid chunk leaves allocator and custom properties untouched.
+        let props_before = doc.custom_props.len();
+        assert!(doc.chunk_blocks_with_ids(&CodeChunk::new("r", format!("bad{OBJ}")), &mut ids).is_err());
+        assert_eq!(doc.custom_props.len(), props_before);
+
+        // Next valid chunk gets 6.
+        let b_d = doc.chunk_blocks_with_ids(&CodeChunk::new("r", "d <- 4"), &mut ids).unwrap();
+        assert_eq!(block_id(&b_d), Some(6));
+
+        // External custom property addition is absorbed rather than overwritten.
+        doc.set_custom_prop("wordcraft.chunk.7", "{\"label\":\"external\"}");
+        let b_e = doc.chunk_blocks_with_ids(&CodeChunk::new("r", "e <- 5"), &mut ids).unwrap();
+        assert_eq!(block_id(&b_e), Some(8));
+        assert_eq!(doc.custom_prop("wordcraft.chunk.7"), Some("{\"label\":\"external\"}"));
+        assert_eq!(doc.custom_prop("WORDCRAFT.CHUNK.3"), Some("{\"eval\":\"false\"}"));
     }
 }

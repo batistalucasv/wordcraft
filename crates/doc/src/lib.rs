@@ -61,7 +61,7 @@ use serde::{Deserialize, Serialize};
 
 pub use control::{ContentControl, ControlKind, ControlLock, ControlRange, ControlWrap};
 pub mod chunk;
-pub use chunk::{CHUNK_PROP, CHUNK_STYLE, CHUNK_TAG, ChunkOptions, ChunkRef, CodeChunk};
+pub use chunk::{CHUNK_PROP, CHUNK_STYLE, CHUNK_TAG, ChunkOptions, ChunkRef, CodeChunk, ControlIdAllocator};
 pub use fields::FieldRange;
 pub use numbering::{ListKind, Numbering};
 pub use para::{InlineObject, Paragraph, Run};
