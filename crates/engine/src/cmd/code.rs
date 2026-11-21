@@ -789,20 +789,32 @@ fn insert_output(s: &mut Session, v: &Value) -> CmdResult {
 
     s.doc.ensure_code_output_style();
     let lines: Vec<&str> = trimmed.split('\n').collect();
+    let last_offset = lines.len().saturating_sub(1);
     let base_idx = start_path.last();
     let mut last_idx = base_idx;
+    let mut preserved_section = None;
     for (offset, line) in lines.iter().enumerate() {
         let cur_idx = base_idx.saturating_add(offset);
         last_idx = cur_idx;
         let path = start_path.with_last(cur_idx);
-        let para = Paragraph::with_text(line, CharProps::default()).styled(CODE_OUTPUT_STYLE);
+        let mut para = Paragraph::with_text(line, CharProps::default()).styled(CODE_OUTPUT_STYLE);
         if offset == 0 && replace_empty_at {
             if let Ok(existing) = s.doc.para_mut(story, &path) {
+                // Keep any section break carried by the replaced empty paragraph; for multi-line
+                // output it lands on the last inserted paragraph so every output line stays in
+                // the original section before the break.
+                preserved_section = existing.section.take();
+                if offset == last_offset {
+                    para.section = preserved_section.take();
+                }
                 *existing = para;
             } else {
                 s.doc.insert_block(story, &path, Block::Para(para))?;
             }
         } else {
+            if offset == last_offset {
+                para.section = preserved_section.take();
+            }
             s.doc.insert_block(story, &path, Block::Para(para))?;
         }
     }
