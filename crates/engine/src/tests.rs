@@ -12,6 +12,7 @@ use wordcraft_doc::{Pos, StoryRef};
 use crate::{Session, cmd};
 
 mod bidi;
+mod code;
 mod documents;
 mod find_apostrophes;
 mod fit_one_page;
@@ -6365,7 +6366,7 @@ fn markdown_saved_as_markdown_moves_to_the_new_file() {
     std::fs::create_dir_all(&dir).unwrap();
     let first = dir.join("a.md");
     std::fs::write(&first, b"First\n").unwrap();
-    for name in ["b.md", "c.markdown", "D.MD"] {
+    for name in ["b.md", "c.markdown", "D.MD", "e.qmd", "F.Rmd"] {
         let mut s = s();
         std::fs::write(&first, b"First\n").unwrap();
         let second = dir.join(name);
@@ -6399,6 +6400,173 @@ fn markdown_saved_as_markdown_moves_to_the_new_file() {
     run(&mut text, "file.saveAs", json!({"path": dir.join("copy.md").to_string_lossy()}));
     assert!(text.dirty, "a Markdown copy of a text file leaves it unsaved");
     assert_eq!(text.path.as_deref(), Some(note.as_path()));
+
+    // And Quarto to Markdown remains a copy (Markdown drops Quarto front matter and chunks).
+    let qmd = dir.join("doc.qmd");
+    std::fs::write(&qmd, b"```{r}\nx <- 1\n```\n").unwrap();
+    let mut qmd_session = self::s();
+    run(&mut qmd_session, "file.open", json!({"path": qmd.to_string_lossy()}));
+    run(&mut qmd_session, "text.insert", json!({"text": "Hello "}));
+    run(&mut qmd_session, "file.saveAs", json!({"path": dir.join("copy_from_qmd.md").to_string_lossy()}));
+    assert!(qmd_session.dirty, "a .md save of a .qmd file leaves it unsaved");
+    assert_eq!(qmd_session.path.as_deref(), Some(qmd.as_path()));
+
+    // But Quarto saved to Quarto moves to the new file.
+    let qmd_second = dir.join("second.qmd");
+    run(&mut qmd_session, "file.saveAs", json!({"path": qmd_second.to_string_lossy()}));
+    assert!(!qmd_session.dirty, "a .qmd save of a .qmd moves to the new file");
+    assert_eq!(qmd_session.path.as_deref(), Some(qmd_second.as_path()));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn saving_a_copy_with_password_does_not_encrypt_active_session() {
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let dir = std::env::temp_dir().join(format!("wordcraft-engine-copy-pw-{}-{nanos}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let main_doc = dir.join("main.docx");
+    let copy_doc = dir.join("copy.docx");
+
+    let mut s = self::s();
+    run(&mut s, "text.insert", json!({"text": "Original text"}));
+    run(&mut s, "file.save", json!({"path": main_doc.to_string_lossy()}));
+    assert!(s.password.is_none());
+
+    let res = run(
+        &mut s,
+        "file.saveAs",
+        json!({
+            "path": copy_doc.to_string_lossy(),
+            "password": "Password123!",
+            "copy": true,
+        }),
+    );
+    assert_eq!(res["encrypted"], true);
+    assert!(s.password.is_none(), "session password remains None after saving a copy");
+    assert_eq!(s.path.as_deref(), Some(main_doc.as_path()));
+
+    run(&mut s, "text.insert", json!({"text": " more"}));
+    let res2 = run(&mut s, "file.save", json!({}));
+    assert_eq!(res2["encrypted"], false);
+    assert!(s.password.is_none());
+
+    let (copy_opened, copy_encrypted) = crate::io::open_path_with(&copy_doc, Some("Password123!")).unwrap();
+    assert!(copy_encrypted, "copy file on disk must be encrypted with the copy password");
+    assert_eq!(copy_opened.plain_text(StoryRef::Body), "Original text");
+    assert!(crate::io::open_path_with(&copy_doc, None).is_err(), "copy file must reject opening without its password");
+
+    let (main_opened, main_encrypted) = crate::io::open_path_with(&main_doc, None).unwrap();
+    assert!(!main_encrypted, "active file on disk must remain unencrypted");
+    assert_eq!(main_opened.plain_text(StoryRef::Body), "Original text more");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn saving_a_copy_rejects_active_file_and_path_aliases() {
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let dir = std::env::temp_dir().join(format!("wordcraft-engine-copy-active-{}-{nanos}", std::process::id()));
+    let sub = dir.join("sub");
+    std::fs::create_dir_all(&sub).unwrap();
+    let main_doc = dir.join("main.docx");
+
+    let mut s = self::s();
+    run(&mut s, "text.insert", json!({"text": "Original text"}));
+    run(&mut s, "file.save", json!({"path": main_doc.to_string_lossy()}));
+    assert!(s.password.is_none());
+
+    // Make an unsaved edit so we can verify rejected copy calls write nothing and leave state intact.
+    run(&mut s, "text.insert", json!({"text": " unsaved"}));
+    let core_before = s.doc.core.clone();
+    let zoom_before = s.doc.settings.zoom;
+
+    let dot_alias = dir.join(".").join("main.docx");
+    let parent_alias = sub.join("..").join("main.docx");
+    let cases = [
+        ("file.save", json!({"copy": true, "password": "Password123!"})),
+        ("file.save", json!({"path": main_doc.to_string_lossy(), "copy": true, "password": "Password123!"})),
+        ("file.saveAs", json!({"path": main_doc.to_string_lossy(), "copy": true, "password": "Password123!"})),
+        ("file.saveAs", json!({"path": main_doc.to_string_lossy(), "copy": true})),
+        ("file.saveAs", json!({"path": dot_alias.to_string_lossy(), "copy": true, "password": "Password123!"})),
+        ("file.saveAs", json!({"path": parent_alias.to_string_lossy(), "copy": true, "password": "Password123!"})),
+    ];
+    for (cmd, params) in cases {
+        let err = s.run(cmd, &params).unwrap_err();
+        assert!(matches!(err, crate::CmdError::Params(_)), "{cmd} {params}: expected Params error, got {err:?}");
+    }
+
+    // Write-only automation confinement still rejects aliases of the active file.
+    let write_only = crate::file_access::AutomationRoots::new(None, Some(&dir)).unwrap();
+    let err = crate::file_access::confine(write_only.as_ref(), || {
+        s.run("file.saveAs", &json!({"path": dot_alias.to_string_lossy(), "copy": true, "password": "Password123!"}))
+    })
+    .unwrap_err();
+    assert!(matches!(err, crate::CmdError::Params(_)), "write-only confinement alias: expected Params error, got {err:?}");
+
+    // Verify `main.docx` was never overwritten or encrypted and session state stayed untouched.
+    assert!(s.password.is_none());
+    assert!(s.dirty);
+    assert_eq!(s.doc.core, core_before);
+    assert_eq!(s.doc.settings.zoom, zoom_before);
+    let (opened, encrypted) = crate::io::open_path_with(&main_doc, None).unwrap();
+    assert!(!encrypted, "main.docx must remain unencrypted after rejected copy saves");
+    assert_eq!(opened.plain_text(StoryRef::Body), "Original text", "main.docx must remain untouched on disk");
+
+    // Separately named copies continue to work with their own password.
+    let copy_doc = dir.join("separate-copy.docx");
+    let res = run(&mut s, "file.saveAs", json!({"path": copy_doc.to_string_lossy(), "copy": true, "password": "CopyPassword123!"}));
+    assert_eq!(res["encrypted"], true);
+    assert!(s.password.is_none());
+    assert_eq!(s.path.as_deref(), Some(main_doc.as_path()));
+    let (copy_opened, copy_encrypted) = crate::io::open_path_with(&copy_doc, Some("CopyPassword123!")).unwrap();
+    assert!(copy_encrypted);
+    assert_eq!(copy_opened.plain_text(StoryRef::Body), "Original text unsaved");
+
+    // If the active file was removed from disk, an alias to its path is still rejected and never recreated.
+    std::fs::remove_file(&main_doc).unwrap();
+    let err = s.run("file.saveAs", &json!({"path": parent_alias.to_string_lossy(), "copy": true, "password": "Password123!"})).unwrap_err();
+    assert!(matches!(err, crate::CmdError::Params(_)), "deleted active alias: expected Params error, got {err:?}");
+    assert!(!main_doc.exists(), "rejected copy must not recreate removed active file");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn saving_a_copy_rejects_symlink_and_hardlink_aliases() {
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let dir = std::env::temp_dir().join(format!("wordcraft-engine-copy-links-{}-{nanos}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let main_doc = dir.join("main.docx");
+
+    let mut s = self::s();
+    run(&mut s, "text.insert", json!({"text": "Original text"}));
+    run(&mut s, "file.save", json!({"path": main_doc.to_string_lossy()}));
+
+    let symlink_doc = dir.join("link.docx");
+    std::os::unix::fs::symlink(&main_doc, &symlink_doc).unwrap();
+    let symlink_dir = dir.join("dir-link");
+    std::os::unix::fs::symlink(&dir, &symlink_dir).unwrap();
+    let via_dir_link = symlink_dir.join("main.docx");
+    let hardlink_doc = dir.join("hard.docx");
+    std::fs::hard_link(&main_doc, &hardlink_doc).unwrap();
+
+    for alias in [&symlink_doc, &via_dir_link, &hardlink_doc] {
+        let err = s.run("file.saveAs", &json!({"path": alias.to_string_lossy(), "copy": true, "password": "Password123!"})).unwrap_err();
+        assert!(matches!(err, crate::CmdError::Params(_)), "{alias:?}: expected Params error, got {err:?}");
+    }
+
+    // Reverse symlink: active session opened via symlink, copy targets the canonical target.
+    let mut s_link = self::s();
+    run(&mut s_link, "file.open", json!({"path": symlink_doc.to_string_lossy()}));
+    let err = s_link.run("file.saveAs", &json!({"path": main_doc.to_string_lossy(), "copy": true, "password": "Password123!"})).unwrap_err();
+    assert!(matches!(err, crate::CmdError::Params(_)), "reverse symlink: expected Params error, got {err:?}");
+
+    let (opened, encrypted) = crate::io::open_path_with(&main_doc, None).unwrap();
+    assert!(!encrypted, "main.docx must remain unencrypted after rejected link copy saves");
+    assert_eq!(opened.plain_text(StoryRef::Body), "Original text");
+
     let _ = std::fs::remove_dir_all(&dir);
 }
 
