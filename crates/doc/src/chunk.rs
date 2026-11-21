@@ -565,9 +565,10 @@ impl Document {
             }
         }
         for prop in &self.custom_props {
-            if prop.name.len() > CHUNK_PROP.len()
-                && prop.name[..CHUNK_PROP.len()].eq_ignore_ascii_case(CHUNK_PROP)
-                && let Ok(id) = prop.name[CHUNK_PROP.len()..].parse::<i64>()
+            if let Some(prefix) = prop.name.get(..CHUNK_PROP.len())
+                && prefix.eq_ignore_ascii_case(CHUNK_PROP)
+                && let Some(suffix) = prop.name.get(CHUNK_PROP.len()..)
+                && let Ok(id) = suffix.parse::<i64>()
             {
                 ids.insert(id);
             }
@@ -1044,6 +1045,21 @@ mod tests {
         let id = doc.push_chunk(&CodeChunk::new("r", "1")).unwrap();
         assert_eq!(id, 2);
         assert_eq!(doc.custom_prop("WORDCRAFT.CHUNK.1"), Some("{\"eval\":\"false\"}"));
+    }
+
+    #[test]
+    fn multibyte_custom_property_crossing_chunk_prefix_boundary_does_not_panic() {
+        let mut doc = Document::new();
+        // Byte 16 (`CHUNK_PROP.len()`) falls inside multi-byte UTF-8 characters here.
+        doc.set_custom_prop("Document title é", "Draft");
+        doc.set_custom_prop("123456789012345😀", "Emoji");
+        doc.set_custom_prop("wordcraft.chunk.é", "Not an id");
+        doc.set_custom_prop("WORDCRAFT.CHUNK.1", "{\"eval\":\"false\"}");
+
+        assert_eq!(doc.next_control_id(), 2);
+        let id = doc.push_chunk(&CodeChunk::new("r", "1 + 1")).unwrap();
+        assert_eq!(id, 2);
+        assert_eq!(doc.custom_prop("Document title é"), Some("Draft"));
     }
 
     #[test]
