@@ -792,8 +792,10 @@ impl Document {
         Ok(true)
     }
 
-    /// Rename (or clear the label of) chunk `id`, updating its `label` option, control tag/alias,
-    /// and `wordcraft.chunk.<id>` custom property. Returns `Ok(true)` if the label changed.
+    /// Rename (or clear the label of) chunk `id`, updating its `label` option and control
+    /// tag/alias, and its `wordcraft.chunk.<id>` custom property when full options are known.
+    /// Chunks with missing or truncated options stay marked incomplete (`!`) without writing a
+    /// full custom property. Returns `Ok(true)` if the label changed.
     pub fn set_chunk_label(&mut self, id: i64, label: Option<&str>) -> Result<bool> {
         let cleaned = label
             .map(|raw| raw.chars().filter(|c| !c.is_control()).collect::<String>())
@@ -808,6 +810,13 @@ impl Document {
             return Ok(false);
         }
 
+        let Some(InlineObject::ControlStart { control }) = self.para(found.start.story, &found.start.path).and_then(|p| p.object_at(found.start.off))
+        else {
+            return Ok(false);
+        };
+        let has_full_options_prop = custom_prop_options(self, control).is_some();
+        let options_complete = has_full_options_prop || matches!(decode_tag_options(&control.tag), TagOptions::Complete(_));
+
         let mut options = found.chunk.options.clone();
         match cleaned {
             Some(ref value) => options.set("label", value.clone()),
@@ -819,14 +828,24 @@ impl Document {
 
         let norm_lang = normalize_language(&found.chunk.language);
         let effective_lang = if norm_lang.is_empty() { "text" } else { norm_lang.as_str() };
-        let prop = chunk_prop_name(id);
-        let json = serde_json::to_string(&options).unwrap_or_else(|_| "{}".to_string());
-        self.set_custom_prop(&prop, &json);
 
         let mut updated = CodeChunk::new(effective_lang, &found.chunk.code);
         updated.options = options.clone();
-        let new_tag = encode_control_tag(effective_lang, &options);
+        let new_tag = if options_complete {
+            encode_control_tag(effective_lang, &options)
+        } else {
+            let tag = encode_control_tag_with_truncated(effective_lang, &options, true);
+            if cleaned.is_some() && !matches!(decode_tag_options(&tag), TagOptions::Truncated(ref opts) if opts.get("label") == cleaned.as_deref()) {
+                return Err(DocError::Invalid("chunk label does not fit in the control tag while options are incomplete".to_string()));
+            }
+            tag
+        };
         let new_title = updated.alias();
+        if options_complete {
+            let prop = chunk_prop_name(id);
+            let json = serde_json::to_string(&options).unwrap_or_else(|_| "{}".to_string());
+            self.set_custom_prop(&prop, &json);
+        }
         if let Some(control) = self.control_mut(&found.start) {
             control.tag = new_tag;
             control.title = new_title;
@@ -1558,5 +1577,121 @@ mod tests {
         assert_eq!(out3.start.path, crate::Path::top(0));
         assert_eq!(out3.end.path, crate::Path::top(2));
         assert_eq!(out3.control, outer);
+    }
+
+    #[test]
+    fn set_chunk_label_preserves_incomplete_options_on_legacy_chunk() {
+        // Legacy chunk: no `?` query in tag and no `wordcraft.chunk.<id>` custom property.
+        let mut doc = Document::new();
+        let id = doc.push_chunk(&CodeChunk::new("r", "x <- 1")).unwrap();
+        let start = doc.control_ranges(StoryRef::Body)[0].start.clone();
+        doc.control_mut(&start).unwrap().tag = "wordcraft:chunk:r".to_string();
+        doc.remove_custom_prop(&chunk_prop_name(id));
+
+        let before = doc.chunk_refs(StoryRef::Body);
+        assert!(doc.chunk_options_missing(&before[0]));
+        assert_eq!(before[0].chunk.options.label(), None);
+
+        // Renaming must persist the label without writing a complete custom property or clearing `!`.
+        assert!(doc.set_chunk_label(id, Some("fig-legacy")).unwrap());
+        assert_eq!(doc.custom_prop(&chunk_prop_name(id)), None);
+        let after = doc.chunk_refs(StoryRef::Body);
+        assert_eq!(after[0].chunk.options.label(), Some("fig-legacy"));
+        assert!(doc.chunk_options_missing(&after[0]), "renaming a legacy chunk must not mark unknown options complete");
+        let range = &doc.control_ranges(StoryRef::Body)[0];
+        assert_eq!(range.control.tag, "wordcraft:chunk:r?!label=fig-legacy");
+        assert_eq!(range.control.title, "R code chunk (fig-legacy)");
+
+        // Subsequent source edits and clearing the label keep the incomplete state intact.
+        assert!(doc.update_chunk(id, "python", "x = 2").unwrap());
+        let after_edit = doc.chunk_refs(StoryRef::Body);
+        assert_eq!(after_edit[0].chunk.options.label(), Some("fig-legacy"));
+        assert!(doc.chunk_options_missing(&after_edit[0]));
+        assert_eq!(doc.custom_prop(&chunk_prop_name(id)), None);
+
+        assert!(doc.set_chunk_label(id, None).unwrap());
+        let after_clear = doc.chunk_refs(StoryRef::Body);
+        assert_eq!(after_clear[0].chunk.options.label(), None);
+        assert!(doc.chunk_options_missing(&after_clear[0]));
+        assert_eq!(doc.custom_prop(&chunk_prop_name(id)), None);
+        assert_eq!(doc.control_ranges(StoryRef::Body)[0].control.tag, "wordcraft:chunk:python?!");
+
+        // Legacy chunk with malformed JSON custom property stays incomplete and does not overwrite the property.
+        let mut bad_prop_doc = Document::new();
+        let bad_id = bad_prop_doc.push_chunk(&CodeChunk::new("r", "w <- 1")).unwrap();
+        let bad_start = bad_prop_doc.control_ranges(StoryRef::Body)[0].start.clone();
+        bad_prop_doc.control_mut(&bad_start).unwrap().tag = "wordcraft:chunk:r".to_string();
+        bad_prop_doc.set_custom_prop(&chunk_prop_name(bad_id), "{not valid json");
+        assert!(bad_prop_doc.set_chunk_label(bad_id, Some("fig-bad")).unwrap());
+        assert_eq!(bad_prop_doc.custom_prop(&chunk_prop_name(bad_id)), Some("{not valid json"));
+        let bad_after = bad_prop_doc.chunk_refs(StoryRef::Body);
+        assert!(bad_prop_doc.chunk_options_missing(&bad_after[0]));
+        assert_eq!(bad_after[0].chunk.options.label(), Some("fig-bad"));
+        assert_eq!(bad_prop_doc.control_ranges(StoryRef::Body)[0].control.tag, "wordcraft:chunk:r?!label=fig-bad");
+
+        // An over-budget label on an incomplete chunk is refused without mutating tag or title.
+        let over_budget_label = "😀".repeat(100);
+        assert!(matches!(bad_prop_doc.set_chunk_label(bad_id, Some(&over_budget_label)), Err(DocError::Invalid(_))));
+        assert_eq!(bad_prop_doc.control_ranges(StoryRef::Body)[0].control.tag, "wordcraft:chunk:r?!label=fig-bad");
+        assert_eq!(bad_prop_doc.control_ranges(StoryRef::Body)[0].control.title, "R code chunk (fig-bad)");
+    }
+
+    #[test]
+    fn set_chunk_label_preserves_truncated_and_complete_option_states() {
+        // Copied truncated chunk missing `eval` keeps `!` and does not materialize a custom property.
+        let mut trunc_doc = Document::new();
+        let trunc_id = trunc_doc.push_chunk(&CodeChunk::new("r", "y <- 1")).unwrap();
+        let trunc_start = trunc_doc.control_ranges(StoryRef::Body)[0].start.clone();
+        trunc_doc.control_mut(&trunc_start).unwrap().tag = "wordcraft:chunk:r?!echo=false".to_string();
+        trunc_doc.remove_custom_prop(&chunk_prop_name(trunc_id));
+        assert!(trunc_doc.set_chunk_label(trunc_id, Some("fig-trunc")).unwrap());
+        assert_eq!(trunc_doc.custom_prop(&chunk_prop_name(trunc_id)), None);
+        let trunc_after = trunc_doc.chunk_refs(StoryRef::Body);
+        assert!(trunc_doc.chunk_options_missing(&trunc_after[0]));
+        assert!(!trunc_after[0].chunk.options.echo());
+        assert_eq!(trunc_after[0].chunk.options.label(), Some("fig-trunc"));
+        assert_eq!(trunc_doc.control_ranges(StoryRef::Body)[0].control.tag, "wordcraft:chunk:r?!echo=false&label=fig-trunc");
+
+        // Copied truncated chunk that retained `eval` still preserves `!` and avoids writing a full property.
+        let mut trunc_eval_doc = Document::new();
+        let trunc_eval_id = trunc_eval_doc.push_chunk(&CodeChunk::new("r", "z <- 1")).unwrap();
+        let trunc_eval_start = trunc_eval_doc.control_ranges(StoryRef::Body)[0].start.clone();
+        trunc_eval_doc.control_mut(&trunc_eval_start).unwrap().tag = "wordcraft:chunk:r?!eval=false&echo=false".to_string();
+        trunc_eval_doc.remove_custom_prop(&chunk_prop_name(trunc_eval_id));
+        assert!(trunc_eval_doc.set_chunk_label(trunc_eval_id, Some("fig-eval")).unwrap());
+        assert_eq!(trunc_eval_doc.custom_prop(&chunk_prop_name(trunc_eval_id)), None);
+        let trunc_eval_after = trunc_eval_doc.chunk_refs(StoryRef::Body);
+        assert!(!trunc_eval_doc.chunk_options_missing(&trunc_eval_after[0]));
+        assert!(!trunc_eval_after[0].chunk.options.eval());
+        assert_eq!(trunc_eval_after[0].chunk.options.label(), Some("fig-eval"));
+        assert_eq!(trunc_eval_doc.control_ranges(StoryRef::Body)[0].control.tag, "wordcraft:chunk:r?!eval=false&echo=false&label=fig-eval");
+
+        // Complete chunks (complete copied tag or valid custom property) still update normally.
+        let mut complete_doc = Document::new();
+        let complete_id = complete_doc.push_chunk(&CodeChunk::new("r", "a <- 1")).unwrap();
+        let complete_start = complete_doc.control_ranges(StoryRef::Body)[0].start.clone();
+        complete_doc.control_mut(&complete_start).unwrap().tag = "wordcraft:chunk:r?echo=false".to_string();
+        complete_doc.remove_custom_prop(&chunk_prop_name(complete_id));
+        assert!(complete_doc.set_chunk_label(complete_id, Some("fig-ok")).unwrap());
+        assert!(complete_doc.custom_prop(&chunk_prop_name(complete_id)).is_some());
+        let complete_after = complete_doc.chunk_refs(StoryRef::Body);
+        assert!(!complete_doc.chunk_options_missing(&complete_after[0]));
+        assert!(!complete_after[0].chunk.options.echo());
+        assert_eq!(complete_after[0].chunk.options.label(), Some("fig-ok"));
+        assert_eq!(complete_doc.control_ranges(StoryRef::Body)[0].control.tag, "wordcraft:chunk:r?echo=false&label=fig-ok");
+
+        // A legacy-tagged chunk with a valid full custom property keeps complete options on rename.
+        let mut prop_doc = Document::new();
+        let mut prop_chunk = CodeChunk::new("r", "b <- 1");
+        prop_chunk.options.set("eval", "false");
+        let prop_id = prop_doc.push_chunk(&prop_chunk).unwrap();
+        let prop_start = prop_doc.control_ranges(StoryRef::Body)[0].start.clone();
+        prop_doc.control_mut(&prop_start).unwrap().tag = "wordcraft:chunk:r".to_string();
+        assert!(prop_doc.set_chunk_label(prop_id, Some("fig-prop")).unwrap());
+        let prop_after = prop_doc.chunk_refs(StoryRef::Body);
+        assert!(!prop_doc.chunk_options_missing(&prop_after[0]));
+        assert!(!prop_after[0].chunk.options.eval());
+        assert_eq!(prop_after[0].chunk.options.label(), Some("fig-prop"));
+        assert_eq!(prop_doc.control_ranges(StoryRef::Body)[0].control.tag, "wordcraft:chunk:r?eval=false&label=fig-prop");
     }
 }
