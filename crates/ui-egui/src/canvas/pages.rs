@@ -46,7 +46,7 @@ pub(super) fn page_content_key(page: &Page) -> u64 {
                     format!("{spin:?}").hash(&mut h)
                 }
                 Placed::Clip { rect, spin, items } => format!("{rect:?}{spin:?}{items:?}").hash(&mut h),
-                Placed::Cell { .. } | Placed::Object { .. } => {}
+                Placed::Cell { .. } | Placed::Object { .. } | Placed::Chunk { .. } => {}
             }
         }
     }

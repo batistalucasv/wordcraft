@@ -77,6 +77,7 @@ impl Session {
             // The editor shows a body page reference as stored until fields are updated.
             output_page_refs: false,
             bookmark_error: None,
+            chunk_heights: Default::default(),
         };
         let l = Arc::new(wordcraft_layout::layout(&self.doc, &mut self.cache, &opts));
         let [newest, _] = std::mem::take(&mut self.layout);
