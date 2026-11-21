@@ -159,9 +159,14 @@ impl ChunkOptions {
 }
 
 /// Strip a trailing YAML comment (`# ...`) outside quotes.
+///
+/// Per YAML 1.2, `#` starts a comment only at the start of the input or when
+/// preceded by separation whitespace; a `#` inside a plain scalar such as
+/// `C# tutorial` is kept literally.
 pub fn strip_yaml_comment(raw: &str) -> &str {
     let mut quote: Option<char> = None;
     let mut escaped = false;
+    let mut prev: Option<char> = None;
     for (i, c) in raw.char_indices() {
         if let Some(q) = quote {
             if escaped {
@@ -173,9 +178,10 @@ pub fn strip_yaml_comment(raw: &str) -> &str {
             }
         } else if c == '\'' || c == '"' {
             quote = Some(c);
-        } else if c == '#' {
+        } else if c == '#' && prev.is_none_or(|p| matches!(p, ' ' | '\t' | '\n' | '\r')) {
             return raw[..i].trim_end();
         }
+        prev = Some(c);
     }
     raw.trim_end()
 }
@@ -795,7 +801,9 @@ impl Document {
     /// Rename (or clear the label of) chunk `id`, updating its `label` option and control
     /// tag/alias, and its `wordcraft.chunk.<id>` custom property when full options are known.
     /// Chunks with missing or truncated options stay marked incomplete (`!`) without writing a
-    /// full custom property. Returns `Ok(true)` if the label changed.
+    /// full custom property. Returns `Ok(true)` if the label changed, or `Err(DocError::Invalid)`
+    /// if the chunk is at [`MAX_CHUNK_OPTIONS`] without an existing `label` or the label cannot
+    /// fit in an incomplete control tag.
     pub fn set_chunk_label(&mut self, id: i64, label: Option<&str>) -> Result<bool> {
         let cleaned = label
             .map(|raw| raw.chars().filter(|c| !c.is_control()).collect::<String>())
@@ -819,7 +827,12 @@ impl Document {
 
         let mut options = found.chunk.options.clone();
         match cleaned {
-            Some(ref value) => options.set("label", value.clone()),
+            Some(ref value) => {
+                if !options.contains_key("label") && options.len() >= MAX_CHUNK_OPTIONS {
+                    return Err(DocError::Invalid(format!("chunk already has the maximum of {MAX_CHUNK_OPTIONS} options; cannot store label")));
+                }
+                options.set("label", value.clone());
+            }
             None => {
                 let _ = options.remove("label");
                 let _ = options.remove("id");
@@ -1693,5 +1706,91 @@ mod tests {
         assert!(!prop_after[0].chunk.options.eval());
         assert_eq!(prop_after[0].chunk.options.label(), Some("fig-prop"));
         assert_eq!(prop_doc.control_ranges(StoryRef::Body)[0].control.tag, "wordcraft:chunk:r?eval=false&label=fig-prop");
+    }
+
+    #[test]
+    fn strip_yaml_comment_preserves_literal_hash_in_plain_scalars() {
+        assert_eq!(strip_yaml_comment("C# tutorial"), "C# tutorial");
+        assert_eq!(strip_yaml_comment("C# tutorial # trailing note"), "C# tutorial");
+        assert_eq!(strip_yaml_comment("https://example.com#section"), "https://example.com#section");
+        assert_eq!(strip_yaml_comment("false # explanation"), "false");
+        assert_eq!(strip_yaml_comment("false\t# explanation"), "false");
+        assert_eq!(strip_yaml_comment("# comment only"), "");
+        assert_eq!(strip_yaml_comment("   # comment only"), "");
+
+        let mut o = ChunkOptions::new();
+        o.set("fig-cap", "C# tutorial");
+        assert_eq!(o.fig_caption().as_deref(), Some("C# tutorial"));
+
+        o.set("fig-cap", "C# tutorial # note");
+        assert_eq!(o.fig_caption().as_deref(), Some("C# tutorial"));
+
+        o.set("eval", "false # explanation");
+        assert_eq!(o.flag("eval"), Some(false));
+        assert!(!o.eval());
+
+        o.set("echo", "false\t# tab-separated comment");
+        assert_eq!(o.flag("echo"), Some(false));
+    }
+
+    #[test]
+    fn set_chunk_label_reports_capacity_error_and_updates_existing_label_at_capacity() {
+        // Chunk at MAX_CHUNK_OPTIONS with no `label` key must refuse a new label before mutating.
+        let mut doc = Document::new();
+        let mut full_chunk = CodeChunk::new("r", "x <- 1");
+        for i in 0..MAX_CHUNK_OPTIONS {
+            full_chunk.options.set(format!("opt{i}"), "1");
+        }
+        assert_eq!(full_chunk.options.len(), MAX_CHUNK_OPTIONS);
+        let id = doc.push_chunk(&full_chunk).unwrap();
+        let prop_before = doc.custom_prop(&chunk_prop_name(id)).map(str::to_owned);
+        let tag_before = doc.control_ranges(StoryRef::Body)[0].control.tag.clone();
+        let title_before = doc.control_ranges(StoryRef::Body)[0].control.title.clone();
+
+        let err = doc.set_chunk_label(id, Some("fig-overflow"));
+        assert!(matches!(err, Err(DocError::Invalid(_))), "expected capacity error, got {err:?}");
+        assert_eq!(doc.custom_prop(&chunk_prop_name(id)), prop_before.as_deref());
+        assert_eq!(doc.control_ranges(StoryRef::Body)[0].control.tag, tag_before);
+        assert_eq!(doc.control_ranges(StoryRef::Body)[0].control.title, title_before);
+        assert_eq!(doc.chunks()[0].options.label(), None);
+        assert_eq!(doc.chunks()[0].options.len(), MAX_CHUNK_OPTIONS);
+
+        // Chunk at MAX_CHUNK_OPTIONS with `id` (but no `label`) also refuses adding `label`.
+        let mut id_doc = Document::new();
+        let mut id_chunk = CodeChunk::new("r", "y <- 1");
+        id_chunk.options.set("id", "old-id");
+        for i in 0..(MAX_CHUNK_OPTIONS - 1) {
+            id_chunk.options.set(format!("opt{i}"), "1");
+        }
+        assert_eq!(id_chunk.options.len(), MAX_CHUNK_OPTIONS);
+        let id_alias = id_doc.push_chunk(&id_chunk).unwrap();
+        let id_prop_before = id_doc.custom_prop(&chunk_prop_name(id_alias)).map(str::to_owned);
+        let id_err = id_doc.set_chunk_label(id_alias, Some("new-label"));
+        assert!(matches!(id_err, Err(DocError::Invalid(_))), "expected capacity error, got {id_err:?}");
+        assert_eq!(id_doc.custom_prop(&chunk_prop_name(id_alias)), id_prop_before.as_deref());
+        assert_eq!(id_doc.chunks()[0].options.label(), Some("old-id"));
+
+        // Updating an existing `label` at capacity must succeed in place.
+        let mut existing_doc = Document::new();
+        let mut existing_chunk = CodeChunk::new("r", "z <- 1");
+        existing_chunk.options.set("label", "fig-old");
+        for i in 0..(MAX_CHUNK_OPTIONS - 1) {
+            existing_chunk.options.set(format!("opt{i}"), "1");
+        }
+        assert_eq!(existing_chunk.options.len(), MAX_CHUNK_OPTIONS);
+        let existing_id = existing_doc.push_chunk(&existing_chunk).unwrap();
+
+        assert!(existing_doc.set_chunk_label(existing_id, Some("fig-updated")).unwrap());
+        let updated = existing_doc.chunks();
+        assert_eq!(updated[0].options.label(), Some("fig-updated"));
+        assert_eq!(updated[0].options.len(), MAX_CHUNK_OPTIONS);
+        assert_eq!(existing_doc.control_ranges(StoryRef::Body)[0].control.title, "R code chunk (fig-updated)");
+        assert!(!existing_doc.set_chunk_label(existing_id, Some("fig-updated")).unwrap());
+
+        // Clearing the label at capacity also works and frees one option slot.
+        assert!(existing_doc.set_chunk_label(existing_id, None).unwrap());
+        let cleared = existing_doc.chunks();
+        assert_eq!(cleared[0].options.label(), None);
+        assert_eq!(cleared[0].options.len(), MAX_CHUNK_OPTIONS - 1);
     }
 }
