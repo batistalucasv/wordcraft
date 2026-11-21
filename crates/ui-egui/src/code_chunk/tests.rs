@@ -540,7 +540,14 @@ fn active_run_gates_run_set_language_and_attach_run() {
 
 #[test]
 fn browser_mode_reports_desktop_only_message() {
+    assert_eq!(unavailable_run_message(CodeLanguage::Python, true), BROWSER_NO_INTERPRETER_MESSAGE);
+    assert_eq!(unavailable_run_message(CodeLanguage::R, true), BROWSER_NO_INTERPRETER_MESSAGE);
+    let native_msg = unavailable_run_message(CodeLanguage::Python, false);
+    assert!(native_msg.contains("was not found on PATH"), "native builds keep PATH instructions: {native_msg}");
+
     let mut chunk = python();
+    chunk.available = false;
+    chunk.force_browser_for_test = true;
     chunk.run_browser();
     let output = chunk.output().expect("browser run records an explanatory error");
     assert_eq!(output.error.as_deref(), Some(BROWSER_NO_INTERPRETER_MESSAGE));
@@ -552,10 +559,49 @@ fn browser_mode_reports_desktop_only_message() {
     assert!(harness.query_by_label_contains(BROWSER_NO_INTERPRETER_MESSAGE).is_some());
     assert!(harness.query_by_label_contains("Did not run").is_some());
 
+    harness.get_by_label("Run").hover();
+    steps(&mut harness, 2);
+    assert!(
+        harness.query_by_label_contains(BROWSER_NO_INTERPRETER_MESSAGE).is_some(),
+        "disabled Run button in browser mode must explain desktop-only execution"
+    );
+    assert!(
+        harness.query_by_label_contains("was not found on PATH").is_none(),
+        "browser mode must not instruct users to install an interpreter on PATH"
+    );
+
     let (_tx, rx) = mpsc::channel();
     harness.state_mut().chunk.attach_run(rx);
     harness.state_mut().chunk.run_browser();
     assert!(harness.state().chunk.is_running(), "browser run gate also respects active run");
+}
+
+#[test]
+fn plot_tab_borrows_payload_across_repaints_and_clones_only_on_insert() {
+    let png = plot_png();
+    let svg = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 16 12\"></svg>".to_owned();
+    let mut chunk = python();
+    chunk.set_output(ChunkOutput {
+        plot_png: Some(png.clone()),
+        plot_svg: Some(svg.clone()),
+        success: true,
+        duration_ms: 15,
+        ..ChunkOutput::default()
+    });
+
+    let mut harness = harness(chunk);
+    steps(&mut harness, 6);
+    assert_eq!(harness.state().chunk.plot_decode_attempts, 1, "cached texture must decode only once across repaints");
+    assert!(harness.state().actions.is_empty(), "repaints without clicking Insert must not emit InsertPlot");
+
+    harness.get_by_label("Insert into document").click();
+    steps(&mut harness, 2);
+    assert_eq!(harness.state().chunk.plot_decode_attempts, 1);
+    assert_eq!(
+        harness.state().actions.as_slice(),
+        &[CodeChunkAction::InsertPlot { png: Some(png), svg: Some(svg) }],
+        "clicking Insert must clone both PNG and SVG payloads into InsertPlot"
+    );
 }
 
 #[test]

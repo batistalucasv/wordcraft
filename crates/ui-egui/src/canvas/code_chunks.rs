@@ -77,6 +77,8 @@ pub(crate) struct CodeChunksState {
     last_outputs_rev: Option<u64>,
     last_generation: Option<u64>,
     next_batch_id: u64,
+    #[cfg(test)]
+    fail_next_launch: Option<String>,
 }
 
 impl CodeChunksState {
@@ -128,6 +130,9 @@ impl CodeChunksState {
         self.next_batch_id
     }
 
+    /// Transfer in-flight pending and queued runs to `target`, enforcing at most one live
+    /// (non-invalidated) run per chunk: a live pending run always supersedes any queued run for
+    /// the same chunk, and `target`'s existing live run wins over a duplicate from `self`.
     pub(crate) fn transfer_in_flight_runs_to(&mut self, target: &mut CodeChunksState) {
         let mut batch_map: HashMap<u64, u64> = HashMap::new();
         let mut remap = |target: &mut CodeChunksState, batch_id: u64, stop_on_error: bool| -> u64 {
@@ -141,7 +146,14 @@ impl CodeChunksState {
                 if matches!(run.rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)) {
                     target.pending_runs.push(run);
                 }
-            } else if !target.pending_runs.iter().any(|r| !r.invalidated && r.chunk_id == run.chunk_id) {
+            } else if target.pending_runs.iter().any(|r| !r.invalidated && r.chunk_id == run.chunk_id) {
+                target.queued_runs.retain(|q| q.chunk_id != run.chunk_id);
+                run.invalidated = true;
+                if matches!(run.rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)) {
+                    target.pending_runs.push(run);
+                }
+            } else {
+                target.queued_runs.retain(|q| q.chunk_id != run.chunk_id);
                 run.batch_id = remap(target, run.batch_id, run.stop_on_error);
                 target.pending_runs.push(run);
             }
@@ -234,6 +246,11 @@ impl CodeChunksState {
     #[cfg(test)]
     pub(crate) fn allocate_batch_id_for_test(&mut self) -> u64 {
         self.allocate_batch_id()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_launch_for_test(&mut self, err: impl Into<String>) {
+        self.fail_next_launch = Some(err.into());
     }
 }
 
@@ -445,7 +462,7 @@ fn poll_pending_runs(app: &mut WordApp, ctx: &egui::Context) {
     if !failed_batches.is_empty() {
         app.canvas.code_chunks.queued_runs.retain(|q| !failed_batches.contains(&q.batch_id));
     }
-    pump_queued_runs(app, Some(ctx));
+    let _ = pump_queued_runs(app, Some(ctx));
     if !app.canvas.code_chunks.pending_runs.is_empty() {
         ctx.request_repaint_after(std::time::Duration::from_millis(50));
     }
@@ -810,7 +827,7 @@ fn collect_visible_chunks(app: &mut WordApp, ui: &Ui, layout: &DocLayout, pages:
     visible
 }
 
-fn apply_paint_events(app: &mut WordApp, ui: &Ui, events: PaintEvents) {
+fn apply_paint_events(app: &mut WordApp, ui: &Ui, layout: &DocLayout, events: PaintEvents) {
     if let Some(click) = events.context_click {
         app.canvas.code_chunks.pending_context_click = Some(click);
     }
@@ -840,14 +857,15 @@ fn apply_paint_events(app: &mut WordApp, ui: &Ui, events: PaintEvents) {
         }
     }
 
-    // Offscreen or Teaching-Mode-hidden chunks are not passed to `TextEdit::show`, so
-    // `editor_lost_focus` never fires for them; reconcile `active_chunk` against egui focus.
+    // Offscreen, unplaced (e.g. Outline view), or Teaching-Mode-hidden chunks are not passed to
+    // `TextEdit::show`, so `editor_lost_focus` never fires for them; reconcile `active_chunk` against egui focus.
     if let Some(active_id) = app.canvas.code_chunks.active_chunk {
         let mut focus_canvas = false;
+        let is_placed = chunk_placement(layout, active_id).is_some();
         let still_focused = !app.session.view.read_mode
             && app.canvas.code_chunks.widgets.get(&active_id).is_some_and(|entry| {
                 let editor_id = entry.widget.editor_id();
-                if !entry.widget.show_code {
+                if !entry.widget.show_code || !is_placed {
                     if ui.ctx().memory(|m| m.has_focus(editor_id)) {
                         ui.ctx().memory_mut(|m| m.surrender_focus(editor_id));
                         focus_canvas = true;
@@ -1116,7 +1134,7 @@ pub(crate) fn paint_and_interact(app: &mut WordApp, ui: &mut Ui, layout: &DocLay
         events.record(id, pi, read_mode, frame);
     }
 
-    apply_paint_events(app, ui, events);
+    apply_paint_events(app, ui, layout, events);
 
     if let Some((fid, at_end)) = app.canvas.code_chunks.pending_focus {
         if app.canvas.code_chunks.is_mounted(fid)
@@ -1313,16 +1331,39 @@ pub(crate) fn try_click_below_trailing_chunk(
     let Some(pg) = layout.pages.get(page) else {
         return false;
     };
-    let clicked_below_chunk = pg.items.iter().any(|it| match it {
-        Placed::Chunk { id, rect, .. } => *id == chunk_id && y > rect.bottom(),
-        _ => false,
-    });
-    if !clicked_below_chunk {
+    let Some(chunk_rect) = pg.items.iter().find_map(|it| match it {
+        Placed::Chunk { id, rect, .. } if *id == chunk_id => Some(*rect),
+        _ => None,
+    }) else {
+        return false;
+    };
+    if y <= chunk_rect.bottom() || y > pg.body.bottom() || x < chunk_rect.x || x > chunk_rect.right() {
         return false;
     }
-    if let Some(hit) = layout.hit(page, x, y, story)
-        && hit.path.0.first().is_some_and(|&b| (b as usize) > last_block)
-    {
+    let pt = wordcraft_geom::Point::new(x, y);
+    let hits_or_has_body_below = pg.items.iter().any(|it| match it {
+        Placed::Lines { story: StoryRef::Body, para, l0, l1, x: lx, y: ly, turn, .. } => {
+            if turn.is_turned() {
+                it.turned_bounds().is_some_and(|r| r.expand(2.0).contains(pt))
+            } else {
+                para.lines.get(*l0).is_some_and(|first| {
+                    (*l0..*l1).filter_map(|li| para.lines.get(li)).any(|l| {
+                        let top = *ly + (l.top - first.top);
+                        let bottom = top + l.height;
+                        let left = *lx + l.left;
+                        let right = *lx + l.right;
+                        (y >= top - 2.0 && y <= bottom + 2.0 && x >= left - 2.0 && x <= right + 2.0)
+                            || (bottom > chunk_rect.bottom() && right >= chunk_rect.x && left <= chunk_rect.right())
+                    })
+                })
+            }
+        }
+        Placed::Cell { story: StoryRef::Body, rect, .. } => {
+            rect.expand(2.0).contains(pt) || (rect.bottom() > chunk_rect.bottom() && rect.right() >= chunk_rect.x && rect.x <= chunk_rect.right())
+        }
+        _ => false,
+    });
+    if hits_or_has_body_below {
         return false;
     }
     if let Err(err) = flush_one(app, chunk_id) {
@@ -1371,24 +1412,35 @@ pub(crate) fn maybe_enter_from_canvas_arrow(app: &mut WordApp, key: egui::Key, m
         return false;
     }
     let refs = top_level_chunks(&app.session.doc);
-    let has_placement = |cid: i64| {
-        app.canvas.code_chunks.is_mounted(cid)
-            && layout.pages.iter().any(|pg| pg.items.iter().any(|it| matches!(it, wordcraft_layout::Placed::Chunk { id, .. } if *id == cid)))
+    let mut placed_ids: Option<HashSet<i64>> = None;
+    let mut has_placement = |cid: i64| {
+        if !app.canvas.code_chunks.is_mounted(cid) {
+            return false;
+        }
+        let ids = placed_ids.get_or_insert_with(|| {
+            layout
+                .pages
+                .iter()
+                .flat_map(|pg| pg.items.iter())
+                .filter_map(|it| match it {
+                    Placed::Chunk { id, .. } => Some(*id),
+                    _ => None,
+                })
+                .collect()
+        });
+        ids.contains(&cid)
     };
 
     if dir > 0 {
         for r in refs {
             let Some(cid) = r.chunk.id else { continue };
-            if !has_placement(cid) {
-                continue;
-            }
             let first = r.start.path.0.first().copied().unwrap_or(0) as usize;
             let last = r.end.path.0.first().copied().unwrap_or(0) as usize;
             if cur_block < first {
                 let jumped_over = next_block.is_some_and(|nb| nb > last);
                 let entered_chunk = next_block.is_some_and(|nb| (first..=last).contains(&nb));
                 let at_edge_before = next_block.is_none() && cur_block + 1 == first;
-                if jumped_over || entered_chunk || at_edge_before {
+                if (jumped_over || entered_chunk || at_edge_before) && has_placement(cid) {
                     app.canvas.code_chunks.request_focus(cid, false);
                     return true;
                 }
@@ -1397,16 +1449,13 @@ pub(crate) fn maybe_enter_from_canvas_arrow(app: &mut WordApp, key: egui::Key, m
     } else {
         for r in refs.into_iter().rev() {
             let Some(cid) = r.chunk.id else { continue };
-            if !has_placement(cid) {
-                continue;
-            }
             let first = r.start.path.0.first().copied().unwrap_or(0) as usize;
             let last = r.end.path.0.first().copied().unwrap_or(0) as usize;
             if cur_block > last {
                 let jumped_over = next_block.is_some_and(|nb| nb < first);
                 let entered_chunk = next_block.is_some_and(|nb| (first..=last).contains(&nb));
                 let at_edge_after = next_block.is_none() && cur_block == last + 1;
-                if jumped_over || entered_chunk || at_edge_after {
+                if (jumped_over || entered_chunk || at_edge_after) && has_placement(cid) {
                     app.canvas.code_chunks.request_focus(cid, true);
                     return true;
                 }
@@ -1433,17 +1482,26 @@ fn validate_chunk_run(lang_str: &str, code: &str) -> Result<CodeLanguage, String
     parse_lang(lang_str).ok_or_else(|| format!("unsupported language: {lang_str}"))
 }
 
-fn pump_queued_runs(app: &mut WordApp, ctx: Option<&egui::Context>) {
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+fn pump_queued_runs(app: &mut WordApp, ctx: Option<&egui::Context>) -> Vec<(i64, u64, String)> {
     #[cfg(target_arch = "wasm32")]
-    let _ = (app, ctx);
+    {
+        let _ = (app, ctx);
+        Vec::new()
+    }
     #[cfg(not(target_arch = "wasm32"))]
     {
         let current_gen = app.session.chunks.generation();
         app.canvas.code_chunks.invalidate_stale_runs(current_gen);
         app.canvas.code_chunks.reap_invalidated_runs();
         let live_ids: HashSet<i64> = top_level_chunks(&app.session.doc).into_iter().filter_map(|r| r.chunk.id).collect();
-        app.canvas.code_chunks.queued_runs.retain(|q| q.generation == current_gen && live_ids.contains(&q.chunk_id));
+        let pending_ids: HashSet<i64> = app.canvas.code_chunks.pending_runs.iter().filter(|p| !p.invalidated).map(|p| p.chunk_id).collect();
+        app.canvas
+            .code_chunks
+            .queued_runs
+            .retain(|q| q.generation == current_gen && live_ids.contains(&q.chunk_id) && !pending_ids.contains(&q.chunk_id));
 
+        let mut launch_errors = Vec::new();
         while app.canvas.code_chunks.pending_runs.len() < MAX_CONCURRENT_CHUNK_RUNS {
             let Some(front) = app.canvas.code_chunks.queued_runs.front() else {
                 break;
@@ -1454,12 +1512,16 @@ fn pump_queued_runs(app: &mut WordApp, ctx: Option<&egui::Context>) {
             let Some(next) = app.canvas.code_chunks.queued_runs.pop_front() else {
                 break;
             };
-            let (batch_id, stop_on_error) = (next.batch_id, next.stop_on_error);
+            if app.canvas.code_chunks.pending_runs.iter().any(|p| !p.invalidated && p.chunk_id == next.chunk_id) {
+                continue;
+            }
+            let (chunk_id, batch_id, stop_on_error) = (next.chunk_id, next.batch_id, next.stop_on_error);
             if let Err(err) = launch_worker(app, next, ctx) {
-                app.status(err);
+                app.status(err.clone());
                 if stop_on_error {
                     app.canvas.code_chunks.queued_runs.retain(|q| q.batch_id != batch_id);
                 }
+                launch_errors.push((chunk_id, batch_id, err));
             }
         }
         if !app.canvas.code_chunks.pending_runs.is_empty()
@@ -1467,11 +1529,16 @@ fn pump_queued_runs(app: &mut WordApp, ctx: Option<&egui::Context>) {
         {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
+        launch_errors
     }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 fn launch_worker(app: &mut WordApp, queued: QueuedRun, ctx: Option<&egui::Context>) -> Result<(), String> {
+    #[cfg(test)]
+    if let Some(err) = app.canvas.code_chunks.fail_next_launch.take() {
+        return Err(err);
+    }
     let mut req = ExecutionRequest::new(queued.language, queued.code.clone()).with_timeout(queued.timeout_ms);
     if let Some(fmt) = queued.plot {
         req = req.with_plot_capture(true).with_plot_format(fmt);
@@ -1571,12 +1638,17 @@ pub(crate) fn run_chunk_async(app: &mut WordApp, params: &Value, ctx: Option<&eg
             stop_on_error: false,
         };
         app.canvas.code_chunks.queued_runs.push_back(queued);
-        pump_queued_runs(app, ctx);
+        let launch_errors = pump_queued_runs(app, ctx);
+        if let Some((_, _, err)) = launch_errors.into_iter().find(|(cid, _, _)| *cid == id) {
+            return Err(err);
+        }
         let started = app.canvas.code_chunks.pending_runs.iter().any(|p| !p.invalidated && p.chunk_id == id);
         if started {
             Ok(json!({ "started": true, "chunk": { "id": id, "language": range.chunk.language } }))
-        } else {
+        } else if app.canvas.code_chunks.queued_runs.iter().any(|q| q.chunk_id == id) {
             Ok(json!({ "started": false, "queued": true, "chunk": { "id": id, "language": range.chunk.language } }))
+        } else {
+            Err(format!("failed to start or queue code chunk {id}"))
         }
     }
 }
@@ -1623,7 +1695,7 @@ pub(crate) fn run_all_async(app: &mut WordApp, params: &Value, ctx: Option<&egui
         batch.push(QueuedRun { chunk_id: id, language: lang, code: r.chunk.code, timeout_ms, plot, generation, batch_id, stop_on_error });
     }
     if batch.is_empty() {
-        return Ok(json!({ "started": 0 }));
+        return Ok(json!({ "started": 0, "queued": 0 }));
     }
     #[cfg(target_arch = "wasm32")]
     {
@@ -1632,20 +1704,29 @@ pub(crate) fn run_all_async(app: &mut WordApp, params: &Value, ctx: Option<&egui
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
-        let started = batch.len();
         app.canvas.code_chunks.queued_runs.extend(batch);
-        pump_queued_runs(app, ctx);
-        Ok(json!({ "started": started }))
+        let launch_errors = pump_queued_runs(app, ctx);
+        let started = app.canvas.code_chunks.pending_runs.iter().filter(|p| !p.invalidated && p.batch_id == batch_id).count();
+        let queued = app.canvas.code_chunks.queued_runs.iter().filter(|q| q.batch_id == batch_id).count();
+        if started == 0
+            && queued == 0
+            && let Some((_, _, err)) = launch_errors.into_iter().find(|(_, bid, _)| *bid == batch_id)
+        {
+            return Err(err);
+        }
+        Ok(json!({ "started": started, "queued": queued }))
     }
 }
 
-/// Whether the document caret currently sits inside a mounted code chunk (so the canvas caret hides).
-pub(crate) fn caret_in_mounted_chunk(app: &WordApp) -> bool {
-    if app.canvas.code_chunks.active_chunk.is_some() {
-        return true;
+/// Whether the document caret currently sits inside a mounted and placed code chunk (so the canvas caret hides).
+pub(crate) fn caret_in_mounted_chunk(app: &mut WordApp) -> bool {
+    let layout = app.session.layout();
+    if let Some(active_id) = app.canvas.code_chunks.active_chunk {
+        return chunk_placement(&layout, active_id).is_some();
     }
     let pos = &app.session.sel.focus;
-    chunks::chunk_at(&app.session.doc, pos).is_some_and(|r| r.chunk.id.is_some_and(|id| app.canvas.code_chunks.is_mounted(id)))
+    chunks::chunk_at(&app.session.doc, pos)
+        .is_some_and(|r| r.chunk.id.is_some_and(|id| app.canvas.code_chunks.is_mounted(id) && chunk_placement(&layout, id).is_some()))
 }
 
 /// Draw the right-click context menu for mounted code chunk `id`.
