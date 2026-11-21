@@ -679,7 +679,8 @@ impl Document {
     }
 
     /// Replace the language and code of chunk `id` in the body, keeping its control properties,
-    /// custom options, existing `CodeChunk` style, and any section break on its last paragraph.
+    /// custom options, existing `CodeChunk` style, enclosing content control markers, and any
+    /// section break on its last paragraph.
     /// Returns `Ok(true)` if the chunk changed, `Ok(false)` if unchanged or not found.
     pub fn update_chunk(&mut self, id: i64, language: &str, code: &str) -> Result<bool> {
         if code.len() > MAX_CHUNK_CODE_BYTES {
@@ -717,12 +718,27 @@ impl Document {
         let Some(first_para) = container.get(first).and_then(|b| b.as_para()) else {
             return Ok(false);
         };
-        let Some(mut control) = first_para.objects.iter().find_map(|o| match o {
-            InlineObject::ControlStart { control } if control.id == Some(id) => Some((**control).clone()),
-            _ => None,
-        }) else {
+        let Some(last_para) = container.get(last).and_then(|b| b.as_para()) else {
             return Ok(false);
         };
+        let Some(InlineObject::ControlStart { control }) = first_para.object_at(found.start.off) else {
+            return Ok(false);
+        };
+        if !matches!(last_para.object_at(found.end.off), Some(InlineObject::ControlEnd)) {
+            return Ok(false);
+        }
+        let mut control = (**control).clone();
+
+        let leading_controls: Vec<InlineObject> = first_para
+            .objects_with_offsets()
+            .filter(|(off, obj)| *off < found.start.off && matches!(obj, InlineObject::ControlStart { .. } | InlineObject::ControlEnd))
+            .map(|(_, obj)| obj.clone())
+            .collect();
+        let trailing_controls: Vec<InlineObject> = last_para
+            .objects_with_offsets()
+            .filter(|(off, obj)| *off > found.end.off && matches!(obj, InlineObject::ControlStart { .. } | InlineObject::ControlEnd))
+            .map(|(_, obj)| obj.clone())
+            .collect();
 
         let has_full_options_prop = custom_prop_options(self, &control).is_some();
         let new_tag = match decode_tag_options(&control.tag) {
@@ -735,7 +751,7 @@ impl Document {
         updated.options = found.chunk.options.clone();
         control.title = updated.alias();
 
-        let trailing_section = container.get(last).and_then(|b| b.as_para()).and_then(|p| p.section.clone());
+        let trailing_section = last_para.section.clone();
         let first_ppr = first_para.props.clone();
 
         if self.styles.get(CHUNK_STYLE).is_none() {
@@ -752,13 +768,21 @@ impl Document {
                 p.props.page_break_before = first_ppr.page_break_before;
                 p.props.keep_next = first_ppr.keep_next;
                 p.props.keep_lines = first_ppr.keep_lines;
-                p.insert_object(0, InlineObject::ControlStart { control: Box::new(control.clone()) }, &mark)?;
+                let mut insert_off = 0;
+                for marker in &leading_controls {
+                    p.insert_object(insert_off, marker.clone(), &mark)?;
+                    insert_off += OBJ.len_utf8();
+                }
+                p.insert_object(insert_off, InlineObject::ControlStart { control: Box::new(control.clone()) }, &mark)?;
             }
             if i == last_line {
                 if let Some(sect) = &trailing_section {
                     p.section = Some(sect.clone());
                 }
                 p.insert_object(p.len(), InlineObject::ControlEnd, &mark)?;
+                for marker in &trailing_controls {
+                    p.insert_object(p.len(), marker.clone(), &mark)?;
+                }
             }
             blocks.push(para_block(p));
         }
@@ -1407,5 +1431,132 @@ mod tests {
         let bad_after = bad_prop_doc.chunk_refs(StoryRef::Body);
         assert!(bad_prop_doc.chunk_options_missing(&bad_after[0]));
         assert_eq!(bad_prop_doc.control_ranges(StoryRef::Body)[0].control.tag, "wordcraft:chunk:r?!echo=false");
+    }
+
+    fn assert_nested_controls(doc: &Document, chunk_id: i64, outer: &ContentControl, repeating: &ContentControl, last_block: usize) {
+        assert!(!doc.has_unbalanced_controls());
+        let ranges = doc.control_ranges(StoryRef::Body);
+        assert_eq!(ranges.len(), 3, "enclosing block controls must survive chunk edit");
+        let chunk_r = ranges.iter().find(|r| r.control.id == Some(chunk_id)).expect("chunk control present");
+        let rep_r = ranges.iter().find(|r| r.control.id == repeating.id).expect("repeating control preserved");
+        let out_r = ranges.iter().find(|r| r.control.id == outer.id).expect("outer control preserved");
+        assert_eq!(out_r.depth, 0);
+        assert_eq!(rep_r.depth, 1);
+        assert_eq!(chunk_r.depth, 2);
+        assert_eq!(out_r.start.path, crate::Path::top(0));
+        assert_eq!(out_r.end.path, crate::Path::top(last_block));
+        assert_eq!(rep_r.start.path, crate::Path::top(0));
+        assert_eq!(rep_r.end.path, crate::Path::top(last_block));
+        assert_eq!(chunk_r.start.path, crate::Path::top(0));
+        assert_eq!(chunk_r.end.path, crate::Path::top(last_block));
+        assert!(out_r.start.off < rep_r.start.off);
+        assert!(rep_r.start.off < chunk_r.start.off);
+        assert!(chunk_r.end.off < rep_r.end.off);
+        assert!(rep_r.end.off < out_r.end.off);
+        assert_eq!(&out_r.control, outer);
+        assert_eq!(&rep_r.control, repeating);
+    }
+
+    fn locked_outer_control() -> ContentControl {
+        use crate::control::ControlLock;
+
+        let mut outer = ContentControl::new(ControlKind::RichText);
+        outer.id = Some(9001);
+        outer.tag = "section:locked".to_string();
+        outer.title = "Locked Section".to_string();
+        outer.lock = ControlLock::SdtLocked;
+        outer.block = true;
+        outer
+    }
+
+    #[test]
+    fn update_chunk_preserves_enclosing_block_controls_on_single_paragraph_chunk() {
+        use crate::control::ControlLock;
+
+        let mut doc = Document::new();
+        doc.body.clear();
+        let chunk_id = doc.push_chunk(&CodeChunk::new("r", "x <- 1")).unwrap();
+        let chunk_path = doc.chunk_refs(StoryRef::Body)[0].start.path.clone();
+        assert_eq!(chunk_path, crate::Path::top(0));
+        let mark = CharProps::default();
+
+        let outer = locked_outer_control();
+        let mut repeating = ContentControl::new(ControlKind::RepeatingSection { title: "Item".to_string(), no_insert_delete: true });
+        repeating.id = Some(9002);
+        repeating.tag = "section:repeat".to_string();
+        repeating.title = "Repeating Section".to_string();
+        repeating.lock = ControlLock::SdtContentLocked;
+        repeating.block = true;
+
+        {
+            let p = doc.para_mut(StoryRef::Body, &chunk_path).unwrap();
+            p.insert_object(0, InlineObject::ControlStart { control: Box::new(outer.clone()) }, &mark).unwrap();
+            p.insert_object(OBJ.len_utf8(), InlineObject::ControlStart { control: Box::new(repeating.clone()) }, &mark).unwrap();
+            p.insert_object(p.len(), InlineObject::ControlEnd, &mark).unwrap();
+            p.insert_object(p.len(), InlineObject::ControlEnd, &mark).unwrap();
+        }
+        assert_nested_controls(&doc, chunk_id, &outer, &repeating, 0);
+
+        // Single-paragraph -> single-paragraph edit.
+        assert!(doc.update_chunk(chunk_id, "python", "x = 2").unwrap());
+        assert_nested_controls(&doc, chunk_id, &outer, &repeating, 0);
+        assert_eq!(doc.chunks()[0].language, "python");
+        assert_eq!(doc.chunks()[0].code, "x = 2");
+
+        // Single-paragraph -> multi-paragraph edit keeps outer starts on first para and ends on last para.
+        assert!(doc.update_chunk(chunk_id, "python", "x = 2\ny = 3\nz = 4").unwrap());
+        assert_nested_controls(&doc, chunk_id, &outer, &repeating, 2);
+        assert_eq!(doc.chunks()[0].code, "x = 2\ny = 3\nz = 4");
+
+        // Multi-paragraph -> single-paragraph edit preserves nesting and exact marker order.
+        assert!(doc.update_chunk(chunk_id, "r", "done <- TRUE").unwrap());
+        assert_nested_controls(&doc, chunk_id, &outer, &repeating, 0);
+        assert_eq!(doc.chunks()[0].code, "done <- TRUE");
+    }
+
+    #[test]
+    fn update_chunk_preserves_outer_control_spanning_adjacent_paragraphs() {
+        let mark = CharProps::default();
+        let outer = locked_outer_control();
+
+        // Outer control starting on a preceding paragraph and closing on the chunk's last paragraph.
+        let mut doc2 = Document::from_text("intro");
+        let cid2 = doc2.push_chunk(&CodeChunk::new("r", "a <- 1")).unwrap();
+        assert_eq!(doc2.chunk_refs(StoryRef::Body)[0].start.path, crate::Path::top(1));
+        {
+            let p0 = doc2.para_mut(StoryRef::Body, &crate::Path::top(0)).unwrap();
+            p0.insert_object(0, InlineObject::ControlStart { control: Box::new(outer.clone()) }, &mark).unwrap();
+            let p1 = doc2.para_mut(StoryRef::Body, &crate::Path::top(1)).unwrap();
+            p1.insert_object(p1.len(), InlineObject::ControlEnd, &mark).unwrap();
+        }
+        assert!(!doc2.has_unbalanced_controls());
+        assert!(doc2.update_chunk(cid2, "r", "a <- 1\nb <- 2").unwrap());
+        assert!(!doc2.has_unbalanced_controls());
+        let r2 = doc2.control_ranges(StoryRef::Body);
+        let out2 = r2.iter().find(|r| r.control.id == Some(9001)).expect("outer control preserved");
+        assert_eq!(out2.start.path, crate::Path::top(0));
+        assert_eq!(out2.end.path, crate::Path::top(2));
+        assert_eq!(out2.control, outer);
+
+        // Outer control starting on the chunk's first paragraph and closing on a following paragraph.
+        let mut doc3 = Document::new();
+        doc3.body.clear();
+        let cid3 = doc3.push_chunk(&CodeChunk::new("r", "c <- 1")).unwrap();
+        assert_eq!(doc3.chunk_refs(StoryRef::Body)[0].start.path, crate::Path::top(0));
+        doc3.body.push(para_block(Paragraph::with_text("outro", CharProps::default())));
+        {
+            let p0 = doc3.para_mut(StoryRef::Body, &crate::Path::top(0)).unwrap();
+            p0.insert_object(0, InlineObject::ControlStart { control: Box::new(outer.clone()) }, &mark).unwrap();
+            let p1 = doc3.para_mut(StoryRef::Body, &crate::Path::top(1)).unwrap();
+            p1.insert_object(p1.len(), InlineObject::ControlEnd, &mark).unwrap();
+        }
+        assert!(!doc3.has_unbalanced_controls());
+        assert!(doc3.update_chunk(cid3, "r", "c <- 1\nd <- 2").unwrap());
+        assert!(!doc3.has_unbalanced_controls());
+        let r3 = doc3.control_ranges(StoryRef::Body);
+        let out3 = r3.iter().find(|r| r.control.id == Some(9001)).expect("outer control preserved");
+        assert_eq!(out3.start.path, crate::Path::top(0));
+        assert_eq!(out3.end.path, crate::Path::top(2));
+        assert_eq!(out3.control, outer);
     }
 }
