@@ -9,7 +9,7 @@
 use std::str::FromStr;
 
 use serde_json::{Map, Value, json};
-use wordcraft_doc::chunk::MAX_CHUNK_LINES;
+use wordcraft_doc::chunk::{CODE_OUTPUT_STYLE, MAX_CHUNK_LINES};
 use wordcraft_doc::para::OBJ;
 use wordcraft_doc::table::{Cell, MAX_COLS, MAX_ROWS, Table};
 use wordcraft_doc::{Block, CharProps, ChunkOptions, ChunkRef, CodeChunk, Paragraph, Path, Pos, StoryRef, para_block};
@@ -45,15 +45,20 @@ pub fn specs() -> Vec<CommandSpec> {
             .params(r#"{"chunkId"?: n (control id; default: chunk at cursor), "all"?: bool}"#)
             .pure(),
         CommandSpec::new("code.update_chunk", "Update Code Chunk", LOC, update_chunk)
-            .params(r#"{"chunkId"?: n (control id; default: chunk at cursor), "code": string (at most 4 MiB), "language"?: "r"|"python"}"#)
+            .params(r#"{"chunkId"?: n (control id; default: chunk at cursor), "code"?: string (at most 4 MiB), "language"?: "r"|"python", "label"?: string (optional chunk name; empty clears)}"#)
             .when(has_any_chunks),
         CommandSpec::new("code.delete_chunk", "Delete Code Chunk", LOC, delete_chunk)
             .params(r#"{"chunkId"?: n (control id; default: chunk at cursor)}"#)
             .when(has_any_chunks),
+        CommandSpec::new("code.exit_below_chunk", "Continue After Code Chunk", LOC, exit_below_chunk)
+            .params(r#"{"chunkId"?: n (control id; default: chunk at cursor)}"#)
+            .when(has_any_chunks),
         CommandSpec::new("code.insert_plot", "Insert Chunk Plot", LOC, insert_plot)
-            .params(r#"{"chunkId"?: n (control id; default: chunk at cursor), "png"?: string (base64 PNG), "svg"?: string (SVG XML to archive), "width"?: n (points), "alt"?: string}"#),
+            .params(r#"{"chunkId"?: n (control id; default: chunk at cursor), "plotIndex"?: n (0-based plot index), "png"?: string (base64 PNG), "svg"?: string (SVG XML to archive), "width"?: n (points), "alt"?: string, "atCaret"?: bool}"#),
         CommandSpec::new("code.insert_table", "Insert Chunk Table", LOC, insert_table)
-            .params(r#"{"chunkId"?: n (control id; default: chunk at cursor), "headers": [string], "rows"?: [[string]]}"#),
+            .params(r#"{"chunkId"?: n (control id; default: chunk at cursor), "headers": [string], "rows"?: [[string]], "atCaret"?: bool}"#),
+        CommandSpec::new("code.insert_output", "Insert Chunk Output", LOC, insert_output)
+            .params(r#"{"chunkId"?: n (control id; default: chunk at cursor), "text"?: string, "atCaret"?: bool}"#),
     ]
 }
 
@@ -412,8 +417,14 @@ fn remap_pos_after_chunk_resize(
 
 fn update_chunk(s: &mut Session, v: &Value) -> CmdResult {
     let range = resolve_target_chunk(s, v)?;
-    let code = p::str(v, "code").ok_or_else(|| CmdError::Params("code: required string".into()))?;
-    validate_code_text(code)?;
+    let code = match v.get("code") {
+        None | Some(Value::Null) => range.chunk.code.as_str(),
+        Some(Value::String(text)) => {
+            validate_code_text(text)?;
+            text.as_str()
+        }
+        Some(_) => return Err(CmdError::Params("code: expected a string".into())),
+    };
     let lang_str = match v.get("language") {
         None | Some(Value::Null) => range.chunk.language.clone(),
         Some(Value::String(name)) => {
@@ -424,13 +435,22 @@ fn update_chunk(s: &mut Session, v: &Value) -> CmdResult {
         }
         Some(_) => return Err(CmdError::Params("language: expected \"r\" or \"python\"".into())),
     };
+    let label_update: Option<Option<&str>> = match v.get("label") {
+        None => None,
+        Some(Value::Null) => Some(None),
+        Some(Value::String(text)) => Some(Some(text.as_str())),
+        Some(_) => return Err(CmdError::Params("label: expected a string or null".into())),
+    };
 
     let id = chunk_id(s, &range);
     let old_first = range.start.path.last();
     let old_last = range.end.path.last();
     let story = range.start.story;
     let parent = range.start.path.parent().to_vec();
-    let changed = s.doc.update_chunk(id, &lang_str, code)?;
+    let mut changed = s.doc.update_chunk(id, &lang_str, code)?;
+    if let Some(new_label) = label_update {
+        changed |= s.doc.set_chunk_label(id, new_label)?;
+    }
     let updated = find_chunk(s, id)?;
     let new_last = updated.end.path.last();
 
@@ -446,6 +466,7 @@ fn update_chunk(s: &mut Session, v: &Value) -> CmdResult {
     out["chunk"] = json!({
         "id": id,
         "language": updated.chunk.language,
+        "label": updated.chunk.options.label(),
         "tag": updated.chunk.tag(),
         "lines": updated.chunk.code.split('\n').count(),
     });
@@ -525,14 +546,20 @@ fn move_caret_below_chunk(s: &mut Session, range: &ChunkRef) -> Result<(), CmdEr
     Ok(())
 }
 
+fn place_at_caret(s: &Session, v: &Value) -> bool {
+    p::bool(v, "atCaret").unwrap_or(false) && chunks::chunk_at(&s.doc, &s.sel.focus).is_none()
+}
+
 fn insert_plot(s: &mut Session, v: &Value) -> CmdResult {
+    let at_caret = place_at_caret(s, v);
     let target_chunk = match optional_chunk_id(v)? {
         Some(id) => Some(find_chunk(s, id)?),
         None => chunks::chunk_at(&s.doc, &s.sel.focus),
     };
-    if let Some(ref range) = target_chunk {
+    if !at_caret && let Some(ref range) = target_chunk {
         let _ = ensure_top_level_body_chunk(range)?;
     }
+    let plot_index = p::u64(v, "plotIndex").unwrap_or(0) as usize;
 
     let explicit_png = p::str(v, "png").or_else(|| p::str(v, "data"));
     let mut cached_matches = false;
@@ -546,7 +573,12 @@ fn insert_plot(s: &mut Session, v: &Value) -> CmdResult {
             return Err(CmdError::Failed("the code chunk changed since its last run; run the chunk again before inserting its plot".into()));
         }
         cached_matches = true;
-        output.plot_png.clone().ok_or_else(|| CmdError::Params("insert_plot requires PNG base64 data or a chunk with a cached PNG plot".into()))?
+        output
+            .plots
+            .get(plot_index)
+            .and_then(|p| p.png.clone())
+            .or_else(|| if plot_index == 0 { output.plot_png.clone() } else { None })
+            .ok_or_else(|| CmdError::Params("insert_plot requires PNG base64 data or a chunk with a cached PNG plot".into()))?
     } else {
         return Err(CmdError::Params("insert_plot requires PNG base64 data or a chunk with a cached PNG plot".into()));
     };
@@ -566,9 +598,11 @@ fn insert_plot(s: &mut Session, v: &Value) -> CmdResult {
     }
 
     let svg_opt: Option<&str> = match v.get("svg") {
-        None | Some(Value::Null) if explicit_png.is_none() && cached_matches => {
-            target_chunk.as_ref().and_then(|r| r.chunk.id).and_then(|id| s.chunks.output(id)).and_then(|o| o.plot_svg.as_deref())
-        }
+        None | Some(Value::Null) if explicit_png.is_none() && cached_matches => target_chunk
+            .as_ref()
+            .and_then(|r| r.chunk.id)
+            .and_then(|id| s.chunks.output(id))
+            .and_then(|o| o.plots.get(plot_index).and_then(|p| p.svg.as_deref()).or(if plot_index == 0 { o.plot_svg.as_deref() } else { None })),
         None | Some(Value::Null) => None,
         Some(Value::String(s)) => Some(s.as_str()),
         Some(_) => return Err(CmdError::Params("svg: expected a string".into())),
@@ -585,7 +619,7 @@ fn insert_plot(s: &mut Session, v: &Value) -> CmdResult {
         .or_else(|| target_chunk.as_ref().and_then(|r| r.chunk.options.fig_caption()))
         .unwrap_or_else(|| "Code chunk plot".to_owned());
 
-    if let Some(ref range) = target_chunk {
+    if !at_caret && let Some(ref range) = target_chunk {
         move_caret_below_chunk(s, range)?;
     }
 
@@ -615,11 +649,12 @@ fn parse_string_row(arr: &[Value], field: &str, text_budget: &mut usize) -> Resu
 }
 
 fn insert_table(s: &mut Session, v: &Value) -> CmdResult {
+    let at_caret = place_at_caret(s, v);
     let target_chunk = match optional_chunk_id(v)? {
         Some(id) => Some(find_chunk(s, id)?),
         None => chunks::chunk_at(&s.doc, &s.sel.focus),
     };
-    if let Some(ref range) = target_chunk {
+    if !at_caret && let Some(ref range) = target_chunk {
         let _ = ensure_top_level_body_chunk(range)?;
     }
 
@@ -671,7 +706,7 @@ fn insert_table(s: &mut Session, v: &Value) -> CmdResult {
         }
     }
 
-    let (story, insert_at) = if let Some(ref range) = target_chunk {
+    let (story, insert_at) = if !at_caret && let Some(ref range) = target_chunk {
         (StoryRef::Body, Path::top(range.end.path.last().saturating_add(1)))
     } else {
         let at = delete_selection(s)?;
@@ -695,4 +730,133 @@ fn insert_table(s: &mut Session, v: &Value) -> CmdResult {
         "rows": total_rows,
         "cols": cols,
     }))
+}
+
+fn insert_output(s: &mut Session, v: &Value) -> CmdResult {
+    let at_caret = place_at_caret(s, v);
+    let target_chunk = match optional_chunk_id(v)? {
+        Some(id) => Some(find_chunk(s, id)?),
+        None => chunks::chunk_at(&s.doc, &s.sel.focus),
+    };
+    if !at_caret && let Some(ref range) = target_chunk {
+        let _ = ensure_top_level_body_chunk(range)?;
+    }
+
+    let raw_text = match v.get("text") {
+        None | Some(Value::Null) => {
+            let range =
+                target_chunk.as_ref().ok_or_else(|| CmdError::Params("insert_output requires text or a chunk with cached console output".into()))?;
+            let id = range.chunk.id.ok_or_else(|| CmdError::Params("the target chunk has no id".into()))?;
+            if !s.chunks.output_matches(id, &range.chunk.language, &range.chunk.code) {
+                return Err(CmdError::Failed("the code chunk changed since its last run; run the chunk again before inserting its output".into()));
+            }
+            let output = s.chunks.output(id).ok_or_else(|| CmdError::Params("the target chunk has no cached output".into()))?;
+            let mut combined = output.stdout.trim_end_matches(['\r', '\n']).to_owned();
+            let err = output.stderr.trim_end_matches(['\r', '\n']);
+            if !err.is_empty() {
+                if !combined.is_empty() {
+                    combined.push('\n');
+                }
+                combined.push_str(err);
+            }
+            combined
+        }
+        Some(Value::String(text)) => text.clone(),
+        Some(_) => return Err(CmdError::Params("text: expected a string".into())),
+    };
+
+    let normalized = raw_text.replace("\r\n", "\n");
+    let trimmed = normalized.trim_end_matches('\n');
+    if trimmed.trim().is_empty() {
+        return Err(CmdError::Params("output text is empty".into()));
+    }
+    validate_code_text(trimmed)?;
+
+    let (story, start_path, replace_empty_at) = if !at_caret && let Some(ref range) = target_chunk {
+        (StoryRef::Body, Path::top(range.end.path.last().saturating_add(1)), false)
+    } else {
+        let at = delete_selection(s)?;
+        if s.doc.para_at(&at).is_some_and(|p| p.is_empty()) {
+            (at.story, at.path, true)
+        } else {
+            (at.story, at.path.with_last(at.path.last().saturating_add(1)), false)
+        }
+    };
+
+    if crate::cmd::protect::enforced(&s.doc) {
+        return Err(CmdError::Disabled("the document is protected".into()));
+    }
+
+    s.doc.ensure_code_output_style();
+    let lines: Vec<&str> = trimmed.split('\n').collect();
+    let base_idx = start_path.last();
+    let mut last_idx = base_idx;
+    for (offset, line) in lines.iter().enumerate() {
+        let cur_idx = base_idx.saturating_add(offset);
+        last_idx = cur_idx;
+        let path = start_path.with_last(cur_idx);
+        let para = Paragraph::with_text(line, CharProps::default()).styled(CODE_OUTPUT_STYLE);
+        if offset == 0 && replace_empty_at {
+            if let Ok(existing) = s.doc.para_mut(story, &path) {
+                *existing = para;
+            } else {
+                s.doc.insert_block(story, &path, Block::Para(para))?;
+            }
+        } else {
+            s.doc.insert_block(story, &path, Block::Para(para))?;
+        }
+    }
+
+    let next_path = start_path.with_last(last_idx.saturating_add(1));
+    let end_pos = if s.doc.block(story, &next_path).is_none() {
+        s.doc.insert_block(story, &next_path, Block::Para(Paragraph::new()))?;
+        Pos::new(story, next_path, 0)
+    } else {
+        let last_path = start_path.with_last(last_idx);
+        let end_off = s.doc.para(story, &last_path).map_or(0, |p| p.len());
+        Pos::new(story, last_path, end_off)
+    };
+    s.sel = Selection::caret(end_pos);
+    s.goal_x = None;
+    s.touch();
+
+    Ok(json!({
+        "lines": lines.len(),
+        "path": start_path.0,
+    }))
+}
+
+fn exit_below_chunk(s: &mut Session, v: &Value) -> CmdResult {
+    let range = resolve_target_chunk(s, v)?;
+    exit_below_chunk_range(s, &range, false)?;
+    sel_result(s)
+}
+
+/// Move the caret after top-level body chunk `range`, creating a trailing normal paragraph
+/// when `insert_new_para` is true or when `range` ends the document body.
+pub(crate) fn exit_below_chunk_range(s: &mut Session, range: &ChunkRef, insert_new_para: bool) -> Result<(), CmdError> {
+    let (_first, last) = ensure_top_level_body_chunk(range)?;
+    let next = last.saturating_add(1);
+    let path = Path::top(next);
+    let pos = if !insert_new_para && s.doc.body.get(next).is_some() {
+        let mut caret_path = path;
+        while matches!(s.doc.block(StoryRef::Body, &caret_path), Some(Block::Table(_))) {
+            caret_path.0.extend([0, 0, 0]);
+        }
+        if s.doc.para(StoryRef::Body, &caret_path).is_some() {
+            Pos::new(StoryRef::Body, caret_path, 0)
+        } else {
+            s.doc.clamp(&Pos::new(StoryRef::Body, Path::top(next), 0))
+        }
+    } else {
+        if crate::cmd::protect::enforced(&s.doc) {
+            return Err(CmdError::Disabled("the document is protected".into()));
+        }
+        s.doc.insert_block(StoryRef::Body, &path, Block::Para(Paragraph::new()))?;
+        s.touch();
+        Pos::new(StoryRef::Body, path, 0)
+    };
+    s.sel = Selection::caret(pos);
+    s.goal_x = None;
+    Ok(())
 }

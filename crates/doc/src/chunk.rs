@@ -31,6 +31,8 @@ pub const CHUNK_TAG: &str = "wordcraft:chunk:";
 pub const CHUNK_PROP: &str = "wordcraft.chunk.";
 /// Paragraph style of a chunk's code, and of the box around it.
 pub const CHUNK_STYLE: &str = "CodeChunk";
+/// Paragraph style of inserted console output blocks (editable code text, not a runnable chunk).
+pub const CODE_OUTPUT_STYLE: &str = "CodeOutput";
 /// Most options a chunk keeps.
 pub const MAX_CHUNK_OPTIONS: usize = 256;
 /// Longest option name or value a chunk keeps, in characters.
@@ -740,6 +742,55 @@ impl Document {
         container.splice(first..=last, blocks);
         Ok(true)
     }
+
+    /// Rename (or clear the label of) chunk `id`, updating its `label` option, control tag/alias,
+    /// and `wordcraft.chunk.<id>` custom property. Returns `Ok(true)` if the label changed.
+    pub fn set_chunk_label(&mut self, id: i64, label: Option<&str>) -> Result<bool> {
+        let cleaned = label
+            .map(|raw| raw.chars().filter(|c| !c.is_control()).collect::<String>())
+            .map(|s| s.trim().chars().take(128).collect::<String>())
+            .filter(|s| !s.is_empty());
+
+        let Some(found) = self.chunk_refs(StoryRef::Body).into_iter().find(|r| r.chunk.id == Some(id)) else {
+            return Ok(false);
+        };
+        let existing = found.chunk.options.label().map(str::to_owned);
+        if existing == cleaned {
+            return Ok(false);
+        }
+
+        let mut options = found.chunk.options.clone();
+        match cleaned {
+            Some(ref value) => options.set("label", value.clone()),
+            None => {
+                let _ = options.remove("label");
+                let _ = options.remove("id");
+            }
+        }
+
+        let norm_lang = normalize_language(&found.chunk.language);
+        let effective_lang = if norm_lang.is_empty() { "text" } else { norm_lang.as_str() };
+        let prop = chunk_prop_name(id);
+        let json = serde_json::to_string(&options).unwrap_or_else(|_| "{}".to_string());
+        self.set_custom_prop(&prop, &json);
+
+        let mut updated = CodeChunk::new(effective_lang, &found.chunk.code);
+        updated.options = options.clone();
+        let new_tag = encode_control_tag(effective_lang, &options);
+        let new_title = updated.alias();
+        if let Some(control) = self.control_mut(&found.start) {
+            control.tag = new_tag;
+            control.title = new_title;
+        }
+        Ok(true)
+    }
+
+    /// Ensure the [`CODE_OUTPUT_STYLE`] paragraph style exists on the document.
+    pub fn ensure_code_output_style(&mut self) {
+        if self.styles.get(CODE_OUTPUT_STYLE).is_none() {
+            Arc::make_mut(&mut self.styles).upsert(code_output_style());
+        }
+    }
 }
 
 /// The style a chunk's code is set in: a light code box, readable in Word without anything else.
@@ -752,6 +803,27 @@ fn chunk_style() -> Style {
         based_on: Some("Normal".into()),
         para: ParaProps {
             shading: Some(Rgb(0xF4, 0xF4, 0xF4)),
+            borders: Some(Borders { left: Some(border), ..Default::default() }),
+            indent_left: Some(8.0),
+            indent_right: Some(8.0),
+            space_before: Some(0.0),
+            space_after: Some(0.0),
+            ..Default::default()
+        },
+        chr: CharProps { font: Some("Courier New".into()), size: Some(9.5), no_proof: Some(true), ..Default::default() },
+        ..Default::default()
+    }
+}
+
+fn code_output_style() -> Style {
+    let border = Border { style: BorderStyle::Single, width: 1.5, color: Some(Rgb(0xCB, 0xD5, 0xE1)), space: 6.0 };
+    Style {
+        id: CODE_OUTPUT_STYLE.into(),
+        name: "Code Output".into(),
+        kind: StyleKind::Paragraph,
+        based_on: Some("Normal".into()),
+        para: ParaProps {
+            shading: Some(Rgb(0xF8, 0xFA, 0xFC)),
             borders: Some(Borders { left: Some(border), ..Default::default() }),
             indent_left: Some(8.0),
             indent_right: Some(8.0),

@@ -301,6 +301,7 @@ fn to_widget_output(o: &EngineOutput) -> WidgetOutput {
         duration_ms: o.duration_ms,
         plot_png: o.plot_png.clone(),
         plot_svg: o.plot_svg.clone(),
+        plots: o.plots.clone(),
         tables: o.tables.clone(),
         error: None,
     }
@@ -321,6 +322,7 @@ fn to_engine_output(o: &WidgetOutput) -> EngineOutput {
         duration_ms: o.duration_ms,
         plot_png: o.plot_png.clone(),
         plot_svg: o.plot_svg.clone(),
+        plots: o.plots.clone(),
         tables: o.tables.clone(),
     }
 }
@@ -432,11 +434,16 @@ pub(crate) fn sync_before_layout(app: &mut WordApp, ui: &Ui) {
         let Some(lang) = parse_lang(&r.chunk.language) else { continue };
         live_ids.insert(id);
 
+        let label = r.chunk.options.label().unwrap_or("");
         if let Some(entry) = app.canvas.code_chunks.widgets.get_mut(&id) {
             // Reconcile external document edits (e.g. Undo/Redo/MCP) before flushing drafts.
             reconcile_entry(entry, lang, &r.chunk.code);
+            if !entry.widget.is_editing_label() && entry.widget.label() != label {
+                entry.widget.set_label(label);
+            }
         } else {
             let mut widget = CodeChunk::new(lang, r.chunk.code.clone());
+            widget.set_label(label);
             let applied_output_rev = if let Some((out, out_rev)) = app.session.chunks.output_with_rev(id) {
                 widget.set_output(to_widget_output(out));
                 Some(out_rev)
@@ -693,6 +700,7 @@ struct PaintEvents {
     newly_focused: Vec<(i64, usize)>,
     completed_runs: Vec<(i64, CompletedRun)>,
     actions: Vec<(i64, CodeChunkAction)>,
+    label_commits: Vec<(i64, String)>,
     run_requests: Vec<i64>,
     clear_requests: Vec<i64>,
     arrow_exits: Vec<(i64, i32)>,
@@ -717,6 +725,9 @@ impl PaintEvents {
             }
             if let Some(action) = frame.action {
                 self.actions.push((id, action));
+            }
+            if let Some(label) = frame.committed_label {
+                self.label_commits.push((id, label));
             }
             if frame.run_requested {
                 self.run_requests.push(id);
@@ -821,6 +832,17 @@ fn apply_paint_events(app: &mut WordApp, ui: &Ui, events: PaintEvents) {
         clear_chunk_output(app, id);
     }
 
+    for (id, label) in events.label_commits {
+        match flush_one(app, id) {
+            Ok(()) => {
+                if let Err(err) = app.run("code.update_chunk", json!({ "chunkId": id, "label": label })) {
+                    app.status(err);
+                }
+            }
+            Err(err) => app.status(err),
+        }
+    }
+
     for (id, action) in events.actions {
         match flush_one(app, id) {
             Ok(()) => dispatch_chunk_action(app, id, action),
@@ -895,36 +917,74 @@ pub(crate) fn paint_and_interact(app: &mut WordApp, ui: &mut Ui, layout: &DocLay
     apply_paint_events(app, ui, events);
 }
 
+fn chunk_output_stale(app: &WordApp, chunk_id: i64) -> bool {
+    app.session.chunks.output(chunk_id).is_some()
+        && top_level_chunks(&app.session.doc)
+            .into_iter()
+            .find(|r| r.chunk.id == Some(chunk_id))
+            .is_some_and(|r| !app.session.chunks.output_matches(chunk_id, &r.chunk.language, &r.chunk.code))
+}
+
 fn dispatch_chunk_action(app: &mut WordApp, chunk_id: i64, action: CodeChunkAction) {
     let result = match action {
         CodeChunkAction::InsertPlot { png, svg } => {
-            if app.session.chunks.output(chunk_id).is_some() {
-                app.run("code.insert_plot", json!({ "chunkId": chunk_id }))
-            } else if let Some(bytes) = png {
+            if chunk_output_stale(app, chunk_id) {
+                app.status("the code chunk changed since its last run; run the chunk again before inserting its plot".to_string());
+                app.canvas.want_focus = true;
+                return;
+            }
+            if let Some(bytes) = png {
                 let b64 = wordcraft_engine::cmd::insert::base64_encode(&bytes);
-                app.run("code.insert_plot", json!({ "chunkId": chunk_id, "png": b64, "svg": svg }))
+                app.run("code.insert_plot", json!({ "chunkId": chunk_id, "png": b64, "svg": svg, "atCaret": true }))
+            } else if app.session.chunks.output(chunk_id).is_some() {
+                app.run("code.insert_plot", json!({ "chunkId": chunk_id, "atCaret": true }))
             } else {
-                app.run("code.insert_plot", json!({ "chunkId": chunk_id, "svg": svg }))
+                app.run("code.insert_plot", json!({ "chunkId": chunk_id, "svg": svg, "atCaret": true }))
             }
         }
         CodeChunkAction::InsertTable { headers, rows } => {
             let _ = flush_one(app, chunk_id);
-            let is_stale = top_level_chunks(&app.session.doc)
-                .into_iter()
-                .find(|r| r.chunk.id == Some(chunk_id))
-                .is_some_and(|r| !app.session.chunks.output_matches(chunk_id, &r.chunk.language, &r.chunk.code));
-            if is_stale {
+            if chunk_output_stale(app, chunk_id) {
                 app.status("table output is stale; run the chunk again".to_string());
                 app.canvas.want_focus = true;
                 return;
             }
-            app.run("code.insert_table", json!({ "chunkId": chunk_id, "headers": headers, "rows": rows }))
+            app.run("code.insert_table", json!({ "chunkId": chunk_id, "headers": headers, "rows": rows, "atCaret": true }))
+        }
+        CodeChunkAction::InsertOutput { text } => {
+            let _ = flush_one(app, chunk_id);
+            if chunk_output_stale(app, chunk_id) {
+                app.status("console output is stale; run the chunk again".to_string());
+                app.canvas.want_focus = true;
+                return;
+            }
+            app.run("code.insert_output", json!({ "chunkId": chunk_id, "text": text, "atCaret": true }))
         }
     };
     if let Err(err) = result {
         app.status(err);
     }
     app.canvas.want_focus = true;
+    app.canvas.caret_visible_since = crate::now_ms();
+}
+
+fn first_table_para_pos(doc: &wordcraft_doc::Document, target_block: usize) -> Option<wordcraft_doc::Pos> {
+    let mut path_indices = vec![target_block as u32];
+    let mut block = doc.body.get(target_block)?;
+    loop {
+        match &**block {
+            wordcraft_doc::Block::Para(_) => {
+                return Some(wordcraft_doc::Pos::new(StoryRef::Body, wordcraft_doc::Path(path_indices), 0));
+            }
+            wordcraft_doc::Block::Table(table) => {
+                let row = table.rows.first()?;
+                let cell = row.cells.first()?;
+                let next_block = cell.blocks.first()?;
+                path_indices.extend([0, 0, 0]);
+                block = next_block;
+            }
+        }
+    }
 }
 
 fn last_table_para_pos(doc: &wordcraft_doc::Document, target_block: usize) -> Option<wordcraft_doc::Pos> {
@@ -999,16 +1059,80 @@ fn exit_chunk_to_canvas(app: &mut WordApp, id: i64, dir: i32) {
             app.canvas.code_chunks.request_focus(next_id, false);
             return;
         }
-        if let Some(pos) = app.session.doc.body.get(target_block).map(|b| match &**b {
-            wordcraft_doc::Block::Para(_) => wordcraft_doc::Pos::body(target_block, 0),
-            wordcraft_doc::Block::Table(_) => wordcraft_doc::Pos::new(StoryRef::Body, wordcraft_doc::Path(vec![target_block as u32, 0, 0, 0]), 0),
+        if let Some(pos) = app.session.doc.body.get(target_block).and_then(|b| match &**b {
+            wordcraft_doc::Block::Para(_) => Some(wordcraft_doc::Pos::body(target_block, 0)),
+            wordcraft_doc::Block::Table(_) => first_table_para_pos(&app.session.doc, target_block),
         }) {
             app.session.sel = wordcraft_engine::Selection::caret(pos);
+        } else if !app.session.view.read_mode && app.run("code.exit_below_chunk", json!({ "chunkId": id })).is_ok() {
+            // A trailing normal paragraph now exists below the chunk with the caret inside it.
         } else {
             app.session.sel = wordcraft_engine::Selection::caret(current.end.clone());
         }
         app.canvas.want_focus = true;
+        app.canvas.caret_visible_since = crate::now_ms();
     }
+}
+
+/// If a plain primary click lands in empty page space below a document-ending code chunk,
+/// create/move into a trailing body paragraph below that chunk instead of snapping above it.
+pub(crate) fn try_click_below_trailing_chunk(
+    app: &mut WordApp,
+    ctx: &egui::Context,
+    layout: &DocLayout,
+    page: usize,
+    (x, y): (f32, f32),
+    story: StoryRef,
+) -> bool {
+    if story != StoryRef::Body || app.session.view.read_mode {
+        return false;
+    }
+    let refs = top_level_chunks(&app.session.doc);
+    let Some(last_ref) = refs.last() else {
+        return false;
+    };
+    let Some(chunk_id) = last_ref.chunk.id else {
+        return false;
+    };
+    let last_block = last_ref.end.path.0.first().copied().unwrap_or(0) as usize;
+    if last_ref.end.path.0.len() != 1 || last_block.saturating_add(1) != app.session.doc.body.len() {
+        return false;
+    }
+    let Some(pg) = layout.pages.get(page) else {
+        return false;
+    };
+    let clicked_below_chunk = pg.items.iter().any(|it| match it {
+        Placed::Chunk { id, rect, .. } => *id == chunk_id && y > rect.bottom(),
+        _ => false,
+    });
+    if !clicked_below_chunk {
+        return false;
+    }
+    if let Some(hit) = layout.hit(page, x, y, story)
+        && hit.path.0.first().is_some_and(|&b| (b as usize) > last_block)
+    {
+        return false;
+    }
+    if let Err(err) = flush_one(app, chunk_id) {
+        app.status(err);
+    }
+    if app.canvas.code_chunks.active_chunk == Some(chunk_id) {
+        app.canvas.code_chunks.active_chunk = None;
+    }
+    if let Some(entry) = app.canvas.code_chunks.widgets.get(&chunk_id) {
+        let editor_id = entry.widget.editor_id();
+        if ctx.memory(|m| m.has_focus(editor_id)) {
+            ctx.memory_mut(|m| m.surrender_focus(editor_id));
+        }
+    }
+    if app.run("code.exit_below_chunk", json!({ "chunkId": chunk_id })).is_err() {
+        return false;
+    }
+    app.session.page_hint = page;
+    app.canvas.dragging = false;
+    app.canvas.want_focus = true;
+    app.canvas.caret_visible_since = crate::now_ms();
+    true
 }
 
 /// If a plain Up/Down key on the canvas crosses into a mounted code chunk, enter its editor cleanly.

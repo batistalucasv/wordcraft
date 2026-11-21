@@ -335,6 +335,14 @@ fn handle_primary_press(
         app.canvas.dragging = true;
         return true;
     }
+    if clicks == 1
+        && !mods.alt
+        && !mods.command
+        && !mods.shift
+        && crate::canvas::code_chunks::try_click_below_trailing_chunk(app, ui.ctx(), layout, page, (x, y), story)
+    {
+        return true;
+    }
     let Some(pos) = layout.hit(page, x, y, story) else { return true };
     // Ctrl/⌘+click follows a hyperlink.
     if mods.command

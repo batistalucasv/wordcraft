@@ -31,6 +31,7 @@ fn result(stdout: &str, plot: Option<Vec<u8>>) -> ExecutionResult {
         output_truncated: false,
         plot_png: plot,
         plot_svg: None,
+        plots: Vec::new(),
         tables: Vec::new(),
         duration_ms: 120,
     }
@@ -445,15 +446,15 @@ fn failed_plot_decode_is_cached_until_output_changes() {
     steps(&mut harness, 5);
 
     assert_eq!(harness.state().chunk.plot_decode_attempts, 1, "corrupt PNG is decoded only once");
-    assert!(harness.state().chunk.plot_decode_failed);
-    assert!(harness.state().chunk.plot_texture.is_none());
+    assert_eq!(harness.state().chunk.plot_decode_failed.first().copied(), Some(true));
+    assert!(harness.state().chunk.plot_textures.first().and_then(Option::as_ref).is_none());
 
     harness.state_mut().chunk.set_output(ChunkOutput { plot_png: Some(plot_png()), success: true, ..ChunkOutput::default() });
     steps(&mut harness, 4);
 
     assert_eq!(harness.state().chunk.plot_decode_attempts, 2, "replacing output retries decode once");
-    assert!(!harness.state().chunk.plot_decode_failed);
-    assert!(harness.state().chunk.plot_texture.is_some());
+    assert_eq!(harness.state().chunk.plot_decode_failed.first().copied(), Some(false));
+    assert!(harness.state().chunk.plot_textures.first().and_then(Option::as_ref).is_some());
 }
 
 #[test]
@@ -509,4 +510,50 @@ fn browser_mode_reports_desktop_only_message() {
     harness.state_mut().chunk.attach_run(rx);
     harness.state_mut().chunk.run_browser();
     assert!(harness.state().chunk.is_running(), "browser run gate also respects active run");
+}
+
+#[test]
+fn multi_plot_selection_console_insert_and_inline_rename() {
+    let mut chunk = python();
+    chunk.set_output(ChunkOutput {
+        stdout: "linha 1\nlinha 2\n".into(),
+        plots: vec![
+            wordcraft_kernel::PlotOutput { png: Some(plot_png()), svg: None },
+            wordcraft_kernel::PlotOutput { png: Some(plot_png()), svg: Some("<svg/>".into()) },
+        ],
+        plot_png: Some(plot_png()),
+        success: true,
+        ..ChunkOutput::default()
+    });
+    chunk.set_label("Tabela de Dados");
+    assert_eq!(chunk.label(), "Tabela de Dados");
+
+    let mut h = harness(chunk);
+    steps(&mut h, 3);
+    assert!(h.query_by_label("Tabela de Dados").is_some(), "custom chunk label must show in header");
+    assert!(h.query_by_label("Plot 1").is_some());
+    assert!(h.query_by_label("Plot 2").is_some());
+
+    // Select Plot 2 and insert: must emit Plot 2's SVG alongside PNG.
+    h.get_by_label("Plot 2").click();
+    steps(&mut h, 2);
+    h.get_by_label("Insert into document").click();
+    steps(&mut h, 2);
+    assert!(
+        matches!(h.state().actions.last(), Some(CodeChunkAction::InsertPlot { png: Some(_), svg: Some(s) }) if s == "<svg/>"),
+        "Plot 2 insert must pass second plot payload: {:?}",
+        h.state().actions
+    );
+
+    // Switch to Console tab and insert output as code text.
+    h.state_mut().actions.clear();
+    h.get_by_label("Console").click();
+    steps(&mut h, 2);
+    h.get_by_label("Insert into document").click();
+    steps(&mut h, 2);
+    assert_eq!(
+        h.state().actions.last(),
+        Some(&CodeChunkAction::InsertOutput { text: "linha 1\nlinha 2".into() }),
+        "Console insert must emit captured console text"
+    );
 }

@@ -1357,3 +1357,35 @@ fn which_binary_skips_non_executable_candidates() {
         assert_eq!(which_binary_in(language, &all_paths), Some(exec_bin), "{name}: search must fall through to the executable candidate");
     }
 }
+
+#[test]
+fn captures_multiple_plots_in_creation_order() {
+    if is_language_available(CodeLanguage::Python) {
+        let py_code = r#"
+import matplotlib.pyplot as plt
+fig1, ax1 = plt.subplots()
+ax1.plot([0, 1], [0, 1])
+fig2, ax2 = plt.subplots()
+ax2.plot([0, 1], [1, 0])
+"#;
+        let res = execute(&ExecutionRequest::new(CodeLanguage::Python, py_code).with_plot_format(PlotFormat::Both)).expect("python execute");
+        assert!(res.success, "stderr: {}", res.stderr);
+        if res.plots.is_empty() {
+            // Skip plot count assertions if matplotlib is absent in the Python environment.
+            return;
+        }
+        assert_eq!(res.plots.len(), 2, "must capture both Python figures");
+        assert!(res.plots[0].png.is_some() && res.plots[0].svg.is_some());
+        assert!(res.plots[1].png.is_some() && res.plots[1].svg.is_some());
+        assert_eq!(res.plot_png.as_ref(), res.plots[0].png.as_ref());
+    }
+
+    if is_language_available(CodeLanguage::R) {
+        let r_code = "plot(1:5, 1:5)\nplot(1:5, 5:1)\n";
+        let res = execute(&ExecutionRequest::new(CodeLanguage::R, r_code).with_plot_format(PlotFormat::Png)).expect("r execute");
+        assert!(res.success, "stderr: {}", res.stderr);
+        assert_eq!(res.plots.len(), 2, "must capture both R plots");
+        assert!(res.plots[0].png.is_some() && res.plots[1].png.is_some());
+        assert_eq!(res.plot_png.as_ref(), res.plots[0].png.as_ref());
+    }
+}

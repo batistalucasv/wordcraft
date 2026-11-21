@@ -11,7 +11,7 @@ use std::hash::{Hash, Hasher};
 
 use serde_json::{Value, json};
 use wordcraft_doc::{ChunkRef, Document, Pos, StoryRef};
-use wordcraft_kernel::{ExecutionRequest, ExecutionResult, KernelError, TabularOutput};
+use wordcraft_kernel::{ExecutionRequest, ExecutionResult, KernelError, PlotOutput, TabularOutput};
 
 /// Default execution limit when a command doesn't pass `timeoutMs`.
 pub const DEFAULT_TIMEOUT_MS: u64 = 30_000;
@@ -58,12 +58,23 @@ pub struct ChunkOutput {
     pub plot_png: Option<Vec<u8>>,
     /// Plot as SVG XML, when the run captured one.
     pub plot_svg: Option<String>,
+    /// All captured plots, in creation order.
+    pub plots: Vec<PlotOutput>,
     /// Tables passed to `wc_table()`, in call order.
     pub tables: Vec<TabularOutput>,
 }
 
 impl ChunkOutput {
     pub fn from_result(result: ExecutionResult) -> Self {
+        let plots = if !result.plots.is_empty() {
+            result.plots
+        } else if result.plot_png.is_some() || result.plot_svg.is_some() {
+            vec![PlotOutput { png: result.plot_png.clone(), svg: result.plot_svg.clone() }]
+        } else {
+            Vec::new()
+        };
+        let plot_png = result.plot_png.or_else(|| plots.first().and_then(|p| p.png.clone()));
+        let plot_svg = result.plot_svg.or_else(|| plots.first().and_then(|p| p.svg.clone()));
         ChunkOutput {
             stdout: result.stdout,
             stderr: result.stderr,
@@ -72,8 +83,9 @@ impl ChunkOutput {
             timed_out: result.timed_out,
             output_truncated: result.output_truncated,
             duration_ms: result.duration_ms,
-            plot_png: result.plot_png,
-            plot_svg: result.plot_svg,
+            plot_png,
+            plot_svg,
+            plots,
             tables: result.tables,
         }
     }
@@ -92,6 +104,7 @@ impl ChunkOutput {
             _ => (None, false),
         };
         let truncated = self.output_truncated || stdout_cut || stderr_cut || svg_cut;
+        let plot_count = if !self.plots.is_empty() { self.plots.len() } else { usize::from(self.plot_png.is_some() || self.plot_svg.is_some()) };
         let mut out = json!({
             "stdout": stdout,
             "stderr": stderr,
@@ -100,7 +113,8 @@ impl ChunkOutput {
             "timedOut": self.timed_out,
             "outputTruncated": truncated,
             "durationMs": self.duration_ms,
-            "hasPlot": self.plot_png.is_some() || self.plot_svg.is_some(),
+            "hasPlot": plot_count > 0,
+            "plotCount": plot_count,
             "tableCount": self.tables.len(),
         });
         if include_plot {

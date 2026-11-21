@@ -35,6 +35,8 @@ const PROCESS_GROUP_REAP_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_CAPTURED_BYTES: usize = 10 * 1024 * 1024;
 /// Maximum size of a captured plot artifact (PNG or SVG) read back from disk.
 const MAX_PLOT_BYTES: u64 = 20 * 1024 * 1024;
+const MAX_PLOTS: usize = 16;
+const MAX_TOTAL_PLOT_BYTES: usize = 64 * 1024 * 1024;
 /// Size of each read from a child pipe.
 const CAPTURE_CHUNK_BYTES: usize = 8 * 1024;
 /// How long a cancellable reader sleeps between non-blocking reads.
@@ -206,6 +208,16 @@ impl ExecutionRequest {
     }
 }
 
+/// One plot/chart captured from a script execution, in PNG and/or SVG format.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PlotOutput {
+    /// PNG bytes of the captured plot, if captured.
+    pub png: Option<Vec<u8>>,
+    /// Vector SVG XML of the captured plot, if captured.
+    pub svg: Option<String>,
+}
+
 /// Result of executing a code chunk.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutionResult {
@@ -222,10 +234,13 @@ pub struct ExecutionResult {
     /// True when stdout or stderr was cut at the capture limit.
     #[serde(default)]
     pub output_truncated: bool,
-    /// PNG bytes of plot/chart if generated and captured.
+    /// PNG bytes of the first captured plot/chart if generated and captured.
     pub plot_png: Option<Vec<u8>>,
-    /// Vector SVG XML string of plot/chart if generated and captured.
+    /// Vector SVG XML string of the first captured plot/chart if generated and captured.
     pub plot_svg: Option<String>,
+    /// All captured plots/charts in creation order (bounded to 16 plots).
+    #[serde(default)]
+    pub plots: Vec<PlotOutput>,
     /// Tables passed to `wc_table()`, in call order.
     #[serde(default)]
     pub tables: Vec<TabularOutput>,
@@ -385,21 +400,15 @@ pub fn execute(request: &ExecutionRequest) -> Result<ExecutionResult, KernelErro
     let stdout = String::from_utf8_lossy(&stdout.bytes).into_owned();
     let stderr = String::from_utf8_lossy(&stderr.bytes).into_owned();
 
-    let mut plot_png = None;
-    if request.capture_plots && request.plot_format.captures_png() {
-        plot_png = read_plot_png(&plot_png_path, MAX_PLOT_BYTES);
-    }
-
-    let mut plot_svg = None;
-    if request.capture_plots && request.plot_format.captures_svg() {
-        plot_svg = read_plot_svg(&plot_svg_path, MAX_PLOT_BYTES);
-    }
+    let plots = if request.capture_plots { read_plots(&plot_png_path, &plot_svg_path, request.language, request.plot_format) } else { Vec::new() };
+    let plot_png = plots.first().and_then(|p| p.png.clone());
+    let plot_svg = plots.first().and_then(|p| p.svg.clone());
 
     let tables = read_tables(&tables_file);
     let exit_code = exit_status.and_then(|s| s.code());
     let success = exit_status.map(|s| s.success()).unwrap_or(false) && !timed_out;
 
-    Ok(ExecutionResult { stdout, stderr, exit_code, success, timed_out, output_truncated, plot_png, plot_svg, tables, duration_ms })
+    Ok(ExecutionResult { stdout, stderr, exit_code, success, timed_out, output_truncated, plot_png, plot_svg, plots, tables, duration_ms })
 }
 
 /// Create the per-run scratch directory exclusively, with owner-only permissions.
@@ -1105,7 +1114,8 @@ def wc_table(value):
 /// The figure cleanup that follows a Python chunk when plots are captured.
 const PY_PLOT_CLEANUP: &str = r#"if _has_plt and plt is not None:
     try:
-        if plt.get_fignums():
+        _wc_nums = list(plt.get_fignums())[:16]
+        if _wc_nums:
             __WC_SAVE__
             plt.close('all')
     except Exception:
@@ -1125,12 +1135,14 @@ fn r_plot_sections(capture: bool, format: PlotFormat, captured: CapturePaths<'_>
             format!(
                 r#"options(warn = 1)
 .wc_plot_png <- "{png}"
+.wc_plot_png_seq <- sub("\\.png$", "_%03d.png", .wc_plot_png)
 setHook("plot.new", function() assign(".wc_has_plot", TRUE, envir = .GlobalEnv))
 setHook("grid.newpage", function() assign(".wc_has_plot", TRUE, envir = .GlobalEnv))
-png(.wc_plot_png, width = 1600, height = 1200, res = 200)"#
+png(.wc_plot_png_seq, width = 1600, height = 1200, res = 200)"#
             ),
             r#"  if (dev.cur() != 1) dev.off()
   if (!exists(".wc_has_plot", envir = .GlobalEnv) || !get(".wc_has_plot", envir = .GlobalEnv)) {
+    for (.wc_f in Sys.glob(sub("\\.png$", "_*.png", .wc_plot_png))) if (file.exists(.wc_f)) file.remove(.wc_f)
     if (file.exists(.wc_plot_png)) file.remove(.wc_plot_png)
   }
 "#
@@ -1140,12 +1152,14 @@ png(.wc_plot_png, width = 1600, height = 1200, res = 200)"#
             format!(
                 r#"options(warn = 1)
 .wc_plot_svg <- "{svg}"
+.wc_plot_svg_seq <- sub("\\.svg$", "_%03d.svg", .wc_plot_svg)
 setHook("plot.new", function() assign(".wc_has_plot", TRUE, envir = .GlobalEnv))
 setHook("grid.newpage", function() assign(".wc_has_plot", TRUE, envir = .GlobalEnv))
-svg(.wc_plot_svg, width = 8, height = 6)"#
+svg(.wc_plot_svg_seq, width = 8, height = 6, onefile = FALSE)"#
             ),
             r#"  if (dev.cur() != 1) dev.off()
   if (!exists(".wc_has_plot", envir = .GlobalEnv) || !get(".wc_has_plot", envir = .GlobalEnv)) {
+    for (.wc_f in Sys.glob(sub("\\.svg$", "_*.svg", .wc_plot_svg))) if (file.exists(.wc_f)) file.remove(.wc_f)
     if (file.exists(.wc_plot_svg)) file.remove(.wc_plot_svg)
   }
 "#
@@ -1155,10 +1169,11 @@ svg(.wc_plot_svg, width = 8, height = 6)"#
             format!(
                 r#"options(warn = 1)
 .wc_plot_png <- "{png}"
+.wc_plot_png_seq <- sub("\\.png$", "_%03d.png", .wc_plot_png)
 .wc_plot_svg <- "{svg}"
 setHook("plot.new", function() assign(".wc_has_plot", TRUE, envir = .GlobalEnv))
 setHook("grid.newpage", function() assign(".wc_has_plot", TRUE, envir = .GlobalEnv))
-png(.wc_plot_png, width = 1600, height = 1200, res = 200)
+png(.wc_plot_png_seq, width = 1600, height = 1200, res = 200)
 dev.control("enable")"#
             ),
             r#"  if (exists(".wc_has_plot", envir = .GlobalEnv) && get(".wc_has_plot", envir = .GlobalEnv)) {
@@ -1167,6 +1182,7 @@ dev.control("enable")"#
   }
   if (dev.cur() != 1) dev.off()
   if (!exists(".wc_has_plot", envir = .GlobalEnv) || !get(".wc_has_plot", envir = .GlobalEnv)) {
+    for (.wc_f in Sys.glob(sub("\\.png$", "_*.png", .wc_plot_png))) if (file.exists(.wc_f)) file.remove(.wc_f)
     if (file.exists(.wc_plot_png)) file.remove(.wc_plot_png)
     if (file.exists(.wc_plot_svg)) file.remove(.wc_plot_svg)
   }
@@ -1176,16 +1192,43 @@ dev.control("enable")"#
     }
 }
 
+fn numbered_plot_path(base: &Path, index: usize) -> std::path::PathBuf {
+    let stem = base.file_stem().and_then(|s| s.to_str()).unwrap_or("__wordcraft_plot__");
+    let ext = base.extension().and_then(|s| s.to_str()).unwrap_or("bin");
+    base.with_file_name(format!("{stem}_{index:03}.{ext}"))
+}
+
 /// Python's plot-saving lines for the chosen format.
 fn python_plot_save(format: PlotFormat, captured: CapturePaths<'_>) -> String {
     let png = escape_path_literal(captured.png);
     let svg = escape_path_literal(captured.svg);
+    let png_seq = escape_path_literal(&numbered_plot_path(captured.png, 2));
+    let svg_seq = escape_path_literal(&numbered_plot_path(captured.svg, 2));
+    let png_prefix = png_seq.strip_suffix("_002.png").unwrap_or(&png_seq);
+    let svg_prefix = svg_seq.strip_suffix("_002.svg").unwrap_or(&svg_seq);
     match format {
-        PlotFormat::Png => format!(r#"plt.savefig("{png}", dpi=200, bbox_inches='tight')"#),
-        PlotFormat::Svg => format!(r#"plt.savefig("{svg}", format='svg', bbox_inches='tight')"#),
+        PlotFormat::Png => format!(
+            r#"plt.figure(_wc_nums[0])
+            plt.savefig("{png}", dpi=200, bbox_inches='tight')
+            for _wc_i, _wc_num in enumerate(_wc_nums[1:], start=2):
+                plt.figure(_wc_num)
+                plt.savefig(f"{png_prefix}_{{_wc_i:03d}}.png", dpi=200, bbox_inches='tight')"#
+        ),
+        PlotFormat::Svg => format!(
+            r#"plt.figure(_wc_nums[0])
+            plt.savefig("{svg}", format='svg', bbox_inches='tight')
+            for _wc_i, _wc_num in enumerate(_wc_nums[1:], start=2):
+                plt.figure(_wc_num)
+                plt.savefig(f"{svg_prefix}_{{_wc_i:03d}}.svg", format='svg', bbox_inches='tight')"#
+        ),
         PlotFormat::Both => format!(
-            r#"plt.savefig("{png}", dpi=200, bbox_inches='tight')
-            plt.savefig("{svg}", format='svg', bbox_inches='tight')"#
+            r#"plt.figure(_wc_nums[0])
+            plt.savefig("{png}", dpi=200, bbox_inches='tight')
+            plt.savefig("{svg}", format='svg', bbox_inches='tight')
+            for _wc_i, _wc_num in enumerate(_wc_nums[1:], start=2):
+                plt.figure(_wc_num)
+                plt.savefig(f"{png_prefix}_{{_wc_i:03d}}.png", dpi=200, bbox_inches='tight')
+                plt.savefig(f"{svg_prefix}_{{_wc_i:03d}}.svg", format='svg', bbox_inches='tight')"#
         ),
     }
 }
@@ -1308,6 +1351,64 @@ fn read_plot_svg(path: &Path, max_bytes: u64) -> Option<String> {
 
 fn read_plot_svg_from_reader<R: Read>(reader: R, max_bytes: u64) -> Option<String> {
     read_bounded_bytes(reader, max_bytes).and_then(|bytes| String::from_utf8(bytes).ok()).filter(|content| is_complete_svg(content))
+}
+
+fn read_plots(png_base: &Path, svg_base: &Path, language: CodeLanguage, format: PlotFormat) -> Vec<PlotOutput> {
+    let mut plots = Vec::new();
+    let mut used_bytes = 0usize;
+
+    for index in 1..=MAX_PLOTS {
+        let png = if format.captures_png() {
+            let numbered = numbered_plot_path(png_base, index);
+            if index == 1 {
+                read_plot_png(&numbered, MAX_PLOT_BYTES).or_else(|| read_plot_png(png_base, MAX_PLOT_BYTES))
+            } else {
+                read_plot_png(&numbered, MAX_PLOT_BYTES)
+            }
+        } else {
+            None
+        };
+        let svg = if format.captures_svg() {
+            let numbered = numbered_plot_path(svg_base, index);
+            if index == 1 {
+                if matches!((language, format), (CodeLanguage::R, PlotFormat::Both)) {
+                    None
+                } else {
+                    read_plot_svg(&numbered, MAX_PLOT_BYTES).or_else(|| read_plot_svg(svg_base, MAX_PLOT_BYTES))
+                }
+            } else {
+                read_plot_svg(&numbered, MAX_PLOT_BYTES)
+            }
+        } else {
+            None
+        };
+        if png.is_none() && svg.is_none() {
+            if index == 1
+                && matches!((language, format), (CodeLanguage::R, PlotFormat::Both))
+                && let Some(last_svg) = read_plot_svg(svg_base, MAX_PLOT_BYTES)
+            {
+                plots.push(PlotOutput { png: None, svg: Some(last_svg) });
+            }
+            break;
+        }
+        let item_bytes = png.as_ref().map_or(0, Vec::len).saturating_add(svg.as_ref().map_or(0, String::len));
+        if used_bytes.saturating_add(item_bytes) > MAX_TOTAL_PLOT_BYTES {
+            break;
+        }
+        used_bytes = used_bytes.saturating_add(item_bytes);
+        plots.push(PlotOutput { png, svg });
+    }
+
+    if matches!((language, format), (CodeLanguage::R, PlotFormat::Both))
+        && let Some(last) = plots.last_mut()
+        && last.svg.is_none()
+        && let Some(last_svg) = read_plot_svg(svg_base, MAX_PLOT_BYTES)
+        && used_bytes.saturating_add(last_svg.len()) <= MAX_TOTAL_PLOT_BYTES
+    {
+        last.svg = Some(last_svg);
+    }
+
+    plots
 }
 
 /// Anything unreadable, oversized or malformed yields no tables instead of an error. When the

@@ -6336,6 +6336,7 @@ fn code_chunk_polling_settles_offscreen_runs_drops_stale_gen_and_clears_others()
         output_truncated: false,
         plot_png: None,
         plot_svg: None,
+        plots: Vec::new(),
         tables: Vec::new(),
         duration_ms: 5,
     };
@@ -6366,6 +6367,7 @@ fn code_chunk_polling_settles_offscreen_runs_drops_stale_gen_and_clears_others()
         output_truncated: false,
         plot_png: None,
         plot_svg: None,
+        plots: Vec::new(),
         tables: Vec::new(),
         duration_ms: 5,
     };
@@ -6470,6 +6472,7 @@ fn code_chunk_plot_checks_source_exits_up_into_table_and_honors_stop_on_error() 
             output_truncated: false,
             plot_png: None,
             plot_svg: None,
+            plots: Vec::new(),
             tables: Vec::new(),
             duration_ms: 5,
         }))
@@ -6713,4 +6716,67 @@ fn canvas_caret_renders_after_offscreen_or_hidden_chunk_loses_focus() {
     steps(&mut h, 4);
     assert!(!crate::canvas::code_chunks::caret_in_mounted_chunk(h.state()), "canvas caret must not be suppressed after hiding chunk code");
     assert!(crate::caret_glide::state(&h.ctx).drawn().is_some(), "canvas caret must draw in prose after hiding chunk code");
+}
+
+#[test]
+fn exiting_or_clicking_below_trailing_chunk_creates_editable_paragraph_and_shows_caret() {
+    let mut a = WordApp::new(wordcraft_engine::Session::new(wordcraft_doc::Document::new()), Default::default());
+    a.run("text.insert", json!({"text": "Above"})).unwrap();
+    a.run("code.insert_chunk", json!({"language": "python", "code": "x = 1\ny = 2"})).unwrap();
+    let chunk_id = wordcraft_engine::chunks::chunks_in(&a.session.doc, StoryRef::Body)[0].chunk.id.unwrap();
+    let base_blocks = a.session.doc.body.len();
+
+    let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1280.0, 960.0)).build_ui_state(
+        |ui, app: &mut WordApp| {
+            let ctx = ui.ctx().clone();
+            app.logic(&ctx);
+            app.ui(ui);
+        },
+        a,
+    );
+    steps(&mut h, 6);
+
+    let chunk_rect = h.state().canvas.code_chunks.screen_rects[&chunk_id];
+    assert_eq!(h.state().session.doc.body.len(), base_blocks);
+
+    // 1. Exiting downward from the trailing chunk must create an editable paragraph below it and show the canvas caret.
+    crate::canvas::code_chunks::exit_chunk_to_canvas_for_test(h.state_mut(), chunk_id, 1);
+    steps(&mut h, 4);
+    assert!(
+        wordcraft_engine::chunks::chunk_at(&h.state().session.doc, &h.state().session.sel.focus).is_none(),
+        "exiting downward past the trailing chunk must leave the chunk control"
+    );
+    assert!(!crate::canvas::code_chunks::caret_in_mounted_chunk(h.state()), "canvas caret must not stay suppressed inside chunk");
+    assert!(h.state().canvas.focused, "canvas must receive focus after downward exit");
+    h.input_mut().events.push(egui::Event::Text("After arrow".into()));
+    steps(&mut h, 4);
+    assert_eq!(h.state().session.doc.para(StoryRef::Body, &wordcraft_doc::Path::top(base_blocks)).map(|p| p.text.as_str()), Some("After arrow"));
+    assert_eq!(wordcraft_engine::chunks::chunks_in(&h.state().session.doc, StoryRef::Body)[0].chunk.code, "x = 1\ny = 2");
+
+    // 2. Clicking in the blank page space below a trailing chunk (with no paragraph below it yet) must place a paragraph and caret below it.
+    h.state_mut().run("edit.undo", json!({})).unwrap();
+    h.state_mut().run("edit.undo", json!({})).unwrap();
+    steps(&mut h, 4);
+    assert_eq!(h.state().session.doc.body.len(), base_blocks);
+
+    let click_below = egui::pos2(chunk_rect.left() + 24.0, chunk_rect.bottom() + 40.0);
+    h.event(egui::Event::PointerMoved(click_below));
+    h.event(egui::Event::PointerButton { pos: click_below, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() });
+    h.step();
+    h.event(egui::Event::PointerButton { pos: click_below, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() });
+    steps(&mut h, 4);
+
+    assert!(
+        wordcraft_engine::chunks::chunk_at(&h.state().session.doc, &h.state().session.sel.focus).is_none(),
+        "clicking below the trailing chunk must place caret outside the chunk control"
+    );
+    assert_eq!(h.state().session.sel.focus, Pos::body(base_blocks, 0));
+    assert!(!crate::canvas::code_chunks::caret_in_mounted_chunk(h.state()));
+    let caret = h.state_mut().session.layout().caret(&Pos::body(base_blocks, 0)).expect("layout must place caret below chunk");
+    let caret_screen = page_to_screen(h.state_mut(), caret.page, caret.x, caret.top).expect("trailing caret on screen");
+    assert!(caret_screen.y >= chunk_rect.bottom() - 2.0, "caret must sit below chunk ({}), got {caret_screen:?}", chunk_rect.bottom());
+    assert!(crate::caret_glide::state(&h.ctx).drawn().is_some(), "canvas caret must render below trailing chunk");
+    h.input_mut().events.push(egui::Event::Text("After click".into()));
+    steps(&mut h, 4);
+    assert_eq!(h.state().session.doc.para(StoryRef::Body, &wordcraft_doc::Path::top(base_blocks)).map(|p| p.text.as_str()), Some("After click"));
 }

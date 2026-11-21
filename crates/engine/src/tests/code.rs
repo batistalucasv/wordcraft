@@ -22,6 +22,7 @@ fn ok(stdout: &str) -> ExecutionResult {
         output_truncated: false,
         plot_png: None,
         plot_svg: None,
+        plots: Vec::new(),
         tables: Vec::new(),
         duration_ms: 7,
     }
@@ -821,4 +822,82 @@ fn update_chunk_clamps_caret_on_utf8_boundary() {
     let p = s.doc.para(StoryRef::Body, &range.start.path).expect("chunk source paragraph");
     assert!(p.text.is_char_boundary(returned_off), "command-returned caret offset {returned_off} must land on a UTF-8 boundary of {:?}", p.text);
     assert!(p.text.is_char_boundary(s.sel.focus.off), "remapped caret offset {} must land on a UTF-8 boundary of {:?}", s.sel.focus.off, p.text);
+}
+
+#[test]
+fn new_paragraph_at_trailing_chunk_end_exits_below_chunk_instead_of_expanding_it() {
+    let mut s = s();
+    run(&mut s, "text.insert", json!({"text": "Above"}));
+    run(&mut s, "code.insert_chunk", json!({"language": "r", "code": "x <- 1"}));
+    assert_eq!(s.doc.body.len(), 2, "chunk after non-empty prose ends the body with no trailing paragraph");
+    caret_into(&mut s, 0);
+    assert!(chunks::chunk_at(&s.doc, &s.sel.focus).is_some());
+
+    run(&mut s, "text.newParagraph", json!({}));
+    assert!(chunks::chunk_at(&s.doc, &s.sel.focus).is_none(), "Enter at chunk end must leave the code chunk control");
+    run(&mut s, "text.insert", json!({"text": "After"}));
+
+    let refs = chunks::chunks_in(&s.doc, StoryRef::Body);
+    assert_eq!(refs.len(), 1);
+    assert_eq!(refs[0].chunk.code, "x <- 1", "Enter must not split or grow the chunk infinitely");
+    assert_eq!(s.doc.body.len(), 3);
+    assert_eq!(s.doc.para(StoryRef::Body, &wordcraft_doc::Path::top(2)).map(|p| p.text.as_str()), Some("After"));
+}
+
+#[test]
+fn insert_at_caret_insert_output_and_chunk_label_commands() {
+    let mut s = s();
+    run(&mut s, "text.insert", json!({"text": "Intro"}));
+    run(&mut s, "text.newParagraph", json!({}));
+    run(&mut s, "text.insert", json!({"text": "Here target"}));
+    run(&mut s, "text.newParagraph", json!({}));
+    let cid = chunk_id(&run(&mut s, "code.insert_chunk", json!({"language": "r", "code": "cat('ok\\nline2')"})));
+
+    // Rename chunk via `code.update_chunk` with `label`, verify persistence + clearing.
+    let updated = run(&mut s, "code.update_chunk", json!({"chunkId": cid, "label": "Tabela de Dados"}));
+    assert_eq!(updated["chunk"]["label"], "Tabela de Dados");
+    assert_eq!(chunks::chunks_in(&s.doc, StoryRef::Body)[0].chunk.options.label(), Some("Tabela de Dados"));
+    assert_eq!(s.doc.control_ranges(StoryRef::Body)[0].control.title, "R code chunk (Tabela de Dados)");
+
+    // Cache console output + two plots on chunk.
+    let png1 = vec![
+        0x89u8, b'P', b'N', b'G', b'\r', b'\n', 0x1A, b'\n', 0, 0, 0, 13, b'I', b'H', b'D', b'R', 0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0, 0, 0, 0x1F, 0x15,
+        0xC4, 0x89, 0, 0, 0, 10, b'I', b'D', b'A', b'T', 0x78, 0x9C, 0x63, 0, 1, 0, 0, 5, 0, 1, 0x0D, 0x0A, 0x2D, 0xB4, 0, 0, 0, 0, b'I', b'E', b'N',
+        b'D', 0xAE, 0x42, 0x60, 0x82,
+    ];
+    let mut out = crate::chunks::ChunkOutput::from_result(ExecutionResult {
+        stdout: "ok\nline2\n".into(),
+        plots: vec![
+            wordcraft_kernel::PlotOutput { png: Some(png1.clone()), svg: None },
+            wordcraft_kernel::PlotOutput { png: Some(png1.clone()), svg: None },
+        ],
+        ..ok("ok\nline2\n")
+    });
+    out.stdout = "ok\nline2\n".into();
+    s.chunks.store_for(cid, "r", "cat('ok\\nline2')", out);
+
+    // Move caret to paragraph 1 ("Here target") before the chunk, and insert table + output at caret.
+    s.sel = Selection::caret(wordcraft_doc::Pos::body(1, 0));
+    let tbl_res = run(&mut s, "code.insert_table", json!({"chunkId": cid, "headers": ["A"], "rows": [["1"]], "atCaret": true}));
+    assert_eq!(tbl_res["table"], json!([2]), "table must be inserted after caret block 1, not below chunk");
+
+    // Put caret on block 0 ("Intro") and insert console output at caret as code-styled paragraphs.
+    s.sel = Selection::caret(wordcraft_doc::Pos::body(0, 5));
+    let out_res = run(&mut s, "code.insert_output", json!({"chunkId": cid, "atCaret": true}));
+    assert_eq!(out_res["lines"], json!(2));
+    assert_eq!(out_res["path"], json!([1]));
+    let p1 = s.doc.para(StoryRef::Body, &wordcraft_doc::Path::top(1)).expect("inserted output line 1");
+    let p2 = s.doc.para(StoryRef::Body, &wordcraft_doc::Path::top(2)).expect("inserted output line 2");
+    assert_eq!(p1.text, "ok");
+    assert_eq!(p2.text, "line2");
+    assert_eq!(p1.props.style.as_deref(), Some(wordcraft_doc::chunk::CODE_OUTPUT_STYLE));
+    assert_eq!(chunks::chunks_in(&s.doc, StoryRef::Body).len(), 1, "inserted output must not become an executable chunk");
+
+    // Second plot via `plotIndex: 1` at caret outside chunk.
+    let plot_res = run(&mut s, "code.insert_plot", json!({"chunkId": cid, "plotIndex": 1, "atCaret": true}));
+    assert!(plot_res["media"].as_str().is_some());
+    assert!(
+        s.doc.para(StoryRef::Body, &s.sel.focus.path).is_some_and(|p| !p.objects.is_empty()),
+        "second plot must insert at the current caret paragraph outside the chunk"
+    );
 }

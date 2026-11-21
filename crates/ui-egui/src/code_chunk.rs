@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use egui::text::LayoutJob;
 use egui::{Align, Align2, Color32, CornerRadius, FontId, Id, Key, Layout, Margin, RichText, Stroke, TextEdit, Ui, pos2, vec2};
-use wordcraft_kernel::{CodeLanguage, ExecutionResult, TabularOutput};
+use wordcraft_kernel::{CodeLanguage, ExecutionResult, PlotOutput, TabularOutput};
 
 #[cfg(not(target_arch = "wasm32"))]
 use wordcraft_kernel::{ExecutionRequest, PlotFormat};
@@ -102,6 +102,8 @@ pub struct ChunkOutput {
     pub plot_png: Option<Vec<u8>>,
     /// Vector SVG of the captured plot, for insertion at full quality.
     pub plot_svg: Option<String>,
+    /// All captured plots in creation order.
+    pub plots: Vec<PlotOutput>,
     /// Tables passed to `wc_table()`, in call order.
     pub tables: Vec<TabularOutput>,
     /// Why the chunk could not run at all (no interpreter, worker failure). When set, the other
@@ -117,6 +119,15 @@ impl ChunkOutput {
 
     /// A finished kernel run, with streams bounded to what the console shows.
     pub fn from_result(result: &ExecutionResult) -> Self {
+        let plots = if !result.plots.is_empty() {
+            result.plots.clone()
+        } else if result.plot_png.is_some() || result.plot_svg.is_some() {
+            vec![PlotOutput { png: result.plot_png.clone(), svg: result.plot_svg.clone() }]
+        } else {
+            Vec::new()
+        };
+        let plot_png = result.plot_png.clone().or_else(|| plots.first().and_then(|p| p.png.clone()));
+        let plot_svg = result.plot_svg.clone().or_else(|| plots.first().and_then(|p| p.svg.clone()));
         Self {
             stdout: capped(&result.stdout),
             stderr: capped(&result.stderr),
@@ -124,21 +135,52 @@ impl ChunkOutput {
             success: result.success,
             timed_out: result.timed_out,
             duration_ms: result.duration_ms,
-            plot_png: result.plot_png.clone(),
-            plot_svg: result.plot_svg.clone(),
+            plot_png,
+            plot_svg,
+            plots,
             tables: result.tables.clone(),
             error: None,
         }
     }
 
+    fn plot_count(&self) -> usize {
+        if !self.plots.is_empty() { self.plots.len() } else { usize::from(self.plot_png.is_some() || self.plot_svg.is_some()) }
+    }
+
+    fn plot_at(&self, index: usize) -> Option<(Option<&[u8]>, Option<&str>)> {
+        if !self.plots.is_empty() {
+            self.plots.get(index).map(|p| (p.png.as_deref(), p.svg.as_deref()))
+        } else if index == 0 && (self.plot_png.is_some() || self.plot_svg.is_some()) {
+            Some((self.plot_png.as_deref(), self.plot_svg.as_deref()))
+        } else {
+            None
+        }
+    }
+
     /// Whether the run captured a plot in either format.
     pub fn has_plot(&self) -> bool {
-        self.plot_png.is_some() || self.plot_svg.is_some()
+        self.plot_count() > 0
     }
 
     /// Whether the run captured at least one table.
     pub fn has_tables(&self) -> bool {
         !self.tables.is_empty()
+    }
+
+    fn console_text(&self) -> Option<String> {
+        if let Some(err) = &self.error {
+            let trimmed = err.trim_end_matches(['\r', '\n']);
+            return (!trimmed.trim().is_empty()).then(|| trimmed.to_owned());
+        }
+        let mut combined = self.stdout.trim_end_matches(['\r', '\n']).to_owned();
+        let stderr = self.stderr.trim_end_matches(['\r', '\n']);
+        if !stderr.is_empty() {
+            if !combined.is_empty() {
+                combined.push('\n');
+            }
+            combined.push_str(stderr);
+        }
+        (!combined.trim().is_empty()).then_some(combined)
     }
 }
 
@@ -153,12 +195,17 @@ pub enum CodeChunkAction {
         /// The lossless vector, if one was captured.
         svg: Option<String>,
     },
-    /// Insert a table below the chunk.
+    /// Insert a table at the document caret (or below the chunk).
     InsertTable {
         /// Column names in display order.
         headers: Vec<String>,
         /// Body rows, each with one cell per header.
         rows: Vec<Vec<String>>,
+    },
+    /// Insert console output into the document as code-formatted paragraphs at the caret (or below the chunk).
+    InsertOutput {
+        /// Console text lines to insert into the document.
+        text: String,
     },
 }
 
@@ -194,6 +241,8 @@ pub struct EmbeddedFrame {
     pub run_requested: bool,
     /// True if the user clicked Clear output in the chunk header this frame.
     pub clear_requested: bool,
+    /// New or cleared chunk label committed from the inline header editor this frame.
+    pub committed_label: Option<String>,
 }
 
 /// Outcome of [`CodeChunk::header`] on a single frame.
@@ -201,6 +250,7 @@ pub struct EmbeddedFrame {
 struct HeaderOutcome {
     run: bool,
     clear: bool,
+    committed_label: Option<String>,
 }
 
 /// Outcome of [`CodeChunk::editor`] on a single frame.
@@ -228,6 +278,8 @@ pub struct CodeChunk {
     pub tab: OutputTab,
     /// The plot viewer's scale; 1.0 shows one image pixel per device pixel.
     pub zoom: f32,
+    /// Which captured plot the drawer shows when a run produced more than one.
+    plot_index: usize,
     /// Which captured table the drawer shows when a run produced more than one.
     table_index: usize,
     output: Option<ChunkOutput>,
@@ -235,12 +287,16 @@ pub struct CodeChunk {
     pending: Option<Receiver<RunResult>>,
     /// Monotonic start timestamp from [`crate::clock::now_ms`], in milliseconds.
     started_ms: Option<f64>,
-    /// The plot's texture, decoded on first sight of its bytes.
-    plot_texture: Option<egui::TextureHandle>,
-    /// Remembers a failed PNG decode so corrupt bytes are not retried every frame.
-    plot_decode_failed: bool,
+    /// The plots' decoded textures, lazily filled by index.
+    plot_textures: Vec<Option<egui::TextureHandle>>,
+    /// Remembers failed PNG decodes per plot index so corrupt bytes are not retried every frame.
+    plot_decode_failed: Vec<bool>,
     #[cfg(test)]
     plot_decode_attempts: usize,
+    /// Optional human-readable chunk label (`#| label: ...`).
+    label: String,
+    editing_label: bool,
+    label_draft: String,
     /// Pending cursor placement when entering the editor (`Some(false)` = start, `Some(true)` = end).
     pending_cursor_edge: Option<bool>,
     /// Read-only view (e.g. Read Mode): blocks editing source, language, and run/insert actions.
@@ -261,18 +317,40 @@ impl CodeChunk {
             output_open: false,
             tab: OutputTab::Console,
             zoom: 1.0,
+            plot_index: 0,
             table_index: 0,
             output: None,
             pending: None,
             started_ms: None,
-            plot_texture: None,
-            plot_decode_failed: false,
+            plot_textures: Vec::new(),
+            plot_decode_failed: Vec::new(),
             #[cfg(test)]
             plot_decode_attempts: 0,
+            label: String::new(),
+            editing_label: false,
+            label_draft: String::new(),
             pending_cursor_edge: None,
             read_only: false,
             pending_source: None,
         }
+    }
+
+    /// Optional user-chosen label (`#| label: ...`).
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+
+    /// Update the chunk's displayed label without changing its code or output.
+    pub fn set_label(&mut self, label: impl Into<String>) {
+        self.label = clean_label(&label.into());
+        if !self.editing_label {
+            self.label_draft = self.label.clone();
+        }
+    }
+
+    /// Whether the user is currently typing a new chunk name in the header.
+    pub fn is_editing_label(&self) -> bool {
+        self.editing_label
     }
 
     /// The chunk's language.
@@ -328,6 +406,7 @@ impl CodeChunk {
         } else {
             OutputTab::Console
         };
+        self.plot_index = 0;
         self.table_index = 0;
         self.output = Some(output);
         self.output_open = true;
@@ -401,8 +480,8 @@ impl CodeChunk {
     }
 
     fn clear_plot_cache(&mut self) {
-        self.plot_texture = None;
-        self.plot_decode_failed = false;
+        self.plot_textures.clear();
+        self.plot_decode_failed.clear();
     }
 
     /// Clear any displayed output, plot texture, or in-flight status.
@@ -488,6 +567,7 @@ impl CodeChunk {
             context_click_pos,
             run_requested: !self.read_only && (shortcut_run || header_outcome.run),
             clear_requested: !self.read_only && header_outcome.clear,
+            committed_label: header_outcome.committed_label,
         }
     }
 
@@ -557,9 +637,11 @@ impl CodeChunk {
         let mut clear = false;
         let mut copy = false;
         let mut run = false;
-        egui::Frame::NONE.fill(t.input).corner_radius(CornerRadius { nw: 8, ne: 8, sw: 0, se: 0 }).inner_margin(Margin::symmetric(8, 5)).show(
-            ui,
-            |ui| {
+        let header_label = egui::Frame::NONE
+            .fill(t.input)
+            .corner_radius(CornerRadius { nw: 8, ne: 8, sw: 0, se: 0 })
+            .inner_margin(Margin::symmetric(8, 5))
+            .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     let badge = ui.add_enabled(
                         !self.read_only && !self.is_running(),
@@ -586,10 +668,16 @@ impl CodeChunk {
                     if ui.add(egui::Button::new(RichText::new(arrow).color(t.text_dim)).frame(false)).clicked() {
                         toggle_code = true;
                     }
-                    ui.label(RichText::new(crate::tl!("Code chunk")).color(t.text_dim));
+                    let committed_label = self.header_title(ui, t);
 
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         let options = ui.menu_button(RichText::new(crate::tl!("Options")).color(t.text_dim).size(11.5), |ui| {
+                            if ui.add_enabled(!self.read_only, egui::Button::new(crate::tl!("Rename chunk"))).clicked() {
+                                self.label_draft = self.label.clone();
+                                self.editing_label = true;
+                                ui.memory_mut(|m| m.request_focus(self.label_editor_id()));
+                                ui.close();
+                            }
                             if ui.button(crate::tl!("Copy code")).clicked() {
                                 copy = true;
                                 ui.close();
@@ -648,9 +736,11 @@ impl CodeChunk {
                             ui.ctx().request_repaint_after(Duration::from_millis(100));
                         }
                     });
-                });
-            },
-        );
+                    committed_label
+                })
+                .inner
+            })
+            .inner;
         if !self.read_only
             && let Some(language) = picked
         {
@@ -662,7 +752,57 @@ impl CodeChunk {
         if copy {
             ui.ctx().copy_text(self.code.clone());
         }
-        HeaderOutcome { run: !self.read_only && !self.is_running() && run, clear: !self.read_only && !self.is_running() && clear }
+        HeaderOutcome {
+            run: !self.read_only && !self.is_running() && run,
+            clear: !self.read_only && !self.is_running() && clear,
+            committed_label: header_label,
+        }
+    }
+
+    fn label_editor_id(&self) -> Id {
+        Id::unique(("wordcraft-code-chunk-label", self.id))
+    }
+
+    fn header_title(&mut self, ui: &mut Ui, t: &Tokens) -> Option<String> {
+        if self.read_only {
+            self.editing_label = false;
+        }
+        if self.editing_label {
+            let editor_id = self.label_editor_id();
+            let resp = ui.add(
+                TextEdit::singleline(&mut self.label_draft).id(editor_id).desired_width(160.0).char_limit(128).hint_text(crate::tl!("Chunk name")),
+            );
+            let cancel = ui.input(|i| i.key_pressed(Key::Escape));
+            let commit = ui.input(|i| i.key_pressed(Key::Enter)) || resp.lost_focus();
+            if cancel {
+                self.editing_label = false;
+                self.label_draft = self.label.clone();
+                return None;
+            }
+            if commit {
+                self.editing_label = false;
+                let cleaned = clean_label(&self.label_draft);
+                if cleaned != self.label {
+                    self.label = cleaned.clone();
+                    self.label_draft = cleaned.clone();
+                    return Some(cleaned);
+                }
+                self.label_draft = self.label.clone();
+            }
+            return None;
+        }
+
+        let display = if self.label.is_empty() { crate::tl!("Code chunk") } else { self.label.as_str() };
+        let color = if self.label.is_empty() { t.text_dim } else { t.text };
+        let resp = ui.add_enabled(!self.read_only, egui::Button::new(RichText::new(display).color(color)).frame(false));
+        if resp.clicked() {
+            self.label_draft = self.label.clone();
+            self.editing_label = true;
+            ui.memory_mut(|m| m.request_focus(self.label_editor_id()));
+        } else if !self.read_only {
+            resp.on_hover_text(crate::tl!("Click to name this chunk"));
+        }
+        None
     }
 
     fn editor(&mut self, ui: &mut Ui, t: &Tokens) -> EditorOutcome {
@@ -803,17 +943,28 @@ impl CodeChunk {
         });
         ui.add_space(2.0);
         match self.tab {
-            OutputTab::Console => Self::console(ui, self.output.as_ref(), t, self.id),
+            OutputTab::Console => self.console(ui, t, action),
             OutputTab::Plot => self.plot(ui, t, action),
             OutputTab::Table => self.table(ui, t, action),
         }
     }
 
-    fn console(ui: &mut Ui, output: Option<&ChunkOutput>, t: &Tokens, id: u64) {
-        let Some(output) = output else {
+    fn console(&self, ui: &mut Ui, t: &Tokens, action: &mut Option<CodeChunkAction>) {
+        let Some(output) = self.output.as_ref() else {
             ui.label(RichText::new(crate::tl!("Run the chunk to see its output.")).color(t.text_dim).size(12.0));
             return;
         };
+        if let Some(insert_text) = output.console_text() {
+            ui.horizontal(|ui| {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let response = ui.add_enabled(!self.read_only, egui::Button::new(crate::tl!("Insert into document")));
+                    if response.clicked() {
+                        *action = Some(CodeChunkAction::InsertOutput { text: insert_text });
+                    }
+                    response.on_hover_text(crate::tl!("Insert console output into the document as code text"));
+                });
+            });
+        }
         if let Some(error) = &output.error {
             ui.label(RichText::new(error).color(t.red).size(12.0));
             return;
@@ -825,7 +976,7 @@ impl CodeChunk {
             let text = if output.success { crate::tl!("No output") } else { crate::tl!("No output, but the exit code was not zero.") };
             ui.label(RichText::new(text).color(t.text_dim).size(12.0));
         }
-        egui::ScrollArea::vertical().id_salt(("wordcraft-code-chunk-console", id)).max_height(CONSOLE_MAX_H).auto_shrink([false, true]).show(
+        egui::ScrollArea::vertical().id_salt(("wordcraft-code-chunk-console", self.id)).max_height(CONSOLE_MAX_H).auto_shrink([false, true]).show(
             ui,
             |ui| {
                 for (title, text, color) in [("stdout", &output.stdout, t.text), ("stderr", &output.stderr, t.red)] {
@@ -843,31 +994,52 @@ impl CodeChunk {
     }
 
     fn plot(&mut self, ui: &mut Ui, t: &Tokens, action: &mut Option<CodeChunkAction>) {
-        let Some(output) = self.output.as_ref() else {
-            ui.label(RichText::new(crate::tl!("Run the chunk to see its plot.")).color(t.text_dim).size(12.0));
+        let Some(count) = self.output.as_ref().map(ChunkOutput::plot_count).filter(|&n| n > 0) else {
+            let msg = if self.output.is_none() { crate::tl!("Run the chunk to see its plot.") } else { crate::tl!("This run captured no plot.") };
+            ui.label(RichText::new(msg).color(t.text_dim).size(12.0));
             return;
         };
-        if !output.has_plot() {
-            ui.label(RichText::new(crate::tl!("This run captured no plot.")).color(t.text_dim).size(12.0));
-            return;
+        let mut selected = self.plot_index.min(count - 1);
+        if count > 1 {
+            ui.horizontal_wrapped(|ui| {
+                for index in 0..count {
+                    let label = format!("{} {}", crate::tl!("Plot"), index + 1);
+                    if ui.selectable_label(selected == index, label).clicked() {
+                        selected = index;
+                    }
+                }
+            });
         }
-        if self.plot_texture.is_none()
-            && !self.plot_decode_failed
-            && let Some(png) = output.plot_png.as_deref()
+        self.plot_index = selected;
+
+        if self.plot_textures.len() < count {
+            self.plot_textures.resize_with(count, || None);
+            self.plot_decode_failed.resize(count, false);
+        }
+        let (png_bytes, svg_xml) = {
+            let Some(output) = self.output.as_ref() else { return };
+            let Some((png, svg)) = output.plot_at(selected) else { return };
+            (png.map(ToOwned::to_owned), svg.map(ToOwned::to_owned))
+        };
+
+        if self.plot_textures[selected].is_none()
+            && !self.plot_decode_failed[selected]
+            && let Some(png) = png_bytes.as_deref()
         {
             #[cfg(test)]
             {
                 self.plot_decode_attempts += 1;
             }
-            self.plot_texture = decode_plot(ui.ctx(), png, self.id);
-            if self.plot_texture.is_none() {
-                self.plot_decode_failed = true;
+            self.plot_textures[selected] = decode_plot(ui.ctx(), png, self.id, selected);
+            if self.plot_textures[selected].is_none() {
+                self.plot_decode_failed[selected] = true;
             }
         }
 
+        let texture = self.plot_textures[selected].clone();
         let mut insert = false;
         ui.horizontal(|ui| {
-            let can_zoom = self.plot_texture.is_some();
+            let can_zoom = texture.is_some();
             if ui.add_enabled(can_zoom && self.zoom > MIN_ZOOM, egui::Button::new("−").min_size(vec2(22.0, 0.0))).clicked() {
                 self.zoom = (self.zoom / 1.25).clamp(MIN_ZOOM, MAX_ZOOM);
             }
@@ -876,18 +1048,18 @@ impl CodeChunk {
                 self.zoom = (self.zoom * 1.25).clamp(MIN_ZOOM, MAX_ZOOM);
             }
             if ui.add_enabled(can_zoom, egui::Button::new(crate::tl!("Fit"))).clicked()
-                && let Some(texture) = &self.plot_texture
+                && let Some(tex) = &texture
             {
-                let natural = texture.size_vec2() / ui.ctx().pixels_per_point();
+                let natural = tex.size_vec2() / ui.ctx().pixels_per_point();
                 let room = (ui.available_width() - 24.0).max(1.0);
                 self.zoom = (room / natural.x.max(1.0)).clamp(MIN_ZOOM, MAX_ZOOM);
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let response = ui.add_enabled(!self.read_only && output.plot_png.is_some(), egui::Button::new(crate::tl!("Insert into document")));
+                let response = ui.add_enabled(!self.read_only && png_bytes.is_some(), egui::Button::new(crate::tl!("Insert into document")));
                 if response.clicked() {
                     insert = true;
                 }
-                let tip = if output.plot_png.is_none() {
+                let tip = if png_bytes.is_none() {
                     crate::tl!("Inline insertion requires a PNG plot; rerun with PNG or both formats.")
                 } else {
                     crate::tl!("Add the plot to the document as a picture")
@@ -896,19 +1068,20 @@ impl CodeChunk {
             });
         });
 
-        if let Some(texture) = &self.plot_texture {
-            let natural = texture.size_vec2() / ui.ctx().pixels_per_point();
+        if let Some(tex) = &texture {
+            let natural = tex.size_vec2() / ui.ctx().pixels_per_point();
             let size = natural * self.zoom;
-            egui::ScrollArea::both().id_salt(("wordcraft-code-chunk-plot", self.id)).max_height(PLOT_MAX_H).auto_shrink([false, true]).show(
-                ui,
-                |ui| {
+            egui::ScrollArea::both()
+                .id_salt(("wordcraft-code-chunk-plot", self.id, selected))
+                .max_height(PLOT_MAX_H)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
                     egui::Frame::NONE.fill(t.input).inner_margin(Margin::same(4)).show(ui, |ui| {
-                        ui.add(egui::Image::new(texture).fit_to_exact_size(size));
+                        ui.add(egui::Image::new(tex).fit_to_exact_size(size));
                     });
-                },
-            );
+                });
         } else {
-            let message = if output.plot_png.is_none() {
+            let message = if png_bytes.is_none() {
                 crate::tl!("The plot is vector-only (SVG). Inline insertion requires a PNG; rerun the chunk with PNG or both plot formats.")
             } else {
                 crate::tl!("This plot could not be decoded for preview.")
@@ -917,7 +1090,7 @@ impl CodeChunk {
         }
 
         if insert {
-            *action = Some(CodeChunkAction::InsertPlot { png: output.plot_png.clone(), svg: output.plot_svg.clone() });
+            *action = Some(CodeChunkAction::InsertPlot { png: png_bytes, svg: svg_xml });
         }
     }
 
@@ -1154,7 +1327,11 @@ fn capped(text: &str) -> String {
     out
 }
 
-fn decode_plot(ctx: &egui::Context, png: &[u8], id: u64) -> Option<egui::TextureHandle> {
+fn clean_label(raw: &str) -> String {
+    raw.chars().filter(|c| !c.is_control()).collect::<String>().trim().chars().take(128).collect()
+}
+
+fn decode_plot(ctx: &egui::Context, png: &[u8], id: u64, index: usize) -> Option<egui::TextureHandle> {
     let gpu_side = ctx.input(|input| input.max_texture_side).min(MAX_PLOT_SIDE as usize).max(1);
     let side = u32::try_from(gpu_side).unwrap_or(MAX_PLOT_SIDE);
     let image = wordcraft_geom::picture::decode_for_drawing(png, wordcraft_geom::MAX_DECODED_BYTES, side).ok()?;
@@ -1164,7 +1341,7 @@ fn decode_plot(ctx: &egui::Context, png: &[u8], id: u64) -> Option<egui::Texture
         return None;
     }
     let pixels = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
-    Some(ctx.load_texture(format!("wordcraft-code-chunk-plot-{id}"), pixels, egui::TextureOptions::LINEAR))
+    Some(ctx.load_texture(format!("wordcraft-code-chunk-plot-{id}-{index}"), pixels, egui::TextureOptions::LINEAR))
 }
 
 #[derive(Debug, Clone, Copy)]
