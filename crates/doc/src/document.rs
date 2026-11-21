@@ -846,7 +846,10 @@ impl Document {
 
     /// Set a custom text property, replacing one of the same name in place.
     pub fn set_custom_prop(&mut self, name: &str, value: &str) {
-        match self.custom_props.iter_mut().find(|p| p.name.eq_ignore_ascii_case(name)) {
+        match self.custom_props.iter_mut().find(|p| {
+            crate::work::steps(1);
+            p.name.eq_ignore_ascii_case(name)
+        }) {
             Some(p) => {
                 p.kind = "lpwstr".into();
                 p.value = value.to_string();
