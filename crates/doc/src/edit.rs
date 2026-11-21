@@ -1202,12 +1202,22 @@ impl Document {
                         old.overlay(&c.old);
                         c.old = old;
                     }
+                    if let Some(c) = st.chr_change.as_mut() {
+                        let mut old = src.styles.default_chr.clone();
+                        old.overlay(&c.old);
+                        c.old = old;
+                    }
                     st.chr = chr;
                     let mut para = para_defaults.clone();
                     para.overlay(&st.para);
                     para.fmt_change = st.para.fmt_change;
                     para.num_change = st.para.num_change;
                     if let Some(c) = para.fmt_change.as_mut() {
+                        let mut old = para_defaults.clone();
+                        old.overlay(&c.old);
+                        c.old = old;
+                    }
+                    if let Some(c) = st.para_change.as_mut() {
                         let mut old = para_defaults.clone();
                         old.overlay(&c.old);
                         c.old = old;
