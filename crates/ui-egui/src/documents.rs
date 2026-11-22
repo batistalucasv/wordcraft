@@ -215,13 +215,30 @@ impl WordApp {
             return json!({"quit": true});
         }
         if self.closing.is_some() {
+            if let Some(id) = self.closing.as_ref().and_then(|c| c.prompt)
+                && let Some(ctx) = self.ctx.as_ref()
+            {
+                crate::dialogs::chrome::trigger_prompt_nudge(ctx, id);
+            }
+            if let Some(closing) = self.closing.as_mut() {
+                closing.pending_nudge = true;
+            }
             return json!({"quit": false});
         }
         self.ui.backstage = false;
-        match self.begin_closing(craft::quit::CloseScope::Quit, documents, "file.close".into(), json!({"quit": true})) {
+        let res = match self.begin_closing(craft::quit::CloseScope::Quit, documents, "file.close".into(), json!({"quit": true})) {
             Ok(_) => json!({"quit": self.quit_requested}),
             Err(e) => json!({"quit": false, "error": e}),
+        };
+        if let Some(id) = self.closing.as_ref().and_then(|c| c.prompt)
+            && let Some(ctx) = self.ctx.as_ref()
+        {
+            crate::dialogs::chrome::trigger_prompt_nudge(ctx, id);
         }
+        if let Some(closing) = self.closing.as_mut() {
+            closing.pending_nudge = true;
+        }
+        res
     }
 }
 

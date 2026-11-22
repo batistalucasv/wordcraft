@@ -17,6 +17,8 @@ pub(crate) struct Closing {
     pub params: Value,
     /// The open Save Changes prompt, when the guard waits for an answer.
     pub prompt: Option<DialogId>,
+    /// Whether the prompt should be nudged on next render pass.
+    pub pending_nudge: bool,
 }
 
 impl WordApp {
@@ -50,7 +52,7 @@ impl WordApp {
         // PLAN: shell-w6's `run` starts `file.close` and the other held-back commands through this
         let guard = CloseGuard::new(scope, documents);
         let step = guard.current().copied().map_or(GuardStep::Finished, GuardStep::Ask);
-        self.closing = Some(Closing { guard, then, params, prompt: None });
+        self.closing = Some(Closing { guard, then, params, prompt: None, pending_nudge: false });
         self.drive_guard(step, None)
     }
 
@@ -181,6 +183,7 @@ impl WordApp {
     /// Close prompt `id` from outside and drop the answer that leaves behind.
     pub(crate) fn close_prompt(&mut self, id: DialogId) {
         if let Some(ctx) = self.ctx.clone() {
+            crate::dialogs::chrome::forget_nudge(&ctx, id);
             self.dialog_host.cancel_by_id(&ctx, id);
         }
         let _ = self.dialog_host.take_by_id::<UnsavedChangesDialog>(id);
@@ -191,6 +194,9 @@ impl WordApp {
     pub(crate) fn pump_close_prompt(&mut self) {
         let Some(id) = self.closing.as_ref().and_then(|c| c.prompt) else { return };
         let Some(result) = self.dialog_host.take_by_id::<UnsavedChangesDialog>(id) else { return };
+        if let Some(ctx) = self.ctx.as_ref() {
+            crate::dialogs::chrome::forget_nudge(ctx, id);
+        }
         if let Some(closing) = self.closing.as_mut() {
             closing.prompt = None;
         }
@@ -215,6 +221,14 @@ impl WordApp {
             self.close_window(root);
             CloseDecision::Hold
         } else if self.closing.is_some() {
+            if let Some(id) = self.closing.as_ref().and_then(|c| c.prompt)
+                && let Some(ctx) = self.ctx.as_ref()
+            {
+                crate::dialogs::chrome::trigger_prompt_nudge(ctx, id);
+            }
+            if let Some(closing) = self.closing.as_mut() {
+                closing.pending_nudge = true;
+            }
             CloseDecision::Hold
         } else if self.close_requested() {
             CloseDecision::Close
