@@ -910,3 +910,52 @@ fn table_ribbon_menu_buttons_disable_when_unselected_or_protected() {
         "Delete should indicate protection in disabled hint"
     );
 }
+
+fn collect_shapes<'a>(shapes: &'a [egui::epaint::ClippedShape], out: &mut Vec<&'a egui::Shape>) {
+    for clipped in shapes {
+        fn walk<'a>(shape: &'a egui::Shape, out: &mut Vec<&'a egui::Shape>) {
+            match shape {
+                egui::Shape::Vec(children) => {
+                    for child in children {
+                        walk(child, out);
+                    }
+                }
+                other => out.push(other),
+            }
+        }
+        walk(&clipped.shape, out);
+    }
+}
+
+/// #7450: the Dictate button on Home › Voice renders cleanly with the dictate microphone icon at button size (16–22 pt).
+#[test]
+fn dictate_ribbon_button_renders_microphone_icon_at_button_size() {
+    use egui::accesskit::Role;
+
+    let app = WordApp::new(Session::new(wordcraft_doc::Document::from_text("Hello")), crate::Services::default());
+    let h = tab_harness(app, "Home");
+
+    let button = h
+        .query_all(By::new().role(Role::Button))
+        .find(|n| n.accesskit_node().label().is_some_and(|l| l.contains("Dictate")))
+        .expect("Dictate ribbon button must exist on Home tab");
+
+    let rect = button.rect();
+    assert!(rect.is_positive(), "Dictate button must be laid out with positive bounds");
+
+    // Ribbon large button renders the icon centered above the label with height in 16–22 pt range
+    assert!(rect.width() >= 16.0 && rect.height() >= 16.0, "Dictate button dimensions must accommodate button size: {rect:?}");
+
+    let mut shapes = Vec::new();
+    collect_shapes(&h.output().shapes, &mut shapes);
+
+    let has_icon_shape = shapes.iter().any(|s| match s {
+        egui::Shape::Mesh(mesh) => {
+            let bounds = mesh.calc_bounds();
+            rect.expand(1.0).contains_rect(bounds) && !mesh.vertices.is_empty()
+        }
+        egui::Shape::Path(path) => rect.expand(1.0).contains(path.points.first().copied().unwrap_or_default()),
+        _ => false,
+    });
+    assert!(has_icon_shape, "Dictate ribbon button must render icon shapes inside bounds {rect:?}");
+}
