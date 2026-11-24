@@ -544,3 +544,22 @@ fn nul_in_the_document_title_never_reaches_an_os_window_title() {
         }
     }
 }
+
+/// Issue #117, #7674: a viewport command schedules a repaint, so resending the title every frame
+/// kept the app redrawing at the monitor's refresh rate while idle.
+#[test]
+fn window_title_is_sent_only_when_it_changes() {
+    let mut rig = Rig::new();
+    let mut a = WordApp::new(Session::new(wordcraft_doc::Document::new()), Services::default());
+    let titles = |rig: &mut Rig, a: &mut WordApp| {
+        rig.frame(a);
+        rig.commands.iter().filter(|(_, c)| matches!(c, ViewportCommand::Title(_))).count()
+    };
+    // The title goes out on the first frame that sets it.
+    assert_eq!(titles(&mut rig, &mut a), 1, "first frame sends the window title");
+    assert_eq!(titles(&mut rig, &mut a), 0, "subsequent idle frame sends no title");
+    assert_eq!(titles(&mut rig, &mut a), 0, "steady idle sends no title");
+    a.run("text.insert", json!({"text": "edit"})).unwrap();
+    assert_eq!(titles(&mut rig, &mut a), 1, "dirty document changes the title stem, sending it once");
+    assert_eq!(titles(&mut rig, &mut a), 0, "steady state after edit sends no title");
+}

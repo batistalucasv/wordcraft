@@ -34,6 +34,8 @@ pub(crate) struct WindowUi {
     /// Per window, as each window shows its own layout: one shared list would be read again
     /// on every frame of every window.
     pub(crate) missing_fonts: chrome::MissingFontsMemo,
+    /// The window title last sent to the shell; a viewport command schedules a repaint, so only send changes (#117, #7674).
+    pub(crate) sent_title: Option<String>,
     /// This window's refused or failed export, shown on its Export and Print pages (Backstage hides the status bar).
     pub(crate) export_error: String,
     pub(crate) last_autosave: f64,
@@ -85,6 +87,7 @@ impl WindowUi {
             escape_free: false,
             status_counts: NOT_COUNTED,
             missing_fonts: Default::default(),
+            sent_title: None,
             export_error: String::new(),
             last_autosave: 0.0,
             equation_prev_tab: None,
@@ -196,6 +199,7 @@ impl WordApp {
             escape_free,
             status_counts,
             missing_fonts,
+            sent_title,
             export_error,
             last_autosave,
             equation_prev_tab,
@@ -294,6 +298,7 @@ impl WordApp {
             escape_free,
             status_counts,
             missing_fonts,
+            sent_title,
             export_error,
             last_autosave,
             equation_prev_tab,

@@ -81,11 +81,16 @@ impl WordApp {
         let mode = self.screen_mode();
         let dropped = self.ribbon_dropped;
         let key = self.windows.window_key();
-        let shell = AppShell::new(key)
-            .mode_set(ScreenModeSet::Document)
-            .screen_mode(Bind::given(mode))
-            .dropped(Bind::given(dropped))
-            .window_title(self.window_title())
+        let title = self.window_title();
+        let title_changed = self.sent_title.as_deref() != Some(&title);
+        if title_changed {
+            self.sent_title = Some(title.clone());
+        }
+        let mut shell = AppShell::new(key).mode_set(ScreenModeSet::Document).screen_mode(Bind::given(mode)).dropped(Bind::given(dropped));
+        if title_changed {
+            shell = shell.window_title(title);
+        }
+        let shell = shell
             .page(self.ui.backstage, crate::backstage::scope(), crate::backstage::show)
             .title_bar(chrome::title_bar::show)
             .top(Slot::new("screenBar").screen_bar(), chrome::screen_bar::show)
