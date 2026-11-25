@@ -1,0 +1,19 @@
+[package]
+name = "wordcraft-kernel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "WordCraft execution runner for interactive code chunks (R and Python)"
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+getrandom = { workspace = true }
+rustix = { version = "1.1", default-features = false, features = ["std", "fs", "process"] }
