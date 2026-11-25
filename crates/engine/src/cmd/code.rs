@@ -89,6 +89,9 @@ pub fn specs() -> Vec<CommandSpec> {
         CommandSpec::new("code.delete_chunk", "Delete Code Chunk", LOC, delete_chunk)
             .params(r#"{"chunkId"?: n (control id; default: chunk at cursor)}"#)
             .when(has_any_chunks),
+        CommandSpec::new("code.move_chunk", "Move Code Chunk", LOC, move_chunk)
+            .params(r#"{"chunkId": n (control id), "page": n (0-based page), "x": n (page points), "y": n (page points)}"#)
+            .when(has_any_chunks),
         CommandSpec::new("code.exit_below_chunk", "Continue After Code Chunk", LOC, exit_below_chunk)
             .params(r#"{"chunkId"?: n (control id; default: chunk at cursor)}"#)
             .when(has_any_chunks),
@@ -659,6 +662,102 @@ fn delete_chunk(s: &mut Session, v: &Value) -> CmdResult {
 
     let mut out = sel_result(s)?;
     out["deleted"] = json!(true);
+    out["chunkId"] = json!(range.chunk.id);
+    Ok(out)
+}
+
+fn target_block_for_drop(s: &mut Session, page: usize, y: f32) -> usize {
+    let chunk_refs = chunks::chunks_in(&s.doc, StoryRef::Body);
+    let layout = s.layout();
+    let Some(pg) = layout.pages.get(page) else {
+        return s.doc.body.len();
+    };
+    let mut best: Option<(f32, usize, bool)> = None;
+    for item in &pg.items {
+        let (block, top, bottom) = match item {
+            wordcraft_layout::Placed::Lines { story: StoryRef::Body, path, para, l0, l1, y: ly, .. } => {
+                let Some(idx) = path.0.first().copied() else { continue };
+                let h = para
+                    .lines
+                    .get(*l0)
+                    .zip(para.lines.get(l1.saturating_sub(1)))
+                    .map_or(14.0, |(first, last)| (last.top + last.height - first.top).max(4.0));
+                (idx as usize, *ly, *ly + h)
+            }
+            wordcraft_layout::Placed::Cell { story: StoryRef::Body, table, rect, .. } => {
+                let Some(idx) = table.0.first().copied() else { continue };
+                (idx as usize, rect.y, rect.bottom())
+            }
+            wordcraft_layout::Placed::Chunk { id, rect, .. } => {
+                let Some(idx) = chunk_refs.iter().find(|r| r.chunk.id == Some(*id)).and_then(|r| r.start.path.0.first().copied()) else {
+                    continue;
+                };
+                (idx as usize, rect.y, rect.bottom())
+            }
+            _ => continue,
+        };
+        let mid = 0.5 * (top + bottom);
+        let dist = if y < top {
+            top - y
+        } else if y > bottom {
+            y - bottom
+        } else {
+            0.0
+        };
+        let after = y > mid;
+        if best.is_none_or(|(best_dist, _, _)| dist < best_dist) {
+            best = Some((dist, block, after));
+        }
+    }
+    let Some((_, mut block, after)) = best else {
+        return s.doc.body.len();
+    };
+    if after {
+        block = block.saturating_add(1);
+    }
+    for r in &chunk_refs {
+        if r.start.path.0.len() != 1 || r.end.path.0.len() != 1 {
+            continue;
+        }
+        let c_first = r.start.path.0[0] as usize;
+        let c_last = r.end.path.0[0] as usize;
+        if block > c_first && block <= c_last {
+            block = if block - c_first <= c_last + 1 - block { c_first } else { c_last + 1 };
+        }
+    }
+    block.min(s.doc.body.len())
+}
+
+fn move_chunk(s: &mut Session, v: &Value) -> CmdResult {
+    let range = resolve_target_chunk(s, v)?;
+    let (first, last) = ensure_top_level_body_chunk(&range)?;
+    if last >= s.doc.body.len() {
+        return Err(CmdError::Failed("chunk block range is out of bounds".into()));
+    }
+    let page = v.get("page").and_then(Value::as_u64).ok_or_else(|| CmdError::Params("missing page".into()))? as usize;
+    let y = p::req_f32(v, "y")?;
+    let mut insert_at = target_block_for_drop(s, page, y);
+    if insert_at >= first && insert_at <= last + 1 {
+        return sel_result(s);
+    }
+    let span = last - first + 1;
+    let mut moved = Vec::with_capacity(span);
+    for _ in 0..span {
+        moved.push(s.doc.remove_block(StoryRef::Body, &Path::top(first))?);
+    }
+    if insert_at > last {
+        insert_at -= span;
+    }
+    let dest = insert_at.min(s.doc.body.len());
+    for (offset, block) in moved.into_iter().enumerate() {
+        s.doc.insert_block(StoryRef::Body, &Path::top(dest + offset), block)?;
+    }
+    s.sel = Selection::caret(first_para_pos_at_block(&s.doc, dest));
+    s.goal_x = None;
+    s.touch();
+
+    let mut out = sel_result(s)?;
+    out["moved"] = json!(true);
     out["chunkId"] = json!(range.chunk.id);
     Ok(out)
 }

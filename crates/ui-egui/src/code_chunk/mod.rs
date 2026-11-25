@@ -23,7 +23,7 @@ use craft::theme::variant::Tone;
 use craft::theme::{ControlSize, Variant};
 use craft::ui::buttons::Button;
 use craft::ui::contract::{Bind, Entry, Props as _, Show as _, ShowContainer as _, TooltipSpec, Trigger};
-use craft::ui::controls::{Disclosure, DisclosureGlyph};
+use craft::ui::controls::disclosure::{Disclosure, DisclosureGlyph};
 use craft::ui::display::{Divider, Shade, Spinner, Text};
 use craft::ui::menu::{Menu, MenuItem};
 use craft::ui::runtime::env::Env;
@@ -118,6 +118,10 @@ pub struct EmbeddedFrame {
     pub clear_requested: bool,
     /// New or cleared chunk label committed from the inline header editor this frame.
     pub committed_label: Option<String>,
+    /// True if the user clicked the code editor area this frame.
+    pub editor_clicked: bool,
+    /// True if the user started dragging the chunk's move handle this frame.
+    pub drag_started: bool,
 }
 
 /// Outcome of [`CodeChunk::header`] on a single frame.
@@ -126,6 +130,7 @@ struct HeaderOutcome {
     run: bool,
     clear: bool,
     committed_label: Option<String>,
+    drag_started: bool,
 }
 
 /// Outcome of [`CodeChunk::editor`] on a single frame.
@@ -134,6 +139,7 @@ struct EditorOutcome {
     changed: bool,
     has_focus: bool,
     lost_focus: bool,
+    clicked: bool,
     arrow_exit: Option<i32>,
 }
 
@@ -166,6 +172,7 @@ pub struct CodeChunk {
     plot_textures: Vec<Option<egui::TextureHandle>>,
     /// Remembers failed PNG decodes per plot index so corrupt bytes are not retried every frame.
     plot_decode_failed: Vec<bool>,
+    plot_auto_fit: bool,
     #[cfg(test)]
     plot_decode_attempts: usize,
     #[cfg(test)]
@@ -202,6 +209,7 @@ impl CodeChunk {
             started_ms: None,
             plot_textures: Vec::new(),
             plot_decode_failed: Vec::new(),
+            plot_auto_fit: true,
             #[cfg(test)]
             plot_decode_attempts: 0,
             #[cfg(test)]
@@ -330,6 +338,7 @@ impl CodeChunk {
     fn clear_plot_cache(&mut self) {
         self.plot_textures.clear();
         self.plot_decode_failed.clear();
+        self.plot_auto_fit = true;
     }
 
     /// Clear any displayed output, plot texture, or in-flight status.
@@ -429,6 +438,8 @@ impl CodeChunk {
             run_requested: !self.read_only && !self.is_running() && (shortcut_run || header_outcome.run),
             clear_requested: !self.read_only && !self.is_running() && header_outcome.clear,
             committed_label: header_outcome.committed_label,
+            editor_clicked: editor_outcome.clicked,
+            drag_started: !self.read_only && header_outcome.drag_started,
         }
     }
 
@@ -494,6 +505,7 @@ impl CodeChunk {
         let mut clear = false;
         let mut copy = false;
         let mut run = false;
+        let mut drag_started = false;
         let r = UiTokens::corner(tokens.shape.radius.panel).nw;
         let committed_label = egui::Frame::NONE
             .fill(rgba_color(tokens.color.surface.sunken))
@@ -501,6 +513,19 @@ impl CodeChunk {
             .inner_margin(Margin::symmetric(8, 5))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
+                    if !self.read_only {
+                        let grip = ui
+                            .add_sized(
+                                vec2(20.0, 20.0),
+                                egui::Label::new(egui::RichText::new("⋮⋮").size(14.0).strong().color(rgba_color(tokens.color.text.muted)))
+                                    .sense(egui::Sense::click_and_drag()),
+                            )
+                            .on_hover_cursor(egui::CursorIcon::Grab)
+                            .on_hover_text(crate::tl!("Drag to move code chunk"));
+                        if grip.drag_started() {
+                            drag_started = true;
+                        }
+                    }
                     picked = self.header_language_badge(ui, current);
                     let mut show_code = self.show_code;
                     Disclosure::new(Bind::bound(&mut show_code))
@@ -534,7 +559,12 @@ impl CodeChunk {
         if copy {
             ui.ctx().copy_text(self.code.clone());
         }
-        HeaderOutcome { run: !self.read_only && !self.is_running() && run, clear: !self.read_only && !self.is_running() && clear, committed_label }
+        HeaderOutcome {
+            run: !self.read_only && !self.is_running() && run,
+            clear: !self.read_only && !self.is_running() && clear,
+            committed_label,
+            drag_started,
+        }
     }
 
     fn header_language_badge(&self, ui: &mut Ui, current: CodeLanguage) -> Option<CodeLanguage> {
@@ -667,18 +697,19 @@ impl CodeChunk {
             return None;
         }
 
+        let tokens = Env::of(ui).tokens.clone();
         let display = if self.label.is_empty() { crate::tl!("Code chunk").to_owned() } else { self.label.clone() };
+        let title_size = tokens.typography.body.size + 2.0;
+        let title_color = if self.label.is_empty() { rgba_color(tokens.color.text.muted) } else { rgba_color(tokens.color.text.normal) };
+        let title_text = egui::RichText::new(display).size(title_size).strong().color(title_color);
         if self.read_only {
-            let shade = if self.label.is_empty() { Shade::Muted } else { Shade::Normal };
-            Text::new(display).role(TypeRole::Body).shade(shade).show(ui);
+            ui.label(title_text);
             return None;
         }
-        let resp = Button::new(display)
-            .variant(Variant::GHOST)
-            .size(ControlSize::Sm)
-            .tooltip(crate::tl!("Click to name this chunk"))
-            .id_salt(("code-chunk-title", self.id))
-            .show(ui);
+        let resp = ui
+            .add(egui::Label::new(title_text).sense(egui::Sense::click()))
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .on_hover_text(crate::tl!("Click to name this chunk"));
         if resp.clicked() {
             self.label_draft = self.label.clone();
             self.editing_label = true;
@@ -700,6 +731,7 @@ impl CodeChunk {
         let text_w = columns as f32 * char_w + 2.0 * char_w;
         let digits = lines.to_string().len().max(2);
         let gutter = digits as f32 * char_w + 14.0;
+        let editor_w = text_w.max((ui.available_width() - gutter).max(2.0 * char_w));
 
         let mut outcome = EditorOutcome { arrow_exit, ..Default::default() };
         let read_only = self.read_only;
@@ -707,10 +739,10 @@ impl CodeChunk {
         let border_color = rgba_color(tokens.color.line.border);
         let number_color = rgba_color(tokens.color.text.disabled);
 
-        egui::Frame::NONE.inner_margin(Margin::symmetric(0, 6)).show(ui, |ui| {
+        let frame_resp = egui::Frame::NONE.inner_margin(Margin::symmetric(0, 6)).show(ui, |ui| {
             egui::ScrollArea::horizontal().id_salt(("wordcraft-code-chunk-scroll", self.id)).auto_shrink([false, true]).show(ui, |ui| {
-                // The child's width is the source's, so long lines scroll instead of being cut.
-                let size = vec2(gutter + text_w, lines as f32 * line_h + 4.0);
+                // The child's width is at least the card's width, and wider when long lines scroll.
+                let size = vec2(gutter + editor_w, lines as f32 * line_h + 4.0);
                 ui.allocate_ui_with_layout(size, Layout::left_to_right(Align::Min), |ui| {
                     ui.spacing_mut().item_spacing.x = 0.0;
                     ui.add_space(gutter);
@@ -721,7 +753,7 @@ impl CodeChunk {
                             .lock_focus(false)
                             .frame(egui::Frame::NONE)
                             .margin(Margin::ZERO)
-                            .desired_width(text_w)
+                            .desired_width(editor_w)
                             .desired_rows(lines)
                             .hint_text(crate::tl!("Code"))
                             .char_limit(MAX_CODE_CHARS)
@@ -740,10 +772,20 @@ impl CodeChunk {
                     outcome.changed = !read_only && out.response.changed();
                     outcome.has_focus = out.response.has_focus();
                     outcome.lost_focus = out.response.lost_focus();
+                    outcome.clicked =
+                        !read_only && (out.response.clicked() || (out.response.has_focus() && ui.input(|i| i.pointer.primary_pressed())));
                     paint_line_numbers(ui, &out, gutter, border_color, number_color);
                 });
             });
         });
+        if !read_only
+            && ui.input(|i| i.pointer.primary_pressed())
+            && ui.input(|i| i.pointer.interact_pos()).is_some_and(|pos| frame_resp.response.rect.contains(pos))
+        {
+            ui.memory_mut(|m| m.request_focus(editor_id));
+            outcome.has_focus = true;
+            outcome.clicked = true;
+        }
         outcome
     }
 
@@ -764,7 +806,7 @@ impl CodeChunk {
             && let Some(range) = TextEdit::load_state(ui.ctx(), editor_id).and_then(|s| s.cursor.char_range())
             && range.primary == range.secondary
         {
-            let b = self.code.char_indices().nth(range.primary.index).map_or(self.code.len(), |(i, _)| i);
+            let b = self.code.char_indices().nth(range.primary.index.into()).map_or(self.code.len(), |(i, _)| i);
             let on_first_line = self.code.get(..b).is_some_and(|s| !s.contains('\n'));
             let on_last_line = self.code.get(b..).is_some_and(|s| !s.contains('\n'));
             if on_first_line && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::ArrowUp)) {

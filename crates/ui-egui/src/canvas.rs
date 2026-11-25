@@ -997,6 +997,11 @@ fn show_pages(app: &mut WordApp, ui: &mut Ui, layout: &Arc<DocLayout>, full: Rec
         if app.canvas.code_chunks.active_chunk.is_some() {
             ctx.request_repaint();
         }
+    } else if !app.modal_open()
+        && let Some(active_id) = app.canvas.code_chunks.just_focused_by_click.take()
+        && let Some(editor_id) = app.canvas.code_chunks.widgets.get(&active_id).map(|e| e.widget.editor_id())
+    {
+        ui.ctx().memory_mut(|m| m.request_focus(editor_id));
     }
     app.canvas.resident_pictures = out.resident_pictures();
     app.canvas.view = state;

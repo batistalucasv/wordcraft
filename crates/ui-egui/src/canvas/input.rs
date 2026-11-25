@@ -185,7 +185,9 @@ impl CanvasTool for PageTextTool<'_> {
                 return ToolAction::Claimed;
             }
         }
-        if !over_text && !self.app.canvas.dragging && self.app.canvas.code_chunks.hit(pointer.pos).is_some() {
+        if self.app.canvas.code_chunks.dragging_chunk.is_some()
+            || (!over_text && !self.app.canvas.dragging && self.app.canvas.code_chunks.hit(pointer.pos).is_some())
+        {
             return ToolAction::Ignored;
         }
         let ended = || if over_text { ToolAction::Claimed } else { ToolAction::Done };

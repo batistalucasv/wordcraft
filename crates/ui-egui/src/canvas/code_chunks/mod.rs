@@ -55,6 +55,8 @@ pub(crate) struct CodeChunksState {
     pub(crate) active_chunk: Option<i64>,
     pub(crate) context_chunk: Option<i64>,
     pub(crate) pending_focus: Option<(i64, bool)>,
+    pub(crate) just_focused_by_click: Option<i64>,
+    pub(crate) dragging_chunk: Option<i64>,
     pending_context_click: Option<(i64, Pos2)>,
     pending_runs: Vec<pool::PendingRun>,
     queued_runs: VecDeque<pool::QueuedRun>,

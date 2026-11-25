@@ -1,14 +1,13 @@
 //! Collapsible output drawer for [`CodeChunk`]: console streams, zoomable plots, and tables.
 
 use craft::theme::ControlSize;
-use craft::theme::variant::Tone;
+use craft::theme::variant::{Tone, Variant};
 use craft::ui::buttons::Button;
-use craft::ui::choice::Segmented;
-use craft::ui::contract::{Bind, Entry, Props as _, Show as _, TooltipSpec};
-use craft::ui::controls::Disclosure;
+use craft::ui::contract::{Bind, Props as _, Show as _, TooltipSpec};
+use craft::ui::controls::disclosure::Disclosure;
 use craft::ui::display::{Shade, Text};
 use craft::ui::style::{TypeRole, UiTokens, rgba_color};
-use egui::{Align, CornerRadius, Layout, Margin, RichText, Ui, vec2};
+use egui::{Align, Layout, Margin, RichText, Ui};
 use wordcraft_engine::chunks::{ExecutionResult, PlotOutput, TabularOutput};
 
 use super::{CodeChunk, CodeChunkAction};
@@ -177,15 +176,26 @@ impl CodeChunk {
 
         let has_plot = self.output.as_ref().is_some_and(ChunkOutput::has_plot);
         let has_tables = self.output.as_ref().is_some_and(ChunkOutput::has_tables);
-        let tabs = [
-            Entry::new(OutputTab::Console, crate::tl!("Console")),
-            Entry::new(OutputTab::Plot, crate::tl!("Plot")).enabled(has_plot),
-            Entry::new(OutputTab::Table, crate::tl!("Table")).enabled(has_tables),
-        ];
-        Segmented::new(crate::tl!("Output views"), Bind::bound(&mut self.tab), &tabs)
-            .size(ControlSize::Sm)
-            .id_salt(("code-chunk-tabs", self.id))
-            .show(ui);
+        ui.horizontal_wrapped(|ui| {
+            for (tab, label, enabled, salt) in [
+                (OutputTab::Console, crate::tl!("Console"), true, "console"),
+                (OutputTab::Plot, crate::tl!("Plot"), has_plot, "plot"),
+                (OutputTab::Table, crate::tl!("Table"), has_tables, "table"),
+            ] {
+                let variant = if self.tab == tab { Variant::SECONDARY } else { Variant::GHOST };
+                if Button::new(label)
+                    .variant(variant)
+                    .size(ControlSize::Sm)
+                    .enabled(enabled)
+                    .id_salt(("code-chunk-tab", salt, self.id))
+                    .show(ui)
+                    .clicked()
+                    && enabled
+                {
+                    self.tab = tab;
+                }
+            }
+        });
         ui.add_space(tokens.space.gap.tight);
 
         match self.tab {
@@ -261,17 +271,31 @@ impl CodeChunk {
         };
         let mut selected = self.plot_index.min(count - 1);
         if count > 1 {
-            let entries: Vec<Entry<usize>> =
-                (0..count).map(|index| Entry::new(index, crate::i18n::fmt(crate::tl!("Plot {n}"), &[("n", &(index + 1).to_string())]))).collect();
-            Segmented::new(crate::tl!("Plots"), Bind::bound(&mut selected), &entries)
-                .size(ControlSize::Sm)
-                .id_salt(("code-chunk-plot-picker", self.id))
-                .show(ui);
+            ui.horizontal_wrapped(|ui| {
+                for index in 0..count {
+                    let label = crate::i18n::fmt(crate::tl!("Plot {n}"), &[("n", &(index + 1).to_string())]);
+                    let variant = if selected == index { Variant::SECONDARY } else { Variant::GHOST };
+                    if Button::new(label)
+                        .variant(variant)
+                        .size(ControlSize::Sm)
+                        .id_salt(("code-chunk-plot-picker", self.id, index))
+                        .show(ui)
+                        .clicked()
+                    {
+                        selected = index;
+                    }
+                }
+            });
         }
         self.plot_index = selected;
 
         let has_png = self.ensure_plot_texture(ui.ctx(), count, selected);
         let texture = self.plot_textures.get(selected).and_then(Option::as_ref).cloned();
+        if self.plot_auto_fit
+            && let Some(tex) = texture.as_ref()
+        {
+            self.zoom = fit_zoom_for_width(tex, ui);
+        }
         let insert = self.plot_toolbar(ui, texture.as_ref(), has_png);
         self.plot_preview(ui, tokens, selected, texture.as_ref(), has_png);
 
@@ -315,6 +339,7 @@ impl CodeChunk {
                 .show(ui)
                 .clicked()
             {
+                self.plot_auto_fit = false;
                 self.zoom = (self.zoom / 1.25).clamp(MIN_ZOOM, MAX_ZOOM);
             }
             Text::new(format!("{:.0}%", self.zoom * 100.0)).role(TypeRole::Mono).show(ui);
@@ -326,6 +351,7 @@ impl CodeChunk {
                 .show(ui)
                 .clicked()
             {
+                self.plot_auto_fit = false;
                 self.zoom = (self.zoom * 1.25).clamp(MIN_ZOOM, MAX_ZOOM);
             }
             if Button::new(crate::tl!("Fit"))
@@ -337,9 +363,8 @@ impl CodeChunk {
                 .clicked()
                 && let Some(tex) = texture
             {
-                let natural = tex.size_vec2() / ui.ctx().pixels_per_point();
-                let room = (ui.available_width() - 24.0).max(1.0);
-                self.zoom = (room / natural.x.max(1.0)).clamp(MIN_ZOOM, MAX_ZOOM);
+                self.plot_auto_fit = true;
+                self.zoom = fit_zoom_for_width(tex, ui);
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 let tip = TooltipSpec::new(crate::tl!("Add the plot to the document as a picture"))
@@ -400,12 +425,21 @@ impl CodeChunk {
         let count = output.tables.len();
         let mut selected = self.table_index.min(count - 1);
         if count > 1 {
-            let entries: Vec<Entry<usize>> =
-                (0..count).map(|index| Entry::new(index, crate::i18n::fmt(crate::tl!("Table {n}"), &[("n", &(index + 1).to_string())]))).collect();
-            Segmented::new(crate::tl!("Tables"), Bind::bound(&mut selected), &entries)
-                .size(ControlSize::Sm)
-                .id_salt(("code-chunk-table-picker", self.id))
-                .show(ui);
+            ui.horizontal_wrapped(|ui| {
+                for index in 0..count {
+                    let label = crate::i18n::fmt(crate::tl!("Table {n}"), &[("n", &(index + 1).to_string())]);
+                    let variant = if selected == index { Variant::SECONDARY } else { Variant::GHOST };
+                    if Button::new(label)
+                        .variant(variant)
+                        .size(ControlSize::Sm)
+                        .id_salt(("code-chunk-table-picker", self.id, index))
+                        .show(ui)
+                        .clicked()
+                    {
+                        selected = index;
+                    }
+                }
+            });
         }
         self.table_index = selected;
 
@@ -538,6 +572,12 @@ fn capped(text: &str) -> String {
     out.push('\n');
     out.push_str(crate::tl!("… output cut after 64 KiB"));
     out
+}
+
+fn fit_zoom_for_width(tex: &egui::TextureHandle, ui: &Ui) -> f32 {
+    let natural = tex.size_vec2() / ui.ctx().pixels_per_point();
+    let room = (ui.available_width() - 24.0).max(1.0);
+    (room / natural.x.max(1.0)).clamp(MIN_ZOOM, MAX_ZOOM)
 }
 
 fn decode_plot(ctx: &egui::Context, png: &[u8], id: u64, index: usize) -> Option<egui::TextureHandle> {

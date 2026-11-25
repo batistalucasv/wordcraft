@@ -25,6 +25,8 @@ struct PaintEvents {
     clear_requests: Vec<i64>,
     arrow_exits: Vec<(i64, i32)>,
     context_click: Option<(i64, Pos2)>,
+    editor_clicked: Option<i64>,
+    drag_started: Option<i64>,
     height_changed: bool,
 }
 
@@ -32,6 +34,12 @@ impl PaintEvents {
     fn record(&mut self, id: i64, page_index: usize, read_mode: bool, frame: crate::code_chunk::EmbeddedFrame) {
         if !read_mode && frame.editor_has_focus {
             self.newly_focused.push((id, page_index));
+        }
+        if !read_mode && frame.editor_clicked {
+            self.editor_clicked = Some(id);
+        }
+        if !read_mode && frame.drag_started {
+            self.drag_started = Some(id);
         }
         if frame.editor_lost_focus {
             self.blur_flush.push(id);
@@ -146,6 +154,12 @@ fn apply_focus_events(app: &mut WordApp, ui: &Ui, layout: &DocLayout, events: &P
         }
     }
 
+    if let Some(id) = events.editor_clicked {
+        app.canvas.code_chunks.just_focused_by_click = Some(id);
+        app.canvas.code_chunks.active_chunk = Some(id);
+        app.canvas.focus_pending = false;
+    }
+
     reconcile_active_chunk_focus(app, ui, layout);
 }
 
@@ -198,6 +212,10 @@ fn apply_edit_and_run_events(app: &mut WordApp, ui: &Ui, events: PaintEvents) {
 
     for (id, dir) in events.arrow_exits {
         exit_chunk_to_canvas(app, id, dir);
+    }
+
+    if let Some(id) = events.drag_started {
+        app.canvas.code_chunks.dragging_chunk = Some(id);
     }
 
     if events.height_changed {
@@ -386,6 +404,7 @@ pub(crate) fn paint_and_interact(app: &mut WordApp, ui: &mut Ui, layout: &DocLay
     };
     let mut events = PaintEvents::default();
 
+    let view_clip = ui.clip_rect();
     for (id, pi, sr, pscale) in mounted_positions {
         let Some(entry) = app.canvas.code_chunks.widgets.get_mut(&id) else { continue };
         entry.widget.read_only = read_mode;
@@ -395,15 +414,27 @@ pub(crate) fn paint_and_interact(app: &mut WordApp, ui: &mut Ui, layout: &DocLay
             app.session.page_hint = pi;
         }
 
-        // Measure intrinsic height cleanly without capping height to last frame's box.
-        let max_rect = Rect::from_min_size(sr.min, vec2(sr.width().max(48.0), f32::INFINITY));
-        let mut child_ui = ui.new_child(egui::UiBuilder::new().max_rect(max_rect));
-        let frame = entry.widget.show_embedded(&mut child_ui);
+        // Mount each chunk in its own Area layer above PageView so TextEdit clicks, cursor
+        // placement, and drag handles are never intercepted by the page background sensor.
+        let area_id = egui::Id::new(("wordcraft-code-chunk-area", id));
+        let (frame, measured_pt) = egui::Area::new(area_id)
+            .order(egui::Order::Middle)
+            .fixed_pos(sr.min)
+            .constrain(false)
+            .interactable(true)
+            .show(ui.ctx(), |area_ui| {
+                area_ui.set_clip_rect(view_clip);
+                area_ui.set_width(sr.width().max(48.0));
+                let frame = entry.widget.show_embedded(area_ui);
+                let measured_pt = (area_ui.min_rect().height() / pscale.max(0.01)).clamp(24.0, 20000.0);
+                (frame, measured_pt)
+            })
+            .inner;
         if let Some(at_end) = requested_edge
             && frame.editor_has_focus
         {
             app.canvas.code_chunks.pending_focus = None;
-            let view_rect = if app.canvas.shown.view.is_positive() { app.canvas.shown.view } else { ui.clip_rect() };
+            let view_rect = if app.canvas.shown.view.is_positive() { app.canvas.shown.view } else { view_clip };
             let band = chunk_focus_band_y(sr, view_rect, at_end);
             let dy = overshoot_axis(band, (view_rect.min.y, view_rect.max.y));
             if dy != 0.0 {
@@ -412,7 +443,6 @@ pub(crate) fn paint_and_interact(app: &mut WordApp, ui: &mut Ui, layout: &DocLay
             }
         }
 
-        let measured_pt = (child_ui.min_rect().height() / pscale.max(0.01)).clamp(24.0, 20000.0);
         let new_centipts = (measured_pt * 100.0).round() as u32;
         if entry.measured_centipts.is_none_or(|old| (old as i64 - new_centipts as i64).abs() > HEIGHT_HYSTERESIS_CENTIPTS) {
             entry.measured_centipts = Some(new_centipts);
@@ -427,6 +457,7 @@ pub(crate) fn paint_and_interact(app: &mut WordApp, ui: &mut Ui, layout: &DocLay
     }
 
     apply_paint_events(app, ui, layout, events);
+    handle_chunk_drag(app, ui, layout, pages);
 
     if let Some((fid, at_end)) = app.canvas.code_chunks.pending_focus {
         if app.canvas.code_chunks.is_mounted(fid)
@@ -437,6 +468,71 @@ pub(crate) fn paint_and_interact(app: &mut WordApp, ui: &mut Ui, layout: &DocLay
             app.canvas.code_chunks.pending_focus = None;
         }
     }
+}
+
+fn handle_chunk_drag(app: &mut WordApp, ui: &Ui, layout: &DocLayout, pages: &[PlacedPage]) {
+    let Some(drag_id) = app.canvas.code_chunks.dragging_chunk else {
+        return;
+    };
+    let pointer_pos = ui.input(|i| i.pointer.latest_pos().or_else(|| i.pointer.interact_pos()));
+    let hit_page = pointer_pos.and_then(|pos| {
+        pages.iter().find(|p| p.rect.contains(pos)).map(|p| {
+            let pt = p.to_page(pos);
+            (p, pt.x as f32, pt.y as f32)
+        })
+    });
+    if ui.input(|i| i.pointer.primary_down()) {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+        if let Some((placed, _, py)) = hit_page
+            && let Some(pg) = layout.pages.get(placed.page)
+        {
+            let target_y = drop_preview_y(pg, py);
+            let left = placed.to_screen(Point::new(f64::from(pg.body.x), f64::from(target_y)));
+            let right = placed.to_screen(Point::new(f64::from(pg.body.right()), f64::from(target_y)));
+            let color = ui.visuals().selection.stroke.color;
+            let preview_painter = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("code-chunk-drag-preview")));
+            preview_painter.line_segment([left, right], egui::Stroke::new(2.5, color));
+        }
+        return;
+    }
+    app.canvas.code_chunks.dragging_chunk = None;
+    if let Some((placed, px, py)) = hit_page {
+        let _ = flush_one(app, drag_id);
+        if let Err(err) = app.run("code.move_chunk", json!({ "chunkId": drag_id, "page": placed.page, "x": px, "y": py })) {
+            app.status(err);
+        }
+    }
+}
+
+fn drop_preview_y(pg: &wordcraft_layout::Page, y: f32) -> f32 {
+    let mut best: Option<(f32, f32)> = None;
+    for item in &pg.items {
+        let (top, bottom) = match item {
+            Placed::Lines { story: StoryRef::Body, para, l0, l1, y: ly, .. } => {
+                let h = para
+                    .lines
+                    .get(*l0)
+                    .zip(para.lines.get(l1.saturating_sub(1)))
+                    .map_or(14.0, |(first, last)| (last.top + last.height - first.top).max(4.0));
+                (*ly, *ly + h)
+            }
+            Placed::Cell { story: StoryRef::Body, rect, .. } => (rect.y, rect.bottom()),
+            Placed::Chunk { rect, .. } => (rect.y, rect.bottom()),
+            _ => continue,
+        };
+        let dist = if y < top {
+            top - y
+        } else if y > bottom {
+            y - bottom
+        } else {
+            0.0
+        };
+        let line_y = if y > 0.5 * (top + bottom) { bottom } else { top };
+        if best.is_none_or(|(best_dist, _)| dist < best_dist) {
+            best = Some((dist, line_y));
+        }
+    }
+    best.map_or(y, |(_, line_y)| line_y)
 }
 
 fn chunk_output_stale(app: &mut WordApp, chunk_id: i64) -> bool {
@@ -488,6 +584,7 @@ fn dispatch_chunk_action(app: &mut WordApp, chunk_id: i64, action: CodeChunkActi
             }
             app.run("code.insert_output", json!({ "chunkId": chunk_id, "text": text, "atCaret": true }))
         }
+        CodeChunkAction::Run { .. } => return,
     };
     if let Err(err) = result {
         app.status(err);
