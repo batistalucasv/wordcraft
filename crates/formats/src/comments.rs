@@ -134,7 +134,7 @@ pub fn append(ext: &str, doc: &Document, bytes: Vec<u8>) -> Vec<u8> {
             s.insert_str(at, &html(&notes));
             s.into_bytes()
         }
-        "md" | "markdown" => {
+        "md" | "markdown" | "qmd" | "rmd" => {
             let mut s = bytes;
             s.extend_from_slice(markdown(&notes).as_bytes());
             s
