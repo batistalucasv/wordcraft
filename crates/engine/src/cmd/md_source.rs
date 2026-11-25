@@ -64,15 +64,23 @@ impl MdSource {
     }
 }
 
-/// A Markdown file's own text, which keeps what the document can't (front matter, comments, a
-/// code block's language, the author's own spacing): the text the file was opened or last saved
-/// with, and the last text the view applied. Either stands for the document while reading it
-/// gives the document as it is, so an Undo back to either finds it again.
+/// Which text-file parser checks whether a kept [`FileText`] still stands for the document.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TextFormat {
+    Markdown,
+    Quarto,
+}
+
+/// A Markdown or Quarto file's own text, which keeps what the document can't (front matter,
+/// comments, callouts, shortcodes, attribute lists, a code block's language, the author's own
+/// spacing): the text the file was opened or last saved with, and the last text the view applied.
+/// Either stands for the document while reading it gives the document as it is, so an Undo back
+/// to either finds it again.
 #[derive(Clone, Default)]
 pub struct FileText {
     saved: Option<String>,
     latest: Option<String>,
-    cached_exact: RefCell<Option<(u64, Option<String>)>>,
+    cached_exact: RefCell<Option<(u64, TextFormat, Option<String>)>>,
 }
 
 impl FileText {
@@ -95,27 +103,30 @@ impl FileText {
     }
 }
 
-/// The kept text that stands for the document as it is, if one does: the latest first.
-fn exact_text(s: &Session) -> Option<String> {
-    if let Some((cached_rev, ref res)) = *s.md_file.cached_exact.borrow()
+/// The kept text that stands for the document as it is when read as `format`, if one does: the
+/// latest first.
+fn exact_text(s: &Session, format: TextFormat) -> Option<String> {
+    if let Some((cached_rev, cached_fmt, ref res)) = *s.md_file.cached_exact.borrow()
         && cached_rev == s.rev()
+        && cached_fmt == format
     {
         return res.clone();
     }
     let kept = [s.md_file.latest.as_deref(), s.md_file.saved.as_deref()];
-    let res = kept.into_iter().flatten().find(|text| parse(&s.doc, text).same_content(&s.doc)).map(str::to_string);
-    *s.md_file.cached_exact.borrow_mut() = Some((s.rev(), res.clone()));
+    let res = kept.into_iter().flatten().find(|text| parse_as(&s.doc, text, format).same_content(&s.doc)).map(str::to_string);
+    *s.md_file.cached_exact.borrow_mut() = Some((s.rev(), format, res.clone()));
     res
 }
 
-/// What Save writes to the Markdown file `path`, in place of the document written out again: the
-/// file's own text, while it stands for the document. Not for a Print Markup copy, which adds
-/// the comments.
+/// What Save writes to the Markdown or Quarto file `path`, in place of the document written out
+/// again: the file's own text, while it stands for the document. Not for a Print Markup copy,
+/// which adds the comments.
 pub(crate) fn text_to_save(s: &Session, path: &std::path::Path, markup: bool) -> Option<String> {
-    if markup || !is_markdown_file(path) {
+    if markup {
         return None;
     }
-    exact_text(s)
+    let format = text_format(path)?;
+    exact_text(s, format)
 }
 
 /// Command specifications for Markdown Source view toggling and text inspection.
@@ -139,16 +150,34 @@ pub fn is_markdown_file(path: &std::path::Path) -> bool {
     path.extension().and_then(std::ffi::OsStr::to_str).is_some_and(|e| e.eq_ignore_ascii_case("md") || e.eq_ignore_ascii_case("markdown"))
 }
 
+/// Whether a file's name says it is Quarto or R Markdown.
+pub fn is_quarto_file(path: &std::path::Path) -> bool {
+    path.extension().and_then(std::ffi::OsStr::to_str).is_some_and(|e| e.eq_ignore_ascii_case("qmd") || e.eq_ignore_ascii_case("rmd"))
+}
+
+/// Whether a file keeps its own source text beside the document while unedited.
+pub fn keeps_file_text(path: &std::path::Path) -> bool {
+    text_format(path).is_some()
+}
+
+fn text_format(path: &std::path::Path) -> Option<TextFormat> {
+    if is_markdown_file(path) {
+        Some(TextFormat::Markdown)
+    } else if is_quarto_file(path) {
+        Some(TextFormat::Quarto)
+    } else {
+        None
+    }
+}
+
 /// Whether the current session's path points to a Markdown file.
 fn is_markdown_path(s: &Session) -> bool {
     s.path.as_deref().is_some_and(is_markdown_file)
 }
 
-/// Checks whether the Markdown Source view can currently be toggled in `s`.
-fn can_toggle(s: &Session) -> Option<&'static str> {
-    if s.md_source.is_some() {
-        None
-    } else if !is_markdown_path(s) {
+/// Checks whether the Markdown Source view can currently be entered in `s`.
+fn can_enter(s: &Session) -> Option<&'static str> {
+    if !is_markdown_path(s) {
         Some("only for Markdown (.md) files")
     } else if s.view.read_mode {
         Some("not in Read Mode")
@@ -158,6 +187,26 @@ fn can_toggle(s: &Session) -> Option<&'static str> {
         Some("not in a protected document")
     } else {
         None
+    }
+}
+
+/// Checks whether the Markdown Source view can currently be toggled in `s`.
+fn can_toggle(s: &Session) -> Option<&'static str> {
+    if s.md_source.is_some() { None } else { can_enter(s) }
+}
+
+/// Closes Markdown Source view if the session can no longer enter it (for example, after Save As
+/// transfers ownership to a non-Markdown path such as `.qmd` or `.docx`).
+pub(crate) fn close_if_ineligible(s: &mut Session) {
+    if s.md_source.is_none() || can_enter(s).is_none() {
+        return;
+    }
+    apply(s);
+    if let Some(src) = s.md_source.take()
+        && (src.has_step || src.text != *src.entry_text)
+    {
+        let block = block_of_caret(&src.text, src.caret, &s.doc, &src.block_lines);
+        s.sel = Selection::caret(block);
     }
 }
 
@@ -214,7 +263,7 @@ fn too_long() -> String {
 /// Enters Markdown Source view, preparing source text and mapping caret position.
 fn enter(s: &mut Session) -> Result<(), CmdError> {
     // The file's own text when it still says what the document holds, so nothing is lost.
-    let (text, loses_content, block_lines) = match exact_text(s) {
+    let (text, loses_content, block_lines) = match exact_text(s, TextFormat::Markdown) {
         Some(text) => {
             let (_, lines) = parse_with_lines(&s.doc, &text);
             (text, false, lines)
@@ -302,7 +351,7 @@ pub fn apply(s: &mut Session) {
     s.touch();
     s.clamp_selection();
     s.md_file.latest = Some(text.clone());
-    *s.md_file.cached_exact.borrow_mut() = Some((s.rev(), Some(text.clone())));
+    *s.md_file.cached_exact.borrow_mut() = Some((s.rev(), TextFormat::Markdown, Some(text.clone())));
     if let Some(src) = s.md_source.as_mut() {
         src.applied = Arc::from(text.as_str());
         src.block_lines = lines;
@@ -311,21 +360,33 @@ pub fn apply(s: &mut Session) {
     }
 }
 
-/// `text` as a document and block lines, with what isn't in Markdown from `current`: its page, settings,
-/// properties and language, as opening the file gave it.
-fn parse_with_lines(current: &Document, text: &str) -> (Document, Vec<usize>) {
-    let (mut doc, lines) = wordcraft_formats::markdown::import_on_with_lines(text, &current.last_section);
+/// Copies page-independent document metadata from `current` onto a freshly imported `doc`.
+fn copy_doc_metadata(current: &Document, doc: &mut Document) {
     doc.ensure_nonempty();
     doc.settings = current.settings.clone();
     doc.core = current.core.clone();
     Arc::make_mut(&mut doc.styles).default_chr.lang = current.styles.default_chr.lang.clone();
+}
+
+/// `text` as a document and block lines, with what isn't in Markdown from `current`: its page, settings,
+/// properties and language, as opening the file gave it.
+fn parse_with_lines(current: &Document, text: &str) -> (Document, Vec<usize>) {
+    let (mut doc, lines) = wordcraft_formats::markdown::import_on_with_lines(text, &current.last_section);
+    copy_doc_metadata(current, &mut doc);
     (doc, lines)
 }
 
-/// `text` as a document, with what isn't in Markdown from `current`: its page, settings,
+/// `text` as a document read by the parser for `format`, with `current`'s page, settings,
 /// properties and language, as opening the file gave it.
-fn parse(current: &Document, text: &str) -> Document {
-    parse_with_lines(current, text).0
+fn parse_as(current: &Document, text: &str, format: TextFormat) -> Document {
+    match format {
+        TextFormat::Markdown => parse_with_lines(current, text).0,
+        TextFormat::Quarto => {
+            let mut doc = wordcraft_formats::quarto::import_on(text, &current.last_section);
+            copy_doc_metadata(current, &mut doc);
+            doc
+        }
+    }
 }
 
 /// The byte offset where `line` starts, or the end of a text with fewer lines.
@@ -893,5 +954,173 @@ mod tests {
         let s = session(SAMPLE);
         let spec = s.registry.get(TEXT).unwrap();
         assert!(spec.mutates, "view.markdownSourceText mutates session and dirty state");
+    }
+
+    struct ScratchDir(PathBuf);
+
+    impl ScratchDir {
+        fn new(tag: &str) -> Self {
+            let dir = unique_temp_dir(tag);
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+    }
+
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    const QUARTO_OWN: &str = "---\ntitle: \"Quarto Article\"\nformat: html\n---\n\n::: {.callout-note}\nTexto do aviso com **negrito**.\n:::\n\nVeja {{< video https://example.com/x.mp4 >}} e o [link](https://a.b){.external}.\n\n```{r}\n#| label: fig-plot\n#| echo: false\nx <- 1 + 1\n```\n";
+
+    #[test]
+    fn quarto_file_saved_without_edits_is_byte_identical_and_keeps_source_view_disabled() {
+        let bom_qmd = [b"\xEF\xBB\xBF".as_slice(), QUARTO_OWN.as_bytes()].concat();
+        let cases: [(&str, &str, Vec<u8>); 4] = [
+            ("qmd-plain", "article.qmd", QUARTO_OWN.as_bytes().to_vec()),
+            ("rmd-plain", "article.Rmd", QUARTO_OWN.as_bytes().to_vec()),
+            ("qmd-crlf", "article.qmd", QUARTO_OWN.replace('\n', "\r\n").into_bytes()),
+            ("qmd-bom", "article.qmd", bom_qmd),
+        ];
+
+        for (tag, filename, bytes) in cases {
+            let dir = ScratchDir::new(tag);
+            let path = dir.0.join(filename);
+            std::fs::write(&path, &bytes).unwrap();
+            let mut s = Session::new(Document::from_text(""));
+            s.run("file.open", &json!({"path": path.to_string_lossy()})).unwrap();
+            assert!(!s.md_file.is_empty(), "{tag}: Quarto file text must be kept");
+            assert!(
+                matches!(s.run(TOGGLE, &json!({})), Err(CmdError::Disabled(_))),
+                "{tag}: Markdown Source view must stay disabled for Quarto files"
+            );
+
+            let r1 = save(&mut s);
+            assert_eq!(r1["rewritten"], false, "{tag}: first unedited save must not rewrite");
+            assert_eq!(std::fs::read(&path).unwrap(), bytes, "{tag}: first save must be byte-identical");
+
+            let r2 = save(&mut s);
+            assert_eq!(r2["rewritten"], false, "{tag}: second unedited save must not rewrite");
+            assert_eq!(std::fs::read(&path).unwrap(), bytes, "{tag}: second save must remain byte-identical");
+        }
+    }
+
+    #[test]
+    fn quarto_file_opened_from_handed_over_bytes_saves_byte_identical() {
+        let dir = ScratchDir::new("qmd-handed");
+        let path = dir.0.join("handed.qmd");
+        std::fs::write(&path, b"stale content").unwrap();
+        let mut s = Session::new(Document::from_text(""));
+        let data = crate::cmd::insert::base64_encode(QUARTO_OWN.as_bytes());
+        s.run("file.open", &json!({"path": path.to_string_lossy(), "data": data})).unwrap();
+        assert_eq!(save(&mut s)["rewritten"], false);
+        assert_eq!(std::fs::read(&path).unwrap(), QUARTO_OWN.as_bytes());
+    }
+
+    #[test]
+    fn quarto_edited_rewrites_once_and_undo_restores_exact_save_and_md_copy_does_not_leak_cache() {
+        let dir = ScratchDir::new("qmd-edit");
+        let qmd_path = dir.0.join("article.qmd");
+        let md_copy_path = dir.0.join("copy.md");
+        std::fs::write(&qmd_path, QUARTO_OWN.as_bytes()).unwrap();
+
+        let mut s = Session::new(Document::from_text(""));
+        s.run("file.open", &json!({"path": qmd_path.to_string_lossy()})).unwrap();
+
+        // Saving a copy as .md at the same revision must not dump raw Quarto front matter/chunks
+        // nor poison the exact-match cache for the subsequent .qmd save.
+        s.run("file.saveAs", &json!({"path": md_copy_path.to_string_lossy()})).unwrap();
+        let md_copy = std::fs::read_to_string(&md_copy_path).unwrap();
+        assert!(!md_copy.starts_with("---\ntitle:"), ".md export must not emit raw Quarto front matter: {md_copy}");
+        assert_eq!(s.path.as_deref(), Some(qmd_path.as_path()), ".qmd to .md remains a copy");
+
+        assert_eq!(save(&mut s)["rewritten"], false, "subsequent .qmd save still uses Quarto cache");
+        assert_eq!(std::fs::read(&qmd_path).unwrap(), QUARTO_OWN.as_bytes());
+
+        // Formatted edit -> undo -> restores byte-identical save.
+        s.run("text.insert", &json!({"text": "New "})).unwrap();
+        s.run("edit.undo", &json!({})).unwrap();
+        assert_eq!(save(&mut s)["rewritten"], false);
+        assert_eq!(std::fs::read(&qmd_path).unwrap(), QUARTO_OWN.as_bytes());
+
+        // Formatted edit kept -> writes out Quarto once with rewritten=true, then rewritten=false.
+        s.run("text.insert", &json!({"text": "Edited "})).unwrap();
+        assert_eq!(save(&mut s)["rewritten"], true);
+        let written = std::fs::read_to_string(&qmd_path).unwrap();
+        assert!(written.contains("Edited "), "{written}");
+        assert!(written.contains("```{r}"), "chunks survive formatted save: {written}");
+        assert!(written.contains("#| label: fig-plot"), "{written}");
+
+        s.run("text.insert", &json!({"text": "Again "})).unwrap();
+        assert_eq!(save(&mut s)["rewritten"], false, "warned once for Quarto as for Markdown");
+    }
+
+    #[test]
+    fn save_as_to_non_markdown_closes_source_view_only_when_ownership_transfers() {
+        for (tag, dest_name) in [("to-qmd", "moved.qmd"), ("to-rmd", "moved.Rmd"), ("to-docx", "moved.docx")] {
+            let dir = ScratchDir::new(&format!("save-as-close-{tag}"));
+            let md_path = dir.0.join("notes.md");
+            let dest_path = dir.0.join(dest_name);
+            std::fs::write(&md_path, SAMPLE.as_bytes()).unwrap();
+
+            let mut s = Session::new(Document::from_text(""));
+            s.run("file.open", &json!({"path": md_path.to_string_lossy()})).unwrap();
+            let before = s.doc.clone();
+            let depth = s.undo_depth();
+
+            s.run(TOGGLE, &json!({})).unwrap();
+            assert!(s.md_source.is_some(), "{tag}: Markdown Source opened");
+            set_text(&mut s, "# Moved Heading\n\nUpdated paragraph.\n");
+
+            s.run("file.saveAs", &json!({"path": dest_path.to_string_lossy()})).unwrap();
+            assert_eq!(s.path.as_deref(), Some(dest_path.as_path()), "{tag}: ownership moved to destination");
+            assert!(!s.dirty, "{tag}: saved");
+            assert!(s.md_source.is_none(), "{tag}: Markdown Source must close after moving to a non-Markdown path");
+            assert!(
+                matches!(s.run(TOGGLE, &json!({})), Err(CmdError::Disabled(_))),
+                "{tag}: Markdown Source must stay disabled on the new non-Markdown path"
+            );
+            assert!(
+                matches!(s.run(TEXT, &json!({"text": "# Still open?\n"})), Err(CmdError::Disabled(_))),
+                "{tag}: markdownSourceText must be disabled after closing"
+            );
+            assert!(body_text(&s).contains("Moved Heading"), "{tag}: pending source edits were applied");
+
+            // Normal editing works immediately and undo reverts the source visit cleanly.
+            s.run("text.insert", &json!({"text": "Prefix "})).unwrap();
+            assert!(body_text(&s).contains("Prefix "));
+            s.run("edit.undo", &json!({})).unwrap();
+            assert_eq!(s.undo_depth(), depth + 1, "{tag}: source visit kept as a single undo step");
+            s.run("edit.undo", &json!({})).unwrap();
+            assert!(s.doc.same_content(&before), "{tag}: undoing source visit restores original document");
+        }
+
+        // Saving to a non-ownership format (`.txt`, `.html`) keeps ownership on the `.md` file and
+        // leaves Markdown Source open.
+        let dir = ScratchDir::new("save-as-copy-keeps-source");
+        let md_path = dir.0.join("notes.md");
+        std::fs::write(&md_path, SAMPLE.as_bytes()).unwrap();
+        let mut s = Session::new(Document::from_text(""));
+        s.run("file.open", &json!({"path": md_path.to_string_lossy()})).unwrap();
+        s.run(TOGGLE, &json!({})).unwrap();
+        set_text(&mut s, "# Still Markdown\n");
+
+        for (name, params) in [
+            ("txt-copy", json!({"path": dir.0.join("copy.txt").to_string_lossy()})),
+            ("html-copy", json!({"path": dir.0.join("copy.html").to_string_lossy()})),
+        ] {
+            s.run("file.saveAs", &params).unwrap();
+            assert_eq!(s.path.as_deref(), Some(md_path.as_path()), "{name}: ownership stayed on .md");
+            assert!(s.md_source.is_some(), "{name}: Markdown Source must stay open for copy saves");
+        }
+
+        // Moving to another `.md` path transfers ownership and keeps Markdown Source open.
+        let other_md = dir.0.join("other.md");
+        s.run("file.saveAs", &json!({"path": other_md.to_string_lossy()})).unwrap();
+        assert_eq!(s.path.as_deref(), Some(other_md.as_path()));
+        assert!(!s.dirty);
+        assert!(s.md_source.is_some(), "Save As to another .md path keeps Markdown Source open");
     }
 }
