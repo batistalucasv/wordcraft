@@ -138,7 +138,9 @@ impl PageBuilder<'_> {
         pg.items
             .iter()
             .skip(self.page_items_start)
-            .filter(|it| matches!(it, Placed::Lines { story: StoryRef::Body, .. } | Placed::Cell { story: StoryRef::Body, .. }))
+            .filter(|it| {
+                matches!(it, Placed::Lines { story: StoryRef::Body, .. } | Placed::Cell { story: StoryRef::Body, .. } | Placed::Chunk { .. })
+            })
             .map(|it| v_span(it).1)
             .fold(self.top, f32::max)
     }
@@ -472,6 +474,7 @@ fn text_extent(items: &[Placed], first_block: usize) -> Option<(f32, f32)> {
                 Some((*y, item_bottom(*y, para, *l0, *l1)?))
             }
             Placed::Cell { story: StoryRef::Body, table, rect, .. } if ours(table) => Some((rect.y, rect.bottom())),
+            Placed::Chunk { rect, first, .. } if *first >= first_block => Some((rect.y, rect.bottom())),
             _ => None,
         })
         .filter(|(t, b)| t.is_finite() && b.is_finite())

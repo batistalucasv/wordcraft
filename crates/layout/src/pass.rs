@@ -388,6 +388,58 @@ fn prepare_section_end(pb: &mut PageBuilder, sections: &[(usize, &SectionProps)]
     balance
 }
 
+fn mounted_chunks(doc: &Document, heights: &std::collections::BTreeMap<i64, u32>) -> HashMap<usize, (i64, usize, f32)> {
+    let mut map = HashMap::new();
+    if heights.is_empty() || !doc.has_chunks(StoryRef::Body) {
+        return map;
+    }
+    for bounds in doc.chunk_bounds(StoryRef::Body) {
+        let Some(id) = bounds.id else { continue };
+        let Some(&centipts) = heights.get(&id) else { continue };
+        if bounds.start.path.0.len() != 1 || bounds.end.path.0.len() != 1 {
+            continue;
+        }
+        let first = bounds.start.path.last();
+        let last = bounds.end.path.last();
+        if last >= first && last < doc.body.len() {
+            let h = (centipts as f32 / 100.0).clamp(24.0, 20_000.0);
+            map.insert(first, (id, last, h));
+        }
+    }
+    map
+}
+
+fn place_chunk(ctx: &mut Ctx, pb: &mut PageBuilder, id: i64, first: usize, last: usize, h: f32, body_top: f32) {
+    pb.prev = None;
+    if ctx.doc.body.get(first).and_then(|b| b.as_para()).is_some_and(|p| ctx.doc.styles.resolve_para(&p.props).page_break_before) && !pb.at_top() {
+        pb.new_page(first, body_top);
+        ctx.fields.page = pb.number;
+    }
+    let mut top_gap = if pb.at_top() { 0.0 } else { 4.0 };
+    while (!pb.fresh() || pb.balance.is_some_and(|(pg, _)| pb.pages.len() <= pg + 1)) && pb.y + top_gap + h > pb.bottom + 0.5 {
+        pb.advance(first, body_top);
+        ctx.fields.page = pb.number;
+        top_gap = 0.0;
+        if pb.balance.is_some_and(|(pg, _)| pb.pages.len() > pg + 1) {
+            break;
+        }
+    }
+    let y = pb.y + top_gap;
+    let placed_h = if pb.balance.is_some() {
+        h
+    } else {
+        let max_h = (pb.bottom - y).max(24.0);
+        h.min(max_h)
+    };
+    let rect = wordcraft_geom::Rect::new(pb.col_x(), y, pb.col_w(), placed_h);
+    if let Some(pg) = pb.page() {
+        pg.items.push(Placed::Chunk { id, rect, first, last });
+    }
+    pb.after_break_mark = false;
+    pb.y = y + placed_h + 6.0;
+    pb.content_bottom = pb.content_bottom.max(y + placed_h);
+}
+
 fn place_block(ctx: &mut Ctx, pb: &mut PageBuilder, outline: &Option<OutlinePass>, block: usize, body_top: f32) {
     let Some(b) = ctx.doc.body.get(block) else { return };
     match (&**b, outline) {
@@ -395,6 +447,29 @@ fn place_block(ctx: &mut Ctx, pb: &mut PageBuilder, outline: &Option<OutlinePass
         (Block::Table(_), Some(o)) if o.hidden.get(block).copied().unwrap_or(false) => {}
         (Block::Para(p), None) => place_para(ctx, pb, p, block, body_top),
         (Block::Table(t), _) => place_table(ctx, pb, t, block, body_top),
+    }
+}
+
+/// Place a mounted chunk spanning `block..end` when present, or the ordinary block at `block`.
+/// Returns the next block index, or `None` when `block` is past the end of `doc.body`.
+fn place_block_or_chunk(
+    ctx: &mut Ctx,
+    pb: &mut PageBuilder,
+    outline: &Option<OutlinePass>,
+    (block, end): (usize, usize),
+    body_top: f32,
+    chunks: &HashMap<usize, (i64, usize, f32)>,
+) -> Option<usize> {
+    ctx.doc.body.get(block)?;
+    if outline.is_none()
+        && let Some(&(id, chunk_last, h)) = chunks.get(&block)
+        && chunk_last < end
+    {
+        place_chunk(ctx, pb, id, block, chunk_last, h, body_top);
+        Some(chunk_last + 1)
+    } else {
+        place_block(ctx, pb, outline, block, body_top);
+        Some(block + 1)
     }
 }
 
@@ -406,20 +481,24 @@ fn place_section_blocks<'p>(
     outline: &Option<OutlinePass>,
     (mut block, last): (usize, usize),
     (balance, body_top): (bool, f32),
+    chunks: &HashMap<usize, (i64, usize, f32)>,
 ) -> (usize, usize) {
+    let end = last.saturating_add(1);
     let mut from = balance.then(|| (block, Snap::take(pb, ctx)));
-    while block <= last && ctx.doc.body.get(block).is_some() {
+    while block <= last {
         let before = balance.then(|| (pb.pages.len(), Snap::take(pb, ctx)));
         pb.mark_block();
-        place_block(ctx, pb, outline, block, body_top);
+        let Some(next) = place_block_or_chunk(ctx, pb, outline, (block, end), body_top, chunks) else {
+            break;
+        };
         if let Some((pages, snap)) = before
             && pb.pages.len() != pages
         {
             from = Some((block, snap));
         }
-        block += 1;
+        block = next;
     }
-    let discarded = from.map_or(0, |(first, snap)| balance_columns(ctx, pb, (first, block), &snap, body_top));
+    let discarded = from.map_or(0, |(first, snap)| balance_columns(ctx, pb, (first, block), &snap, body_top, chunks));
     (block, discarded)
 }
 
@@ -471,7 +550,11 @@ fn fit_web_page(pages: &mut [Page]) {
     let bottom = p
         .items
         .iter()
-        .filter_map(|it| if let Placed::Lines { y, para, l0, l1, .. } = it { item_bottom(*y, para, *l0, *l1) } else { None })
+        .filter_map(|it| match it {
+            Placed::Lines { y, para, l0, l1, .. } => item_bottom(*y, para, *l0, *l1),
+            Placed::Chunk { rect, .. } => Some(rect.bottom()),
+            _ => None,
+        })
         .fold(0.0f32, f32::max);
     p.h = bottom + 36.0;
 }
@@ -554,6 +637,7 @@ pub(crate) fn layout_pass(
 ) -> Pass {
     reset_cache(doc, cache, opts);
     let mut ctx = new_ctx(doc, cache, opts, (note_pages, marks, totals));
+    let chunks = mounted_chunks(doc, &opts.chunk_heights);
     let hf = Arc::clone(&ctx.hf);
     let sections = &hf.sections;
     let mode = Mode::of(opts.view);
@@ -606,7 +690,7 @@ pub(crate) fn layout_pass(
         pb.foot_top = sec.tops.foot;
         let last = (*end).min(doc.body.len().saturating_sub(1));
         let balance = prepare_section_end(&mut pb, sections, (si, mode.web));
-        let (next, discarded) = place_section_blocks(&mut ctx, &mut pb, &outline, (block, last), (balance, sec.tops.body));
+        let (next, discarded) = place_section_blocks(&mut ctx, &mut pb, &outline, (block, last), (balance, sec.tops.body), &chunks);
         (block, boxes_discarded) = (next, boxes_discarded + discarded);
         section_endnotes(&mut ctx, &mut pb, &mut endnotes, (sect, si, block));
     }
@@ -706,18 +790,19 @@ fn balance_pass<'a>(
     (first, end): (usize, usize),
     (page, top, h): (usize, f32, f32),
     body_top: f32,
+    chunks: &HashMap<usize, (i64, usize, f32)>,
 ) -> bool {
     let relaxed = pb.relaxed;
     snap.restore(pb, ctx);
     pb.relaxed = relaxed;
     pb.balance = Some((page, h));
     pb.cap_columns();
-    for block in first..end {
-        match ctx.doc.body.get(block).map(|b| &**b) {
-            Some(Block::Para(p)) => place_para(ctx, pb, p, block, body_top),
-            Some(Block::Table(t)) => place_table(ctx, pb, t, block, body_top),
-            None => break,
-        }
+    let mut block = first;
+    while block < end {
+        let Some(next) = place_block_or_chunk(ctx, pb, &None, (block, end), body_top, chunks) else {
+            break;
+        };
+        block = next;
         // Spilled onto another page: too short (and no need to lay out the rest).
         if pb.pages.len() > page + 1 {
             break;
@@ -726,6 +811,30 @@ fn balance_pass<'a>(
     pb.balance = None;
     pb.cap_columns();
     pb.pages.len() == page + 1 && pb.content_bottom <= top + h + 0.5
+}
+
+/// Lay out `first..end` again from `snap` with ordinary (unbalanced) column heights.
+/// Used when even a full-height balancing pass cannot fit every block on `page` (for example,
+/// an oversized chunk that ordinary placement clamps to the column height).
+fn replay_unbalanced<'a>(
+    ctx: &mut Ctx,
+    pb: &mut PageBuilder<'a>,
+    snap: &Snap<'a>,
+    (first, end): (usize, usize),
+    body_top: f32,
+    chunks: &HashMap<usize, (i64, usize, f32)>,
+) {
+    snap.restore(pb, ctx);
+    pb.balance = None;
+    pb.cap_columns();
+    let mut block = first;
+    while block < end {
+        pb.mark_block();
+        let Some(next) = place_block_or_chunk(ctx, pb, &None, (block, end), body_top, chunks) else {
+            break;
+        };
+        block = next;
+    }
 }
 
 /// Balancing lays out at most this many pages again per pass (a block reaching the last page
@@ -743,7 +852,14 @@ const BALANCE_PASSES: usize = 12;
 /// apply as usual, so the columns may come out a little uneven. Not balanced: a page with an
 /// explicit column break, which says where the columns end. Returns the text boxes laid out in the
 /// passes thrown away.
-fn balance_columns<'a>(ctx: &mut Ctx, pb: &mut PageBuilder<'a>, blocks: (usize, usize), snap: &Snap<'a>, body_top: f32) -> usize {
+fn balance_columns<'a>(
+    ctx: &mut Ctx,
+    pb: &mut PageBuilder<'a>,
+    blocks: (usize, usize),
+    snap: &Snap<'a>,
+    body_top: f32,
+    chunks: &HashMap<usize, (i64, usize, f32)>,
+) -> usize {
     let page = pb.pages.len().saturating_sub(1);
     let ncols = pb.cols.len().max(1) as f32;
     let top = pb.top;
@@ -758,7 +874,7 @@ fn balance_columns<'a>(ctx: &mut Ctx, pb: &mut PageBuilder<'a>, blocks: (usize, 
     {
         return 0;
     }
-    let pass = |ctx: &mut Ctx, pb: &mut PageBuilder<'a>, h: f32| balance_pass(ctx, pb, snap, blocks, (page, top, h), body_top);
+    let pass = |ctx: &mut Ctx, pb: &mut PageBuilder<'a>, h: f32| balance_pass(ctx, pb, snap, blocks, (page, top, h), body_top, chunks);
     // The text on the page fills `ncols` columns at least `used / ncols` high; the original layout
     // (`full`) fits, and so, nearly always, do columns as high as its tallest one.
     let mut lo = (used / ncols - 1.0).max(0.0);
@@ -805,8 +921,14 @@ fn balance_columns<'a>(ctx: &mut Ctx, pb: &mut PageBuilder<'a>, blocks: (usize, 
     if !fits {
         thrown = discard(ctx);
         pb.relaxed = true;
-        pass(ctx, pb, full);
+        fits = pass(ctx, pb, full);
         pb.relaxed = false;
+    }
+    // If even the relaxed full-column pass spills in balance mode (e.g. an oversized chunk that
+    // ordinary placement clamps), replay the unbalanced pass so no trailing blocks are dropped.
+    if !fits {
+        thrown = discard(ctx);
+        replay_unbalanced(ctx, pb, snap, blocks, body_top, chunks);
     }
     thrown
 }

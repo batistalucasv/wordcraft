@@ -16388,3 +16388,274 @@ fn header_text_covers_the_whole_band_of_centred_and_right_lines() {
         assert!(hit(x + left - 60.0), "{align:?}: beyond 40pt left of the band the picture is hit");
     }
 }
+
+#[test]
+fn chunk_heights_reserve_vertical_space_and_push_following_blocks() {
+    use wordcraft_doc::{CodeChunk, Document, InlineObject, Table};
+
+    let mut d = Document::from_text("before");
+    d.last_section.page_h = 792.0;
+    d.last_section.margin_top = 72.0;
+    d.last_section.margin_bottom = 72.0;
+    let id = d.push_chunk(&CodeChunk::new("r", "x <- 1")).unwrap();
+    d.body.push(wordcraft_doc::para_block(wordcraft_doc::Paragraph::with_text("after", Default::default())));
+
+    // Without UI chunk heights, headless/PDF layout emits ordinary Placed::Lines for the chunk.
+    let headless = lay(&d);
+    assert!(!headless.pages[0].items.iter().any(|it| matches!(it, Placed::Chunk { .. })));
+    assert!(
+        headless.pages[0].items.iter().any(|it| matches!(it, Placed::Lines { path, .. } if path.0 == [1])),
+        "headless layout must render the chunk source block as Placed::Lines"
+    );
+
+    // With chunk_heights populated, layout emits Placed::Chunk and pushes "after" down.
+    let mut small_opts = LayoutOptions::default();
+    small_opts.chunk_heights.insert(id, 10_000); // 100.0 pt
+    let small = layout(&d, &mut LayoutCache::new(), &small_opts);
+    let chunk_rect_small = small.pages[0]
+        .items
+        .iter()
+        .find_map(|it| match it {
+            Placed::Chunk { id: cid, rect, .. } if *cid == id => Some(*rect),
+            _ => None,
+        })
+        .expect("mounted chunk item");
+    assert!((chunk_rect_small.h - 100.0).abs() < 0.01);
+
+    let after_y_small = small.pages[0]
+        .items
+        .iter()
+        .find_map(|it| match it {
+            Placed::Lines { path, y, .. } if path.0 == [2] => Some(*y),
+            _ => None,
+        })
+        .expect("after paragraph line");
+    assert!(after_y_small >= chunk_rect_small.bottom());
+
+    // Growing chunk height pushes "after" onto a later page.
+    let mut big_opts = LayoutOptions::default();
+    big_opts.chunk_heights.insert(id, 64_000); // 640.0 pt of 648.0 pt printable height
+    let big = layout(&d, &mut LayoutCache::new(), &big_opts);
+    let chunk_page = big
+        .pages
+        .iter()
+        .position(|p| p.items.iter().any(|it| matches!(it, Placed::Chunk { id: cid, .. } if *cid == id)))
+        .expect("tall chunk should be placed");
+    let after_page = big
+        .pages
+        .iter()
+        .position(|p| p.items.iter().any(|it| matches!(it, Placed::Lines { path, .. } if path.0 == [2])))
+        .expect("after paragraph should be placed");
+    assert!(after_page > chunk_page, "tall chunk on page {chunk_page} must push after paragraph to a later page (got {after_page})");
+
+    // Nested table-cell chunks must not be mounted into top-level body blocks.
+    let mut td = Document::from_text("body intro");
+    let cell_blocks = td.chunk_blocks(&CodeChunk::new("r", "nested <- 1")).unwrap();
+    let nested_id = match &*cell_blocks[0] {
+        wordcraft_doc::Block::Para(p) => match &p.objects[0] {
+            InlineObject::ControlStart { control } => control.id.unwrap(),
+            _ => panic!("expected control start"),
+        },
+        _ => panic!("expected para"),
+    };
+    let mut tbl = Table::new(1, 1, 200.0);
+    tbl.rows[0].cells[0].blocks = cell_blocks;
+    td.body.push(std::sync::Arc::new(wordcraft_doc::Block::Table(tbl)));
+    let mut nested_opts = LayoutOptions::default();
+    nested_opts.chunk_heights.insert(nested_id, 10_000);
+    let nested_layout = layout(&td, &mut LayoutCache::new(), &nested_opts);
+    assert!(
+        !nested_layout.pages.iter().flat_map(|p| &p.items).any(|it| matches!(it, Placed::Chunk { .. })),
+        "table-cell chunk must never mount as a top-level Placed::Chunk"
+    );
+    assert!(
+        nested_layout.pages[0].items.iter().any(|it| matches!(it, Placed::Lines { path, .. } if path.0 == [0])),
+        "top-level block 0 must stay intact"
+    );
+
+    // Stale chunk_heights on a chunkless document short-circuits without placing Placed::Chunk.
+    let plain = Document::from_text("plain paragraph");
+    let mut stale_opts = LayoutOptions::default();
+    stale_opts.chunk_heights.insert(999, 10_000);
+    let plain_layout = layout(&plain, &mut LayoutCache::new(), &stale_opts);
+    assert!(!plain_layout.pages.iter().flat_map(|p| &p.items).any(|it| matches!(it, Placed::Chunk { .. })));
+    assert!(plain_layout.pages[0].items.iter().any(|it| matches!(it, Placed::Lines { path, .. } if path.0 == [0])));
+}
+
+#[test]
+fn mounted_chunk_clears_contextual_spacing_and_rechecks_short_columns() {
+    use wordcraft_doc::section::{Columns, SectionStart};
+    use wordcraft_doc::{CodeChunk, Document, Paragraph, SectionProps, para_block};
+
+    // 1. Contextual spacing above a chunk must not consume space_after from the paragraph above
+    //    and make the paragraph below overlap the mounted chunk.
+    let mut d = Document::new();
+    let mut p_above = Paragraph::with_text("Above", Default::default());
+    p_above.props.space_after = Some(40.0);
+    p_above.props.contextual_spacing = Some(true);
+    let mut p_below = Paragraph::with_text("Below", Default::default());
+    p_below.props.contextual_spacing = Some(true);
+    d.body = vec![para_block(p_above)];
+    let cid = d.push_chunk(&CodeChunk::new("r", "x <- 1")).unwrap();
+    d.body.push(para_block(p_below));
+
+    let mut opts = LayoutOptions::default();
+    opts.chunk_heights.insert(cid, 6_000); // 60 pt
+    let laid = layout(&d, &mut LayoutCache::new(), &opts);
+    let chunk_rect = laid.pages[0]
+        .items
+        .iter()
+        .find_map(|it| match it {
+            Placed::Chunk { id, rect, .. } if *id == cid => Some(*rect),
+            _ => None,
+        })
+        .expect("mounted chunk");
+    let below_y = laid.pages[0]
+        .items
+        .iter()
+        .find_map(|it| match it {
+            Placed::Lines { path, y, .. } if path.0 == [2] => Some(*y),
+            _ => None,
+        })
+        .expect("below paragraph");
+    assert!(
+        below_y >= chunk_rect.bottom() - 0.1,
+        "paragraph below chunk ({below_y}) must not overlap chunk bottom ({}) via stale contextual spacing",
+        chunk_rect.bottom()
+    );
+
+    // 2. In a mid-page continuous 2-column section where neither shortened column can hold the
+    //    chunk, advancing from column 0 to column 1 must recheck available space and move the
+    //    chunk onto page 2 instead of overflowing past the bottom margin.
+    let mut cols_doc = Document::new();
+    let mut s1_paras = Vec::new();
+    for i in 0..30 {
+        let mut p = Paragraph::with_text(&format!("Lead {i}"), Default::default());
+        p.props.space_after = Some(6.0);
+        if i == 29 {
+            let s1 = SectionProps { page_h: 792.0, margin_top: 72.0, margin_bottom: 72.0, ..Default::default() };
+            p.section = Some(Box::new(s1));
+        }
+        s1_paras.push(para_block(p));
+    }
+    cols_doc.body = s1_paras;
+    let tall_id = cols_doc.push_chunk(&CodeChunk::new("python", "plot(1)")).unwrap();
+    cols_doc.last_section.page_h = 792.0;
+    cols_doc.last_section.margin_top = 72.0;
+    cols_doc.last_section.margin_bottom = 72.0;
+    cols_doc.last_section.start = SectionStart::Continuous;
+    cols_doc.last_section.columns = Columns { count: 2, space: 24.0, separator: false, widths: Vec::new() };
+
+    let mut tall_opts = LayoutOptions::default();
+    tall_opts.chunk_heights.insert(tall_id, 30_000); // 300 pt
+    let cols_laid = layout(&cols_doc, &mut LayoutCache::new(), &tall_opts);
+    let (chunk_page, chunk_rect) = cols_laid
+        .pages
+        .iter()
+        .enumerate()
+        .find_map(|(pi, page)| {
+            page.items.iter().find_map(|it| match it {
+                Placed::Chunk { id, rect, .. } if *id == tall_id => Some((pi, *rect)),
+                _ => None,
+            })
+        })
+        .expect("tall chunk placed");
+    assert_eq!(chunk_page, 1, "chunk too tall for shortened continuous columns must move to page 2");
+    assert!(
+        chunk_rect.bottom() <= cols_laid.pages[chunk_page].body.bottom() + 0.5,
+        "placed chunk ({}) must stay inside page body bottom ({})",
+        chunk_rect.bottom(),
+        cols_laid.pages[chunk_page].body.bottom()
+    );
+}
+
+#[test]
+fn oversized_chunk_taller_than_page_clamped_to_page_height_without_endless_advance() {
+    let mut doc = Document::new();
+    let id = doc.push_chunk(&wordcraft_doc::CodeChunk::new("python", "x = 1")).unwrap();
+    let mut opts = LayoutOptions::default();
+    // 100,000 centipts = 1000 pt, which exceeds standard letter page height (792 pt).
+    opts.chunk_heights.insert(id, 100_000);
+    let laid = layout(&doc, &mut LayoutCache::new(), &opts);
+    assert!(!laid.pages.is_empty(), "layout must terminate with pages");
+    let (chunk_page, chunk_rect) = laid
+        .pages
+        .iter()
+        .enumerate()
+        .find_map(|(pi, page)| {
+            page.items.iter().find_map(|it| match it {
+                Placed::Chunk { id: cid, rect, .. } if *cid == id => Some((pi, *rect)),
+                _ => None,
+            })
+        })
+        .expect("oversized chunk must be placed");
+    assert!(
+        chunk_rect.bottom() <= laid.pages[chunk_page].body.bottom() + 0.5,
+        "oversized chunk bottom ({}) must be clamped within page body bottom ({})",
+        chunk_rect.bottom(),
+        laid.pages[chunk_page].body.bottom()
+    );
+}
+
+#[test]
+fn balanced_columns_with_oversized_chunk_preserves_following_blocks() {
+    use wordcraft_doc::section::{Columns, SectionStart};
+    use wordcraft_doc::{CodeChunk, Document, Paragraph, para_block};
+
+    // 1. Oversized chunk in a balanced 2-column section must fall back cleanly instead of
+    //    dropping blocks after the chunk when the final balancing trial spills.
+    let mut doc = Document::new();
+    doc.body.clear();
+    let chunk_id = doc.push_chunk(&CodeChunk::new("python", "x = 1")).unwrap();
+    let after_idx = doc.body.len();
+    doc.body.push(para_block(Paragraph::with_text("After oversized chunk", Default::default())));
+    doc.last_section.page_h = 792.0;
+    doc.last_section.margin_top = 72.0;
+    doc.last_section.margin_bottom = 72.0;
+    doc.last_section.columns = Columns { count: 2, space: 24.0, separator: false, widths: Vec::new() };
+    doc.last_section.balance_columns = Some(true);
+
+    let mut opts = LayoutOptions::default();
+    opts.chunk_heights.insert(chunk_id, 100_000); // 1000 pt > 648 pt printable height
+    let laid = layout(&doc, &mut LayoutCache::new(), &opts);
+
+    let chunk_placed = laid
+        .pages
+        .iter()
+        .enumerate()
+        .find_map(|(pi, page)| {
+            page.items.iter().find_map(|it| match it {
+                Placed::Chunk { id, rect, .. } if *id == chunk_id => Some((pi, *rect)),
+                _ => None,
+            })
+        })
+        .expect("oversized chunk must remain placed in balanced section");
+    assert!(
+        chunk_placed.1.bottom() <= laid.pages[chunk_placed.0].body.bottom() + 0.5,
+        "oversized chunk bottom ({}) must stay within page body ({})",
+        chunk_placed.1.bottom(),
+        laid.pages[chunk_placed.0].body.bottom()
+    );
+    let after_placed = laid.pages.iter().flat_map(|p| &p.items).any(|it| matches!(it, Placed::Lines { path, .. } if path.0 == [after_idx as u32]));
+    assert!(after_placed, "paragraph following an oversized chunk in a balanced section must not be dropped");
+
+    // 2. A normal-sized chunk in a balanced 2-column section must keep its full measured height
+    //    alongside all following paragraphs.
+    let mut normal_opts = LayoutOptions::default();
+    normal_opts.chunk_heights.insert(chunk_id, 20_000); // 200 pt
+    let normal = layout(&doc, &mut LayoutCache::new(), &normal_opts);
+    let normal_rect = normal
+        .pages
+        .iter()
+        .flat_map(|p| &p.items)
+        .find_map(|it| match it {
+            Placed::Chunk { id, rect, .. } if *id == chunk_id => Some(*rect),
+            _ => None,
+        })
+        .expect("normal chunk must be placed");
+    assert!((normal_rect.h - 200.0).abs() < 0.5, "balanced column must not shrink normal chunk: got {}", normal_rect.h);
+    assert!(
+        normal.pages.iter().flat_map(|p| &p.items).any(|it| matches!(it, Placed::Lines { path, .. } if path.0 == [after_idx as u32])),
+        "paragraph following normal chunk must remain placed"
+    );
+}
