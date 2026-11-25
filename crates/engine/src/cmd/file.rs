@@ -239,9 +239,9 @@ pub(crate) fn normal_document(s: &Session) -> Document {
     d
 }
 
-/// Open a document, using the saved proofing default only for plain text and Markdown. A file
-/// that is already open becomes the active document instead (`"alreadyOpen": true`). The file
-/// replaces an untouched blank document; otherwise it opens beside the open documents.
+/// Open a document, using the saved proofing default only for plain text, Markdown and Quarto.
+/// A file that is already open becomes the active document instead (`"alreadyOpen": true`). The
+/// file replaces an untouched blank document; otherwise it opens beside the open documents.
 fn open(s: &mut Session, v: &Value) -> CmdResult {
     let Some(path) = p::str(v, "path") else {
         s.push_ui_request(json!({"open": "openFile"}));
@@ -269,8 +269,8 @@ fn open(s: &mut Session, v: &Value) -> CmdResult {
         super::view::restore_zoom(s, z);
     }
     s.path = Some(path.into());
-    // A Markdown file's own text, for the view to show and Save to write back as it is.
-    if super::md_source::is_markdown_file(std::path::Path::new(path)) {
+    // A Markdown or Quarto file's own text, for Save (and Markdown Source view) to keep as it is.
+    if super::md_source::keeps_file_text(std::path::Path::new(path)) {
         s.md_file = markdown_file_text(path, v);
     }
     // Like Word, a document opened with a password is saved with it again.
@@ -282,8 +282,8 @@ fn open(s: &mut Session, v: &Value) -> CmdResult {
     )
 }
 
-/// A Markdown file's own text as `file.open` finds it: the bytes the caller hands over (base64 in
-/// `data`, the same ones `read_document` decodes), else the head of the file at `path`.
+/// A Markdown or Quarto file's own text as `file.open` finds it: the bytes the caller hands over
+/// (base64 in `data`, the same ones `read_document` decodes), else the head of the file at `path`.
 /// `FileText::from_bytes` keeps it only when it can be written back as it is.
 fn markdown_file_text(path: &str, v: &Value) -> super::md_source::FileText {
     if let Some(data) = p::str(v, "data") {
@@ -325,7 +325,7 @@ fn read_document(s: &Session, path: &str, v: &Value) -> Result<(Document, bool),
     };
     let ext = std::path::Path::new(path).extension().and_then(std::ffi::OsStr::to_str).unwrap_or("").to_ascii_lowercase();
     if let Some(lang) = s.prefs.default_language.as_ref().or(s.editing_lang.as_ref())
-        && matches!(ext.as_str(), "txt" | "text" | "md" | "markdown")
+        && matches!(ext.as_str(), "txt" | "text" | "md" | "markdown" | "qmd" | "rmd")
     {
         Arc::make_mut(&mut doc.styles).default_chr.lang = Some(lang.clone());
     }
@@ -435,10 +435,12 @@ fn save(s: &mut Session, v: &Value) -> CmdResult {
     let password = s.password.as_ref().map(crate::io::Password::as_str);
     // A header/footer just made and left empty isn't saved (#960).
     let copy = super::insert::saved_copy(s);
-    // A Markdown file's own text goes back as it is while it still says what the document holds;
-    // once it doesn't (an edit in the formatted view), the document is written out again.
+    // A Markdown or Quarto file's own text goes back as it is while it still says what the
+    // document holds; once it doesn't (an edit in the formatted view), the document is written out
+    // again.
+    let keeps_text = super::md_source::keeps_file_text(&path);
     let exact = super::md_source::text_to_save(s, &path, opts.markup);
-    let rewritten = exact.is_none() && !s.md_file.is_empty() && super::md_source::is_markdown_file(&path);
+    let rewritten = exact.is_none() && !s.md_file.is_empty() && keeps_text;
     let written = match &exact {
         Some(text) => crate::io::save_text_path(&path, text),
         None => crate::io::save_path_with(&path, copy.as_ref().unwrap_or(&s.doc), password, &opts),
@@ -451,16 +453,35 @@ fn save(s: &mut Session, v: &Value) -> CmdResult {
     // A save in a format that doesn't keep everything (plain text, Markdown, a page image) is a
     // copy, except over the document's own file: a note.txt opened and saved is saved (#2376).
     // A Markdown file saved as another one loses nothing its own save wouldn't: it moves there.
+    // Quarto / R Markdown files transfer ownership only when the destination preserves Quarto
+    // front matter and chunk options (.qmd, .Rmd); saving .qmd as .md remains a copy.
     let own_file = s.path.as_deref() == Some(path.as_path());
-    let markdown_to_markdown = super::md_source::is_markdown_file(&path) && s.path.as_deref().is_some_and(super::md_source::is_markdown_file);
-    if own_file || markdown_to_markdown || ["docx", "docm", "dotx", "dotm", "odt", "ott", "fodt", "rtf", "json", "xml"].contains(&ext.as_str()) {
+    if own_file
+        || text_to_text(s.path.as_deref(), &path)
+        || ["docx", "docm", "dotx", "dotm", "odt", "ott", "fodt", "rtf", "json", "xml"].contains(&ext.as_str())
+    {
         s.path = Some(path.clone());
         s.dirty = false;
-        s.relayout();
+        super::md_source::close_if_ineligible(s);
         // What the file holds now.
-        s.md_file = super::md_source::FileText::saved(exact.filter(|_| super::md_source::is_markdown_file(&path)));
+        s.md_file = super::md_source::FileText::saved(exact.filter(|_| keeps_text));
+        s.relayout();
     }
     Ok(json!({"saved": true, "path": path.to_string_lossy(), "encrypted": encrypted, "rewritten": rewritten}))
+}
+
+/// Whether saving from `src` to `dest` preserves all features of the source text format.
+fn text_to_text(src: Option<&std::path::Path>, dest: &std::path::Path) -> bool {
+    let Some(src) = src else { return false };
+    if super::md_source::is_quarto_file(src) {
+        // A .qmd / .Rmd source transfers ownership only when the destination preserves
+        // Quarto front matter and chunk options (.qmd or .Rmd); saving to .md remains a copy.
+        super::md_source::is_quarto_file(dest)
+    } else if super::md_source::is_markdown_file(src) {
+        super::md_source::is_markdown_file(dest) || super::md_source::is_quarto_file(dest)
+    } else {
+        false
+    }
 }
 
 /// Does `path` hold a Word 2003 XML Document already (so a plain save keeps that format)?

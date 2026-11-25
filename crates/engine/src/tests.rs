@@ -6366,7 +6366,7 @@ fn markdown_saved_as_markdown_moves_to_the_new_file() {
     std::fs::create_dir_all(&dir).unwrap();
     let first = dir.join("a.md");
     std::fs::write(&first, b"First\n").unwrap();
-    for name in ["b.md", "c.markdown", "D.MD"] {
+    for name in ["b.md", "c.markdown", "D.MD", "e.qmd", "F.Rmd"] {
         let mut s = s();
         std::fs::write(&first, b"First\n").unwrap();
         let second = dir.join(name);
@@ -6400,6 +6400,22 @@ fn markdown_saved_as_markdown_moves_to_the_new_file() {
     run(&mut text, "file.saveAs", json!({"path": dir.join("copy.md").to_string_lossy()}));
     assert!(text.dirty, "a Markdown copy of a text file leaves it unsaved");
     assert_eq!(text.path.as_deref(), Some(note.as_path()));
+
+    // And Quarto to Markdown remains a copy (Markdown drops Quarto front matter and chunks).
+    let qmd = dir.join("doc.qmd");
+    std::fs::write(&qmd, b"```{r}\nx <- 1\n```\n").unwrap();
+    let mut qmd_session = self::s();
+    run(&mut qmd_session, "file.open", json!({"path": qmd.to_string_lossy()}));
+    run(&mut qmd_session, "text.insert", json!({"text": "Hello "}));
+    run(&mut qmd_session, "file.saveAs", json!({"path": dir.join("copy_from_qmd.md").to_string_lossy()}));
+    assert!(qmd_session.dirty, "a .md save of a .qmd file leaves it unsaved");
+    assert_eq!(qmd_session.path.as_deref(), Some(qmd.as_path()));
+
+    // But Quarto saved to Quarto moves to the new file.
+    let qmd_second = dir.join("second.qmd");
+    run(&mut qmd_session, "file.saveAs", json!({"path": qmd_second.to_string_lossy()}));
+    assert!(!qmd_session.dirty, "a .qmd save of a .qmd moves to the new file");
+    assert_eq!(qmd_session.path.as_deref(), Some(qmd_second.as_path()));
     let _ = std::fs::remove_dir_all(&dir);
 }
 

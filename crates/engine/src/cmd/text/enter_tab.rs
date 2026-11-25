@@ -62,6 +62,17 @@ pub(super) fn new_paragraph(s: &mut Session, _: &Value) -> CmdResult {
     if crate::cmd::controls::refuses_paragraph(s) {
         return sel_result(s);
     }
+    if s.sel.is_collapsed()
+        && let Some(range) = crate::chunks::chunk_at(&s.doc, &s.sel.focus)
+        && s.sel.focus == range.end
+        && range.start.story == wordcraft_doc::StoryRef::Body
+        && range.start.path.0.len() == 1
+        && range.end.path.0.len() == 1
+    {
+        crate::cmd::controls::prepare_edit(s)?;
+        crate::cmd::code::exit_below_chunk_range(s, &range, true)?;
+        return sel_result(s);
+    }
     enter(s, true)?;
     sel_result(s)
 }
