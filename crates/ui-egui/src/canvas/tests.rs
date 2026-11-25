@@ -2301,3 +2301,1421 @@ fn a_linked_text_box_shows_and_follows_its_link_from_inside() {
     let (start, _) = wordcraft_engine::cmd::insert::bookmark_range(&s.doc, "Spot").unwrap();
     assert!(s.sel.is_collapsed() && s.sel.focus == start, "the caret went to the bookmark: {:?}", s.sel);
 }
+
+#[test]
+fn mounted_code_chunk_reserves_canvas_space_reflows_text_and_syncs_edits_with_undo() {
+    let mut a = WordApp::new(wordcraft_engine::Session::new(wordcraft_doc::Document::new()), Default::default());
+    a.run("text.insert", json!({"text": "Above paragraph"})).unwrap();
+    a.run("text.newParagraph", json!({})).unwrap();
+    a.run("text.insert", json!({"text": "Below paragraph"})).unwrap();
+    a.session.sel = wordcraft_engine::Selection::caret(Pos::body(0, 0));
+    a.run("code.insert_chunk", json!({"language": "python", "code": "x = 1"})).unwrap();
+
+    let mut h = crate::test_harness::builder().with_size(egui::vec2(1280.0, 860.0)).build_eframe(|_| a);
+    h.run_steps(6);
+
+    let chunk_id = wordcraft_engine::chunks::chunks_in(&h.state().session.doc, StoryRef::Body)[0].chunk.id.expect("chunk id");
+    assert!(h.state().canvas.code_chunks.is_mounted(chunk_id), "code chunk should be mounted on canvas");
+    assert!(h.state().canvas.code_chunks.screen_rects.contains_key(&chunk_id), "chunk screen rect should be tracked");
+
+    let layout = h.state_mut().session.layout();
+    let chunk_rect = layout.pages[0]
+        .items
+        .iter()
+        .find_map(|it| match it {
+            wordcraft_layout::Placed::Chunk { id, rect, .. } if *id == chunk_id => Some(*rect),
+            _ => None,
+        })
+        .expect("layout must allocate Placed::Chunk");
+    let below_y = layout.pages[0]
+        .items
+        .iter()
+        .filter_map(|it| match it {
+            wordcraft_layout::Placed::Lines { y, .. } => Some(*y),
+            _ => None,
+        })
+        .max_by(|a, b| a.total_cmp(b))
+        .expect("below paragraph line");
+    assert!(below_y >= chunk_rect.bottom() - 1.0, "below paragraph ({below_y}) must reflow below chunk ({})", chunk_rect.bottom());
+
+    // Simulate typing directly inside the mounted widget, let debounce flush cleanly to the doc, then Undo/Redo.
+    let editor_id = h.state().canvas.code_chunks.widgets[&chunk_id].widget.editor_id();
+    h.state_mut().canvas.code_chunks.request_focus(chunk_id, true);
+    h.run_steps(2);
+    assert!(h.ctx.memory(|m| m.has_focus(editor_id)), "mounted chunk editor should acquire focus");
+    h.input_mut().events.extend([
+        egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE },
+        egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed: false, repeat: false, modifiers: egui::Modifiers::NONE },
+        egui::Event::Text("y = 2".into()),
+    ]);
+    h.step();
+    assert!(crate::canvas::code_chunks::has_dirty_chunks(h.state()), "widget edit should mark draft dirty before debounce expires");
+    assert_eq!(wordcraft_engine::chunks::chunks_in(&h.state().session.doc, StoryRef::Body)[0].chunk.code, "x = 1");
+    let next_time = h.ctx.input(|i| i.time) + 0.7;
+    h.input_mut().time = Some(next_time);
+    h.step();
+    assert!(!crate::canvas::code_chunks::has_dirty_chunks(h.state()), "expired debounce should flush draft cleanly");
+    assert_eq!(wordcraft_engine::chunks::chunks_in(&h.state().session.doc, StoryRef::Body)[0].chunk.code, "x = 1\ny = 2");
+
+    h.state_mut().run("edit.undo", json!({})).unwrap();
+    h.run_steps(4);
+    assert_eq!(h.state().canvas.code_chunks.widgets[&chunk_id].widget.code(), "x = 1");
+
+    h.state_mut().run("edit.redo", json!({})).unwrap();
+    h.run_steps(4);
+    assert_eq!(h.state().canvas.code_chunks.widgets[&chunk_id].widget.code(), "x = 1\ny = 2");
+
+    // Delete removes the chunk from document and widget cache cleanly.
+    h.state_mut().run("code.delete_chunk", json!({"chunkId": chunk_id})).unwrap();
+    h.run_steps(4);
+    assert!(!h.state().canvas.code_chunks.is_mounted(chunk_id));
+}
+
+#[test]
+fn code_chunk_context_menu_is_wired() {
+    let mut a = WordApp::new(wordcraft_engine::Session::new(wordcraft_doc::Document::new()), Default::default());
+    a.run("code.insert_chunk", json!({"language": "r", "code": "1 + 1"})).unwrap();
+    let chunk_id = wordcraft_engine::chunks::chunks_in(&a.session.doc, StoryRef::Body)[0].chunk.id.unwrap();
+
+    let mut h = crate::test_harness::builder().with_size(egui::vec2(1440.0, 900.0)).build_eframe(|_| a);
+    h.run_steps(4);
+
+    // Right-click the mounted chunk, verify the context menu entries, and delete via menu.
+    let rect = h.state().canvas.code_chunks.screen_rects[&chunk_id];
+    markup::right_click(&mut h, rect.center());
+    markup::assert_menu(&h, &["Run Chunk", "Hide Code (Teaching Mode)", "Clear Output", "Restart Kernel", "Delete Code Chunk"], true);
+    markup::pick(&mut h, &["Delete Code Chunk"]);
+    h.run_steps(3);
+    assert!(wordcraft_engine::chunks::chunks_in(&h.state().session.doc, StoryRef::Body).is_empty());
+}
+
+#[test]
+fn mounted_chunk_teaching_mode_toggle_reflows_and_arrow_keys_cross_boundary() {
+    let mut a = WordApp::new(wordcraft_engine::Session::new(wordcraft_doc::Document::new()), Default::default());
+    a.run("text.insert", json!({"text": "Line above"})).unwrap();
+    a.run("text.newParagraph", json!({})).unwrap();
+    a.run("text.insert", json!({"text": "Line below"})).unwrap();
+    a.session.sel = wordcraft_engine::Selection::caret(Pos::body(0, 0));
+    a.run("code.insert_chunk", json!({"language": "python", "code": "a = 1\nb = 2\nc = 3\nd = 4\ne = 5\nf = 6"})).unwrap();
+    let chunk_id = wordcraft_engine::chunks::chunks_in(&a.session.doc, StoryRef::Body)[0].chunk.id.unwrap();
+
+    let mut h = crate::test_harness::builder().with_size(egui::vec2(1280.0, 860.0)).build_eframe(|_| a);
+    h.run_steps(6);
+
+    let full_h = h.state().canvas.code_chunks.screen_rects[&chunk_id].height();
+    h.state_mut().canvas.code_chunks.widgets.get_mut(&chunk_id).unwrap().widget.show_code = false;
+    h.run_steps(6);
+    let hidden_h = h.state().canvas.code_chunks.screen_rects[&chunk_id].height();
+    assert!(hidden_h < full_h - 20.0, "hiding code ({hidden_h}) must shrink chunk height below full ({full_h})");
+
+    // Canvas caret right above chunk + ArrowDown enters chunk editor smoothly.
+    h.state_mut().session.sel = wordcraft_engine::Selection::caret(Pos::body(0, 0));
+    let ctx = h.ctx.clone();
+    h.state_mut().canvas.focus_page(&ctx);
+    h.state_mut().canvas.code_chunks.active_chunk = None;
+    let entered = crate::canvas::code_chunks::maybe_enter_from_canvas_arrow(h.state_mut(), egui::Key::ArrowDown, egui::Modifiers::NONE);
+    assert!(entered, "ArrowDown on paragraph above chunk should enter the chunk editor");
+    assert_eq!(h.state().canvas.code_chunks.pending_focus, Some((chunk_id, false)));
+
+    // Execute plot and table insertion actions from output drawer below the chunk.
+    let png = [
+        0x89u8, b'P', b'N', b'G', b'\r', b'\n', 0x1A, b'\n', 0, 0, 0, 13, b'I', b'H', b'D', b'R', 0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0, 0, 0, 0x1F, 0x15,
+        0xC4, 0x89, 0, 0, 0, 10, b'I', b'D', b'A', b'T', 0x78, 0x9C, 0x63, 0, 1, 0, 0, 5, 0, 1, 0x0D, 0x0A, 0x2D, 0xB4, 0, 0, 0, 0, b'I', b'E', b'N',
+        b'D', 0xAE, 0x42, 0x60, 0x82,
+    ];
+    let b64 = wordcraft_engine::cmd::insert::base64_encode(&png);
+    h.state_mut().run("code.insert_plot", json!({"chunkId": chunk_id, "png": b64})).unwrap();
+    h.state_mut().run("code.insert_table", json!({"chunkId": chunk_id, "headers": ["k", "v"], "rows": [["1", "2"]]})).unwrap();
+    h.run_steps(4);
+    assert!(h.state().session.doc.body.iter().any(|b| matches!(&**b, wordcraft_doc::Block::Table(_))));
+}
+
+#[test]
+fn mounted_chunk_in_read_mode_blocks_edits_and_arrow_entry() {
+    let mut a = WordApp::new(wordcraft_engine::Session::new(wordcraft_doc::Document::new()), Default::default());
+    a.run("text.insert", json!({"text": "Above"})).unwrap();
+    a.run("text.newParagraph", json!({})).unwrap();
+    a.run("code.insert_chunk", json!({"language": "python", "code": "x = 1"})).unwrap();
+    let chunk_id = wordcraft_engine::chunks::chunks_in(&a.session.doc, StoryRef::Body)[0].chunk.id.unwrap();
+    a.session.view.read_mode = true;
+
+    let mut h = crate::test_harness::builder().with_size(egui::vec2(1280.0, 860.0)).build_eframe(|_| a);
+    h.run_steps(4);
+    assert!(h.state().canvas.code_chunks.is_mounted(chunk_id));
+    assert!(h.state().canvas.code_chunks.widgets[&chunk_id].widget.read_only);
+
+    let editor_id = h.state().canvas.code_chunks.widgets[&chunk_id].widget.editor_id();
+    h.ctx.memory_mut(|m| m.request_focus(editor_id));
+    h.step();
+    h.input_mut().events.push(egui::Event::Text(" + 99".into()));
+    h.run_steps(2);
+    assert_eq!(h.state().canvas.code_chunks.widgets[&chunk_id].widget.code(), "x = 1", "Read Mode must keep chunk source immutable");
+    assert!(!crate::canvas::code_chunks::has_dirty_chunks(h.state()));
+
+    h.state_mut().session.sel = wordcraft_engine::Selection::caret(Pos::body(0, 0));
+    assert!(!crate::canvas::code_chunks::maybe_enter_from_canvas_arrow(h.state_mut(), egui::Key::ArrowDown, egui::Modifiers::NONE));
+    assert_eq!(h.state().canvas.code_chunks.pending_focus, None);
+}
+
+#[test]
+fn arrow_navigation_enters_chunk_from_table_cell_and_picks_nearest_chunk_on_arrow_up() {
+    let mut a = WordApp::new(wordcraft_engine::Session::new(wordcraft_doc::Document::new()), Default::default());
+    let temp = a.run("code.insert_chunk", json!({"language": "python", "code": "tmp = 0"})).unwrap()["chunk"]["id"].as_i64().unwrap();
+    a.run("code.insert_table", json!({"chunkId": temp, "headers": ["Col"], "rows": [["Cell"]]})).unwrap();
+    a.run("code.delete_chunk", json!({"chunkId": temp})).unwrap();
+    // `insert_table` + `delete_chunk` leave `[Table(0), Para(1)]`. Insert chunk A at block 1.
+    a.session.sel = wordcraft_engine::Selection::caret(Pos::body(1, 0));
+    let chunk_a = a.run("code.insert_chunk", json!({"language": "python", "code": "a = 1"})).unwrap()["chunk"]["id"].as_i64().unwrap();
+    let end_a = wordcraft_engine::chunks::chunks_in(&a.session.doc, StoryRef::Body)[0].end.path.last();
+    a.session.doc.body.truncate(end_a + 1);
+    a.session.doc.body.push(wordcraft_doc::para_block(wordcraft_doc::Paragraph::new()));
+    a.session.sel = wordcraft_engine::Selection::caret(Pos::body(end_a + 1, 0));
+    let chunk_b = a.run("code.insert_chunk", json!({"language": "python", "code": "b = 2"})).unwrap()["chunk"]["id"].as_i64().unwrap();
+    let end_b = wordcraft_engine::chunks::chunks_in(&a.session.doc, StoryRef::Body)[1].end.path.last();
+    a.session.doc.body.truncate(end_b + 1);
+    let below_idx = a.session.doc.body.len();
+    a.session.doc.body.push(wordcraft_doc::para_block(wordcraft_doc::Paragraph::with_text("Below", Default::default())));
+
+    let mut h = crate::test_harness::builder().with_size(egui::vec2(1280.0, 860.0)).build_eframe(|_| a);
+    h.run_steps(6);
+
+    // ArrowDown from row 0 stays inside row 1 of the table; ArrowDown from row 1 enters chunk A.
+    h.state_mut().session.sel = wordcraft_engine::Selection::caret(Pos::new(StoryRef::Body, wordcraft_doc::Path(vec![0, 0, 0, 0]), 0));
+    assert!(!crate::canvas::code_chunks::maybe_enter_from_canvas_arrow(h.state_mut(), egui::Key::ArrowDown, egui::Modifiers::NONE));
+    h.state_mut().session.sel = wordcraft_engine::Selection::caret(Pos::new(StoryRef::Body, wordcraft_doc::Path(vec![0, 1, 0, 0]), 0));
+    assert!(crate::canvas::code_chunks::maybe_enter_from_canvas_arrow(h.state_mut(), egui::Key::ArrowDown, egui::Modifiers::NONE));
+    assert_eq!(h.state().canvas.code_chunks.pending_focus, Some((chunk_a, false)));
+
+    // ArrowUp from paragraph below two adjacent chunks must enter the closest chunk (chunk B), not chunk A.
+    h.state_mut().canvas.code_chunks.pending_focus = None;
+    h.state_mut().session.sel = wordcraft_engine::Selection::caret(Pos::body(below_idx, 0));
+    assert!(crate::canvas::code_chunks::maybe_enter_from_canvas_arrow(h.state_mut(), egui::Key::ArrowUp, egui::Modifiers::NONE));
+    assert_eq!(h.state().canvas.code_chunks.pending_focus, Some((chunk_b, true)));
+}
+
+#[test]
+fn code_chunk_polling_settles_offscreen_runs_drops_stale_gen_and_clears_others() {
+    let mut a = WordApp::new(wordcraft_engine::Session::new(wordcraft_doc::Document::new()), Default::default());
+    let chunk_a = a.run("code.insert_chunk", json!({"language": "python", "code": "a = 1"})).unwrap()["chunk"]["id"].as_i64().unwrap();
+    let chunk_b = a.run("code.insert_chunk", json!({"language": "python", "code": "b = 2"})).unwrap()["chunk"]["id"].as_i64().unwrap();
+    let chunk_c = a.run("code.insert_chunk", json!({"language": "python", "code": "c = 3"})).unwrap()["chunk"]["id"].as_i64().unwrap();
+    a.session.chunks.store_for(
+        chunk_b,
+        "python",
+        "b = 2",
+        wordcraft_engine::chunks::ChunkOutput { stdout: "old-b".into(), success: true, ..Default::default() },
+    );
+
+    let mut h = crate::test_harness::builder().with_size(egui::vec2(1280.0, 860.0)).build_eframe(|_| a);
+    h.run_steps(4);
+
+    // 1. Offscreen completion + unrelated chunk B cleared externally must both reconcile cleanly.
+    let (tx_ui_a, rx_ui_a) = std::sync::mpsc::channel();
+    let (tx_store_a, rx_store_a) = std::sync::mpsc::channel();
+    h.state_mut().canvas.code_chunks.widgets.get_mut(&chunk_a).unwrap().widget.attach_run(rx_ui_a);
+    let doc_id = h.state().session.document_id();
+    let gen0 = h.state().session.chunks.generation();
+    h.state_mut().canvas.code_chunks.push_pending_for_test(
+        chunk_a,
+        wordcraft_engine::chunks::CodeLanguage::Python,
+        "a = 1",
+        (doc_id, gen0, 0, false),
+        rx_store_a,
+    );
+    let ok_res = wordcraft_engine::chunks::ExecutionResult {
+        stdout: "from-a".into(),
+        stderr: String::new(),
+        exit_code: Some(0),
+        success: true,
+        timed_out: false,
+        output_truncated: false,
+        plot_png: None,
+        plot_svg: None,
+        plots: Vec::new(),
+        tables: Vec::new(),
+        duration_ms: 5,
+    };
+    tx_ui_a.send(Ok(ok_res.clone())).unwrap();
+    tx_store_a.send(Ok(ok_res)).unwrap();
+    h.state_mut().session.chunks.clear(chunk_b);
+
+    // Run `sync_before_layout` even without painting chunk A to prove offscreen settlement.
+    let ctx = h.ctx.clone();
+    let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+        crate::canvas::code_chunks::sync_before_layout(h.state_mut(), ui);
+    });
+    assert!(!h.state().canvas.code_chunks.widgets[&chunk_a].widget.is_running(), "offscreen run must settle immediately");
+    assert_eq!(h.state().canvas.code_chunks.widgets[&chunk_a].widget.output().map(|o| o.stdout.as_str()), Some("from-a"));
+    assert!(h.state().canvas.code_chunks.widgets[&chunk_b].widget.output().is_none(), "cleared chunk B must still clear when chunk A finishes");
+
+    // 2. Restarting kernel while a result is already sitting in `rx` must drop the stale result and detach widget receiver.
+    let (tx_ui_c, rx_ui_c) = std::sync::mpsc::channel();
+    let (tx_store_c, rx_store_c) = std::sync::mpsc::channel();
+    h.state_mut().canvas.code_chunks.widgets.get_mut(&chunk_c).unwrap().widget.attach_run(rx_ui_c);
+    h.state_mut().canvas.code_chunks.push_pending_for_test(
+        chunk_c,
+        wordcraft_engine::chunks::CodeLanguage::Python,
+        "c = 3",
+        (doc_id, gen0, 0, false),
+        rx_store_c,
+    );
+    let stale_res = wordcraft_engine::chunks::ExecutionResult {
+        stdout: "stale-c".into(),
+        stderr: String::new(),
+        exit_code: Some(0),
+        success: true,
+        timed_out: false,
+        output_truncated: false,
+        plot_png: None,
+        plot_svg: None,
+        plots: Vec::new(),
+        tables: Vec::new(),
+        duration_ms: 5,
+    };
+    tx_ui_c.send(Ok(stale_res.clone())).unwrap();
+    tx_store_c.send(Ok(stale_res)).unwrap();
+    h.state_mut().run("code.restart_kernel", json!({})).unwrap();
+    h.run_steps(2);
+    assert!(!h.state().canvas.code_chunks.widgets[&chunk_c].widget.is_running());
+    assert!(h.state().canvas.code_chunks.widgets[&chunk_c].widget.output().is_none(), "pre-restart output must never appear");
+    assert!(h.state().session.chunks.output(chunk_c).is_none());
+
+    // 3. Deleted chunk queued in `queued_runs` is pruned before pumping starts more work.
+    let gen1 = h.state().session.chunks.generation();
+    h.state_mut().canvas.code_chunks.queue_for_test(chunk_c, wordcraft_engine::chunks::CodeLanguage::Python, "c = 3", (doc_id, gen1, 99, true));
+    h.state_mut().run("code.delete_chunk", json!({"chunkId": chunk_c})).unwrap();
+    let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+        crate::canvas::code_chunks::sync_before_layout(h.state_mut(), ui);
+    });
+    assert!(h.state().canvas.code_chunks.queued_len_for_test() == 0);
+    assert!(h.state().canvas.code_chunks.pending_len_for_test() == 0);
+}
+
+#[test]
+fn code_chunk_plot_checks_source_exits_up_into_table_and_honors_stop_on_error() {
+    let mut a = WordApp::new(wordcraft_engine::Session::new(wordcraft_doc::Document::new()), Default::default());
+    let temp = a.run("code.insert_chunk", json!({"language": "python", "code": "tmp = 0"})).unwrap()["chunk"]["id"].as_i64().unwrap();
+    a.run("code.insert_table", json!({"chunkId": temp, "headers": ["H1", "H2"], "rows": [["R1C1", "R1C2"]]})).unwrap();
+    a.run("code.delete_chunk", json!({"chunkId": temp})).unwrap();
+    a.session.sel = wordcraft_engine::Selection::caret(Pos::body(1, 0));
+    let chunk_a = a.run("code.insert_chunk", json!({"language": "python", "code": "plot(1)"})).unwrap()["chunk"]["id"].as_i64().unwrap();
+    let chunk_b = a.run("code.insert_chunk", json!({"language": "python", "code": "print(2)"})).unwrap()["chunk"]["id"].as_i64().unwrap();
+
+    let png = [
+        0x89u8, b'P', b'N', b'G', b'\r', b'\n', 0x1A, b'\n', 0, 0, 0, 13, b'I', b'H', b'D', b'R', 0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0, 0, 0, 0x1F, 0x15,
+        0xC4, 0x89, 0, 0, 0, 10, b'I', b'D', b'A', b'T', 0x78, 0x9C, 0x63, 0, 1, 0, 0, 5, 0, 1, 0x0D, 0x0A, 0x2D, 0xB4, 0, 0, 0, 0, b'I', b'E', b'N',
+        b'D', 0xAE, 0x42, 0x60, 0x82,
+    ];
+    a.session.chunks.store_for(
+        chunk_a,
+        "python",
+        "plot(1)",
+        wordcraft_engine::chunks::ChunkOutput { plot_png: Some(png.to_vec()), success: true, ..Default::default() },
+    );
+
+    let mut h = crate::test_harness::builder().with_size(egui::vec2(1280.0, 860.0)).build_eframe(|_| a);
+    h.run_steps(4);
+
+    // 1. Stale plot insert after editing the chunk source must be rejected by the engine fingerprint check.
+    let entry_a = h.state_mut().canvas.code_chunks.widgets.get_mut(&chunk_a).unwrap();
+    entry_a.widget.set_code("plot(2)");
+    entry_a.mark_dirty_for_test();
+    crate::canvas::code_chunks::flush_one(h.state_mut(), chunk_a).unwrap();
+    crate::canvas::code_chunks::dispatch_chunk_action_for_test(
+        h.state_mut(),
+        chunk_a,
+        crate::code_chunk::CodeChunkAction::InsertPlot { png: Some(png.to_vec()), svg: None },
+    );
+    assert!(
+        h.state().status.as_ref().is_some_and(|s| s.text.contains("changed since its last run")),
+        "stale plot must be rejected after flush: {:?}",
+        h.state().status.as_ref().map(|s| &s.text)
+    );
+
+    // 2. Upward exit from chunk_a below Table(0) must land in the last cell's last paragraph (editable).
+    crate::canvas::code_chunks::exit_chunk_to_canvas_for_test(h.state_mut(), chunk_a, -1);
+    let sel = &h.state().session.sel.focus;
+    assert_eq!(sel.path.0, vec![0, 1, 1, 0], "upward exit into table must target last cell paragraph");
+    assert!(h.state().session.doc.para_at(sel).is_some(), "caret position must be an editable paragraph");
+
+    // 3. stopOnError=true Run All queue holds chunk_b until chunk_a finishes and cancels it if chunk_a fails.
+    let (_tx_ui, rx_ui) = std::sync::mpsc::channel();
+    let (tx_store, rx_store) = std::sync::mpsc::channel();
+    h.state_mut().canvas.code_chunks.widgets.get_mut(&chunk_a).unwrap().widget.attach_run(rx_ui);
+    let doc_id = h.state().session.document_id();
+    let gen_now = h.state().session.chunks.generation();
+    h.state_mut().canvas.code_chunks.push_pending_for_test(
+        chunk_a,
+        wordcraft_engine::chunks::CodeLanguage::Python,
+        "plot(2)",
+        (doc_id, gen_now, 42, true),
+        rx_store,
+    );
+    h.state_mut().canvas.code_chunks.queue_for_test(chunk_b, wordcraft_engine::chunks::CodeLanguage::Python, "print(2)", (doc_id, gen_now, 42, true));
+
+    let ctx = h.ctx.clone();
+    // Pumping while chunk_a is still pending must keep chunk_b queued.
+    let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+        crate::canvas::code_chunks::sync_before_layout(h.state_mut(), ui);
+    });
+    out.textures_delta.clear();
+    assert_eq!(h.state().canvas.code_chunks.pending_len_for_test(), 1);
+    assert_eq!(h.state().canvas.code_chunks.queued_len_for_test(), 1);
+
+    // Failing chunk_a must drop queued chunk_b without running it.
+    tx_store
+        .send(Ok(wordcraft_engine::chunks::ExecutionResult {
+            stdout: String::new(),
+            stderr: "boom".into(),
+            exit_code: Some(1),
+            success: false,
+            timed_out: false,
+            output_truncated: false,
+            plot_png: None,
+            plot_svg: None,
+            plots: Vec::new(),
+            tables: Vec::new(),
+            duration_ms: 5,
+        }))
+        .unwrap();
+    let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+        crate::canvas::code_chunks::sync_before_layout(h.state_mut(), ui);
+    });
+    out.textures_delta.clear();
+    assert_eq!(h.state().canvas.code_chunks.pending_len_for_test(), 0);
+    assert_eq!(h.state().canvas.code_chunks.queued_len_for_test(), 0);
+    assert!(h.state().session.chunks.output(chunk_b).is_none());
+}
+
+#[test]
+fn embedded_header_run_validates_draft_and_clear_removes_session_output() {
+    use egui_kittest::kittest::Queryable;
+    let mut a = WordApp::new(wordcraft_engine::Session::new(wordcraft_doc::Document::new()), Default::default());
+    let chunk_id = a.run("code.insert_chunk", json!({"language": "python", "code": "x = 1"})).unwrap()["chunk"]["id"].as_i64().unwrap();
+    a.session.chunks.store_for(
+        chunk_id,
+        "python",
+        "x = 1",
+        wordcraft_engine::chunks::ChunkOutput { stdout: "one".into(), success: true, ..Default::default() },
+    );
+
+    let mut h = crate::test_harness::builder().with_size(egui::vec2(1280.0, 860.0)).build_eframe(|_| a);
+    h.run_steps(4);
+    assert!(h.state().session.chunks.output(chunk_id).is_some());
+
+    // Header Options -> Clear output clears both the widget and the session cache.
+    h.get_by_label("Options").click();
+    h.run_steps(2);
+    h.get_by_label("Clear output").click();
+    h.run_steps(2);
+    assert!(h.state().canvas.code_chunks.widgets[&chunk_id].widget.output().is_none());
+    assert!(h.state().session.chunks.output(chunk_id).is_none(), "header Clear output must clear session cache too");
+
+    // Typing U+FFFC and clicking inline Run must stop at `code.update_chunk` refusal without starting a worker.
+    h.state_mut().canvas.code_chunks.request_focus(chunk_id, true);
+    h.run_steps(2);
+    h.input_mut().events.push(egui::Event::Text("\u{FFFC}".into()));
+    h.step();
+    h.get_by_label("Run").click();
+    h.run_steps(2);
+    assert!(!h.state().canvas.code_chunks.widgets[&chunk_id].widget.is_running(), "refused draft must not start interpreter");
+    assert!(h.state().status.as_ref().is_some_and(|s| s.text.contains("U+FFFC")));
+}
+
+#[test]
+fn transfer_in_flight_runs_remaps_batch_ids_to_prevent_collisions() {
+    let mut a = WordApp::new(wordcraft_engine::Session::new(wordcraft_doc::Document::new()), Default::default());
+    let chunk_a = a.run("code.insert_chunk", json!({"language": "python", "code": "a = 1"})).unwrap()["chunk"]["id"].as_i64().unwrap();
+    let chunk_b = a.run("code.insert_chunk", json!({"language": "python", "code": "b = 2"})).unwrap()["chunk"]["id"].as_i64().unwrap();
+    let chunk_c = a.run("code.insert_chunk", json!({"language": "python", "code": "c = 3"})).unwrap()["chunk"]["id"].as_i64().unwrap();
+    let chunk_d = a.run("code.insert_chunk", json!({"language": "python", "code": "d = 4"})).unwrap()["chunk"]["id"].as_i64().unwrap();
+
+    let mut h = crate::test_harness::builder().with_size(egui::vec2(1280.0, 860.0)).build_eframe(|_| a);
+    h.run_steps(4);
+
+    let doc_id = h.state().session.document_id();
+    let gen_now = h.state().session.chunks.generation();
+    let (tx_a, rx_a) = std::sync::mpsc::channel();
+    let (_tx_c, rx_c) = std::sync::mpsc::channel();
+
+    // Surviving canvas already owns batch 1 (pending chunk C + queued chunk D).
+    let target_batch = h.state_mut().canvas.code_chunks.allocate_batch_id_for_test();
+    assert_eq!(target_batch, 1);
+    h.state_mut().canvas.code_chunks.push_pending_for_test(
+        chunk_c,
+        wordcraft_engine::chunks::CodeLanguage::Python,
+        "c = 3",
+        (doc_id, gen_now, target_batch, true),
+        rx_c,
+    );
+    h.state_mut().canvas.code_chunks.queue_for_test(
+        chunk_d,
+        wordcraft_engine::chunks::CodeLanguage::Python,
+        "d = 4",
+        (doc_id, gen_now, target_batch, true),
+    );
+
+    // Closing canvas also has batch 1 (pending chunk A + queued chunk B).
+    let mut closing = crate::canvas::code_chunks::CodeChunksState::default();
+    let closing_batch = closing.allocate_batch_id_for_test();
+    assert_eq!(closing_batch, 1);
+    closing.push_pending_for_test(chunk_a, wordcraft_engine::chunks::CodeLanguage::Python, "a = 1", (doc_id, gen_now, closing_batch, true), rx_a);
+    closing.queue_for_test(chunk_b, wordcraft_engine::chunks::CodeLanguage::Python, "b = 2", (doc_id, gen_now, closing_batch, true));
+
+    closing.transfer_in_flight_runs_to(&mut h.state_mut().canvas.code_chunks);
+
+    let pending_batches = h.state().canvas.code_chunks.pending_batch_ids_for_test();
+    let queued_batches = h.state().canvas.code_chunks.queued_batch_ids_for_test();
+    let a_batch = pending_batches.iter().find(|(id, _)| *id == chunk_a).map(|(_, b)| *b).unwrap();
+    let b_batch = queued_batches.iter().find(|(id, _)| *id == chunk_b).map(|(_, b)| *b).unwrap();
+    let c_batch = pending_batches.iter().find(|(id, _)| *id == chunk_c).map(|(_, b)| *b).unwrap();
+    let d_batch = queued_batches.iter().find(|(id, _)| *id == chunk_d).map(|(_, b)| *b).unwrap();
+    assert_eq!(a_batch, b_batch, "transferred pending and queued records must keep a shared remapped batch_id");
+    assert_eq!(c_batch, target_batch);
+    assert_eq!(d_batch, target_batch);
+    assert_ne!(a_batch, target_batch, "transferred batch must not collide with surviving canvas batch");
+
+    let future_batch = h.state_mut().canvas.code_chunks.allocate_batch_id_for_test();
+    assert_ne!(future_batch, a_batch);
+    assert_ne!(future_batch, target_batch);
+
+    // Failing transferred chunk A must cancel only its paired queued chunk B, leaving target's batch (C/D) untouched.
+    tx_a.send(Err("boom".into())).unwrap();
+    let ctx = h.ctx.clone();
+    let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+        crate::canvas::code_chunks::sync_before_layout(h.state_mut(), ui);
+    });
+    out.textures_delta.clear();
+    assert_eq!(h.state().canvas.code_chunks.pending_batch_ids_for_test(), vec![(chunk_c, target_batch)]);
+    assert_eq!(h.state().canvas.code_chunks.queued_batch_ids_for_test(), vec![(chunk_d, target_batch)]);
+}
+
+#[test]
+fn restart_kernel_keeps_invalidated_chunk_workers_counted_until_they_exit() {
+    let mut a = WordApp::new(wordcraft_engine::Session::new(wordcraft_doc::Document::new()), Default::default());
+    let mut chunks = Vec::new();
+    for i in 1..=5 {
+        let id = a.run("code.insert_chunk", json!({"language": "python", "code": format!("x{i} = {i}")})).unwrap()["chunk"]["id"].as_i64().unwrap();
+        chunks.push(id);
+    }
+
+    let mut h = crate::test_harness::builder().with_size(egui::vec2(1280.0, 860.0)).build_eframe(|_| a);
+    h.run_steps(4);
+
+    let doc_id = h.state().session.document_id();
+    let gen0 = h.state().session.chunks.generation();
+    let mut old_store_txs = Vec::new();
+    let mut old_ui_txs = Vec::new();
+    for &cid in &chunks[..4] {
+        let (tx_ui, rx_ui) = std::sync::mpsc::channel();
+        let (tx_store, rx_store) = std::sync::mpsc::channel();
+        h.state_mut().canvas.code_chunks.widgets.get_mut(&cid).unwrap().widget.attach_run(rx_ui);
+        h.state_mut().canvas.code_chunks.push_pending_for_test(
+            cid,
+            wordcraft_engine::chunks::CodeLanguage::Python,
+            "x = 1",
+            (doc_id, gen0, 1, false),
+            rx_store,
+        );
+        old_ui_txs.push(tx_ui);
+        old_store_txs.push(tx_store);
+    }
+    assert_eq!(h.state().canvas.code_chunks.pending_len_for_test(), 4);
+
+    // Restarting the kernel advances the generation and detaches widget spinners,
+    // but the 4 still-running workers must keep occupying the concurrency limit until they exit.
+    h.state_mut().run("code.restart_kernel", json!({})).unwrap();
+    let gen1 = h.state().session.chunks.generation();
+    assert_ne!(gen0, gen1);
+
+    // Queue a new run in gen1 while all 4 gen0 workers are still active: it must stay queued rather than starting a 5th worker.
+    let ctx = h.ctx.clone();
+    let run_res = crate::canvas::code_chunks::run_chunk_async(h.state_mut(), &json!({"chunkId": chunks[4]}), Some(&ctx)).unwrap();
+    assert_eq!(run_res["started"], json!(false), "must not start a new worker while 4 invalidated workers are still running");
+    assert_eq!(run_res["queued"], json!(true));
+    for &cid in &chunks[..3] {
+        h.state_mut().canvas.code_chunks.queue_for_test(cid, wordcraft_engine::chunks::CodeLanguage::Python, "x = 2", (doc_id, gen1, 2, false));
+    }
+
+    let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+        crate::canvas::code_chunks::sync_before_layout(h.state_mut(), ui);
+    });
+    out.textures_delta.clear();
+
+    for &cid in &chunks[..4] {
+        assert!(!h.state().canvas.code_chunks.widgets[&cid].widget.is_running(), "widget spinner must clear on restart");
+        assert!(h.state().canvas.code_chunks.widgets[&cid].widget.output().is_none());
+    }
+    assert_eq!(h.state().canvas.code_chunks.pending_len_for_test(), 4, "all 4 invalidated workers must remain counted while alive");
+    assert_eq!(h.state().canvas.code_chunks.queued_len_for_test(), 4, "new gen1 runs must wait in queue while 4 invalidated workers are alive");
+
+    // Clear the queue to test slot release and result discarding deterministically as invalidated workers exit.
+    h.state_mut().run("code.restart_kernel", json!({})).unwrap();
+    let stale_res = wordcraft_engine::chunks::ExecutionResult {
+        stdout: "stale-from-gen0".into(),
+        stderr: String::new(),
+        exit_code: Some(0),
+        success: true,
+        timed_out: false,
+        output_truncated: false,
+        plot_png: None,
+        plot_svg: None,
+        plots: Vec::new(),
+        tables: Vec::new(),
+        duration_ms: 5,
+    };
+    old_store_txs[0].send(Ok(stale_res.clone())).unwrap();
+    old_store_txs[1].send(Err("stale-err".into())).unwrap();
+    let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+        crate::canvas::code_chunks::sync_before_layout(h.state_mut(), ui);
+    });
+    out.textures_delta.clear();
+    assert_eq!(h.state().canvas.code_chunks.pending_len_for_test(), 2, "2 exited invalidated workers must release their slots");
+    for &cid in &chunks[..4] {
+        assert!(h.state().session.chunks.output(cid).is_none(), "invalidated worker results must be discarded");
+        assert!(h.state().canvas.code_chunks.widgets[&cid].widget.output().is_none());
+    }
+
+    // Dropping the remaining 2 worker senders releases the final 2 slots.
+    drop(old_store_txs);
+    drop(old_ui_txs);
+    let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+        crate::canvas::code_chunks::sync_before_layout(h.state_mut(), ui);
+    });
+    out.textures_delta.clear();
+    assert_eq!(h.state().canvas.code_chunks.pending_len_for_test(), 0);
+}
+
+#[test]
+fn canvas_caret_renders_after_offscreen_or_hidden_chunk_loses_focus() {
+    let mut a = WordApp::new(wordcraft_engine::Session::new(wordcraft_doc::Document::new()), Default::default());
+    a.run("text.insert", json!({"text": "Intro paragraph above chunk 1."})).unwrap();
+    a.run("text.newParagraph", json!({})).unwrap();
+    let chunk1_code = (1..=20).map(|i| format!("x{i} <- {i}")).collect::<Vec<_>>().join("\n");
+    let chunk1_id = a.run("code.insert_chunk", json!({"language": "r", "code": chunk1_code})).unwrap()["chunk"]["id"].as_i64().unwrap();
+    a.run("caret.docEnd", json!({})).unwrap();
+    a.run("text.newParagraph", json!({})).unwrap();
+    let chunk2_code = (1..=20).map(|i| format!("y{i} <- {i}")).collect::<Vec<_>>().join("\n");
+    a.run("code.insert_chunk", json!({"language": "r", "code": chunk2_code})).unwrap();
+    a.run("caret.docEnd", json!({})).unwrap();
+    a.run("text.newParagraph", json!({})).unwrap();
+    a.run("text.insert", json!({"text": "Target prose paragraph on page 2."})).unwrap();
+    a.run("text.newParagraph", json!({})).unwrap();
+    let chunk3_id =
+        a.run("code.insert_chunk", json!({"language": "python", "code": "val = 42\nprint(val)"})).unwrap()["chunk"]["id"].as_i64().unwrap();
+    a.session.sel = wordcraft_engine::Selection::caret(Pos::body(0, 0));
+
+    let mut h = crate::test_harness::builder().with_size(egui::vec2(1280.0, 860.0)).build_eframe(|_| a);
+    h.ctx.all_styles_mut(|s| s.animation_time = 0.1);
+    h.run_steps(6);
+
+    // 1. Focus chunk 1, type an edit, scroll it offscreen, and click prose on page 2.
+    h.state_mut().canvas.code_chunks.request_focus(chunk1_id, false);
+    h.run_steps(3);
+    assert_eq!(h.state().canvas.code_chunks.active_chunk, Some(chunk1_id));
+    h.event(egui::Event::Text("# edited\n".into()));
+    h.step();
+
+    let target_para = h
+        .state()
+        .session
+        .doc
+        .body
+        .iter()
+        .position(|b| b.as_para().is_some_and(|p| p.plain_text().contains("Target prose paragraph")))
+        .expect("target prose paragraph");
+
+    h.state_mut().canvas.scroll_to_caret = false;
+    h.state_mut().canvas.view.offset.1 = 1150.0;
+    h.run_steps(4);
+    let layout = h.state_mut().session.layout();
+    let c_target = layout.caret(&Pos::body(target_para, 4)).expect("target prose caret");
+    let pt_target = page_to_screen(h.state_mut(), c_target.page, c_target.x, c_target.top + c_target.height / 2.0).expect("target on screen");
+
+    h.event(egui::Event::PointerMoved(pt_target));
+    h.event(egui::Event::PointerButton { pos: pt_target, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() });
+    h.step();
+    h.event(egui::Event::PointerButton { pos: pt_target, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() });
+    h.run_steps(4);
+
+    assert!(h.state().canvas.focused(&h.ctx), "clicking prose must focus the canvas");
+    assert_eq!(h.state().canvas.code_chunks.active_chunk, None, "stale offscreen active_chunk must clear when canvas gains focus");
+    assert!(!crate::canvas::code_chunks::caret_in_mounted_chunk(h.state_mut()), "canvas caret must not be suppressed in prose");
+    assert!(
+        wordcraft_engine::chunks::chunks_in(&h.state().session.doc, StoryRef::Body)[0].chunk.code.starts_with("# edited\n"),
+        "offscreen blur must still flush chunk edits to the document"
+    );
+    let glide = &h.state().canvas.glide;
+    let drawn = glide.drawn().expect("canvas caret must be drawn");
+    assert!(glide.opacity() > 0.0, "canvas caret must be visible");
+    assert!(drawn[0].y > 500.0, "caret must be drawn at the clicked page-2 prose position, not stale page-1 top: {drawn:?}");
+
+    // 2. Collapsing a focused chunk via Teaching Mode (`show_code = false`) must also release active_chunk
+    // so clicking back into prose immediately restores the canvas caret.
+    h.state_mut().canvas.code_chunks.request_focus(chunk3_id, false);
+    h.run_steps(3);
+    assert_eq!(h.state().canvas.code_chunks.active_chunk, Some(chunk3_id));
+    h.state_mut().canvas.code_chunks.widgets.get_mut(&chunk3_id).unwrap().widget.show_code = false;
+    h.run_steps(3);
+    assert_eq!(h.state().canvas.code_chunks.active_chunk, None, "hiding code must clear active_chunk");
+    h.event(egui::Event::PointerMoved(pt_target));
+    h.event(egui::Event::PointerButton { pos: pt_target, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() });
+    h.step();
+    h.event(egui::Event::PointerButton { pos: pt_target, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() });
+    h.run_steps(4);
+    assert!(!crate::canvas::code_chunks::caret_in_mounted_chunk(h.state_mut()), "canvas caret must not be suppressed after hiding chunk code");
+    assert!(h.state().canvas.glide.drawn().is_some(), "canvas caret must draw in prose after hiding chunk code");
+}
+
+#[test]
+fn exiting_or_clicking_below_trailing_chunk_creates_editable_paragraph_and_shows_caret() {
+    let mut a = WordApp::new(wordcraft_engine::Session::new(wordcraft_doc::Document::new()), Default::default());
+    a.run("text.insert", json!({"text": "Above"})).unwrap();
+    a.run("code.insert_chunk", json!({"language": "python", "code": "x = 1\ny = 2"})).unwrap();
+    let chunk_id = wordcraft_engine::chunks::chunks_in(&a.session.doc, StoryRef::Body)[0].chunk.id.unwrap();
+    let base_blocks = a.session.doc.body.len();
+
+    let mut h = crate::test_harness::builder().with_size(egui::vec2(1280.0, 960.0)).build_eframe(|_| a);
+    h.ctx.all_styles_mut(|s| s.animation_time = 0.1);
+    h.run_steps(6);
+
+    let chunk_rect = h.state().canvas.code_chunks.screen_rects[&chunk_id];
+    assert_eq!(h.state().session.doc.body.len(), base_blocks);
+
+    // 1. Exiting downward from the trailing chunk must create an editable paragraph below it and show the canvas caret.
+    crate::canvas::code_chunks::exit_chunk_to_canvas_for_test(h.state_mut(), chunk_id, 1);
+    h.run_steps(4);
+    assert!(
+        wordcraft_engine::chunks::chunk_at(&h.state().session.doc, &h.state().session.sel.focus).is_none(),
+        "exiting downward past the trailing chunk must leave the chunk control"
+    );
+    assert!(!crate::canvas::code_chunks::caret_in_mounted_chunk(h.state_mut()), "canvas caret must not stay suppressed inside chunk");
+    assert!(h.state().canvas.focused(&h.ctx), "canvas must receive focus after downward exit");
+    h.input_mut().events.push(egui::Event::Text("After arrow".into()));
+    h.run_steps(4);
+    assert_eq!(h.state().session.doc.para(StoryRef::Body, &wordcraft_doc::Path::top(base_blocks)).map(|p| p.text.as_str()), Some("After arrow"));
+    assert_eq!(wordcraft_engine::chunks::chunks_in(&h.state().session.doc, StoryRef::Body)[0].chunk.code, "x = 1\ny = 2");
+
+    // 2. Clicking in the blank page space below a trailing chunk (with no paragraph below it yet) must place a paragraph and caret below it.
+    h.state_mut().run("edit.undo", json!({})).unwrap();
+    h.state_mut().run("edit.undo", json!({})).unwrap();
+    h.run_steps(4);
+    assert_eq!(h.state().session.doc.body.len(), base_blocks);
+
+    let click_below = egui::pos2(chunk_rect.left() + 24.0, chunk_rect.bottom() + 40.0);
+    h.event(egui::Event::PointerMoved(click_below));
+    h.event(egui::Event::PointerButton { pos: click_below, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() });
+    h.step();
+    h.event(egui::Event::PointerButton { pos: click_below, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() });
+    h.run_steps(4);
+
+    assert!(
+        wordcraft_engine::chunks::chunk_at(&h.state().session.doc, &h.state().session.sel.focus).is_none(),
+        "clicking below the trailing chunk must place caret outside the chunk control"
+    );
+    assert_eq!(h.state().session.sel.focus, Pos::body(base_blocks, 0));
+    assert!(!crate::canvas::code_chunks::caret_in_mounted_chunk(h.state_mut()));
+    let caret = h.state_mut().session.layout().caret(&Pos::body(base_blocks, 0)).expect("layout must place caret below chunk");
+    let caret_screen = page_to_screen(h.state_mut(), caret.page, caret.x, caret.top).expect("trailing caret on screen");
+    assert!(caret_screen.y >= chunk_rect.bottom() - 2.0, "caret must sit below chunk ({}), got {caret_screen:?}", chunk_rect.bottom());
+    assert!(h.state().canvas.glide.drawn().is_some(), "canvas caret must render below trailing chunk");
+    h.input_mut().events.push(egui::Event::Text("After click".into()));
+    h.run_steps(4);
+    assert_eq!(h.state().session.doc.para(StoryRef::Body, &wordcraft_doc::Path::top(base_blocks)).map(|p| p.text.as_str()), Some("After click"));
+}
+
+fn has_vertical_stroke_of_height(shape: &egui::Shape, target_h: f32) -> bool {
+    match shape {
+        egui::Shape::Vec(v) => v.iter().any(|s| has_vertical_stroke_of_height(s, target_h)),
+        egui::Shape::LineSegment { points, .. } => {
+            (points[0].x - points[1].x).abs() < 1.0 && ((points[0].y - points[1].y).abs() - target_h).abs() < 2.0
+        }
+        egui::Shape::Path(p) => {
+            p.points.len() == 2 && (p.points[0].x - p.points[1].x).abs() < 1.0 && ((p.points[0].y - p.points[1].y).abs() - target_h).abs() < 2.0
+        }
+        _ => false,
+    }
+}
+
+fn assert_start_screen_docx_open_paints_caret(docx_b64: &str) {
+    let mut a_bs = WordApp::new(wordcraft_engine::Session::new(wordcraft_doc::Document::new()), Default::default());
+    a_bs.start_screen();
+    let ctx_bs = crate::test_harness::context();
+    ctx_bs.all_styles_mut(|s| s.animation_time = egui::Style::default().animation_time);
+    for i in 0..2 {
+        crate::test_harness::pass(
+            &ctx_bs,
+            &mut a_bs,
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 900.0))),
+                time: Some(i as f64 * 0.016),
+                ..Default::default()
+            },
+        );
+    }
+    a_bs.open_from_platform("start-screen.docx", Some(docx_b64)).unwrap();
+    a_bs.ui.backstage = false;
+
+    let mut painted_caret = false;
+    for i in 2..6 {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 900.0))),
+            time: Some(i as f64 * 0.016),
+            ..Default::default()
+        };
+        craft::ui::shell::embed::before_input(&ctx_bs, |out| a_bs.frame_input(out));
+        let mut full = ctx_bs.run_ui(input, |ui| {
+            crate::test_harness::logic(ui.ctx(), &mut a_bs);
+            a_bs.ui(ui);
+        });
+        if let Some(bar) = a_bs.canvas.glide.drawn() {
+            let h_caret = (bar[1].y - bar[0].y).abs();
+            painted_caret |= full.shapes.iter().any(|c| has_vertical_stroke_of_height(&c.shape, h_caret));
+        }
+        full.textures_delta.clear();
+    }
+    assert!(a_bs.canvas.focused(&ctx_bs), "canvas must receive focus when opening .docx with chunks from Start screen");
+    assert!(a_bs.canvas.glide.drawn().is_some());
+    assert!(a_bs.canvas.glide.opacity() > 0.0);
+    assert!(painted_caret, "CaretMarks must paint a visible vertical caret stroke on screen");
+}
+
+#[test]
+fn canvas_caret_renders_outside_chunks_on_initial_open_with_chunks() {
+    let mut seed = WordApp::new(wordcraft_engine::Session::new(wordcraft_doc::Document::new()), Default::default());
+    seed.run("text.insert", json!({"text": "First prose paragraph outside chunks."})).unwrap();
+    seed.run("code.insert_chunk", json!({"language": "r", "code": "x <- 1:10\nmean(x)", "options": {"label": "setup"}})).unwrap();
+    seed.run("code.exit_below_chunk", json!({})).unwrap();
+    seed.run("text.insert", json!({"text": "Middle prose paragraph between chunks."})).unwrap();
+    seed.run("code.insert_chunk", json!({"language": "r", "code": "plot(1:10)", "options": {"label": "plot-one"}})).unwrap();
+    seed.run("code.exit_below_chunk", json!({})).unwrap();
+    seed.run("text.insert", json!({"text": "Before Python chunk."})).unwrap();
+    seed.run("code.insert_chunk", json!({"language": "python", "code": "import math\nprint(math.pi)", "options": {"label": "py-end"}})).unwrap();
+    let docx_bytes = wordcraft_engine::io::save_bytes_with("ecology-report.docx", &seed.session.doc, None, &Default::default()).unwrap();
+    let docx_b64 = wordcraft_engine::cmd::insert::base64_encode(&docx_bytes);
+
+    // 1. Opening a document with prose and 3 mounted chunks (2 R, 1 Python, ending with a chunk)
+    //    must visibly render the canvas caret without focusing or inserting a chunk first.
+    let mut a = WordApp::new(wordcraft_engine::Session::new(wordcraft_doc::Document::new()), Default::default());
+    a.open_from_platform("ecology-report.docx", Some(&docx_b64)).unwrap();
+
+    let mut h = crate::test_harness::builder().with_size(egui::vec2(1280.0, 900.0)).build_eframe(|_| a);
+    h.ctx.all_styles_mut(|s| s.animation_time = egui::Style::default().animation_time);
+    h.run_steps(6);
+
+    let chunk_ids: Vec<i64> =
+        wordcraft_engine::chunks::chunks_in(&h.state().session.doc, StoryRef::Body).into_iter().map(|r| r.chunk.id.expect("chunk id")).collect();
+    assert_eq!(chunk_ids.len(), 3, "expected 3 imported code chunks");
+    for &id in &chunk_ids {
+        assert!(h.state().canvas.code_chunks.is_mounted(id), "chunk {id} must be mounted");
+    }
+    assert!(h.state().canvas.focused(&h.ctx), "canvas must have focus after initial open");
+    assert_eq!(h.state().canvas.code_chunks.active_chunk, None);
+    assert!(!crate::canvas::code_chunks::caret_in_mounted_chunk(h.state_mut()));
+    assert!(h.state().canvas.glide.drawn().is_some(), "canvas caret must be drawn on initial open");
+    assert!(h.state().canvas.glide.opacity() > 0.0, "canvas caret must be visible on initial open");
+
+    // 2. Clicking in prose between chunks and typing must place the caret and keep it visible.
+    let mid_para = h
+        .state()
+        .session
+        .doc
+        .body
+        .iter()
+        .position(|b| b.as_para().is_some_and(|p| p.plain_text().contains("Middle prose")))
+        .expect("middle prose paragraph");
+    let layout = h.state_mut().session.layout();
+    let c_mid = layout.caret(&Pos::body(mid_para, 6)).expect("middle prose caret");
+    let pt_mid = page_to_screen(h.state_mut(), c_mid.page, c_mid.x, c_mid.top + c_mid.height / 2.0).expect("middle prose on screen");
+
+    h.event(egui::Event::PointerMoved(pt_mid));
+    h.event(egui::Event::PointerButton { pos: pt_mid, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() });
+    h.step();
+    h.event(egui::Event::PointerButton { pos: pt_mid, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() });
+    h.run_steps(4);
+
+    assert_eq!(h.state().session.sel.focus.path, wordcraft_doc::Path::top(mid_para));
+    assert!(h.state().canvas.focused(&h.ctx), "clicking prose must keep canvas focused");
+    assert!(!crate::canvas::code_chunks::caret_in_mounted_chunk(h.state_mut()));
+    let bar_before_type = h.state().canvas.glide.drawn().expect("canvas caret must be drawn after clicking prose");
+    assert!(h.state().canvas.glide.opacity() > 0.0, "canvas caret must be visible after clicking prose");
+
+    h.input_mut().events.push(egui::Event::Text("ABC".into()));
+    h.run_steps(4);
+
+    assert_eq!(
+        h.state().session.doc.para(StoryRef::Body, &wordcraft_doc::Path::top(mid_para)).map(|p| p.text.as_str()),
+        Some("MiddleABC prose paragraph between chunks.")
+    );
+    let bar_after_type = h.state().canvas.glide.drawn().expect("canvas caret must remain drawn while typing in prose");
+    assert!(h.state().canvas.glide.opacity() > 0.0, "canvas caret must remain visible while typing in prose");
+    assert!(bar_after_type[0].x > bar_before_type[0].x, "caret must advance right after typing: {bar_before_type:?} -> {bar_after_type:?}");
+
+    // 3. Clicking in blank page space below the trailing chunk must create a trailing paragraph and show the caret.
+    let last_chunk_id = *chunk_ids.last().expect("trailing chunk");
+    let last_rect = h.state().canvas.code_chunks.screen_rects[&last_chunk_id];
+    let pt_below = egui::pos2(last_rect.left() + 24.0, last_rect.bottom() + 30.0);
+    h.event(egui::Event::PointerMoved(pt_below));
+    h.event(egui::Event::PointerButton { pos: pt_below, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() });
+    h.step();
+    h.event(egui::Event::PointerButton { pos: pt_below, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() });
+    h.run_steps(4);
+
+    assert!(h.state().canvas.focused(&h.ctx));
+    assert!(!crate::canvas::code_chunks::caret_in_mounted_chunk(h.state_mut()));
+    assert!(h.state().canvas.glide.drawn().is_some(), "canvas caret must render below trailing chunk");
+    assert!(h.state().canvas.glide.opacity() > 0.0, "canvas caret must be visible below trailing chunk");
+
+    // 4. Opening a document that starts with a code chunk and clicking prose below must show the caret.
+    let mut seed_cf = WordApp::new(wordcraft_engine::Session::new(wordcraft_doc::Document::new()), Default::default());
+    seed_cf.run("code.insert_chunk", json!({"language": "r", "code": "x <- 1"})).unwrap();
+    seed_cf.run("code.exit_below_chunk", json!({})).unwrap();
+    seed_cf.run("text.insert", json!({"text": "Prose below first chunk."})).unwrap();
+    seed_cf.session.sel = wordcraft_engine::Selection::caret(Pos::body(0, 0));
+    let cf_bytes = wordcraft_engine::io::save_bytes_with("chunk-first.docx", &seed_cf.session.doc, None, &Default::default()).unwrap();
+    let cf_b64 = wordcraft_engine::cmd::insert::base64_encode(&cf_bytes);
+    let mut a_cf = WordApp::new(wordcraft_engine::Session::new(wordcraft_doc::Document::new()), Default::default());
+    a_cf.open_from_platform("chunk-first.docx", Some(&cf_b64)).unwrap();
+    let mut h_cf = crate::test_harness::builder().with_size(egui::vec2(1280.0, 900.0)).build_eframe(|_| a_cf);
+    h_cf.ctx.all_styles_mut(|s| s.animation_time = egui::Style::default().animation_time);
+    h_cf.run_steps(4);
+    assert!(crate::canvas::code_chunks::caret_in_mounted_chunk(h_cf.state_mut()), "initial caret inside leading chunk stays suppressed");
+
+    let prose_idx = h_cf
+        .state()
+        .session
+        .doc
+        .body
+        .iter()
+        .position(|b| b.as_para().is_some_and(|p| p.plain_text().contains("Prose below")))
+        .expect("prose below leading chunk");
+    let l_cf = h_cf.state_mut().session.layout();
+    let c_cf = l_cf.caret(&Pos::body(prose_idx, 5)).expect("prose caret");
+    let pt_cf = page_to_screen(h_cf.state_mut(), c_cf.page, c_cf.x, c_cf.top + c_cf.height / 2.0).expect("prose on screen");
+    h_cf.event(egui::Event::PointerMoved(pt_cf));
+    h_cf.event(egui::Event::PointerButton { pos: pt_cf, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() });
+    h_cf.step();
+    h_cf.event(egui::Event::PointerButton { pos: pt_cf, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() });
+    h_cf.run_steps(4);
+
+    assert!(!crate::canvas::code_chunks::caret_in_mounted_chunk(h_cf.state_mut()));
+    assert!(h_cf.state().canvas.glide.drawn().is_some(), "clicking prose below leading chunk must draw canvas caret");
+    assert!(h_cf.state().canvas.glide.opacity() > 0.0, "canvas caret must be visible after clicking prose below leading chunk");
+
+    // 5. Opening a document from the Start screen must focus the canvas and emit an actual vertical caret stroke.
+    assert_start_screen_docx_open_paints_caret(&docx_b64);
+}
+
+#[test]
+fn run_chunk_and_run_all_propagate_launch_errors_and_report_started_vs_queued_counts() {
+    let mut a = WordApp::new(wordcraft_engine::Session::new(wordcraft_doc::Document::new()), Default::default());
+    let chunk_a = a.run("code.insert_chunk", json!({"language": "python", "code": "a = 1"})).unwrap()["chunk"]["id"].as_i64().unwrap();
+    let chunk_b = a.run("code.insert_chunk", json!({"language": "python", "code": "b = 2"})).unwrap()["chunk"]["id"].as_i64().unwrap();
+
+    let mut h = crate::test_harness::builder().with_size(egui::vec2(1280.0, 860.0)).build_eframe(|_| a);
+    h.run_steps(4);
+
+    let ctx = h.ctx.clone();
+    // 1. A failed worker spawn in `run_chunk_async` must return `Err`, not `queued: true`.
+    h.state_mut().canvas.code_chunks.fail_next_launch_for_test("failed to spawn code chunk runner: simulated thread limit");
+    let err = crate::canvas::code_chunks::run_chunk_async(h.state_mut(), &json!({"chunkId": chunk_a}), Some(&ctx)).unwrap_err();
+    assert!(err.contains("simulated thread limit"), "launch error must propagate: {err}");
+    assert_eq!(h.state().canvas.code_chunks.pending_len_for_test(), 0);
+    assert_eq!(h.state().canvas.code_chunks.queued_len_for_test(), 0);
+
+    // 2. A failed worker spawn on the first job of `run_all_async` (with default stopOnError=true)
+    //    cancels the batch and propagates the launch error.
+    h.state_mut().canvas.code_chunks.fail_next_launch_for_test("failed to spawn code chunk runner: simulated batch spawn error");
+    let batch_err = crate::canvas::code_chunks::run_all_async(h.state_mut(), &json!({}), Some(&ctx)).unwrap_err();
+    assert!(batch_err.contains("simulated batch spawn error"), "batch launch error must propagate: {batch_err}");
+    assert_eq!(h.state().canvas.code_chunks.pending_len_for_test(), 0);
+    assert_eq!(h.state().canvas.code_chunks.queued_len_for_test(), 0);
+
+    // 3. Occupy 4 concurrency slots so no real subprocess needs to spawn to test `started: 0, queued: 2`.
+    let doc_id = h.state().session.document_id();
+    let gen_now = h.state().session.chunks.generation();
+    let mut mock_txs = Vec::new();
+    for fake_id in [9001_i64, 9002, 9003, 9004] {
+        let (tx, rx) = std::sync::mpsc::channel();
+        h.state_mut().canvas.code_chunks.push_pending_for_test(
+            fake_id,
+            wordcraft_engine::chunks::CodeLanguage::Python,
+            "pass",
+            (doc_id, gen_now, 50, false),
+            rx,
+        );
+        mock_txs.push(tx);
+    }
+
+    let res_all_queued = crate::canvas::code_chunks::run_all_async(h.state_mut(), &json!({}), Some(&ctx)).unwrap();
+    assert_eq!(res_all_queued["started"], json!(0), "no jobs started while all 4 worker slots are full");
+    assert_eq!(res_all_queued["queued"], json!(2), "both runnable batch jobs must be reported as queued");
+
+    // Clear queued runs via restart_kernel, then verify `run_all_async` with two runnable chunks
+    // and default `stopOnError: true` starts only the first chunk (`started: 1, queued: 1`).
+    h.state_mut().run("code.restart_kernel", json!({})).unwrap();
+    drop(mock_txs);
+    let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+        crate::canvas::code_chunks::sync_before_layout(h.state_mut(), ui);
+    });
+    assert_eq!(h.state().canvas.code_chunks.pending_len_for_test(), 0);
+    assert_eq!(h.state().canvas.code_chunks.queued_len_for_test(), 0);
+
+    let res_stop_on_err = crate::canvas::code_chunks::run_all_async(h.state_mut(), &json!({}), Some(&ctx)).unwrap();
+    assert_eq!(res_stop_on_err["started"], json!(1), "stopOnError batch must report only the 1 job actually started");
+    assert_eq!(res_stop_on_err["queued"], json!(1), "stopOnError batch must report the 2nd job as queued");
+    assert_eq!(h.state().canvas.code_chunks.pending_len_for_test(), 1);
+    assert_eq!(h.state().canvas.code_chunks.queued_len_for_test(), 1);
+
+    // Clean up in-flight worker via restart_kernel.
+    let _ = chunk_b;
+    h.state_mut().run("code.restart_kernel", json!({})).unwrap();
+}
+
+#[test]
+fn transfer_in_flight_runs_and_pump_enforce_one_live_run_per_chunk() {
+    let mut a = WordApp::new(wordcraft_engine::Session::new(wordcraft_doc::Document::new()), Default::default());
+    let chunk_c = a.run("code.insert_chunk", json!({"language": "python", "code": "c = 1"})).unwrap()["chunk"]["id"].as_i64().unwrap();
+
+    let mut h = crate::test_harness::builder().with_size(egui::vec2(1280.0, 860.0)).build_eframe(|_| a);
+    h.run_steps(4);
+
+    let doc_id = h.state().session.document_id();
+    let gen_now = h.state().session.chunks.generation();
+
+    // 1. Target window has chunk C queued; closing window has chunk C pending.
+    //    Handoff must transfer pending C and remove target's queued C so C cannot run twice.
+    h.state_mut().canvas.code_chunks.queue_for_test(chunk_c, wordcraft_engine::chunks::CodeLanguage::Python, "c = 1", (doc_id, gen_now, 1, false));
+    assert_eq!(h.state().canvas.code_chunks.queued_len_for_test(), 1);
+
+    let mut closing = crate::canvas::code_chunks::CodeChunksState::default();
+    let (tx_closing, rx_closing) = std::sync::mpsc::channel();
+    closing.push_pending_for_test(chunk_c, wordcraft_engine::chunks::CodeLanguage::Python, "c = 1", (doc_id, gen_now, 2, false), rx_closing);
+
+    closing.transfer_in_flight_runs_to(&mut h.state_mut().canvas.code_chunks);
+    assert_eq!(h.state().canvas.code_chunks.pending_len_for_test(), 1, "pending run for chunk C must transfer to target");
+    assert_eq!(h.state().canvas.code_chunks.queued_len_for_test(), 0, "target's queued run for chunk C must be dropped when pending C transfers in");
+
+    // 2. If a duplicate queued run for C is present while C is already pending, pumping must drop
+    //    the duplicate queued run without launching a second worker for C.
+    h.state_mut().canvas.code_chunks.queue_for_test(chunk_c, wordcraft_engine::chunks::CodeLanguage::Python, "c = 1", (doc_id, gen_now, 3, false));
+    let ctx = h.ctx.clone();
+    let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+        crate::canvas::code_chunks::sync_before_layout(h.state_mut(), ui);
+    });
+    out.textures_delta.clear();
+    assert_eq!(h.state().canvas.code_chunks.pending_len_for_test(), 1, "pump must not launch a second run while chunk C is pending");
+    assert_eq!(h.state().canvas.code_chunks.queued_len_for_test(), 0, "pump must drop duplicate queued run for already-pending chunk C");
+
+    // 3. If both target and closing windows have a live pending run for C, target keeps its own
+    //    live pending run while the closing window's pending run is invalidated (counted until it exits).
+    let mut closing2 = crate::canvas::code_chunks::CodeChunksState::default();
+    let (tx_dup, rx_dup) = std::sync::mpsc::channel();
+    closing2.push_pending_for_test(chunk_c, wordcraft_engine::chunks::CodeLanguage::Python, "c = 999", (doc_id, gen_now, 4, false), rx_dup);
+    closing2.queue_for_test(chunk_c, wordcraft_engine::chunks::CodeLanguage::Python, "c = 999", (doc_id, gen_now, 4, false));
+
+    closing2.transfer_in_flight_runs_to(&mut h.state_mut().canvas.code_chunks);
+    assert_eq!(h.state().canvas.code_chunks.queued_len_for_test(), 0);
+    assert_eq!(h.state().canvas.code_chunks.pending_len_for_test(), 2, "duplicate worker thread stays counted as invalidated until it exits");
+
+    // Finishing the invalidated duplicate must not store `c = 999` output.
+    tx_dup
+        .send(Ok(wordcraft_engine::chunks::ExecutionResult {
+            stdout: "from-dup".into(),
+            stderr: String::new(),
+            exit_code: Some(0),
+            success: true,
+            timed_out: false,
+            output_truncated: false,
+            plot_png: None,
+            plot_svg: None,
+            plots: Vec::new(),
+            tables: Vec::new(),
+            duration_ms: 1,
+        }))
+        .unwrap();
+    let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+        crate::canvas::code_chunks::sync_before_layout(h.state_mut(), ui);
+    });
+    out.textures_delta.clear();
+    assert_eq!(h.state().canvas.code_chunks.pending_len_for_test(), 1);
+    assert!(h.state().session.chunks.output(chunk_c).is_none(), "invalidated duplicate run must not overwrite chunk output");
+
+    // Finishing the surviving pending run stores its output cleanly.
+    tx_closing
+        .send(Ok(wordcraft_engine::chunks::ExecutionResult {
+            stdout: "from-Transferred".into(),
+            stderr: String::new(),
+            exit_code: Some(0),
+            success: true,
+            timed_out: false,
+            output_truncated: false,
+            plot_png: None,
+            plot_svg: None,
+            plots: Vec::new(),
+            tables: Vec::new(),
+            duration_ms: 1,
+        }))
+        .unwrap();
+    let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+        crate::canvas::code_chunks::sync_before_layout(h.state_mut(), ui);
+    });
+    out.textures_delta.clear();
+    assert_eq!(h.state().canvas.code_chunks.pending_len_for_test(), 0);
+    assert_eq!(h.state().session.chunks.output(chunk_c).map(|o| o.stdout.as_str()), Some("from-Transferred"));
+}
+
+#[test]
+fn arrow_into_chunk_on_unplaced_page_keeps_focus_request_scrolls_and_focuses_editor() {
+    let mut a = WordApp::new(wordcraft_engine::Session::new(wordcraft_doc::Document::new()), Default::default());
+    // Build page 0 with enough paragraphs to fill the page, then place a code chunk on page 1.
+    for i in 0..38 {
+        if i > 0 {
+            a.run("text.newParagraph", json!({})).unwrap();
+        }
+        a.run("text.insert", json!({"text": format!("Page 1 filler paragraph {i}")})).unwrap();
+    }
+    let last_p0_block = a.session.doc.body.len() - 1;
+    let chunk_p1 =
+        a.run("code.insert_chunk", json!({"language": "python", "code": "page_two = 2\nprint(page_two)"})).unwrap()["chunk"]["id"].as_i64().unwrap();
+    let end_p1 = wordcraft_engine::chunks::chunks_in(&a.session.doc, StoryRef::Body)[0].end.path.last();
+    a.session.doc.body.truncate(end_p1 + 1);
+    let below_p1_block = a.session.doc.body.len();
+    a.session.doc.body.push(wordcraft_doc::para_block(wordcraft_doc::Paragraph::with_text("Paragraph below page 2 chunk", Default::default())));
+
+    // Start at the top of page 0 with no initial chunk focus pending so page 1 is below the viewport and unplaced.
+    a.canvas.code_chunks.pending_focus = None;
+    a.session.sel = wordcraft_engine::Selection::caret(Pos::body(0, 0));
+    a.session.page_hint = 0;
+
+    let mut h = crate::test_harness::builder().with_size(egui::vec2(1280.0, 680.0)).build_eframe(|_| a);
+    h.run_steps(6);
+
+    let layout = h.state_mut().session.layout();
+    let (chunk_page, _) = crate::canvas::code_chunks::chunk_placement(&layout, chunk_p1).expect("chunk must have a placement");
+    assert_eq!(chunk_page, 1, "chunk must be laid out on page 1");
+    assert!(
+        h.state().canvas.shown.pages.iter().all(|p| p.page != chunk_page),
+        "page 1 must initially be unplaced while viewing top of page 0: {:?}",
+        h.state().canvas.shown.pages
+    );
+
+    // 1. Place the caret on the last paragraph of page 0 while keeping page 1 unplaced, then press ArrowDown.
+    h.state_mut().session.sel = wordcraft_engine::Selection::caret(Pos::body(last_p0_block, 0));
+    h.state_mut().session.page_hint = 0;
+    h.state_mut().canvas.scroll_to_caret = false;
+    h.state_mut().canvas.code_chunks.active_chunk = None;
+    let ctx = h.ctx.clone();
+    h.state_mut().canvas.focus_page(&ctx);
+
+    assert!(
+        crate::canvas::code_chunks::maybe_enter_from_canvas_arrow(h.state_mut(), egui::Key::ArrowDown, egui::Modifiers::NONE),
+        "ArrowDown at bottom of page 0 must enter the chunk on page 1"
+    );
+    assert_eq!(h.state().canvas.code_chunks.pending_focus, Some((chunk_p1, false)));
+
+    // A paint pass that only visits placed page 0 must NOT clear `pending_focus`, and must scroll toward page 1.
+    let page0_only: Vec<_> = h.state().canvas.shown.pages.iter().filter(|p| p.page == 0).copied().collect();
+    assert!(!page0_only.is_empty());
+    let offset_before = h.state().canvas.view.offset.1;
+    let mut raw_out = ctx.run_ui(egui::RawInput::default(), |ui| {
+        crate::canvas::code_chunks::paint_and_interact(h.state_mut(), ui, &layout, &page0_only);
+    });
+    raw_out.textures_delta.clear();
+    assert_eq!(
+        h.state().canvas.code_chunks.pending_focus,
+        Some((chunk_p1, false)),
+        "paint pass visiting only placed page 0 must retain pending_focus for unplaced page 1"
+    );
+    assert!(
+        h.state().canvas.view.offset.1 > offset_before,
+        "paint pass with unplaced target page must scroll down toward the target placement ({offset_before} -> {})",
+        h.state().canvas.view.offset.1
+    );
+    // Reset offset to 0 to also verify the full canvas pass end-to-end from the unplaced state.
+    h.state_mut().canvas.view.offset.1 = offset_before;
+
+    h.run_steps(3);
+
+    let editor_id = h.state().canvas.code_chunks.widgets[&chunk_p1].widget.editor_id();
+    assert!(
+        h.state().canvas.shown.pages.iter().any(|p| p.page == chunk_page),
+        "canvas must scroll so page 1 becomes placed: {:?}",
+        h.state().canvas.shown.pages
+    );
+    assert_eq!(h.state().canvas.code_chunks.pending_focus, None, "pending_focus must clear after the editor takes focus");
+    assert_eq!(h.state().canvas.code_chunks.active_chunk, Some(chunk_p1), "chunk on page 1 must become active_chunk");
+    assert!(h.ctx.memory(|m| m.has_focus(editor_id)), "chunk editor on page 1 must hold egui focus");
+    assert_ne!(h.state().session.sel.focus, Pos::body(last_p0_block, 0), "document caret must move off the previous line into the focused chunk");
+    assert_eq!(
+        wordcraft_engine::chunks::chunk_at(&h.state().session.doc, &h.state().session.sel.focus).and_then(|r| r.chunk.id),
+        Some(chunk_p1),
+        "document caret must sit inside the focused chunk"
+    );
+
+    // 2. While page 1 is already placed, focusing the chunk on page 1 must still hand off immediately in a single paint pass.
+    h.state_mut().canvas.focus_page(&ctx);
+    h.state_mut().canvas.code_chunks.active_chunk = None;
+    h.state_mut().session.sel = wordcraft_engine::Selection::caret(Pos::body(below_p1_block, 0));
+    assert!(
+        crate::canvas::code_chunks::maybe_enter_from_canvas_arrow(h.state_mut(), egui::Key::ArrowUp, egui::Modifiers::NONE),
+        "ArrowUp below chunk must request focus at chunk end"
+    );
+    assert_eq!(h.state().canvas.code_chunks.pending_focus, Some((chunk_p1, true)));
+    h.step();
+    assert_eq!(h.state().canvas.code_chunks.pending_focus, None, "chunk on a placed page must take focus immediately on the next pass");
+    assert_eq!(h.state().canvas.code_chunks.active_chunk, Some(chunk_p1));
+    assert!(h.ctx.memory(|m| m.has_focus(editor_id)));
+}
+
+#[test]
+fn clicking_body_text_in_another_column_below_trailing_chunk_does_not_create_trailing_paragraph() {
+    let mut a = WordApp::new(wordcraft_engine::Session::new(wordcraft_doc::Document::new()), Default::default());
+    a.run("layout.columns", json!({"count": 2})).unwrap();
+    // Fill column 1 with short prose lines, then insert a column break so the trailing code chunk sits at the top of column 2.
+    for i in 0..14 {
+        if i > 0 {
+            a.run("text.newParagraph", json!({})).unwrap();
+        }
+        a.run("text.insert", json!({"text": format!("Line {i}.")})).unwrap();
+    }
+    a.run("text.columnBreak", json!({})).unwrap();
+    let chunk_id = a.run("code.insert_chunk", json!({"language": "python", "code": "x = 1"})).unwrap()["chunk"]["id"].as_i64().unwrap();
+    let end_block = wordcraft_engine::chunks::chunks_in(&a.session.doc, StoryRef::Body)[0].end.path.last();
+    a.session.doc.body.truncate(end_block + 1);
+    let base_blocks = a.session.doc.body.len();
+
+    let mut h = crate::test_harness::builder().with_size(egui::vec2(1280.0, 960.0)).build_eframe(|_| a);
+    h.run_steps(6);
+
+    let layout = h.state_mut().session.layout();
+    let (chunk_page, chunk_rect) = crate::canvas::code_chunks::chunk_placement(&layout, chunk_id).expect("placed trailing chunk");
+    let first_line = layout.caret(&Pos::body(0, 0)).expect("first line caret");
+    assert_eq!(chunk_page, 0, "chunk must share page 0 with column 1 (pages: {}, chunk {chunk_rect:?})", layout.pages.len());
+    assert!(chunk_rect.x > first_line.x + 20.0, "chunk must sit in column 2 right of column 1 text: {chunk_rect:?} vs {first_line:?}");
+
+    // Pick a paragraph in column 1 whose Y coordinate sits below the trailing chunk's bottom in column 2.
+    let col1_para = (0..14)
+        .find(|&bi| layout.caret(&Pos::body(bi, 2)).is_some_and(|c| c.page == 0 && c.top > chunk_rect.bottom() + 20.0 && c.x < chunk_rect.x - 10.0))
+        .expect("column 1 must have a paragraph below column 2's trailing chunk bottom");
+    let c_col1 = layout.caret(&Pos::body(col1_para, 2)).unwrap();
+
+    // 1. Direct call to `try_click_below_trailing_chunk` on column 1 body text must return false
+    //    and leave both the document and caret unchanged.
+    let focus_before = Pos::body(col1_para, 2);
+    h.state_mut().session.sel = wordcraft_engine::Selection::caret(focus_before.clone());
+    let ctx = h.ctx.clone();
+    let acted = crate::canvas::code_chunks::try_click_below_trailing_chunk(
+        h.state_mut(),
+        &ctx,
+        &layout,
+        0,
+        (c_col1.x, c_col1.top + c_col1.height * 0.5),
+        StoryRef::Body,
+    );
+    assert!(!acted, "clicking body text in column 1 below column 2 chunk bottom must not trigger trailing-chunk exit");
+    assert_eq!(h.state().session.doc.body.len(), base_blocks, "document must remain unchanged");
+    assert_eq!(h.state().session.sel.focus, focus_before, "caret must remain unchanged");
+
+    // 2. Full pointer click on that column 1 text must keep `doc.body.len() == base_blocks` and place caret in `col1_para`.
+    let pt_col1 = page_to_screen(h.state_mut(), 0, c_col1.x, c_col1.top + c_col1.height * 0.5).expect("col1 text on screen");
+    h.event(egui::Event::PointerMoved(pt_col1));
+    h.event(egui::Event::PointerButton { pos: pt_col1, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() });
+    h.step();
+    h.event(egui::Event::PointerButton { pos: pt_col1, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() });
+    h.run_steps(3);
+    assert_eq!(h.state().session.doc.body.len(), base_blocks, "canvas click on column 1 text must not add a trailing paragraph");
+    assert_eq!(h.state().session.sel.focus.path, wordcraft_doc::Path::top(col1_para));
+
+    // 3. Clicking in empty space directly below the trailing chunk in column 2 must still create a trailing paragraph.
+    let acted_col2 = crate::canvas::code_chunks::try_click_below_trailing_chunk(
+        h.state_mut(),
+        &ctx,
+        &layout,
+        0,
+        (chunk_rect.x + 24.0, chunk_rect.bottom() + 30.0),
+        StoryRef::Body,
+    );
+    assert!(acted_col2, "clicking empty space below the trailing chunk in its own column must create a trailing paragraph");
+    assert_eq!(h.state().session.doc.body.len(), base_blocks + 1);
+    assert_eq!(h.state().session.sel.focus, Pos::body(base_blocks, 0));
+}
+
+#[test]
+fn outline_view_shows_caret_and_skips_chunk_arrow_intercept_when_chunk_is_not_placed() {
+    let mut a = WordApp::new(wordcraft_engine::Session::new(wordcraft_doc::Document::new()), Default::default());
+    a.run("text.insert", json!({"text": "Paragraph above chunk"})).unwrap();
+    let chunk_id = a.run("code.insert_chunk", json!({"language": "python", "code": "x = 1\ny = 2"})).unwrap()["chunk"]["id"].as_i64().unwrap();
+
+    let mut h = crate::test_harness::builder().with_size(egui::vec2(1280.0, 860.0)).build_eframe(|_| a);
+    h.ctx.all_styles_mut(|s| s.animation_time = egui::Style::default().animation_time);
+    h.run_steps(6);
+
+    // Focus the chunk in Print Layout first so `is_mounted(chunk_id)` and `active_chunk` are set.
+    h.state_mut().canvas.code_chunks.request_focus(chunk_id, false);
+    h.run_steps(3);
+    assert!(h.state().canvas.code_chunks.is_mounted(chunk_id));
+    assert_eq!(h.state().canvas.code_chunks.active_chunk, Some(chunk_id));
+    assert!(crate::canvas::code_chunks::caret_in_mounted_chunk(h.state_mut()));
+
+    // Switch to Outline view: layout does not emit `Placed::Chunk`, while the widget stays cached in `widgets`.
+    h.state_mut().run("view.outline", json!({})).unwrap();
+    h.run_steps(4);
+
+    let layout = h.state_mut().session.layout();
+    assert!(h.state().canvas.code_chunks.is_mounted(chunk_id), "widget entry remains cached across view switch");
+    assert!(crate::canvas::code_chunks::chunk_placement(&layout, chunk_id).is_none(), "Outline view must not place Placed::Chunk");
+    assert_eq!(h.state().canvas.code_chunks.active_chunk, None, "active_chunk must clear when chunk is unplaced in Outline view");
+    assert!(
+        wordcraft_engine::chunks::chunk_at(&h.state().session.doc, &h.state().session.sel.focus).is_some(),
+        "caret remains inside the chunk's paragraph in Outline view"
+    );
+    assert!(
+        !crate::canvas::code_chunks::caret_in_mounted_chunk(h.state_mut()),
+        "caret_in_mounted_chunk must return false in Outline view when no Placed::Chunk exists"
+    );
+    assert!(h.state().canvas.glide.drawn().is_some(), "canvas caret must be drawn in Outline view inside chunk paragraph");
+    assert!(h.state().canvas.glide.opacity() > 0.0, "canvas caret must be visible in Outline view inside chunk paragraph");
+
+    // Pressing ArrowDown from the paragraph above the chunk in Outline view must not intercept into a hidden chunk widget.
+    h.state_mut().session.sel = wordcraft_engine::Selection::caret(Pos::body(0, 0));
+    assert!(
+        !crate::canvas::code_chunks::maybe_enter_from_canvas_arrow(h.state_mut(), egui::Key::ArrowDown, egui::Modifiers::NONE),
+        "ArrowDown in Outline view must not request focus on an unplaced chunk widget"
+    );
+    assert_eq!(h.state().canvas.code_chunks.pending_focus, None);
+}
+
+#[test]
+fn code_chunks_cache_memoizes_by_session_rev_and_short_circuits_without_chunks() {
+    let a = WordApp::new(wordcraft_engine::Session::new(wordcraft_doc::Document::from_text("Plain prose only")), Default::default());
+    let mut h = crate::test_harness::builder().with_size(egui::vec2(1280.0, 860.0)).build_eframe(|_| a);
+    h.run_steps(3);
+    assert_eq!(
+        h.state().canvas.code_chunks.cached_chunks_key_for_test(),
+        None,
+        "documents without chunks must short-circuit in O(1) without populating cache"
+    );
+
+    let chunk_id = h.state_mut().run("code.insert_chunk", json!({"language": "python", "code": "x = 1"})).unwrap()["chunk"]["id"].as_i64().unwrap();
+    h.run_steps(2);
+    let key1 = (h.state().session.document_id(), h.state().session.rev());
+    assert_eq!(h.state().canvas.code_chunks.cached_chunks_key_for_test(), Some(key1));
+
+    // Deleting the chunk clears widgets and lets subsequent frames short-circuit again.
+    h.state_mut().run("code.delete_chunk", json!({"chunkId": chunk_id})).unwrap();
+    h.run_steps(2);
+    assert!(!h.state().canvas.code_chunks.is_mounted(chunk_id));
+}
+
+#[test]
+fn async_chunk_completion_announces_live_region_and_guards_stale_apply() {
+    use egui::accesskit::{Live, Role};
+    use egui_kittest::kittest::{NodeT, Queryable};
+
+    let mut a = WordApp::new(wordcraft_engine::Session::new(wordcraft_doc::Document::new()), Default::default());
+    let chunk_id = a.run("code.insert_chunk", json!({"language": "python", "code": "x = 1"})).unwrap()["chunk"]["id"].as_i64().unwrap();
+    let skip_id =
+        a.run("code.insert_chunk", json!({"language": "r", "code": "y <- 2", "options": {"eval": false}})).unwrap()["chunk"]["id"].as_i64().unwrap();
+
+    let mut h = crate::test_harness::builder().with_size(egui::vec2(1280.0, 860.0)).build_eframe(|_| a);
+    h.run_steps(4);
+
+    // 1. `run_all_async` uses PR 5 `plan_run_all`: skips `eval: false` chunk and queues only runnable chunk.
+    let ctx = h.ctx.clone();
+    let doc_id = h.state().session.document_id();
+    let gen0 = h.state().session.chunks.generation();
+    let mut mock_txs = Vec::new();
+    for fake_id in [9101_i64, 9102, 9103, 9104] {
+        let (tx, rx) = std::sync::mpsc::channel();
+        h.state_mut().canvas.code_chunks.push_pending_for_test(
+            fake_id,
+            wordcraft_engine::chunks::CodeLanguage::Python,
+            "pass",
+            (doc_id, gen0, 70, false),
+            rx,
+        );
+        mock_txs.push(tx);
+    }
+    let all_res = crate::canvas::code_chunks::run_all_async(h.state_mut(), &json!({}), Some(&ctx)).unwrap();
+    assert_eq!(all_res["started"], json!(0));
+    assert_eq!(all_res["queued"], json!(1), "only the runnable chunk is queued; eval:false chunk must be skipped");
+    assert_eq!(h.state().canvas.code_chunks.queued_batch_ids_for_test().iter().map(|(id, _)| *id).collect::<Vec<_>>(), vec![chunk_id]);
+    h.state_mut().run("code.restart_kernel", json!({})).unwrap();
+    drop(mock_txs);
+    let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+        crate::canvas::code_chunks::sync_before_layout(h.state_mut(), ui);
+    });
+    let gen0 = h.state().session.chunks.generation();
+
+    let (tx_ui, rx_ui) = std::sync::mpsc::channel();
+    let (tx_store, rx_store) = std::sync::mpsc::channel();
+    h.state_mut().canvas.code_chunks.widgets.get_mut(&chunk_id).unwrap().widget.attach_run(rx_ui);
+    h.state_mut().canvas.code_chunks.push_pending_for_test(
+        chunk_id,
+        wordcraft_engine::chunks::CodeLanguage::Python,
+        "x = 1",
+        (doc_id, gen0, 0, false),
+        rx_store,
+    );
+    let ok_res = wordcraft_engine::chunks::ExecutionResult {
+        stdout: "42".into(),
+        stderr: String::new(),
+        exit_code: Some(0),
+        success: true,
+        timed_out: false,
+        output_truncated: false,
+        plot_png: None,
+        plot_svg: None,
+        plots: Vec::new(),
+        tables: Vec::new(),
+        duration_ms: 4,
+    };
+    tx_ui.send(Ok(ok_res.clone())).unwrap();
+    tx_store.send(Ok(ok_res)).unwrap();
+    h.step();
+
+    assert_eq!(h.state().session.chunks.output(chunk_id).map(|o| o.stdout.as_str()), Some("42"));
+    assert!(h.state().session.chunks.output(skip_id).is_none());
+    let announced = h
+        .query_all_by(|n| n.role() == Role::Label && n.data().live() == Some(Live::Polite))
+        .any(|n| n.value().is_some_and(|v| v.contains("Python code chunk finished")));
+    assert!(announced, "async completion must expose a polite live announcement");
+
+    // 2. Stale result when chunk code changes before completion must be ignored by `apply_chunk_run_result`.
+    let (_tx_ui2, rx_ui2) = std::sync::mpsc::channel();
+    let (tx_store2, rx_store2) = std::sync::mpsc::channel();
+    h.state_mut().canvas.code_chunks.widgets.get_mut(&chunk_id).unwrap().widget.attach_run(rx_ui2);
+    h.state_mut().canvas.code_chunks.push_pending_for_test(
+        chunk_id,
+        wordcraft_engine::chunks::CodeLanguage::Python,
+        "x = 1",
+        (doc_id, gen0, 0, false),
+        rx_store2,
+    );
+    h.state_mut().run("code.update_chunk", json!({"chunkId": chunk_id, "code": "x = 999"})).unwrap();
+    tx_store2
+        .send(Ok(wordcraft_engine::chunks::ExecutionResult {
+            stdout: "stale".into(),
+            stderr: String::new(),
+            exit_code: Some(0),
+            success: true,
+            timed_out: false,
+            output_truncated: false,
+            plot_png: None,
+            plot_svg: None,
+            plots: Vec::new(),
+            tables: Vec::new(),
+            duration_ms: 4,
+        }))
+        .unwrap();
+    let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+        crate::canvas::code_chunks::sync_before_layout(h.state_mut(), ui);
+    });
+    assert_eq!(
+        h.state().session.chunks.output(chunk_id).map(|o| o.stdout.as_str()),
+        Some("42"),
+        "stale completion after source edit must not overwrite session output"
+    );
+    assert!(!h.state().canvas.code_chunks.widgets[&chunk_id].widget.is_running());
+}

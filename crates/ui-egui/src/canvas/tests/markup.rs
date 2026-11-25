@@ -525,7 +525,7 @@ fn comment_fields_are_read_only_where_comments_cant_change() {
 // ---------------------------------------------------------------------------------------
 
 /// A right-click at `at`, the button pressed and released a frame apart.
-fn right_click(h: &mut H, at: Pos2) {
+pub(super) fn right_click(h: &mut H, at: Pos2) {
     h.event(egui::Event::PointerMoved(at));
     h.app_frame();
     for pressed in [true, false] {
@@ -544,7 +544,7 @@ fn menu_entry(h: &H, label: &str) -> Option<Pos2> {
 
 /// Picks `path` in the open context menu with the mouse: over each submenu on the way, then a
 /// click on the last entry.
-fn pick(h: &mut H, path: &[&str]) {
+pub(super) fn pick(h: &mut H, path: &[&str]) {
     let Some((last, submenus)) = path.split_last() else { return };
     for label in submenus {
         let at = menu_entry(h, label).expect(label);
@@ -563,7 +563,7 @@ fn pick(h: &mut H, path: &[&str]) {
 
 /// Whether the open context menu has an entry holding each of `labels` (`true`) or none
 /// (`false`).
-fn assert_menu(h: &H, labels: &[&str], there: bool) {
+pub(super) fn assert_menu(h: &H, labels: &[&str], there: bool) {
     for label in labels {
         assert_eq!(menu_entry(h, label).is_some(), there, "{label} in the menu: {there}");
     }
