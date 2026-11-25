@@ -19,9 +19,7 @@ pub(crate) use mount::{
 };
 #[cfg(test)]
 pub(crate) use mount::{chunk_focus_band_y, dispatch_chunk_action_for_test, exit_chunk_to_canvas_for_test};
-#[cfg_attr(not(test), allow(dead_code))] // Wired by PR 9 command handlers.
-pub(crate) use pool::run_all_async;
-pub(crate) use pool::run_chunk_async;
+pub(crate) use pool::{run_all_async, run_chunk_async};
 
 const DEBOUNCE_SECS: f64 = 0.5;
 const HEIGHT_HYSTERESIS_CENTIPTS: i64 = 75; // 0.75 pt
@@ -82,7 +80,6 @@ impl CodeChunksState {
         self.widgets.contains_key(&id)
     }
 
-    #[cfg_attr(not(test), allow(dead_code))] // Wired by PR 9 dirty-check callers.
     pub(crate) fn has_dirty(&self) -> bool {
         self.widgets.values().any(|e| e.dirty) || !self.restored_drafts.is_empty()
     }
@@ -99,7 +96,6 @@ impl CodeChunksState {
         self.pending_focus = Some((id, at_end));
     }
 
-    #[cfg_attr(not(test), allow(dead_code))] // Wired by PR 9 `code.delete_chunk` / `edit.undo`.
     pub(crate) fn discard_draft(&mut self, id: i64) {
         self.widgets.remove(&id);
         self.restored_drafts.remove(&id);
@@ -154,7 +150,6 @@ impl CodeChunksState {
         ctx.request_repaint_after(std::time::Duration::from_secs_f64((ANNOUNCEMENT_MS - age) / 1000.0));
     }
 
-    #[cfg_attr(not(test), allow(dead_code))] // Wired by `run_all_async` and window handoffs (PR 9).
     fn allocate_batch_id(&mut self) -> u64 {
         let limit = self.pending_runs.len().saturating_add(self.queued_runs.len());
         for _ in 0..=limit {
@@ -171,7 +166,6 @@ impl CodeChunksState {
     /// Transfer in-flight pending and queued runs to `target`, enforcing at most one live
     /// (non-invalidated) run per chunk: a live pending run always supersedes any queued run for
     /// the same chunk, and `target`'s existing live run wins over a duplicate from `self`.
-    #[cfg_attr(not(test), allow(dead_code))] // Wired by PR 9 multi-window merge/close handoffs.
     pub(crate) fn transfer_in_flight_runs_to(&mut self, target: &mut CodeChunksState) {
         let mut batch_map: HashMap<u64, u64> = HashMap::new();
         let mut remap = |target: &mut CodeChunksState, batch_id: u64, stop_on_error: bool| -> u64 {
@@ -302,7 +296,6 @@ impl CodeChunksState {
     }
 
     /// Flush dirty chunk widgets and restored drafts into `session`, skipping an optional target chunk.
-    #[cfg_attr(not(test), allow(dead_code))] // Wired by PR 9 Save / Export / Run / Undo / Delete.
     pub(crate) fn flush_dirty_except(&mut self, session: &mut wordcraft_engine::Session, except: Option<i64>) -> Result<(), String> {
         let mut ids: Vec<i64> = self.widgets.iter().filter(|(id, e)| e.dirty && Some(**id) != except).map(|(id, _)| *id).collect();
         ids.sort_unstable();
@@ -437,13 +430,11 @@ impl CodeChunkEntry {
 }
 
 /// Whether any mounted code chunk widget has unsaved edits not yet flushed into the document.
-#[cfg_attr(not(test), allow(dead_code))] // Wired by PR 9 dirty checks.
 pub(crate) fn has_dirty_chunks(app: &WordApp) -> bool {
     app.canvas.code_chunks.has_dirty()
 }
 
 /// Collect dirty chunk drafts from the active canvas so switching documents in one window preserves them.
-#[cfg_attr(not(test), allow(dead_code))] // Wired by PR 9 document switches.
 pub(crate) fn take_dirty_drafts(app: &mut WordApp) -> ChunkDrafts {
     let mut drafts = std::mem::take(&mut app.canvas.code_chunks.restored_drafts);
     for (&id, entry) in &app.canvas.code_chunks.widgets {
@@ -455,7 +446,6 @@ pub(crate) fn take_dirty_drafts(app: &mut WordApp) -> ChunkDrafts {
 }
 
 /// Discard dirty chunk drafts back to each chunk's last committed `(language, code)` in the document.
-#[cfg_attr(not(test), allow(dead_code))] // Wired by PR 9 discard/reload paths.
 pub(crate) fn revert_dirty_chunks(app: &mut WordApp) -> bool {
     let mut reverted = !app.canvas.code_chunks.restored_drafts.is_empty();
     app.canvas.code_chunks.restored_drafts.clear();
@@ -719,15 +709,24 @@ pub(crate) fn flush_one(app: &mut WordApp, id: i64) -> Result<(), String> {
 }
 
 /// Flush every dirty code chunk editor into the document before Undo/Redo/Save/Export/Run.
-#[cfg_attr(not(test), allow(dead_code))] // Wired by PR 9 Save / Export / Run / Undo.
 pub(crate) fn flush_dirty(app: &mut WordApp) -> Result<(), String> {
     flush_dirty_except(app, None)
 }
 
 /// Flush dirty code chunks, skipping an optional target chunk (e.g. for `code.delete_chunk`).
-#[cfg_attr(not(test), allow(dead_code))] // Wired by PR 9 `code.delete_chunk`.
 pub(crate) fn flush_dirty_except(app: &mut WordApp, except: Option<i64>) -> Result<(), String> {
-    app.canvas.code_chunks.flush_dirty_except(&mut app.session, except)
+    let mut first_err = app.canvas.code_chunks.flush_dirty_except(&mut app.session, except).err();
+    // Also flush dirty chunk drafts from other non-shown windows displaying this document.
+    let current_doc = app.session.document_id();
+    if let Err(err) = app.windows.flush_dirty_chunks_for(&mut app.session, current_doc, except)
+        && first_err.is_none()
+    {
+        first_err = Some(err);
+    }
+    match first_err {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
 }
 
 fn clear_chunk_output(app: &mut WordApp, id: i64) {

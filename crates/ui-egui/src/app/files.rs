@@ -381,7 +381,12 @@ impl WordApp {
             }
             let result = match picked {
                 // Only when nothing changed since and no later save of it is still unconfirmed.
-                Picked::Paths(_) | Picked::Downloaded(_) if !self.session.dirty && self.session.rev() == save.rev && !self.save_unconfirmed() => {
+                Picked::Paths(_) | Picked::Downloaded(_)
+                    if !self.document_unsaved_by_id(save.document)
+                        && !self.session.dirty
+                        && self.session.rev() == save.rev
+                        && !self.save_unconfirmed() =>
+                {
                     let step = self.with_guard(|g| g.saved());
                     self.drive_guard(step, None)
                 }
@@ -433,9 +438,10 @@ impl WordApp {
         if !self.has_unsaved_documents() {
             return true;
         }
-        // A comment draft the document refuses is an unsaved change: the prompt can drop it.
+        // A comment or chunk draft the document refuses is an unsaved change: the prompt can drop it.
         if self.has_document() {
             let _ = panes::flush_comment_drafts(self);
+            let _ = crate::canvas::code_chunks::flush_dirty(self);
         }
         if !self.has_unsaved_documents() {
             return true;

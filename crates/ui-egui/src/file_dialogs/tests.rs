@@ -923,3 +923,16 @@ fn many_failed_fonts_end_with_a_count() {
     a.add_fonts(fonts).unwrap();
     assert_eq!(status_text(&a), "Added 0 fonts; 5 couldn't be read: f0.ttf, f1.ttf, f2.ttf and 2 more");
 }
+
+#[test]
+fn documents_filter_includes_uppercase_rmd() {
+    assert!(DOCUMENTS.contains(&"Rmd"));
+    assert!(DOCUMENTS.contains(&"rmd"));
+    let filters = open_filters("document");
+    let (name, exts) = filters[0];
+    assert_eq!(name, "Documents");
+    assert!(exts.contains(&"Rmd"));
+    let path = std::path::Path::new("analysis.Rmd");
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap();
+    assert!(exts.contains(&ext));
+}

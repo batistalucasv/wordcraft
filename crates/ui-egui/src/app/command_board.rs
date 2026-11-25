@@ -22,10 +22,7 @@ fn gate(app: &WordApp, id: &str) -> (bool, Option<&'static str>) {
         return (false, None);
     }
     match app.session.registry.get(id) {
-        Some(_) => {
-            let reason = app.session.why_disabled(id);
-            (reason.is_none(), reason)
-        }
+        Some(_) => gate_registered_inner(app, id),
         None if id.starts_with("ui.zotero.") => (app.zotero.busy.is_none() && !cfg!(target_arch = "wasm32"), None),
         None if id == "ui.linkTextBox" => (command_enabled(app, "shape.link"), None),
         None if id == "ui.crop" => (crate::crop::can_toggle(app), None),
@@ -133,6 +130,13 @@ impl CommandStatesCache {
 /// Gate check for a command known to live in `app.session.registry` (skips the extra registry lookup).
 fn gate_registered(app: &WordApp, id: &str) -> (bool, Option<&'static str>) {
     if !app.has_document() && !super::commands::works_without_document(id) {
+        return (false, None);
+    }
+    gate_registered_inner(app, id)
+}
+
+fn gate_registered_inner(app: &WordApp, id: &str) -> (bool, Option<&'static str>) {
+    if cfg!(target_arch = "wasm32") && matches!(id, "code.run_chunk" | "code.run_all") {
         return (false, None);
     }
     let reason = app.session.why_disabled(id);
@@ -486,5 +490,26 @@ mod tests {
         app.command_states_cache = None;
         let _ = app.command_input();
         assert_eq!(*app.command_states, incremental, "incremental cache matches full rebuild exactly");
+    }
+
+    #[test]
+    fn code_commands_gate_by_document_and_chunk_presence() {
+        let mut app = WordApp::new(Session::new(wordcraft_doc::Document::new()), Default::default());
+        let _ = app.command_input();
+        assert!(app.command_states.get(&CommandRef::new("code.insert_chunk")).unwrap().is_enabled());
+        assert!(app.command_states.get(&CommandRef::new("code.restart_kernel")).unwrap().is_enabled());
+        assert!(!app.command_states.get(&CommandRef::new("code.run_chunk")).unwrap().is_enabled());
+        assert!(!app.command_states.get(&CommandRef::new("code.run_all")).unwrap().is_enabled());
+
+        app.run("code.insert_chunk", json!({"language": "python", "code": "x = 1"})).unwrap();
+        let _ = app.command_input();
+        assert_eq!(app.command_states.get(&CommandRef::new("code.run_chunk")).unwrap().is_enabled(), !cfg!(target_arch = "wasm32"));
+        assert_eq!(app.command_states.get(&CommandRef::new("code.run_all")).unwrap().is_enabled(), !cfg!(target_arch = "wasm32"));
+
+        app.no_document = Some(app.session.document_id());
+        let _ = app.command_input();
+        for id in ["code.insert_chunk", "code.run_chunk", "code.run_all", "code.restart_kernel"] {
+            assert!(!app.command_states.get(&CommandRef::new(id)).unwrap().is_enabled(), "{id} disables without a document");
+        }
     }
 }

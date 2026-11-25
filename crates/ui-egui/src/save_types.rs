@@ -43,6 +43,8 @@ fn format_name(ext: &str) -> String {
         "pdf" => "PDF".into(),
         "txt" => "Plain Text".into(),
         "md" => "Markdown".into(),
+        "qmd" => crate::tl!("Quarto Document").into(),
+        "rmd" => crate::tl!("R Markdown").into(),
         "html" => "Web Page".into(),
         "rtf" => "Rich Text Format".into(),
         "odt" => "OpenDocument Text".into(),

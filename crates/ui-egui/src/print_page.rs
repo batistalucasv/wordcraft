@@ -408,6 +408,8 @@ pub(crate) const EXPORT_FORMATS: &[(&str, &str)] = &[
     ("Rich Text Format (*.rtf)", "rtf"),
     ("Web page (*.html)", "html"),
     ("Markdown (*.md)", "md"),
+    ("Quarto document (*.qmd)", "qmd"),
+    ("R Markdown (*.Rmd)", "rmd"),
     ("LaTeX (*.tex)", "tex"),
     ("Plain text (*.txt)", "txt"),
     ("Page image (*.png)", "png"),

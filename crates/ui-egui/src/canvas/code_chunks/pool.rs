@@ -291,7 +291,6 @@ pub(crate) fn run_chunk_async(app: &mut WordApp, params: &Value, ctx: Option<&eg
 }
 
 /// Non-blocking UI execution for `code.run_all` when dispatched interactively via `WordApp::run`.
-#[cfg_attr(not(test), allow(dead_code))] // Wired by PR 9 command handlers.
 pub(crate) fn run_all_async(app: &mut WordApp, params: &Value, ctx: Option<&egui::Context>) -> Result<Value, String> {
     if let Some(why) = app.session.why_disabled("code.run_all") {
         return Err(why.into());
