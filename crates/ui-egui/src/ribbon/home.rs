@@ -185,11 +185,13 @@ pub(super) fn home(row: &mut RibbonRow<'_>, app: &mut WordApp) {
                     if let Some(f) = out.picked {
                         let _ = app.run("format.font", json!({"name": f}));
                     }
+                    static FONT_SIZE_ENTRIES: std::sync::OnceLock<Vec<Entry<String>>> = std::sync::OnceLock::new();
                     let fmt = |s: f64| if s.fract() == 0.0 { format!("{s:.0}") } else { format!("{s}") };
                     let mut size = st.get("size").and_then(Value::as_f64).map(fmt).unwrap_or_default();
-                    let sizes: Vec<Entry<String>> =
-                        wordcraft_engine::cmd::format::SIZES.iter().map(|s| Entry::new(fmt(f64::from(*s)), fmt(f64::from(*s)))).collect();
-                    let out = craft::ui::pickers::ComboBox::new(tl!("Font Size").to_string(), Bind::bound(&mut size), &sizes)
+                    let sizes = FONT_SIZE_ENTRIES.get_or_init(|| {
+                        wordcraft_engine::cmd::format::SIZES.iter().map(|s| Entry::new(fmt(f64::from(*s)), fmt(f64::from(*s)))).collect()
+                    });
+                    let out = craft::ui::pickers::ComboBox::new(tl!("Font Size").to_string(), Bind::bound(&mut size), sizes)
                         .tooltip(tl!("Font Size").to_string())
                         .show(ui);
                     if let Some(v) = out.edit.events.committed()
