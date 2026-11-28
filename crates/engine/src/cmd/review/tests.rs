@@ -1121,6 +1121,42 @@ mod spelling_navigation_tests {
             assert_eq!(s.doc.plain_text(StoryRef::Body), "A sentense sentense.");
         }
     }
+
+    #[test]
+    fn contextual_paronyms_and_unbalanced_delimiter_surface_in_review_issues_and_apply_with_undo() {
+        for (lang, text, target, suggestion, expected) in [
+            (None, "Their is a team.", "Their", "There", "There is a team."),
+            (Some("pt-BR"), "Ficou cada vez mas claro.", "mas", "mais", "Ficou cada vez mais claro."),
+            (Some("es-ES"), "Haber si viene hoy.", "Haber", "A ver", "A ver si viene hoy."),
+        ] {
+            let mut s = Session::new(Document::from_text(text));
+            if let Some(tag) = lang {
+                s.run("select.all", &json!({})).unwrap();
+                s.run("review.language", &json!({"lang": tag})).unwrap();
+            }
+            let issues = s.run("review.issues", &json!({})).unwrap();
+            let issue = issues
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|i| i["kind"] == "grammar" && i["text"] == target && i["suggestions"].as_array().unwrap().iter().any(|x| x == suggestion))
+                .unwrap_or_else(|| panic!("expected grammar issue for {target:?} in {issues:?}"));
+            let off = issue["start"]["off"].as_u64().unwrap() as usize;
+            s.sel = Selection::caret(Pos::body(0, off));
+            assert_eq!(s.run("review.suggestions", &json!({})).unwrap()["text"], target);
+            s.run("review.applySuggestion", &json!({"text": suggestion})).unwrap();
+            assert_eq!(s.doc.plain_text(StoryRef::Body), expected);
+            s.run("edit.undo", &json!({})).unwrap();
+            assert_eq!(s.doc.plain_text(StoryRef::Body), text);
+        }
+
+        let mut s = Session::new(Document::from_text("Check the (open note."));
+        let issues = s.run("review.issues", &json!({})).unwrap();
+        assert!(
+            issues.as_array().unwrap().iter().any(|i| i["kind"] == "grammar" && i["text"] == "("),
+            "expected unbalanced delimiter issue in {issues:?}"
+        );
+    }
 }
 
 /// #6086 review: A pre-existing table whose cell paragraphs and runs are all redlined (including an
