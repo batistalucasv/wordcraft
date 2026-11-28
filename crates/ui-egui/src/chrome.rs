@@ -24,6 +24,8 @@ pub(crate) struct ChromeOpen {
     pub(crate) title_fit: Fit,
     /// How the status bar's controls fit the room the page leaves them.
     pub(crate) status_fit: Fit,
+    /// Cached command search entries and index for the current registry and UI language.
+    pub(crate) search_cache: Option<std::sync::Arc<search::SearchCache>>,
 }
 
 /// The steps a bar's group of controls takes in a narrow window, from the fullest to the most compact.

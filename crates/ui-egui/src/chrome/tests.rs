@@ -1126,3 +1126,51 @@ fn status_bar_view_mode_toggles_and_zoom_slider_proportions() {
     });
     assert!(has_14pt_knob, "Zoom slider should paint a {glyph_md} pt thumb (ControlSize::Md) matching 14 pt IconButton icons inside {slider:?}");
 }
+
+/// Stage 4: `chrome::search` reuses its built entries and `SearchIndex` across idle and editing frames,
+/// invalidating only when the command registry or interface language changes.
+#[test]
+fn command_search_cache_reuses_across_frames_and_invalidates_on_registry_or_language_change() {
+    struct ResetLang;
+    impl Drop for ResetLang {
+        fn drop(&mut self) {
+            crate::i18n::apply_language(crate::i18n::Lang::EN);
+        }
+    }
+    let _reset = ResetLang;
+
+    let mut h = harness(new_app());
+    let first = h.state().chrome.search_cache.clone().expect("command search cache should populate on first draw");
+
+    crate::test_harness::frames(&mut h, 4);
+    let second = h.state().chrome.search_cache.clone().unwrap();
+    assert!(std::sync::Arc::ptr_eq(&first, &second), "idle frames must reuse the cached SearchIndex");
+
+    h.event(egui::Event::Text("Hello".into()));
+    crate::test_harness::frames(&mut h, 2);
+    let after_typing = h.state().chrome.search_cache.clone().unwrap();
+    assert!(std::sync::Arc::ptr_eq(&first, &after_typing), "typing must not rebuild the command search index");
+
+    h.state_mut().session.registry = wordcraft_engine::Session::new(wordcraft_doc::Document::new()).registry;
+    crate::test_harness::frames(&mut h, 2);
+    let after_registry = h.state().chrome.search_cache.clone().unwrap();
+    assert!(!std::sync::Arc::ptr_eq(&first, &after_registry), "replacing the command registry must invalidate the cache");
+
+    if let Some(ar) = crate::i18n::Lang::from_code("ar") {
+        h.state_mut().run("ui.language", json!({"value": ar.code()})).unwrap();
+        crate::test_harness::frames(&mut h, 2);
+        let after_lang = h.state().chrome.search_cache.clone().unwrap();
+        assert!(!std::sync::Arc::ptr_eq(&after_registry, &after_lang), "changing the interface language must invalidate the cache");
+    }
+}
+
+/// Opening the Customize Quick Access Toolbar button still populates all menu items lazily.
+#[test]
+fn qat_menu_populates_lazily_when_opened() {
+    let mut h = harness(new_app());
+    assert!(h.query_by_label("More Commands…").is_none(), "QAT menu stays closed until clicked");
+    let button = h.get_by_label("Customize Quick Access Toolbar").rect().center();
+    click_at(&mut h, button, egui::PointerButton::Primary);
+    assert!(h.query_by_label("More Commands…").is_some(), "opening QAT menu populates More Commands…");
+    assert!(h.query_by_label("Hide Quick Access Toolbar").is_some(), "opening QAT menu populates Hide Quick Access Toolbar");
+}
