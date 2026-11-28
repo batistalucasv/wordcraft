@@ -1157,6 +1157,53 @@ mod spelling_navigation_tests {
             "expected unbalanced delimiter issue in {issues:?}"
         );
     }
+
+    #[test]
+    fn deep_grammar_and_nominalizations_surface_in_review_issues() {
+        for (lang, text, target, suggestion, expected) in [
+            (None, "We need less steps before launch.", "less", "fewer", "We need fewer steps before launch."),
+            (None, "We should make a decision today.", "make a decision", "decide", "We should decide today."),
+            (Some("pt-BR"), "Houveram falhas no envio.", "Houveram", "Houve", "Houve falhas no envio."),
+            (Some("pt-BR"), "Vamos fazer uma análise completa.", "fazer uma análise", "analisar", "Vamos analisar completa."),
+            (Some("es-ES"), "Pienso de que vendrá pronto.", "de que", "que", "Pienso que vendrá pronto."),
+        ] {
+            let mut s = Session::new(Document::from_text(text));
+            if let Some(tag) = lang {
+                s.run("select.all", &json!({})).unwrap();
+                s.run("review.language", &json!({"lang": tag})).unwrap();
+            }
+            let issues = s.run("review.issues", &json!({})).unwrap();
+            let issue = issues
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|i| i["kind"] == "grammar" && i["text"] == target && i["suggestions"].as_array().unwrap().iter().any(|x| x == suggestion))
+                .unwrap_or_else(|| panic!("expected grammar issue for {target:?} in {issues:?}"));
+            let off = issue["start"]["off"].as_u64().unwrap() as usize;
+            s.sel = Selection::caret(Pos::body(0, off));
+            s.run("review.applySuggestion", &json!({"text": suggestion})).unwrap();
+            assert_eq!(s.doc.plain_text(StoryRef::Body), expected);
+            s.run("edit.undo", &json!({})).unwrap();
+            assert_eq!(s.doc.plain_text(StoryRef::Body), text);
+        }
+    }
+
+    #[test]
+    fn writing_report_command_returns_score_readability_and_tones() {
+        let mut s = Session::new(Document::from_text("Please review this urgent note immediately! Thank you for helping."));
+        let clean = s.run("review.writingReport", &json!({})).unwrap();
+        assert_eq!(clean["score"], 100);
+        assert_eq!(clean["issue_count"], 0);
+        assert!(clean["readability"]["fleschReadingEase"].as_f64().is_some_and(|v| v > 0.0));
+        assert!(clean["readability"]["readingMinutes"].as_f64().is_some_and(|v| v > 0.0));
+        assert!(clean["tones"].as_array().is_some_and(|t| !t.is_empty()), "{clean:?}");
+        assert!(!s.dirty && !s.can_undo(), "review.writingReport must stay pure");
+
+        let mut flawed = Session::new(Document::from_text("Their is less steps and we must make a decision."));
+        let report = flawed.run("review.writingReport", &json!({})).unwrap();
+        assert!(report["score"].as_u64().is_some_and(|n| n < 100), "{report:?}");
+        assert!(report["issue_count"].as_u64().is_some_and(|n| n >= 3), "{report:?}");
+    }
 }
 
 /// #6086 review: A pre-existing table whose cell paragraphs and runs are all redlined (including an

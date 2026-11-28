@@ -173,3 +173,61 @@ pub(super) fn thesaurus(s: &mut Session, v: &Value) -> CmdResult {
     let syn = T.iter().find(|(w, _)| *w == word).map(|(_, l)| l.to_vec()).unwrap_or_default();
     Ok(json!({"word": word, "synonyms": syn}))
 }
+
+fn resolve_doc_proof_lang(s: &Session, v: &Value) -> wordcraft_proof::ProofLang {
+    if let Some(tag) = p::str(v, "lang") {
+        return wordcraft_proof::ProofLang::from_tag(Some(tag));
+    }
+    for path in s.doc.para_paths(StoryRef::Body) {
+        let Some(p) = s.doc.para(StoryRef::Body, &path) else { continue };
+        let runs = wordcraft_layout::para::proof_runs(&s.doc, p, None);
+        if let Some(run) = runs.into_iter().find(|r| !r.skip) {
+            return run.lang;
+        }
+    }
+    wordcraft_proof::ProofLang::from_tag(s.doc.styles.default_chr.lang.as_deref())
+}
+
+/// Deterministic writing report: overall score (0..=100), readability metrics,
+/// dominant tones, and issue count computed via `wordcraft_proof::writing::analyze_writing`.
+pub(super) fn writing_report(s: &mut Session, v: &Value) -> CmdResult {
+    let lang = resolve_doc_proof_lang(s, v);
+    let text = s.doc.plain_text(StoryRef::Body);
+    let report = wordcraft_proof::writing::analyze_writing(&text, lang);
+    let tones: Vec<Value> = report
+        .tone
+        .dominant
+        .iter()
+        .map(|sig| {
+            let spans: Vec<Value> = sig.evidence_spans.iter().map(|sp| json!({"start": sp.start, "end": sp.end})).collect();
+            json!({
+                "kind": sig.kind.as_str(),
+                "strength": sig.strength,
+                "evidenceSpans": spans,
+            })
+        })
+        .collect();
+    Ok(json!({
+        "lang": lang.tag(),
+        "score": report.score.score,
+        "scoreDetails": {
+            "score": report.score.score,
+            "penaltyPoints": report.score.penalty_points,
+            "spellingIssues": report.score.spelling_issues,
+            "grammarIssues": report.score.grammar_issues,
+        },
+        "readability": {
+            "level": report.readability.level.as_str(),
+            "fleschReadingEase": report.readability.flesch_reading_ease,
+            "fleschKincaidGrade": report.readability.flesch_kincaid_grade,
+            "gulpeaseIndex": report.readability.gulpease_index,
+            "readingMinutes": report.readability.reading_minutes,
+            "speakingMinutes": report.readability.speaking_minutes,
+        },
+        "tones": tones,
+        "words": report.words,
+        "sentences": report.sentences,
+        "paragraphs": report.paragraphs,
+        "issue_count": report.issue_count,
+    }))
+}

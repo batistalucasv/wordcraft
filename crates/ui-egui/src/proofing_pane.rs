@@ -1,10 +1,11 @@
 //! Language-aware proofing task pane, laid out from black-box observation of Word on Windows.
 
 use craft::behavior::{DisplayOrder, ItemSource};
-use craft::theme::variant::Tone;
+use craft::theme::Variant;
+use craft::theme::variant::{Emphasis, Tone};
 use craft::ui::buttons::{Button, IconButton};
 use craft::ui::contract::{ActivateOn, Bind, CollectionEvent, Entry, Props as _, SelectMode, Show as _, ShowCollection as _, ShowContainer as _};
-use craft::ui::display::{Shade, Text};
+use craft::ui::display::{Badge, Divider, Shade, Text};
 use craft::ui::layout_components::{Row, Stack};
 use craft::ui::list::{List, ListRow};
 use craft::ui::menu::Menu;
@@ -35,6 +36,13 @@ pub struct SpellingForm {
     /// The suggestion row whose more-options menu is open.
     #[serde(skip)]
     menu_row: Option<usize>,
+    /// Cached `review.writingReport` payload for the current document epoch.
+    #[serde(skip)]
+    report: Option<Value>,
+    #[serde(skip)]
+    report_document: u64,
+    #[serde(skip)]
+    report_epoch: u64,
 }
 
 /// The suggestions as the rows of a list, keyed by position.
@@ -80,7 +88,21 @@ impl SpellingForm {
             epoch: app.session.ime_body_epoch(),
             selection: app.session.sel.clone(),
             menu_row: None,
+            report: None,
+            report_document: 0,
+            report_epoch: 0,
         }
+    }
+
+    fn refresh_report(&mut self, app: &mut WordApp) {
+        let doc = app.session.document_id();
+        let epoch = app.session.ime_body_epoch();
+        if self.report.is_some() && self.report_document == doc && self.report_epoch == epoch {
+            return;
+        }
+        self.report = app.execute("review.writingReport", json!({})).ok();
+        self.report_document = doc;
+        self.report_epoch = epoch;
     }
 
     fn done(&self) -> bool {
@@ -154,8 +176,10 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
 }
 
 fn body(app: &mut WordApp, ui: &mut Ui, form: &mut SpellingForm) {
+    form.refresh_report(app);
     if form.done() {
         Notice::new(Tone::Good, tl!("The spelling and grammar check is complete.")).show(ui);
+        show_writing_report(ui, form);
         if Button::new(tl!("Check Again")).show(ui).clicked() {
             form.next(app, true);
         }
@@ -264,6 +288,7 @@ fn body(app: &mut WordApp, ui: &mut Ui, form: &mut SpellingForm) {
             ask = Some(Ask::CheckAgain);
         }
     }
+    show_writing_report(ui, form);
 
     let Some(ask) = ask else { return };
     match ask {
@@ -304,6 +329,46 @@ fn body(app: &mut WordApp, ui: &mut Ui, form: &mut SpellingForm) {
         Ask::IgnoreAll => form.act(app, Some("review.ignoreAll")),
         Ask::AddToDictionary => form.act(app, Some("review.addToDictionary")),
         Ask::ChangeTyped => form.act(app, Some("review.applySuggestion")),
+    }
+}
+
+fn show_writing_report(ui: &mut Ui, form: &SpellingForm) {
+    let Some(report) = &form.report else { return };
+    let score = report["score"].as_u64().unwrap_or(100);
+    let score_tone = if score >= 85 {
+        Tone::Good
+    } else if score >= 60 {
+        Tone::Warn
+    } else {
+        Tone::Bad
+    };
+    let level = match report["readability"]["level"].as_str().unwrap_or("standard") {
+        "very_easy" => "Very Easy",
+        "easy" => "Easy",
+        "difficult" => "Difficult",
+        "academic" => "Academic",
+        _ => "Standard",
+    };
+    let issues = report["issue_count"].as_u64().unwrap_or(0);
+    Divider::horizontal().show(ui);
+    Text::new(tl!("Writing Score & Tone")).shade(Shade::Muted).show(ui);
+    Row::new().show(ui, |ui, _| {
+        Badge::new(format!("Score {score}/100")).variant(Variant::look(Emphasis::Soft, score_tone)).show(ui);
+        Badge::new(format!("Readability: {level}")).variant(Variant::look(Emphasis::Soft, Tone::Neutral)).show(ui);
+        Badge::new(format!("Issues: {issues}")).variant(Variant::look(Emphasis::Soft, Tone::Neutral)).show(ui);
+    });
+    if let Some(tones) = report["tones"].as_array() {
+        if tones.is_empty() {
+            Text::new(tl!("Tone: Neutral")).shade(Shade::Muted).show(ui);
+        } else {
+            Row::new().show(ui, |ui, _| {
+                for sig in tones.iter().take(3) {
+                    let kind = sig["kind"].as_str().unwrap_or("neutral");
+                    let strength = sig["strength"].as_u64().unwrap_or(0);
+                    Badge::new(format!("{kind} {strength}%")).variant(Variant::look(Emphasis::Soft, Tone::Info)).show(ui);
+                }
+            });
+        }
     }
 }
 
@@ -444,5 +509,16 @@ mod tests {
         assert_eq!(form(&a).issue["text"], "brwn");
         a.run("file.new", json!({})).unwrap();
         assert!(a.spelling_review.is_none());
+    }
+
+    #[test]
+    fn spelling_review_dialog_shows_writing_score_and_tone_summary() {
+        let h = harness("Please review this urgent report immediately!");
+        assert!(form(h.state()).done());
+        let heading = egui_kittest::kittest::By::new().label("Writing Score & Tone");
+        assert!(h.query_all(heading).next().is_some(), "expected Writing Score & Tone summary");
+        let report = form(h.state()).report.as_ref().expect("cached writingReport expected");
+        assert_eq!(report["score"], 100);
+        assert!(report["tones"].as_array().is_some_and(|t| !t.is_empty()), "{report:?}");
     }
 }

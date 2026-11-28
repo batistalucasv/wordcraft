@@ -22,7 +22,7 @@ use comments::{
     comment_at_caret, comments_change, delete_comment, edit_comment, list_comments, nav_comment, new_comment, reply, validate_comment_id,
 };
 pub use comments::{comment_list, comment_range_at_caret};
-use proofing::{all_issues, issue_at, next_issue, suggestions, thesaurus, word_count};
+use proofing::{all_issues, issue_at, next_issue, suggestions, thesaurus, word_count, writing_report};
 
 pub fn specs() -> Vec<CommandSpec> {
     vec![
@@ -139,6 +139,9 @@ pub fn specs() -> Vec<CommandSpec> {
         })
         .pure(),
         CommandSpec::new("review.thesaurus", "Thesaurus", "Review › Proofing", thesaurus).key("Shift+F7").pure(),
+        CommandSpec::new("review.writingReport", "Writing Report", "Review › Proofing", writing_report)
+            .params(r#"{"lang"?: string}"#)
+            .pure(),
     ]
 }
 
